@@ -1,8 +1,386 @@
-//! Axum web server that renders the conversation viewer.
+//! Axum web viewer.
+//!
+//! Renders one conversation per URL at `/c/{uuid}`. The UUID is the
+//! only access control — links posted into Discord are unguessable, and
+//! anyone with the link can read the trace. No auth, no login.
 
-/// Entry point for the `grok web` subcommand. Placeholder until the
-/// Axum routes and Maud templates are implemented.
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    tracing::warn!("web subcommand: not yet implemented");
+use std::net::SocketAddr;
+
+use axum::Router;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::get;
+use grok_discord_bot_core::{ConversationView, Db, DbError, TurnView};
+use maud::{DOCTYPE, Markup, PreEscaped, html};
+use thiserror::Error;
+use uuid::Uuid;
+
+/// Errors returned by the web layer. Map to HTTP responses via
+/// [`IntoResponse`].
+#[derive(Debug, Error)]
+pub enum WebError {
+    /// Failure binding or serving over TCP.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+/// State injected into every handler. Cheap to clone.
+#[derive(Clone)]
+struct WebState {
+    db: Db,
+}
+
+/// Entry point for the `grok web` subcommand.
+pub async fn run(db: Db, listen: SocketAddr) -> Result<(), WebError> {
+    let state = WebState { db };
+    let app = Router::new()
+        .route("/", get(landing))
+        .route("/c/{id}", get(view_conversation))
+        .fallback(not_found)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    tracing::info!(addr = %listen, "web viewer listening");
+    axum::serve(listener, app).await?;
     Ok(())
 }
+
+/// Per-request error type. Distinct from [`WebError`] (which only covers
+/// startup) so individual handlers can return either DB errors or
+/// not-found cleanly.
+#[derive(Debug, Error)]
+enum HandlerError {
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error("conversation not found")]
+    NotFound,
+}
+
+impl IntoResponse for HandlerError {
+    fn into_response(self) -> Response {
+        let (status, body) = match self {
+            HandlerError::NotFound => {
+                (StatusCode::NOT_FOUND, render_404().into_string())
+            }
+            HandlerError::Db(err) => {
+                tracing::error!(error = %err, "db error in handler");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    render_error("Something went wrong loading this conversation.")
+                        .into_string(),
+                )
+            }
+        };
+        (status, Html(body)).into_response()
+    }
+}
+
+async fn landing() -> Html<String> {
+    Html(
+        html! {
+            (DOCTYPE)
+            html {
+                head {
+                    (head_common("grok"))
+                }
+                body {
+                    main.center {
+                        h1 { "grok viewer" }
+                        p {
+                            "Conversation traces are accessed by their unguessable \
+                             UUID, surfaced as a link in Discord when the bot \
+                             opens a new conversation."
+                        }
+                    }
+                }
+            }
+        }
+        .into_string(),
+    )
+}
+
+async fn view_conversation(
+    Path(id): Path<Uuid>,
+    State(state): State<WebState>,
+) -> Result<Html<String>, HandlerError> {
+    let view = state
+        .db
+        .fetch_conversation_view(id)
+        .await?
+        .ok_or(HandlerError::NotFound)?;
+    Ok(Html(render_conversation(&view).into_string()))
+}
+
+async fn not_found() -> Response {
+    (StatusCode::NOT_FOUND, Html(render_404().into_string())).into_response()
+}
+
+fn render_conversation(view: &ConversationView) -> Markup {
+    let title = view
+        .conversation
+        .title
+        .clone()
+        .unwrap_or_else(|| "Untitled conversation".to_string());
+    let model = &view.conversation.model;
+    let created = view.conversation.created_at;
+
+    html! {
+        (DOCTYPE)
+        html {
+            head {
+                (head_common(&title))
+            }
+            body {
+                header.conv-header {
+                    h1 { (title) }
+                    p.meta {
+                        "Started " (created) " · model " code { (model) }
+                    }
+                }
+                main.conv {
+                    @for tv in &view.turns {
+                        (render_turn(tv))
+                    }
+                    @if view.turns.is_empty() {
+                        p.empty { "No turns yet." }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn render_turn(tv: &TurnView) -> Markup {
+    html! {
+        section.turn {
+            h2 {
+                "Turn " (tv.turn.turn_index + 1)
+                @match tv.turn.status.as_str() {
+                    "completed" => span.badge.ok { "completed" },
+                    "failed" => span.badge.err { "failed" },
+                    other => span.badge { (other) },
+                }
+            }
+
+            div.user {
+                h3 { "User" }
+                pre { (tv.turn.user_content) }
+            }
+
+            @if !tv.context.is_empty() {
+                details.context {
+                    summary { "Context fed to model (" (tv.context.len()) " items)" }
+                    @for item in &tv.context {
+                        article.context-item {
+                            header {
+                                span.role { (item.role) }
+                                " · "
+                                span.source { (item.source) }
+                            }
+                            pre { (item.content) }
+                        }
+                    }
+                }
+            }
+
+            @if !tv.tool_calls.is_empty() {
+                section.tools {
+                    h3 { "Tool calls (" (tv.tool_calls.len()) ")" }
+                    @for tc in &tv.tool_calls {
+                        article.tool-call {
+                            header {
+                                span.tool-name { (tc.tool_name) }
+                            }
+                            details {
+                                summary { "Request" }
+                                pre { (PreEscaped(pretty_json(&tc.request))) }
+                            }
+                            details {
+                                summary { "Response" }
+                                pre { (PreEscaped(pretty_json(&tc.response))) }
+                            }
+                        }
+                    }
+                }
+            }
+
+            div.assistant {
+                h3 { "Assistant" }
+                @if let Some(content) = &tv.turn.assistant_content {
+                    pre { (content) }
+                } @else if tv.turn.status == "failed" {
+                    pre.err { (tv.turn.error.as_deref().unwrap_or("(no error message)")) }
+                } @else {
+                    em { "(no response yet)" }
+                }
+            }
+        }
+    }
+}
+
+fn render_404() -> Markup {
+    html! {
+        (DOCTYPE)
+        html {
+            head {
+                (head_common("not found"))
+            }
+            body {
+                main.center {
+                    h1 { "404" }
+                    p { "No conversation here. The link may be wrong or the row was deleted." }
+                }
+            }
+        }
+    }
+}
+
+fn render_error(detail: &str) -> Markup {
+    html! {
+        (DOCTYPE)
+        html {
+            head {
+                (head_common("error"))
+            }
+            body {
+                main.center {
+                    h1 { "500" }
+                    p { (detail) }
+                }
+            }
+        }
+    }
+}
+
+fn head_common(title: &str) -> Markup {
+    html! {
+        meta charset="utf-8";
+        meta name="viewport" content="width=device-width, initial-scale=1";
+        title { (title) " · grok" }
+        style { (PreEscaped(STYLE)) }
+    }
+}
+
+fn pretty_json(value: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+const STYLE: &str = r#"
+:root {
+    color-scheme: light dark;
+    --fg: #1a1a1a;
+    --bg: #fafafa;
+    --muted: #666;
+    --border: #ddd;
+    --card: #ffffff;
+    --code-bg: #f1f1f1;
+    --accent: #5b6cff;
+    --err: #c0392b;
+    --ok: #27ae60;
+}
+@media (prefers-color-scheme: dark) {
+    :root {
+        --fg: #eaeaea;
+        --bg: #111;
+        --muted: #999;
+        --border: #2a2a2a;
+        --card: #1a1a1a;
+        --code-bg: #202020;
+    }
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+}
+header.conv-header, main.conv, main.center {
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 2rem 1.25rem;
+}
+main.center { text-align: center; }
+header.conv-header {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 1rem;
+    margin-bottom: 1rem;
+}
+header.conv-header h1 { margin: 0 0 .5rem; font-size: 1.6rem; }
+.meta { color: var(--muted); font-size: .9rem; margin: 0; }
+section.turn {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    margin-bottom: 1.25rem;
+}
+section.turn h2 {
+    font-size: 1.05rem;
+    margin: 0 0 .75rem;
+    display: flex;
+    align-items: center;
+    gap: .5rem;
+}
+.badge {
+    font-size: .75rem;
+    font-weight: normal;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: var(--code-bg);
+    color: var(--muted);
+}
+.badge.ok { background: rgba(39,174,96,.12); color: var(--ok); }
+.badge.err { background: rgba(192,57,43,.12); color: var(--err); }
+.user h3, .assistant h3, .tools h3 {
+    font-size: .85rem;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--muted);
+    margin: 1rem 0 .35rem;
+}
+pre {
+    background: var(--code-bg);
+    padding: .75rem 1rem;
+    border-radius: 6px;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+pre.err { color: var(--err); }
+details {
+    margin: .5rem 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: .5rem .75rem;
+}
+details summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: .85rem;
+}
+details[open] summary { margin-bottom: .5rem; }
+.context-item, .tool-call {
+    margin: .5rem 0;
+    padding: .5rem .75rem;
+    border-left: 3px solid var(--border);
+    background: var(--bg);
+}
+.context-item header, .tool-call header {
+    font-size: .8rem;
+    color: var(--muted);
+    margin-bottom: .35rem;
+}
+.role { font-weight: 600; color: var(--accent); }
+.tool-name { font-weight: 600; color: var(--accent); }
+code {
+    background: var(--code-bg);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.empty { color: var(--muted); font-style: italic; }
+"#;

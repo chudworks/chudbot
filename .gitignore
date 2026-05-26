@@ -1,5 +1,6 @@
 /target
 /.cargo
+/config.toml
 /.env
 /.env.local
 /.idea

@@ -1,0 +1,33 @@
+# grok-discord-bot configuration. Copy this file to `config.toml` and
+# fill in the secrets. config.toml is gitignored.
+
+[discord]
+# Bot token from https://discord.com/developers/applications
+token = "MTIzNDU2..."
+
+[postgres]
+# Standard libpq connection URL. Local Postgres on the Mac Studio:
+url = "postgres://chud@localhost/grok"
+
+[web]
+# Public base URL of the viewer; used to build the link the bot posts
+# into Discord on new conversations.
+base_url = "http://localhost:8080"
+# host:port the Axum server binds. Optional, defaults to 0.0.0.0:8080.
+# listen = "127.0.0.1:8080"
+
+[llm]
+# Which provider to route requests through: "xai" or "anthropic".
+provider = "xai"
+
+# Required when provider = "xai".
+[llm.xai]
+api_key = "xai-..."
+# Optional, defaults to "grok-4.1-fast".
+# model = "grok-4.3"
+
+# Required when provider = "anthropic".
+[llm.anthropic]
+api_key = "sk-ant-..."
+# Optional, defaults to "claude-sonnet-4-6".
+# model = "claude-opus-4-7"
