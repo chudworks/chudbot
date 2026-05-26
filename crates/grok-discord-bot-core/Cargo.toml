@@ -1,0 +1,19 @@
+[package]
+name = "grok-discord-bot-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+test-case.workspace = true

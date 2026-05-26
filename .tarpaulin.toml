@@ -1,0 +1,9 @@
+[default]
+timeout = "120s"
+out = ["Xml"]
+run-types = ["Tests"]
+follow-exec = true
+count = true
+all-features = true
+ignore-tests = false
+verbose = true
