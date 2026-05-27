@@ -19,9 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use grok_discord_bot_core::{
-    AgentRun, AnyProvider, BotConfig, ChatTurn, ContextItem, Conversation, Db, LlmProvider,
-    MessageRole, PrivacyMode, StepRequest, StepResponse, StorageConfig, ToolDefinition,
-    ToolError, ToolExecutor, TurnBlock,
+    AgentObserver, AgentRun, AnyProvider, BotConfig, ChatTurn, ContextItem, Conversation, Db,
+    LlmProvider, MessageRole, PrivacyMode, StepRequest, StepResponse, StorageConfig,
+    ToolDefinition, ToolError, ToolExecutor, TurnBlock,
     imagegen::{ImageGenRequest, ImageGenerator, ImageQuality},
     run_agent, storage,
     videogen::{JobStatus, VideoGenRequest, VideoGenerator, VideoResolution},
@@ -594,7 +594,8 @@ async fn process(
         messages,
         tools,
         &executor,
-        true, // server-side web search always enabled
+        &executor, // observer (same struct implements both traits)
+        true,      // server-side web search always enabled
         MAX_OUTPUT_TOKENS,
         state.bot_config.temperature,
         state.bot_config.top_p,
@@ -1012,8 +1013,10 @@ fn build_tool_definitions(
         tools.push(start_video_generation_tool());
         tools.push(check_video_status_tool());
     }
-    // Always-available — works for any reply UX.
-    tools.push(post_status_message_tool());
+    // Status messages aren't a tool — the model just writes
+    // intermediate prose alongside its tool_uses and the bot's
+    // AgentObserver posts it as a Discord reply (see
+    // `BotToolExecutor::on_partial_text`).
     tools
 }
 
@@ -1042,30 +1045,6 @@ from the current channel."
                 "before_message_id": {
                     "type": "string",
                     "description": "Fetch messages older than this message ID (snowflake as a string). Use for paginating further back."
-                }
-            },
-            "additionalProperties": false
-        }),
-    }
-}
-
-fn post_status_message_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: "post_status_message".to_string(),
-        description: "Post a short interim status message into the Discord \
-channel as a reply to the user. Use this for long-running operations to keep \
-the user informed — for example: \"Generating your video, should take ~60s\" \
-right after calling start_video_generation. Don't use it for the final \
-answer (your final answer goes back as plain assistant text). Don't spam it; \
-one message per long step is enough."
-            .to_string(),
-        input_schema: json!({
-            "type": "object",
-            "required": ["text"],
-            "properties": {
-                "text": {
-                    "type": "string",
-                    "description": "Plain-text message body. Discord markdown is fine. Max ~1900 chars."
                 }
             },
             "additionalProperties": false
@@ -1222,9 +1201,59 @@ impl ToolExecutor for BotToolExecutor {
             "generate_image" => self.generate_image(input).await,
             "start_video_generation" => self.start_video_generation(input).await,
             "check_video_status" => self.check_video_status(input).await,
-            "post_status_message" => self.post_status_message(input).await,
             other => Err(ToolError::Unknown(other.to_string())),
         }
+    }
+}
+
+impl AgentObserver for BotToolExecutor {
+    /// Post the model's intermediate text — text it emitted alongside
+    /// a `tool_uses` step — as a Discord reply. This is how status
+    /// messages reach the channel; the model just narrates and we
+    /// surface it, no dedicated tool required.
+    async fn on_partial_text(&self, text: &str) {
+        let trimmed = truncate(text, 1990);
+        if trimmed.trim().is_empty() {
+            return;
+        }
+        let create_result = self
+            .http
+            .create_message(self.default_channel_id)
+            .content(&trimmed)
+            .reply(self.user_msg_id)
+            .flags(twilight_model::channel::message::MessageFlags::SUPPRESS_EMBEDS)
+            .await;
+        let posted = match create_result {
+            Ok(resp) => match resp.model().await {
+                Ok(m) => m,
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to deserialize intermediate reply");
+                    return;
+                }
+            },
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to post intermediate reply");
+                return;
+            }
+        };
+        // Link this message to the conversation so the viewer trace
+        // shows every reply the bot posted this turn.
+        let _ = self
+            .db
+            .record_message_link(
+                i64::try_from(posted.id.get()).unwrap_or(i64::MAX),
+                self.guild_id,
+                self.conversation_id,
+                self.turn_id,
+                "assistant_status",
+            )
+            .await;
+        tracing::info!(
+            message_id = %posted.id,
+            turn = %self.turn_id,
+            chars = trimmed.len(),
+            "agent: intermediate reply posted"
+        );
     }
 }
 
@@ -1529,51 +1558,6 @@ impl BotToolExecutor {
                 Err(ToolError::Execution("video generation job expired".to_string()))
             }
         }
-    }
-
-    async fn post_status_message(&self, input: Value) -> Result<Value, ToolError> {
-        let text = input
-            .get("text")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("text is required".to_string()))?;
-        let trimmed = truncate(text, 1990);
-
-        let posted = self
-            .http
-            .create_message(self.default_channel_id)
-            .content(&trimmed)
-            .reply(self.user_msg_id)
-            .flags(twilight_model::channel::message::MessageFlags::SUPPRESS_EMBEDS)
-            .await
-            .map_err(|e| ToolError::Execution(format!("discord http: {e}")))?
-            .model()
-            .await
-            .map_err(|e| ToolError::Execution(format!("discord deserialize: {e}")))?;
-
-        // Link the intermediate message into the conversation so the
-        // viewer trace shows every reply the bot posted this turn.
-        let _ = self
-            .db
-            .record_message_link(
-                i64::try_from(posted.id.get()).unwrap_or(i64::MAX),
-                self.guild_id,
-                self.conversation_id,
-                self.turn_id,
-                "assistant_status",
-            )
-            .await;
-
-        tracing::info!(
-            message_id = %posted.id,
-            turn = %self.turn_id,
-            chars = trimmed.len(),
-            "status message posted"
-        );
-
-        Ok(json!({
-            "posted_message_id": posted.id.get().to_string(),
-            "chars": trimmed.len(),
-        }))
     }
 
     /// Returns true if the message's content should be visible to the
@@ -1940,13 +1924,13 @@ mod tests {
                 .collect()
         };
 
-        // OptIn, no media keys: fetch_messages + post_status_message.
+        // OptIn, no media keys: fetch_messages only.
         assert_eq!(
             names(&PrivacyMode::OptIn, false, false),
-            vec!["fetch_messages", "post_status_message"]
+            vec!["fetch_messages"]
         );
 
-        // OptIn + image + video keys: full set.
+        // OptIn + image + video keys: full client toolset.
         assert_eq!(
             names(&PrivacyMode::OptIn, true, true),
             vec![
@@ -1954,18 +1938,18 @@ mod tests {
                 "generate_image",
                 "start_video_generation",
                 "check_video_status",
-                "post_status_message",
             ]
         );
 
-        // ConversationOnly drops fetch_messages but post_status remains.
+        // ConversationOnly drops fetch_messages and nothing else
+        // remains unless media keys are configured.
         assert_eq!(
             names(&PrivacyMode::ConversationOnly, false, false),
-            vec!["post_status_message"]
+            Vec::<String>::new()
         );
         assert_eq!(
             names(&PrivacyMode::ConversationOnly, true, false),
-            vec!["generate_image", "post_status_message"]
+            vec!["generate_image"]
         );
     }
 }

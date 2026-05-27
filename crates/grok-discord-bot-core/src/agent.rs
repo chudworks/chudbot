@@ -19,6 +19,32 @@ use crate::llm::{
     ToolDefinition, ToolExecutor, ToolUseRequest, TurnBlock,
 };
 
+/// Observes events during an agent run. Currently just intermediate
+/// text the model emits alongside its tool_uses — the bot uses this
+/// to post natural status messages as the model narrates, no
+/// dedicated `post_status_message` tool required.
+///
+/// NOT called for the final assistant answer; that's returned in
+/// [`AgentRun::content`] for the caller to dispatch as it sees fit.
+pub trait AgentObserver: Send + Sync {
+    /// Fired once per agent step that returned non-empty
+    /// `partial_text` alongside one or more tool_uses. Implementations
+    /// should be best-effort (log errors, don't propagate) — failing
+    /// to post a status shouldn't abort the whole turn.
+    fn on_partial_text(
+        &self,
+        text: &str,
+    ) -> impl std::future::Future<Output = ()> + Send;
+}
+
+/// No-op observer for tests and callers that don't care about
+/// intermediate model narration.
+pub struct NoopObserver;
+
+impl AgentObserver for NoopObserver {
+    async fn on_partial_text(&self, _text: &str) {}
+}
+
 /// Result of [`run`].
 #[derive(Debug, Clone)]
 pub struct AgentRun {
@@ -34,11 +60,12 @@ pub struct AgentRun {
 /// Drive the model through a tool-use loop until it produces a final
 /// answer, or `max_iterations` is hit.
 #[allow(clippy::too_many_arguments)]
-pub async fn run<P, T>(
+pub async fn run<P, T, O>(
     provider: &P,
     initial_messages: Vec<ChatTurn>,
     tools: Vec<ToolDefinition>,
     executor: &T,
+    observer: &O,
     enable_web_search: bool,
     max_tokens: u32,
     temperature: Option<f32>,
@@ -48,6 +75,7 @@ pub async fn run<P, T>(
 where
     P: LlmProvider,
     T: ToolExecutor,
+    O: AgentObserver,
 {
     let mut messages = initial_messages;
     let mut all_tool_calls: Vec<ToolCallRecord> = Vec::new();
@@ -114,8 +142,18 @@ where
                     client_tool_uses = tool_uses.len(),
                     server_tool_calls = server_calls,
                     tools = ?tool_names,
+                    has_partial_text = partial_text.is_some(),
                     "agent: model requested tools"
                 );
+
+                // Surface the model's intermediate narration before we
+                // execute its tool calls. This is the natural,
+                // post_status_message-free path.
+                if let Some(text) = partial_text.as_ref() {
+                    if !text.trim().is_empty() {
+                        observer.on_partial_text(text).await;
+                    }
+                }
 
                 // Reconstruct the assistant turn so the next step can see it.
                 let mut assistant_blocks: Vec<TurnBlock> = Vec::new();
