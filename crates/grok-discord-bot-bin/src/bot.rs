@@ -362,6 +362,26 @@ async fn process(
         .collect();
     if !saved_images.is_empty() {
         if let Some(last) = messages.last_mut() {
+            // Inject the attachment URLs as TEXT into the user's turn
+            // so the model can pass them verbatim to tools like
+            // generate_image. Without this hint, the model sees the
+            // images via the structured input_image content block but
+            // doesn't treat the URL as a quotable string and tends to
+            // invent paths instead.
+            let url_list = saved_images
+                .iter()
+                .map(|i| format!("- {}", i.live_url))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let annotation = format!(
+                "\n\n[Images attached to this message — when calling \
+                 generate_image to edit one of them, pass the exact URL \
+                 below as a reference_images entry. Do not invent paths.]\n{url_list}"
+            );
+            match last.blocks.first_mut() {
+                Some(TurnBlock::Text(text)) => text.push_str(&annotation),
+                _ => last.blocks.insert(0, TurnBlock::Text(annotation)),
+            }
             for image in &saved_images {
                 last.blocks.push(TurnBlock::Image {
                     url: image.live_url.clone(),
@@ -416,16 +436,50 @@ async fn process(
             .await?;
     }
 
-    let reply_text =
-        format_reply(&agent_run.content, is_new, &conversation, &state.web_base_url);
-
     // Collect any images the agent generated this turn for upload as
     // Discord attachments on the outgoing reply.
     let generated_attachments =
         collect_generated_attachments(&state.images_dir, &agent_run.tool_calls).await;
 
+    // Detect "model claimed success but generate_image failed" — every
+    // generate_image call produced no usable image_uri. We want to NOT
+    // pretend things worked, so prepend a clear warning to the reply
+    // and surface ❌ instead of ✅ at the caller.
+    let attempted_image_gen = agent_run
+        .tool_calls
+        .iter()
+        .any(|tc| tc.tool_name == "generate_image");
+    let image_gen_failed = attempted_image_gen && generated_attachments.is_empty();
+    let answer_text = if image_gen_failed {
+        let error_snippet = agent_run
+            .tool_calls
+            .iter()
+            .find(|tc| tc.tool_name == "generate_image")
+            .and_then(|tc| tc.response.get("error"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no error message)")
+            .chars()
+            .take(200)
+            .collect::<String>();
+        format!(
+            "⚠️ Image generation failed: `{}`. (Model's claimed text follows.)\n\n{}",
+            error_snippet, agent_run.content
+        )
+    } else {
+        agent_run.content.clone()
+    };
+    let reply_text =
+        format_reply(&answer_text, is_new, &conversation, &state.web_base_url);
+
     let reply_msg =
         post_reply(state, msg, &reply_text, is_new, &generated_attachments).await?;
+    if image_gen_failed {
+        tracing::warn!(
+            conversation = %conversation.id,
+            turn = %turn.id,
+            "image generation was attempted but produced no images; reply marked as failed"
+        );
+    }
     let threaded = is_new && reply_text.len() > REPLY_LENGTH_THRESHOLD;
     tracing::info!(
         conversation = %conversation.id,
@@ -467,6 +521,12 @@ async fn process(
         )
         .await?;
 
+    if image_gen_failed {
+        // Bubble the failure up so handle_message reacts ❌ instead of ✅.
+        return Err(BotError::Llm(grok_discord_bot_core::LlmError::Transport(
+            "generate_image was attempted but produced no images".to_string(),
+        )));
+    }
     Ok(())
 }
 
@@ -759,11 +819,18 @@ fn generate_image_tool() -> ToolDefinition {
         name: "generate_image".to_string(),
         description: "Generate an image with xAI's Grok Imagine model. Use \
 this whenever the user asks for an image, picture, drawing, illustration, or \
-visual. To edit/restyle an image the user attached earlier in this \
-conversation, pass that image's URL in `reference_images` along with your edit \
-prompt. The generated image will be attached to your reply automatically — \
-don't link to it in your text. Returns the saved image's URI so you can \
-reference it in chained generations."
+visual.
+
+To edit/restyle an image the user attached, pass its EXACT URL string in \
+`reference_images`. The URL appears in the user's turn (look for lines \
+starting with `https://cdn.discordapp.com/...` or `file://images/...`). \
+NEVER invent or guess a path — `reference_images` must contain only URLs \
+that appear verbatim in the conversation. If you can't find a real URL, \
+omit `reference_images` and generate from text alone.
+
+The generated image is attached to your reply automatically — don't link to \
+it in your text. Returns the saved image's URI so you can reference it in \
+chained generations on later turns."
             .to_string(),
         input_schema: json!({
             "type": "object",
