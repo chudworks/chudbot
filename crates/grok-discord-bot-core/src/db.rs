@@ -9,7 +9,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::config::PrivacyMode;
-use crate::domain::{ContextItem, Conversation, ConversationView, Turn, TurnView};
+use crate::domain::{ContextItem, Conversation, ConversationView, Turn, TurnView, VideoJob};
 use crate::llm::ToolCallRecord;
 
 /// Migrations baked in at compile time from the workspace's
@@ -374,6 +374,76 @@ impl Db {
         )
         .bind(discord_guild_id)
         .bind(json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Record a freshly-submitted video generation job. Called from the
+    /// `start_video_generation` tool after xAI returns a `request_id`.
+    pub async fn create_video_job(
+        &self,
+        turn_id: Uuid,
+        request_id: &str,
+        prompt: &str,
+    ) -> Result<VideoJob, DbError> {
+        let id = Uuid::new_v4();
+        let job = sqlx::query_as::<_, VideoJob>(
+            "INSERT INTO video_jobs (id, turn_id, request_id, prompt) \
+             VALUES ($1, $2, $3, $4) \
+             RETURNING id, turn_id, request_id, prompt, status, video_uri, \
+               submitted_at, completed_at, error",
+        )
+        .bind(id)
+        .bind(turn_id)
+        .bind(request_id)
+        .bind(prompt)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(job)
+    }
+
+    /// Look up a job by its xAI `request_id`. The `check_video_status`
+    /// tool uses this to associate a polling response with its row.
+    pub async fn get_video_job(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<VideoJob>, DbError> {
+        let row = sqlx::query_as::<_, VideoJob>(
+            "SELECT id, turn_id, request_id, prompt, status, video_uri, \
+               submitted_at, completed_at, error \
+             FROM video_jobs WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Update a job's status. Used both for terminal transitions (done /
+    /// failed / expired with completion timestamp) and for noop status
+    /// snapshots from `check_video_status` polls.
+    pub async fn update_video_job_status(
+        &self,
+        request_id: &str,
+        status: &str,
+        video_uri: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<(), DbError> {
+        let terminal = matches!(status, "done" | "failed" | "expired");
+        sqlx::query(
+            "UPDATE video_jobs \
+             SET status = $2, \
+                 video_uri = COALESCE($3, video_uri), \
+                 error = COALESCE($4, error), \
+                 completed_at = CASE WHEN $5 THEN now() ELSE completed_at END \
+             WHERE request_id = $1",
+        )
+        .bind(request_id)
+        .bind(status)
+        .bind(video_uri)
+        .bind(error)
+        .bind(terminal)
         .execute(&self.pool)
         .await?;
         Ok(())

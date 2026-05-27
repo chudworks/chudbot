@@ -34,21 +34,33 @@ struct WebState {
 }
 
 /// Entry point for the `grok web` subcommand.
-pub async fn run(db: Db, listen: SocketAddr, images_dir: PathBuf) -> Result<(), WebError> {
-    // Ensure the directory exists so ServeDir doesn't 500 on first hit
-    // before any image has been written.
+pub async fn run(
+    db: Db,
+    listen: SocketAddr,
+    images_dir: PathBuf,
+    videos_dir: PathBuf,
+) -> Result<(), WebError> {
+    // Ensure the dirs exist so ServeDir doesn't 500 on first hit
+    // before any media has been written.
     tokio::fs::create_dir_all(&images_dir).await?;
+    tokio::fs::create_dir_all(&videos_dir).await?;
 
     let state = WebState { db };
     let app = Router::new()
         .route("/", get(landing))
         .route("/c/{id}", get(view_conversation))
         .nest_service("/images", ServeDir::new(&images_dir))
+        .nest_service("/videos", ServeDir::new(&videos_dir))
         .fallback(not_found)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!(addr = %listen, images_dir = %images_dir.display(), "web viewer listening");
+    tracing::info!(
+        addr = %listen,
+        images_dir = %images_dir.display(),
+        videos_dir = %videos_dir.display(),
+        "web viewer listening"
+    );
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -195,16 +207,21 @@ fn render_turn(tv: &TurnView) -> Markup {
                 section.tools {
                     h3 { "Tool calls (" (tv.tool_calls.len()) ")" }
                     @for tc in &tv.tool_calls {
-                        @let images = collect_image_uris(&tc.response);
+                        @let media = collect_media_uris(&tc.response);
                         article.tool-call {
                             header {
                                 span.tool-name { (tc.tool_name) }
                             }
-                            @if !images.is_empty() {
+                            @if !media.is_empty() {
                                 div.tool-images {
-                                    @for uri in &images {
-                                        @if let Some(p) = storage::to_web_path(uri) {
-                                            img.context-image src=(p) alt=(tc.tool_name);
+                                    @for m in &media {
+                                        @match m {
+                                            MediaUri::Image(uri) => @if let Some(p) = storage::to_web_path(uri) {
+                                                img.context-image src=(p) alt=(tc.tool_name);
+                                            },
+                                            MediaUri::Video(uri) => @if let Some(p) = storage::to_web_path(uri) {
+                                                video.context-video controls src=(p) {}
+                                            },
                                         }
                                     }
                                 }
@@ -236,33 +253,52 @@ fn render_turn(tv: &TurnView) -> Markup {
     }
 }
 
-/// Render a context item's content. Image-typed items (per the
-/// `file://images/…` URI scheme or a `:image:` source segment) render
-/// as inline `<img>` tags via the `/images/*` static route; everything
-/// else renders as preformatted text.
+/// Render a context item's content. Media-typed items (per the
+/// `file://images/…` or `file://videos/…` URI schemes) render as
+/// inline `<img>` / `<video>` tags via the `/images/*` and `/videos/*`
+/// static routes; everything else renders as preformatted text.
 fn render_context_body(item: &ContextItem) -> Markup {
-    if let Some(web_path) = storage::to_web_path(&item.content) {
-        return html! {
-            img.context-image src=(web_path) alt="user attachment";
-        };
+    if storage::is_image_uri(&item.content) {
+        if let Some(web_path) = storage::to_web_path(&item.content) {
+            return html! { img.context-image src=(web_path) alt="user attachment"; };
+        }
+    }
+    if storage::is_video_uri(&item.content) {
+        if let Some(web_path) = storage::to_web_path(&item.content) {
+            return html! { video.context-video controls src=(web_path) {} };
+        }
     }
     html! { pre { (item.content) } }
 }
 
-/// Walk a JSON value and collect every string we recognise as an image
-/// storage URI. Used to surface images embedded inside tool-call
-/// responses (e.g. `generate_image` returns `{"image_uri": "file://…"}`).
-fn collect_image_uris(value: &serde_json::Value) -> Vec<String> {
+/// Media URI found in a JSON value, with kind tag so the renderer
+/// knows whether to emit `<img>` or `<video>`.
+#[derive(Debug, Clone)]
+enum MediaUri {
+    Image(String),
+    Video(String),
+}
+
+/// Walk a JSON value and collect every string we recognise as a media
+/// storage URI. Used to surface generated content embedded inside
+/// tool-call responses (`generate_image` → `image_uri`,
+/// `check_video_status` → `video_uri`, etc.).
+fn collect_media_uris(value: &serde_json::Value) -> Vec<MediaUri> {
     let mut out = Vec::new();
-    walk_for_image_uris(value, &mut out);
+    walk_for_media_uris(value, &mut out);
     out
 }
 
-fn walk_for_image_uris(value: &serde_json::Value, out: &mut Vec<String>) {
+fn walk_for_media_uris(value: &serde_json::Value, out: &mut Vec<MediaUri>) {
     match value {
-        serde_json::Value::String(s) if storage::is_image_uri(s) => out.push(s.clone()),
-        serde_json::Value::Array(arr) => arr.iter().for_each(|v| walk_for_image_uris(v, out)),
-        serde_json::Value::Object(obj) => obj.values().for_each(|v| walk_for_image_uris(v, out)),
+        serde_json::Value::String(s) if storage::is_image_uri(s) => {
+            out.push(MediaUri::Image(s.clone()));
+        }
+        serde_json::Value::String(s) if storage::is_video_uri(s) => {
+            out.push(MediaUri::Video(s.clone()));
+        }
+        serde_json::Value::Array(arr) => arr.iter().for_each(|v| walk_for_media_uris(v, out)),
+        serde_json::Value::Object(obj) => obj.values().for_each(|v| walk_for_media_uris(v, out)),
         _ => {}
     }
 }
@@ -431,7 +467,7 @@ code {
     font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .empty { color: var(--muted); font-style: italic; }
-.context-image {
+.context-image, .context-video {
     max-width: 100%;
     max-height: 400px;
     border-radius: 6px;
@@ -444,7 +480,8 @@ code {
     gap: .5rem;
     margin: .5rem 0;
 }
-.tool-images .context-image {
+.tool-images .context-image,
+.tool-images .context-video {
     max-height: 300px;
     flex: 0 0 auto;
 }

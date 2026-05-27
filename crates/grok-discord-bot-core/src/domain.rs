@@ -79,6 +79,31 @@ pub struct ContextItem {
     pub discord_message_id: Option<i64>,
 }
 
+/// One outstanding (or completed) video generation job submitted to
+/// xAI. Mutated as `check_video_status` polls; surfaces to the
+/// viewer alongside the tool call trace.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct VideoJob {
+    /// Stable identifier.
+    pub id: Uuid,
+    /// Owning turn.
+    pub turn_id: Uuid,
+    /// xAI's request_id; the key used for polling.
+    pub request_id: String,
+    /// Prompt the job was submitted with.
+    pub prompt: String,
+    /// `pending` | `done` | `failed` | `expired`.
+    pub status: String,
+    /// `file://videos/<uuid>.mp4` URI once status flips to `done`.
+    pub video_uri: Option<String>,
+    /// When the submit call succeeded.
+    pub submitted_at: OffsetDateTime,
+    /// When status reached a terminal state.
+    pub completed_at: Option<OffsetDateTime>,
+    /// Upstream error message if `status = 'failed'` or `'expired'`.
+    pub error: Option<String>,
+}
+
 /// Aggregated read-model for the web viewer: a conversation plus all of
 /// its turns, each with its context items and tool calls.
 #[derive(Debug, Clone, Serialize)]

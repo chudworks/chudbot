@@ -55,29 +55,36 @@ pub struct Config {
     pub storage: StorageConfig,
 }
 
-/// Media storage settings. Today only the local `images/` directory is
-/// used; the URI scheme in the DB (`file://images/<name>`) is the seam
-/// for adding more backends later.
+/// Media storage settings. Local-only today; the URI scheme in the DB
+/// (`file://images/<name>`, `file://videos/<name>`) is the seam for
+/// adding more backends later (`s3://…`, etc.).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct StorageConfig {
-    /// Directory where images saved from Discord attachments live. The
-    /// web viewer mounts `/images/*` at this directory. Path is
-    /// resolved relative to the bot's working directory; the default
-    /// keeps everything inside the repo checkout.
+    /// Directory where images live (Discord attachments + generated
+    /// images). The web viewer mounts `/images/*` at this directory.
     #[serde(default = "default_images_dir")]
     pub images_dir: PathBuf,
+    /// Directory where generated videos live. The web viewer mounts
+    /// `/videos/*` at this directory.
+    #[serde(default = "default_videos_dir")]
+    pub videos_dir: PathBuf,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             images_dir: default_images_dir(),
+            videos_dir: default_videos_dir(),
         }
     }
 }
 
 fn default_images_dir() -> PathBuf {
     PathBuf::from("images")
+}
+
+fn default_videos_dir() -> PathBuf {
+    PathBuf::from("videos")
 }
 
 /// Persona / sampling settings for the agent loop. Edit `system_prompt`

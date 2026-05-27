@@ -2,6 +2,7 @@
 /.cargo
 /config.toml
 /images
+/videos
 /.env
 /.env.local
 /.idea

@@ -101,6 +101,17 @@ The bot's `BotToolExecutor` exposes:
   The tool saves the result bytes to `images_dir`, returns the
   `file://` URI to the agent, and the bot attaches the bytes to the
   outgoing Discord reply. Exposed only when `[llm.xai]` is configured.
+- **`start_video_generation(prompt, image_url?, duration_seconds?, aspect_ratio?, resolution?)`**
+  / **`check_video_status(request_id, wait_seconds?)`** — agent-driven
+  polling pair for `grok-imagine-video`. `start` submits and returns
+  immediately with a `request_id` (persisted to `video_jobs`); `check`
+  sleeps `wait_seconds` (max 30) and polls once, returning `pending`
+  or `done` with the saved `file://videos/…` URI. The model is
+  expected to interleave `post_status_message` calls between polls to
+  keep the user updated.
+- **`post_status_message(text)`** — posts an intermediate Discord
+  reply to the user. Always exposed. Used by the model to narrate
+  long-running operations without hardcoded boilerplate.
 
 Privacy mode constrains the tool:
 - `Open`: returns everything (minus the bot's own messages).

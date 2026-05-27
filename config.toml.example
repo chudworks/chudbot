@@ -48,13 +48,14 @@ api_key = "sk-ant-..."
 [default_privacy]
 mode = "opt_in"
 
-# Where to persist image attachments users send the bot. Files are
-# saved as `<images_dir>/<uuid>.<ext>` and referenced in the DB by
-# `file://images/<uuid>.<ext>` URIs (so future backends like s3://
-# can drop in without a schema change). The path is relative to the
-# bot's working directory; default is ./images (which is gitignored).
+# Where to persist media. Files are saved as `<dir>/<uuid>.<ext>` and
+# referenced in the DB by `file://images/<name>` or `file://videos/<name>`
+# URIs (so future backends like s3:// can drop in without a schema
+# change). Paths are relative to the bot's working directory; both
+# defaults are gitignored.
 [storage]
 # images_dir = "images"
+# videos_dir = "videos"
 
 # Bot persona — system prompt and sampling knobs. All optional; an
 # omitted [bot] block uses sensible defaults. Restart the bot after

@@ -24,7 +24,9 @@ use grok_discord_bot_core::{
     ToolError, ToolExecutor, TurnBlock,
     imagegen::{ImageGenRequest, ImageGenerator, ImageQuality},
     run_agent, storage,
+    videogen::{JobStatus, VideoGenRequest, VideoGenerator, VideoResolution},
 };
+use uuid::Uuid;
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -40,6 +42,7 @@ use twilight_model::id::Id;
 use twilight_model::id::marker::{
     ApplicationMarker, ChannelMarker, GuildMarker, MessageMarker, UserMarker,
 };
+use std::time::Duration;
 
 use crate::commands;
 
@@ -52,9 +55,20 @@ const REPLY_LENGTH_THRESHOLD: usize = 1500;
 /// `max_tokens`; xAI tolerates an unused field.
 const MAX_OUTPUT_TOKENS: u32 = 4096;
 
-/// Safety cap on the agent's tool-use loop. Most turns finish in 1-3
-/// iterations; this is a runaway guard.
-const MAX_AGENT_ITERATIONS: u32 = 6;
+/// Safety cap on the agent's tool-use loop. Bumped from a previous 6
+/// to leave headroom for video generation: the model often does
+/// `start_video_generation` → a couple of `check_video_status` polls →
+/// `post_status_message` → final answer, which is 5+ iterations.
+const MAX_AGENT_ITERATIONS: u32 = 12;
+
+/// Hard cap on how long `check_video_status` will sleep inside one
+/// tool call before polling. Bigger means fewer agent iterations per
+/// video but blocks the request handler longer.
+const MAX_CHECK_WAIT_SECS: u64 = 30;
+
+/// Discord free-tier upload size cap. Files larger than this are
+/// linked rather than attached (avoids a Discord-side reject).
+const DISCORD_FREE_UPLOAD_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
 
 /// System prompt for the pre-flight moderation classifier. The bot
 /// runs in **private friends-only servers**, so the default is ALLOW
@@ -118,9 +132,12 @@ struct State {
     default_privacy: PrivacyMode,
     bot_config: BotConfig,
     images_dir: PathBuf,
+    videos_dir: PathBuf,
     /// Present only when an xAI API key is configured; gates the
     /// `generate_image` tool exposure.
     image_gen: Option<Arc<ImageGenerator>>,
+    /// Same gating; xAI's video endpoints share the chat key.
+    video_gen: Option<Arc<VideoGenerator>>,
 }
 
 /// Entry point for the `grok bot` subcommand.
@@ -135,6 +152,7 @@ pub async fn run(
     bot_config: BotConfig,
     storage_config: StorageConfig,
     image_gen: Option<Arc<ImageGenerator>>,
+    video_gen: Option<Arc<VideoGenerator>>,
 ) -> Result<(), BotError> {
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
@@ -167,7 +185,9 @@ pub async fn run(
         default_privacy,
         bot_config,
         images_dir: storage_config.images_dir,
+        videos_dir: storage_config.videos_dir,
         image_gen,
+        video_gen,
     });
 
     let mut shard = Shard::new(ShardId::ONE, discord_token, intents);
@@ -542,20 +562,31 @@ async fn process(
         }
     }
 
-    // Tools available to the model for this turn. fetch_messages is
-    // exposed in every mode except ConversationOnly; generate_image is
-    // exposed only when an xAI key is configured.
-    let tools = build_tool_definitions(privacy_mode, state.image_gen.is_some());
+    // Tools available to the model for this turn:
+    //   - fetch_messages: every mode except ConversationOnly
+    //   - generate_image / start_video_generation / check_video_status:
+    //     only when an xAI key is configured
+    //   - post_status_message: always available
+    let tools = build_tool_definitions(
+        privacy_mode,
+        state.image_gen.is_some(),
+        state.video_gen.is_some(),
+    );
 
     let executor = BotToolExecutor {
         http: Arc::clone(&state.http),
         db: state.db.clone(),
         bot_user_id: state.bot_user_id,
         default_channel_id: msg.channel_id,
+        user_msg_id: msg.id,
         guild_id: conversation.discord_guild_id,
+        conversation_id: conversation.id,
+        turn_id: turn.id,
         privacy_mode: privacy_mode.clone(),
         image_gen: state.image_gen.clone(),
+        video_gen: state.video_gen.clone(),
         images_dir: state.images_dir.clone(),
+        videos_dir: state.videos_dir.clone(),
     };
 
     let agent_result = run_agent(
@@ -587,49 +618,70 @@ async fn process(
             .await?;
     }
 
-    // Collect any images the agent generated this turn for upload as
+    // Collect any media the agent generated this turn for upload as
     // Discord attachments on the outgoing reply.
-    let generated_attachments =
-        collect_generated_attachments(&state.images_dir, &agent_run.tool_calls).await;
+    let generated_attachments = collect_generated_attachments(
+        &state.images_dir,
+        &state.videos_dir,
+        &agent_run.tool_calls,
+    )
+    .await;
 
-    // If any generate_image call was refused by xAI's safety layer,
-    // treat the whole turn as a TOS refusal and bail out with ❓ —
-    // same shape as if the chat call itself had been refused. We do
-    // this BEFORE the generic image_gen_failed path so a safety 403
-    // doesn't get a ❌ + warning-text reply.
-    let image_gen_safety_refused = agent_run.tool_calls.iter().any(|tc| {
-        tc.tool_name == "generate_image"
-            && tc.response
-                .get("error")
-                .and_then(|v| v.as_str())
-                .map(body_indicates_safety_refusal)
-                .unwrap_or(false)
+    // If any generate_image or check_video_status call was refused by
+    // xAI's safety layer, treat the whole turn as a TOS refusal and
+    // bail out with ❓ — same shape as if the chat call itself had
+    // been refused. We do this BEFORE the generic media-failed path so
+    // a safety 403 doesn't get a ❌ + warning-text reply.
+    let media_safety_refused = agent_run.tool_calls.iter().any(|tc| {
+        matches!(
+            tc.tool_name.as_str(),
+            "generate_image" | "start_video_generation" | "check_video_status"
+        ) && tc
+            .response
+            .get("error")
+            .and_then(|v| v.as_str())
+            .map(body_indicates_safety_refusal)
+            .unwrap_or(false)
     });
-    if image_gen_safety_refused {
+    if media_safety_refused {
         tracing::info!(
             conversation = %conversation.id,
             turn = %turn.id,
-            "image generation refused by upstream safety; surfacing as TOS refusal"
+            "media generation refused by upstream safety; surfacing as TOS refusal"
         );
         state
             .db
-            .fail_turn(turn.id, "image generation refused by upstream safety")
+            .fail_turn(turn.id, "media generation refused by upstream safety")
             .await
             .ok();
         return Err(BotError::Llm(synthesize_safety_refusal(
-            "generate_image was refused by xAI's safety policy",
+            "media generation was refused by xAI's safety policy",
         )));
     }
 
-    // Detect "model claimed success but generate_image failed" — every
-    // generate_image call produced no usable image_uri. We want to NOT
-    // pretend things worked, so prepend a clear warning to the reply
-    // and surface ❌ instead of ✅ at the caller.
+    // Detect "model claimed success but media generation failed" — any
+    // image gen with no image_uri, or any check_video_status that never
+    // reached a 'done' status producing a video_uri. We don't want to
+    // pretend success.
     let attempted_image_gen = agent_run
         .tool_calls
         .iter()
         .any(|tc| tc.tool_name == "generate_image");
-    let image_gen_failed = attempted_image_gen && generated_attachments.is_empty();
+    let attempted_video_gen = agent_run
+        .tool_calls
+        .iter()
+        .any(|tc| tc.tool_name == "start_video_generation");
+    let image_gen_failed = attempted_image_gen
+        && !agent_run
+            .tool_calls
+            .iter()
+            .any(|tc| tc.tool_name == "generate_image" && tc.response.get("image_uri").is_some());
+    let video_gen_failed = attempted_video_gen
+        && !agent_run
+            .tool_calls
+            .iter()
+            .any(|tc| tc.tool_name == "check_video_status" && tc.response.get("video_uri").is_some());
+    let image_gen_failed = image_gen_failed || video_gen_failed;
     let answer_text = if image_gen_failed {
         let error_snippet = agent_run
             .tool_calls
@@ -951,7 +1003,11 @@ async fn quoted_message_allowed(
 ///     mode, which deliberately doesn't reach beyond the conversation.
 ///   - `generate_image` — declared only when an xAI key is configured
 ///     (the only image-gen backend we support today).
-fn build_tool_definitions(mode: &PrivacyMode, image_gen_available: bool) -> Vec<ToolDefinition> {
+fn build_tool_definitions(
+    mode: &PrivacyMode,
+    image_gen_available: bool,
+    video_gen_available: bool,
+) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
     if !matches!(mode, PrivacyMode::ConversationOnly) {
         tools.push(fetch_messages_tool());
@@ -959,6 +1015,12 @@ fn build_tool_definitions(mode: &PrivacyMode, image_gen_available: bool) -> Vec<
     if image_gen_available {
         tools.push(generate_image_tool());
     }
+    if video_gen_available {
+        tools.push(start_video_generation_tool());
+        tools.push(check_video_status_tool());
+    }
+    // Always-available — works for any reply UX.
+    tools.push(post_status_message_tool());
     tools
 }
 
@@ -987,6 +1049,100 @@ from the current channel."
                 "before_message_id": {
                     "type": "string",
                     "description": "Fetch messages older than this message ID (snowflake as a string). Use for paginating further back."
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn post_status_message_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "post_status_message".to_string(),
+        description: "Post a short interim status message into the Discord \
+channel as a reply to the user. Use this for long-running operations to keep \
+the user informed — for example: \"Generating your video, should take ~60s\" \
+right after calling start_video_generation. Don't use it for the final \
+answer (your final answer goes back as plain assistant text). Don't spam it; \
+one message per long step is enough."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Plain-text message body. Discord markdown is fine. Max ~1900 chars."
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn start_video_generation_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "start_video_generation".to_string(),
+        description: "Begin generating a short video with xAI's Grok Imagine \
+Video model. Returns immediately with a `request_id` — the video is NOT yet \
+ready. Follow this up with `check_video_status` polls (typically 2-4 of them, \
+spaced ~15-30s apart) until status=done. Use post_status_message between \
+checks to keep the user informed.
+
+For image-to-video, pass an EXACT image URL in `image_url` (same rules as \
+generate_image — never invent paths). Max duration 15s. 480p is cheap; 720p \
+costs more."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["prompt"],
+            "properties": {
+                "prompt": {"type": "string"},
+                "image_url": {
+                    "type": "string",
+                    "description": "Optional image URL/URI to animate from."
+                },
+                "duration_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 15
+                },
+                "aspect_ratio": {
+                    "enum": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3"]
+                },
+                "resolution": {
+                    "enum": ["480p", "720p"],
+                    "description": "Defaults to 480p (cheaper)."
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn check_video_status_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "check_video_status".to_string(),
+        description: "Poll a previously-submitted video generation job. \
+Returns the current status: 'pending' (still rendering), 'done' (URI \
+returned in `video_uri` — it will be auto-attached to your eventual final \
+reply, don't link to it), 'failed' (with error), or 'expired'. The \
+`wait_seconds` parameter (default 15, max 30) lets you sleep before polling \
+to space out checks without burning agent iterations."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["request_id"],
+            "properties": {
+                "request_id": {
+                    "type": "string",
+                    "description": "The id returned by start_video_generation."
+                },
+                "wait_seconds": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30,
+                    "description": "Sleep this many seconds before polling. Default 15."
                 }
             },
             "additionalProperties": false
@@ -1043,16 +1199,23 @@ chained generations on later turns."
 }
 
 /// [`ToolExecutor`] backing the client-side tools. Owned per-turn so
-/// it can capture the channel + guild + image-gen context.
+/// it can capture the channel + guild + media-gen context plus the
+/// specific turn identifiers we need for `video_jobs` persistence and
+/// `post_status_message` reply targeting.
 struct BotToolExecutor {
     http: Arc<HttpClient>,
     db: Db,
     bot_user_id: Id<UserMarker>,
     default_channel_id: Id<ChannelMarker>,
+    user_msg_id: Id<MessageMarker>,
     guild_id: i64,
+    conversation_id: Uuid,
+    turn_id: Uuid,
     privacy_mode: PrivacyMode,
     image_gen: Option<Arc<ImageGenerator>>,
+    video_gen: Option<Arc<VideoGenerator>>,
     images_dir: PathBuf,
+    videos_dir: PathBuf,
 }
 
 impl ToolExecutor for BotToolExecutor {
@@ -1060,6 +1223,9 @@ impl ToolExecutor for BotToolExecutor {
         match name {
             "fetch_messages" => self.fetch_messages(input).await,
             "generate_image" => self.generate_image(input).await,
+            "start_video_generation" => self.start_video_generation(input).await,
+            "check_video_status" => self.check_video_status(input).await,
+            "post_status_message" => self.post_status_message(input).await,
             other => Err(ToolError::Unknown(other.to_string())),
         }
     }
@@ -1225,6 +1391,194 @@ impl BotToolExecutor {
         }))
     }
 
+    async fn start_video_generation(&self, input: Value) -> Result<Value, ToolError> {
+        let Some(generator) = self.video_gen.as_ref() else {
+            return Err(ToolError::Execution(
+                "video generation isn't configured on this bot".to_string(),
+            ));
+        };
+        let prompt = input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("prompt is required".to_string()))?
+            .to_string();
+        let image_url = input
+            .get("image_url")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let duration = input
+            .get("duration_seconds")
+            .and_then(Value::as_i64)
+            .map(|n| n.clamp(1, 15) as u8);
+        let aspect_ratio = input
+            .get("aspect_ratio")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let resolution = match input.get("resolution").and_then(Value::as_str) {
+            Some("720p") => VideoResolution::P720,
+            _ => VideoResolution::P480,
+        };
+
+        let req = VideoGenRequest {
+            prompt: prompt.clone(),
+            image_url,
+            duration_seconds: duration,
+            aspect_ratio,
+            resolution,
+        };
+
+        let request_id = generator
+            .submit(&req)
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        let job = self
+            .db
+            .create_video_job(self.turn_id, &request_id, &prompt)
+            .await
+            .map_err(|e| ToolError::Execution(format!("db: {e}")))?;
+
+        tracing::info!(
+            request_id = %request_id,
+            job_id = %job.id,
+            turn = %self.turn_id,
+            "videogen: job submitted and persisted"
+        );
+
+        Ok(json!({
+            "request_id": request_id,
+            "status": "pending",
+            "hint": "Call check_video_status with this request_id (wait_seconds=15-30) until status becomes 'done'. Post a status message to the user explaining you're generating a video.",
+        }))
+    }
+
+    async fn check_video_status(&self, input: Value) -> Result<Value, ToolError> {
+        let Some(generator) = self.video_gen.as_ref() else {
+            return Err(ToolError::Execution(
+                "video generation isn't configured on this bot".to_string(),
+            ));
+        };
+        let request_id = input
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("request_id is required".to_string()))?
+            .to_string();
+        let wait_secs = input
+            .get("wait_seconds")
+            .and_then(Value::as_u64)
+            .unwrap_or(15)
+            .min(MAX_CHECK_WAIT_SECS);
+
+        if wait_secs > 0 {
+            tracing::info!(request_id = %request_id, wait_secs, "videogen: sleeping before poll");
+            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
+        }
+
+        let status = generator
+            .check_once(&request_id)
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        match status {
+            JobStatus::Pending => {
+                self.db
+                    .update_video_job_status(&request_id, "pending", None, None)
+                    .await
+                    .ok();
+                Ok(json!({
+                    "request_id": request_id,
+                    "status": "pending",
+                    "hint": "Not done yet. Call check_video_status again after another wait_seconds.",
+                }))
+            }
+            JobStatus::Done(video) => {
+                let bytes = generator
+                    .download_bytes(&video.url)
+                    .await
+                    .map_err(|e| ToolError::Execution(e.to_string()))?;
+                let extension = extension_from_video_url(&video.url);
+                let uri = storage::save_video_bytes(&bytes, extension, &self.videos_dir)
+                    .await
+                    .map_err(|e| ToolError::Execution(format!("save: {e}")))?;
+                self.db
+                    .update_video_job_status(&request_id, "done", Some(&uri), None)
+                    .await
+                    .map_err(|e| ToolError::Execution(format!("db: {e}")))?;
+                tracing::info!(
+                    request_id = %request_id,
+                    uri = %uri,
+                    bytes = bytes.len(),
+                    "videogen: completed and persisted"
+                );
+                Ok(json!({
+                    "request_id": request_id,
+                    "status": "done",
+                    "video_uri": uri,
+                    "duration_seconds": video.duration.unwrap_or(0.0),
+                }))
+            }
+            JobStatus::Failed(msg) => {
+                self.db
+                    .update_video_job_status(&request_id, "failed", None, Some(&msg))
+                    .await
+                    .ok();
+                Err(ToolError::Execution(format!("video generation failed: {msg}")))
+            }
+            JobStatus::Expired => {
+                self.db
+                    .update_video_job_status(&request_id, "expired", None, Some("expired"))
+                    .await
+                    .ok();
+                Err(ToolError::Execution("video generation job expired".to_string()))
+            }
+        }
+    }
+
+    async fn post_status_message(&self, input: Value) -> Result<Value, ToolError> {
+        let text = input
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("text is required".to_string()))?;
+        let trimmed = truncate(text, 1990);
+
+        let posted = self
+            .http
+            .create_message(self.default_channel_id)
+            .content(&trimmed)
+            .reply(self.user_msg_id)
+            .flags(twilight_model::channel::message::MessageFlags::SUPPRESS_EMBEDS)
+            .await
+            .map_err(|e| ToolError::Execution(format!("discord http: {e}")))?
+            .model()
+            .await
+            .map_err(|e| ToolError::Execution(format!("discord deserialize: {e}")))?;
+
+        // Link the intermediate message into the conversation so the
+        // viewer trace shows every reply the bot posted this turn.
+        let _ = self
+            .db
+            .record_message_link(
+                i64::try_from(posted.id.get()).unwrap_or(i64::MAX),
+                self.guild_id,
+                self.conversation_id,
+                self.turn_id,
+                "assistant_status",
+            )
+            .await;
+
+        tracing::info!(
+            message_id = %posted.id,
+            turn = %self.turn_id,
+            chars = trimmed.len(),
+            "status message posted"
+        );
+
+        Ok(json!({
+            "posted_message_id": posted.id.get().to_string(),
+            "chars": trimmed.len(),
+        }))
+    }
+
     /// Returns true if the message's content should be visible to the
     /// model under the active privacy mode.
     async fn is_visible(&self, m: &Message) -> bool {
@@ -1317,31 +1671,44 @@ fn fix_bare_mentions(s: &str) -> String {
     out
 }
 
-/// Walk the agent's tool-call trace and load any images the model
-/// generated this turn from disk, in order. Each becomes a Discord file
-/// attachment on the outgoing reply.
+/// Walk the agent's tool-call trace and load any generated media (images
+/// + videos) from disk, in order. Each becomes a Discord file
+/// attachment on the outgoing reply, skipping anything that exceeds
+/// Discord's free-tier upload size limit.
 async fn collect_generated_attachments(
     images_dir: &std::path::Path,
+    videos_dir: &std::path::Path,
     tool_calls: &[grok_discord_bot_core::ToolCallRecord],
 ) -> Vec<HttpAttachment> {
     let mut attachments: Vec<HttpAttachment> = Vec::new();
     for (i, call) in tool_calls.iter().enumerate() {
-        if call.tool_name != "generate_image" {
-            continue;
-        }
-        let Some(uri) = call.response.get("image_uri").and_then(Value::as_str) else {
+        let (uri_field, dir, fallback_filename) = match call.tool_name.as_str() {
+            "generate_image" => ("image_uri", images_dir, format!("image-{i}.png")),
+            "check_video_status" => ("video_uri", videos_dir, format!("video-{i}.mp4")),
+            _ => continue,
+        };
+        let Some(uri) = call.response.get(uri_field).and_then(Value::as_str) else {
             continue;
         };
-        let Some(local_path) = storage::file_uri_to_local_path(uri, images_dir) else {
+        let Some(local_path) = storage::file_uri_to_local_path(uri, dir) else {
             continue;
         };
         match tokio::fs::read(&local_path).await {
             Ok(bytes) => {
+                if bytes.len() as u64 > DISCORD_FREE_UPLOAD_LIMIT_BYTES {
+                    tracing::warn!(
+                        path = %local_path.display(),
+                        bytes = bytes.len(),
+                        limit = DISCORD_FREE_UPLOAD_LIMIT_BYTES,
+                        "media exceeds Discord free-tier upload limit; skipping attachment"
+                    );
+                    continue;
+                }
                 let filename = local_path
                     .file_name()
                     .and_then(|s| s.to_str())
                     .map(str::to_string)
-                    .unwrap_or_else(|| format!("image-{i}.png"));
+                    .unwrap_or(fallback_filename);
                 let id = u64::try_from(attachments.len()).unwrap_or(0);
                 attachments.push(HttpAttachment::from_bytes(filename, bytes, id));
             }
@@ -1349,12 +1716,23 @@ async fn collect_generated_attachments(
                 tracing::warn!(
                     error = %err,
                     path = %local_path.display(),
-                    "failed to read generated image for Discord attach"
+                    "failed to read generated media for Discord attach"
                 );
             }
         }
     }
     attachments
+}
+
+fn extension_from_video_url(url: &str) -> &'static str {
+    let no_query = url.split('?').next().unwrap_or(url);
+    let ext = no_query.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "mp4" => "mp4",
+        "webm" => "webm",
+        "mov" => "mov",
+        _ => "mp4",
+    }
 }
 
 /// Send the reply. For a new conversation with a long answer we open a
@@ -1557,22 +1935,40 @@ mod tests {
     }
 
     #[test]
-    fn fetch_tool_definition_only_when_allowed() {
-        let names = |mode: &PrivacyMode, image_gen: bool| -> Vec<String> {
-            build_tool_definitions(mode, image_gen)
+    fn tool_definitions_gated_by_mode_and_media_keys() {
+        let names = |mode: &PrivacyMode, image: bool, video: bool| -> Vec<String> {
+            build_tool_definitions(mode, image, video)
                 .into_iter()
                 .map(|t| t.name)
                 .collect()
         };
-        assert_eq!(names(&PrivacyMode::OptIn, false), vec!["fetch_messages"]);
+
+        // OptIn, no media keys: fetch_messages + post_status_message.
         assert_eq!(
-            names(&PrivacyMode::OptIn, true),
-            vec!["fetch_messages", "generate_image"]
+            names(&PrivacyMode::OptIn, false, false),
+            vec!["fetch_messages", "post_status_message"]
         );
-        assert!(names(&PrivacyMode::ConversationOnly, false).is_empty());
+
+        // OptIn + image + video keys: full set.
         assert_eq!(
-            names(&PrivacyMode::ConversationOnly, true),
-            vec!["generate_image"]
+            names(&PrivacyMode::OptIn, true, true),
+            vec![
+                "fetch_messages",
+                "generate_image",
+                "start_video_generation",
+                "check_video_status",
+                "post_status_message",
+            ]
+        );
+
+        // ConversationOnly drops fetch_messages but post_status remains.
+        assert_eq!(
+            names(&PrivacyMode::ConversationOnly, false, false),
+            vec!["post_status_message"]
+        );
+        assert_eq!(
+            names(&PrivacyMode::ConversationOnly, true, false),
+            vec!["generate_image", "post_status_message"]
         );
     }
 }

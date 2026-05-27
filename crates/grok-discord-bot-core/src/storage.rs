@@ -20,12 +20,16 @@ use std::path::Path;
 use thiserror::Error;
 use uuid::Uuid;
 
-/// URI scheme prefix for files saved under `images_dir`.
+/// URI scheme prefix for files saved on local disk.
 pub const FILE_SCHEME: &str = "file://";
 
-/// Relative path component used in `file://` URIs. Kept stable so the
-/// web viewer can mount its `ServeDir` at `/images/`.
+/// Relative path component used in `file://` URIs for image storage.
+/// Kept stable so the web viewer can mount its `ServeDir` at `/images/`.
 pub const IMAGES_PREFIX: &str = "images";
+
+/// Same idea for video storage. Viewer mounts `/videos/` at the
+/// configured `videos_dir`.
+pub const VIDEOS_PREFIX: &str = "videos";
 
 /// Errors returned by the storage layer.
 #[derive(Debug, Error)]
@@ -54,11 +58,31 @@ pub async fn save_image_bytes(
     extension: &str,
     images_dir: &Path,
 ) -> Result<String, StorageError> {
-    tokio::fs::create_dir_all(images_dir).await?;
+    save_bytes_under(bytes, extension, images_dir, IMAGES_PREFIX).await
+}
+
+/// Persist raw video bytes to `videos_dir` with the given extension;
+/// return the `file://videos/<uuid>.<ext>` URI. Used for videos we
+/// already have in memory (e.g. downloaded by `videogen`).
+pub async fn save_video_bytes(
+    bytes: &[u8],
+    extension: &str,
+    videos_dir: &Path,
+) -> Result<String, StorageError> {
+    save_bytes_under(bytes, extension, videos_dir, VIDEOS_PREFIX).await
+}
+
+async fn save_bytes_under(
+    bytes: &[u8],
+    extension: &str,
+    target_dir: &Path,
+    uri_prefix: &str,
+) -> Result<String, StorageError> {
+    tokio::fs::create_dir_all(target_dir).await?;
     let filename = format!("{}.{}", Uuid::new_v4().simple(), extension);
-    let path = images_dir.join(&filename);
+    let path = target_dir.join(&filename);
     tokio::fs::write(&path, bytes).await?;
-    Ok(format!("{FILE_SCHEME}{IMAGES_PREFIX}/{filename}"))
+    Ok(format!("{FILE_SCHEME}{uri_prefix}/{filename}"))
 }
 
 /// Resolve a `file://images/<name>` URI to a filesystem path under
@@ -159,20 +183,32 @@ fn pick_extension(content_type: Option<&str>, url: &str) -> &'static str {
 /// pointing under the `images/` prefix). Used by the viewer to decide
 /// whether to render a context item as an `<img>`.
 pub fn is_image_uri(uri: &str) -> bool {
-    if let Some(path) = uri.strip_prefix(FILE_SCHEME) {
-        return path.starts_with(&format!("{IMAGES_PREFIX}/"));
-    }
-    // Future schemes (s3://, https://…cdn.discordapp.com…) plug in here.
-    false
+    uri_has_local_prefix(uri, IMAGES_PREFIX)
 }
 
-/// Map a stored `file://images/<name>` URI to the web-served path that
-/// matches the viewer's `/images/*` route mount. Returns `None` for
-/// URIs we don't recognise.
+/// Detect whether a URI points at a stored video.
+pub fn is_video_uri(uri: &str) -> bool {
+    uri_has_local_prefix(uri, VIDEOS_PREFIX)
+}
+
+fn uri_has_local_prefix(uri: &str, prefix: &str) -> bool {
+    uri.strip_prefix(FILE_SCHEME)
+        .map(|p| p.starts_with(&format!("{prefix}/")))
+        .unwrap_or(false)
+}
+
+/// Map a stored `file://<prefix>/<name>` URI to the web-served path
+/// that matches the viewer's `ServeDir` route mount at `/<prefix>/`.
+/// Returns `None` for URIs we don't recognise (s3://, https://, etc.).
 pub fn to_web_path(uri: &str) -> Option<String> {
     let path = uri.strip_prefix(FILE_SCHEME)?;
-    let filename = path.strip_prefix(&format!("{IMAGES_PREFIX}/"))?;
-    Some(format!("/{IMAGES_PREFIX}/{filename}"))
+    if path.starts_with(&format!("{IMAGES_PREFIX}/"))
+        || path.starts_with(&format!("{VIDEOS_PREFIX}/"))
+    {
+        Some(format!("/{path}"))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -199,5 +235,20 @@ mod tests {
         assert!(is_image_uri(uri));
         assert_eq!(to_web_path(uri).as_deref(), Some("/images/abc.jpg"));
         assert!(!is_image_uri("https://cdn.discordapp.com/x.png"));
+    }
+
+    #[test]
+    fn video_uri_round_trip() {
+        let uri = "file://videos/abc.mp4";
+        assert!(is_video_uri(uri));
+        assert!(!is_image_uri(uri));
+        assert_eq!(to_web_path(uri).as_deref(), Some("/videos/abc.mp4"));
+    }
+
+    #[test]
+    fn unknown_prefix_rejected() {
+        assert_eq!(to_web_path("file://other/abc"), None);
+        assert!(!is_image_uri("file://other/abc"));
+        assert!(!is_video_uri("file://other/abc"));
     }
 }

@@ -21,11 +21,12 @@ pub mod domain;
 pub mod imagegen;
 pub mod llm;
 pub mod storage;
+pub mod videogen;
 
 pub use agent::{AgentRun, run as run_agent};
 pub use config::{BotConfig, Config, ConfigError, PrivacyMode, StorageConfig};
 pub use db::{Db, DbError};
-pub use domain::{Conversation, ContextItem, ConversationView, Turn, TurnView};
+pub use domain::{Conversation, ContextItem, ConversationView, Turn, TurnView, VideoJob};
 pub use llm::{
     AnyProvider, ChatTurn, LlmError, LlmProvider, MessageRole, StepRequest, StepResponse,
     ToolCallRecord, ToolDefinition, ToolError, ToolExecutor, ToolUseRequest, TurnBlock,

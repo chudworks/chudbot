@@ -4,7 +4,9 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use grok_discord_bot_core::{AnyProvider, Config, Db, imagegen::ImageGenerator};
+use grok_discord_bot_core::{
+    AnyProvider, Config, Db, imagegen::ImageGenerator, videogen::VideoGenerator,
+};
 
 mod bot;
 mod commands;
@@ -69,9 +71,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .xai
                 .as_ref()
                 .map(|x| Arc::new(ImageGenerator::new(x.api_key.clone())));
+            let video_gen = config
+                .llm
+                .xai
+                .as_ref()
+                .map(|x| Arc::new(VideoGenerator::new(x.api_key.clone())));
             tracing::info!(
                 model = %llm_name(&llm),
                 image_gen = image_gen.is_some(),
+                video_gen = video_gen.is_some(),
                 "starting bot"
             );
             bot::run(
@@ -84,13 +92,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.bot.clone(),
                 config.storage.clone(),
                 image_gen,
+                video_gen,
             )
             .await?;
         }
         Cmd::Web => {
             let db = Db::connect(&config.postgres.url).await?;
             let listen = SocketAddr::from_str(&config.web.listen)?;
-            web::run(db, listen, config.storage.images_dir.clone()).await?;
+            web::run(
+                db,
+                listen,
+                config.storage.images_dir.clone(),
+                config.storage.videos_dir.clone(),
+            )
+            .await?;
         }
         Cmd::Migrate => {
             let db = Db::connect(&config.postgres.url).await?;
