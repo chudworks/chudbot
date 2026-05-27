@@ -63,6 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(model = %llm_name(&llm), "starting bot");
             bot::run(
                 config.discord.token.clone(),
+                config.discord.dev_guild_id,
                 db,
                 llm,
                 config.web.base_url.clone(),

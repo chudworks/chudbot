@@ -4,6 +4,12 @@
 [discord]
 # Bot token from https://discord.com/developers/applications
 token = "MTIzNDU2..."
+# Optional: register slash commands to this guild only. Guild commands
+# appear instantly; global commands take up to ~1 hour to propagate.
+# Set to your server id during development; omit once the bot is going
+# global. (Right-click your server icon → Copy Server ID, with Developer
+# Mode enabled in Discord settings.)
+# dev_guild_id = 123456789012345678
 
 [postgres]
 # Standard libpq connection URL. Local Postgres on the Mac Studio:

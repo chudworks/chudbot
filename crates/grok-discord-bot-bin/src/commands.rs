@@ -21,7 +21,7 @@ use twilight_model::channel::message::MessageFlags;
 use twilight_model::guild::Permissions;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
 use twilight_model::id::Id;
-use twilight_model::id::marker::ApplicationMarker;
+use twilight_model::id::marker::{ApplicationMarker, GuildMarker};
 use twilight_util::builder::InteractionResponseDataBuilder;
 use twilight_util::builder::command::{
     ChannelBuilder, CommandBuilder, IntegerBuilder, StringBuilder, SubCommandBuilder,
@@ -97,17 +97,36 @@ pub fn definitions() -> Vec<Command> {
     vec![privacy, mode]
 }
 
-/// Push the command set to Discord globally. Idempotent — Discord
-/// replaces the entire registered set with what we send.
+/// Push the command set to Discord. Idempotent — Discord replaces the
+/// entire registered set with what we send. When `dev_guild_id` is
+/// `Some`, registers as guild commands (visible instantly in that
+/// guild only); when `None`, registers globally (up to ~1 hour to
+/// propagate, then visible in every guild the bot is in).
 pub async fn register(
     http: &HttpClient,
     app_id: Id<ApplicationMarker>,
+    dev_guild_id: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let commands = definitions();
-    http.interaction(app_id)
-        .set_global_commands(&commands)
-        .await?;
-    tracing::info!(count = commands.len(), "registered slash commands");
+    let interaction = http.interaction(app_id);
+    match dev_guild_id {
+        Some(gid) => {
+            let guild = Id::<GuildMarker>::new(gid);
+            interaction.set_guild_commands(guild, &commands).await?;
+            tracing::info!(
+                count = commands.len(),
+                guild = %guild,
+                "registered slash commands to guild (instant)"
+            );
+        }
+        None => {
+            interaction.set_global_commands(&commands).await?;
+            tracing::info!(
+                count = commands.len(),
+                "registered slash commands globally (up to ~1h propagation)"
+            );
+        }
+    }
     Ok(())
 }
 

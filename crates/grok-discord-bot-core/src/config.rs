@@ -105,6 +105,13 @@ impl PrivacyMode {
 pub struct DiscordConfig {
     /// Bot token from the Discord Developer Portal.
     pub token: String,
+    /// If set, register slash commands to this guild only. Guild
+    /// commands appear instantly; global commands take up to an hour to
+    /// propagate, which is painful during development. Set to your
+    /// server's id for fast iteration; omit (or set to None) to register
+    /// globally once the bot is in multiple servers.
+    #[serde(default)]
+    pub dev_guild_id: Option<u64>,
 }
 
 /// Postgres connection settings.

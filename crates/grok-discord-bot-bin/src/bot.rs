@@ -88,6 +88,7 @@ struct State {
 /// Entry point for the `grok bot` subcommand.
 pub async fn run(
     discord_token: String,
+    dev_guild_id: Option<u64>,
     db: Db,
     llm: AnyProvider,
     web_base_url: String,
@@ -109,7 +110,7 @@ pub async fn run(
         "discord bot ready"
     );
 
-    if let Err(err) = commands::register(&http, application.id).await {
+    if let Err(err) = commands::register(&http, application.id, dev_guild_id).await {
         tracing::error!(error = %err, "failed to register slash commands; continuing without them");
     }
 
