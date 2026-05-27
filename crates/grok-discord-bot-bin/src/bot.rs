@@ -581,7 +581,7 @@ async fn process(
         videos_dir: state.videos_dir.clone(),
     };
 
-    let agent_result = run_agent(
+    let agent_run: AgentRun = run_agent(
         &state.llm,
         messages,
         tools,
@@ -594,14 +594,6 @@ async fn process(
         MAX_AGENT_ITERATIONS,
     )
     .await;
-
-    let agent_run: AgentRun = match agent_result {
-        Ok(r) => r,
-        Err(e) => {
-            state.db.fail_turn(turn.id, &e.to_string()).await.ok();
-            return Err(e.into());
-        }
-    };
 
     // Persist all tool calls (server + client) in execution order.
     for (i, tc) in agent_run.tool_calls.iter().enumerate() {
@@ -679,10 +671,45 @@ async fn process(
         (false, true) => "Video generation",
         (false, false) => "Media generation",
     };
-    let answer_text = if media_gen_failed {
-        format!("⚠️ {failure_label} failed.\n\n{}", agent_run.content)
+    // Partial-success handling: if the agent loop errored mid-flight
+    // (e.g. xAI returned a transient 5xx on the final-answer step) but
+    // we already have generated media or some prior assistant text,
+    // surface what we have rather than dumping the raw error on the
+    // user.
+    let agent_loop_error = agent_run.error.as_deref();
+    let have_media = !generated_attachments.is_empty();
+    let final_content: String = if !agent_run.content.is_empty() {
+        agent_run.content.clone()
+    } else if have_media && agent_loop_error.is_some() {
+        // Media generated, but the model never got to write the
+        // closing line. Post the media with a minimal acknowledgement.
+        "Here you go.".to_string()
     } else {
         agent_run.content.clone()
+    };
+
+    let answer_text = if media_gen_failed {
+        format!("⚠️ {failure_label} failed.\n\n{final_content}")
+    } else if let Some(err) = agent_loop_error {
+        if have_media {
+            // The interesting work succeeded; the failed step was the
+            // final-answer LLM call. Keep the reply concise.
+            tracing::warn!(
+                conversation = %conversation.id,
+                turn = %turn.id,
+                error = %err,
+                "agent loop errored after media generation succeeded; \
+                 falling back to short reply + attachment"
+            );
+            final_content
+        } else {
+            // Nothing useful happened. Surface the error briefly so the
+            // user knows the turn died.
+            let snippet = err.chars().take(200).collect::<String>();
+            format!("⚠️ {snippet}")
+        }
+    } else {
+        final_content
     };
     let reply_text =
         format_reply(&answer_text, is_new, &conversation, &state.web_base_url);
@@ -742,6 +769,12 @@ async fn process(
         // Bubble the failure up so handle_message reacts ❌ instead of ✅.
         return Err(BotError::Llm(grok_discord_bot_core::LlmError::Transport(
             format!("{failure_label} was attempted but produced no output"),
+        )));
+    }
+    if agent_loop_error.is_some() && !have_media {
+        // Bare error, nothing to salvage — ❌.
+        return Err(BotError::Llm(grok_discord_bot_core::LlmError::Transport(
+            agent_loop_error.unwrap().to_string(),
         )));
     }
     Ok(())
@@ -1003,11 +1036,48 @@ fn build_tool_definitions(
     if video_gen_available {
         tools.push(generate_video_tool());
     }
-    // Status messages aren't a tool — the model just writes
-    // intermediate prose alongside its tool_uses and the bot's
-    // AgentObserver posts it as a Discord reply (see
-    // `BotToolExecutor::on_partial_text`).
+    // post_status_message is always available. The model is meant to
+    // call it in the same response as a slow tool (generate_video
+    // especially) so the user gets a status update before the wait.
+    // We also surface any natural intermediate text via AgentObserver,
+    // but in practice grok-4.3 leans on the explicit tool more reliably.
+    tools.push(post_status_message_tool());
     tools
+}
+
+fn post_status_message_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "post_status_message".to_string(),
+        description: "Post a short interim status message into the Discord \
+channel as a reply to the user. Call this whenever you're about to do \
+something that takes more than a few seconds — especially generate_video \
+(60-120s) and generate_image (3-10s). The status reaches the user \
+immediately; the slow tool then runs.
+
+Best practice: include `post_status_message` in the SAME RESPONSE as the \
+slow tool. Both tool calls fire in one round-trip, so the user sees the \
+status before the wait starts.
+
+Examples of good status messages:
+- \"Working on your video, takes about a minute…\"
+- \"Cooking up that image for you…\"
+- \"Searching the web for current info…\"
+
+Don't use it for the final answer (the final answer is plain assistant \
+text). Don't spam it — one message per long step is plenty."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["text"],
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Plain-text message body. Discord markdown is fine. Max ~1900 chars."
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
 }
 
 fn fetch_messages_tool() -> ToolDefinition {
@@ -1046,19 +1116,18 @@ fn generate_video_tool() -> ToolDefinition {
     ToolDefinition {
         name: "generate_video".to_string(),
         description: "Generate a short video with xAI's Grok Imagine Video \
-model. This is a SYNCHRONOUS call — it submits the job, polls until done, \
-and returns the saved video URI. Typical wait is ~60-120 seconds; the bot \
-handles the polling internally, you just await the result.
+model. Synchronous: submits the job, polls until done, returns the saved \
+video URI. Typical wait is ~60-120 seconds.
 
-Best practice: emit a brief natural-language status message ALONGSIDE this \
-tool call (e.g. \"Working on your video — takes about a minute…\"). That \
-text reaches the user immediately as a Discord reply, then the tool blocks \
-until the video is ready.
+**ALWAYS call `post_status_message` in the SAME RESPONSE as this tool** \
+so the user sees \"Working on your video, takes about a minute…\" right \
+away. Both tool calls fire in one round-trip — the status posts \
+immediately, then this tool blocks until the video is ready.
 
 When the call returns successfully, the bot auto-attaches the video to \
 your final reply. DO NOT include placeholders like \"[video attached]\", \
-\"(see attached)\", or link to the URI — just write a short natural message; \
-the user sees the actual video file under it.
+\"(see attached)\", or link to the URI — just write a short natural \
+message; the user sees the actual video file under it.
 
 For image-to-video, pass an EXACT image URL in `image_url` (same rules as \
 generate_image — never invent paths). Max duration 15s. 480p is cheap; \
@@ -1096,7 +1165,10 @@ fn generate_image_tool() -> ToolDefinition {
         name: "generate_image".to_string(),
         description: "Generate an image with xAI's Grok Imagine model. Use \
 this whenever the user asks for an image, picture, drawing, illustration, or \
-visual.
+visual. Takes ~3-10 seconds.
+
+Best practice: call `post_status_message` in the SAME RESPONSE as this \
+tool (e.g. \"Cooking up that image…\") so the user knows you're working.
 
 To edit/restyle an image the user attached, pass its EXACT URL string in \
 `reference_images`. The URL appears in the user's turn (look for lines \
@@ -1165,6 +1237,7 @@ impl ToolExecutor for BotToolExecutor {
             "fetch_messages" => self.fetch_messages(input).await,
             "generate_image" => self.generate_image(input).await,
             "generate_video" => self.generate_video(input).await,
+            "post_status_message" => self.post_status_message(input).await,
             other => Err(ToolError::Unknown(other.to_string())),
         }
     }
@@ -1501,6 +1574,48 @@ impl BotToolExecutor {
             "request_id": request_id,
             "video_uri": uri,
             "duration_seconds": video_meta.duration.unwrap_or(0.0),
+        }))
+    }
+
+    async fn post_status_message(&self, input: Value) -> Result<Value, ToolError> {
+        let text = input
+            .get("text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("text is required".to_string()))?;
+        let trimmed = truncate(text, 1990);
+        if trimmed.trim().is_empty() {
+            return Err(ToolError::InvalidInput("text is empty".to_string()));
+        }
+        let posted = self
+            .http
+            .create_message(self.default_channel_id)
+            .content(&trimmed)
+            .reply(self.user_msg_id)
+            .flags(twilight_model::channel::message::MessageFlags::SUPPRESS_EMBEDS)
+            .await
+            .map_err(|e| ToolError::Execution(format!("discord http: {e}")))?
+            .model()
+            .await
+            .map_err(|e| ToolError::Execution(format!("discord deserialize: {e}")))?;
+        let _ = self
+            .db
+            .record_message_link(
+                i64::try_from(posted.id.get()).unwrap_or(i64::MAX),
+                self.guild_id,
+                self.conversation_id,
+                self.turn_id,
+                "assistant_status",
+            )
+            .await;
+        tracing::info!(
+            message_id = %posted.id,
+            turn = %self.turn_id,
+            chars = trimmed.len(),
+            "status message posted (via tool)"
+        );
+        Ok(json!({
+            "posted_message_id": posted.id.get().to_string(),
+            "chars": trimmed.len(),
         }))
     }
 
@@ -1868,27 +1983,32 @@ mod tests {
                 .collect()
         };
 
-        // OptIn, no media keys: fetch_messages only.
+        // OptIn, no media keys: fetch_messages + post_status_message.
         assert_eq!(
             names(&PrivacyMode::OptIn, false, false),
-            vec!["fetch_messages"]
+            vec!["fetch_messages", "post_status_message"]
         );
 
         // OptIn + image + video keys: full client toolset.
         assert_eq!(
             names(&PrivacyMode::OptIn, true, true),
-            vec!["fetch_messages", "generate_image", "generate_video"]
+            vec![
+                "fetch_messages",
+                "generate_image",
+                "generate_video",
+                "post_status_message",
+            ]
         );
 
-        // ConversationOnly drops fetch_messages and nothing else
-        // remains unless media keys are configured.
+        // ConversationOnly drops fetch_messages but post_status_message
+        // is always available.
         assert_eq!(
             names(&PrivacyMode::ConversationOnly, false, false),
-            Vec::<String>::new()
+            vec!["post_status_message"]
         );
         assert_eq!(
             names(&PrivacyMode::ConversationOnly, true, false),
-            vec!["generate_image"]
+            vec!["generate_image", "post_status_message"]
         );
     }
 }

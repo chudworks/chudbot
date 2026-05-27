@@ -15,8 +15,8 @@
 //! into the `tool_calls` table for the web viewer.
 
 use crate::llm::{
-    ChatTurn, LlmError, LlmProvider, MessageRole, StepRequest, StepResponse, ToolCallRecord,
-    ToolDefinition, ToolExecutor, ToolUseRequest, TurnBlock,
+    ChatTurn, LlmProvider, MessageRole, StepRequest, StepResponse, ToolCallRecord, ToolDefinition,
+    ToolExecutor, ToolUseRequest, TurnBlock,
 };
 
 /// Observes events during an agent run. Currently just intermediate
@@ -45,20 +45,33 @@ impl AgentObserver for NoopObserver {
     async fn on_partial_text(&self, _text: &str) {}
 }
 
-/// Result of [`run`].
+/// Result of [`run`]. The run always returns a snapshot of whatever
+/// it accomplished — `tool_calls` may be non-empty even when `error`
+/// is set, so callers can salvage successful media generation or
+/// other side effects that happened before a transient step failure.
 #[derive(Debug, Clone)]
 pub struct AgentRun {
-    /// Final answer text from the model.
+    /// Final answer text from the model. Empty when the run errored
+    /// before the model produced a final response.
     pub content: String,
     /// All tool calls (server + client) performed during the run, in
-    /// execution order.
+    /// execution order. Populated even on error.
     pub tool_calls: Vec<ToolCallRecord>,
     /// Model id reported by the last step.
     pub model_id: String,
+    /// Set when the loop terminated abnormally (provider step failure,
+    /// iteration cap hit). Callers should check this and decide
+    /// whether the partial trace is enough to act on.
+    pub error: Option<String>,
 }
 
 /// Drive the model through a tool-use loop until it produces a final
-/// answer, or `max_iterations` is hit.
+/// answer, or `max_iterations` is hit, or a transient provider error
+/// aborts it. ALWAYS returns an [`AgentRun`] — `error` is populated
+/// when the loop didn't reach a clean final answer. This lets callers
+/// salvage successful tool calls that happened earlier in the loop
+/// (e.g. media that already generated) even when a later LLM step
+/// failed with a 5xx.
 #[allow(clippy::too_many_arguments)]
 pub async fn run<P, T, O>(
     provider: &P,
@@ -71,7 +84,7 @@ pub async fn run<P, T, O>(
     temperature: Option<f32>,
     top_p: Option<f32>,
     max_iterations: u32,
-) -> Result<AgentRun, LlmError>
+) -> AgentRun
 where
     P: LlmProvider,
     T: ToolExecutor,
@@ -90,7 +103,7 @@ where
     );
 
     for iteration in 0..max_iterations {
-        let response = provider
+        let response = match provider
             .step(StepRequest {
                 messages: messages.clone(),
                 tools: tools.clone(),
@@ -99,7 +112,24 @@ where
                 temperature,
                 top_p,
             })
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(err) => {
+                tracing::warn!(
+                    iteration,
+                    error = %err,
+                    tool_calls_so_far = all_tool_calls.len(),
+                    "agent: step failed; returning partial run"
+                );
+                return AgentRun {
+                    content: String::new(),
+                    tool_calls: all_tool_calls,
+                    model_id: last_model_id,
+                    error: Some(err.to_string()),
+                };
+            }
+        };
 
         match response {
             StepResponse::Final {
@@ -118,11 +148,12 @@ where
                     total_tool_calls = all_tool_calls.len(),
                     "agent: final answer received"
                 );
-                return Ok(AgentRun {
+                return AgentRun {
                     content,
                     tool_calls: all_tool_calls,
                     model_id,
-                });
+                    error: None,
+                };
             }
             StepResponse::UseTools {
                 partial_text,
@@ -210,14 +241,19 @@ where
         }
     }
 
-    // Out of iterations — log the partial trace via the error.
+    // Out of iterations — return what we accumulated.
     tracing::warn!(
         iterations = max_iterations,
         model = %last_model_id,
         tool_calls = all_tool_calls.len(),
         "agent loop hit iteration cap"
     );
-    Err(LlmError::TooManyIterations(max_iterations))
+    AgentRun {
+        content: String::new(),
+        tool_calls: all_tool_calls,
+        model_id: last_model_id,
+        error: Some(format!("hit iteration cap ({max_iterations})")),
+    }
 }
 
 /// Emit one info line per server-side tool call (web_search, x_search,
