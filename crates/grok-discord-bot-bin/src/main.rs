@@ -1,9 +1,10 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use grok_discord_bot_core::{AnyProvider, Config, Db};
+use grok_discord_bot_core::{AnyProvider, Config, Db, imagegen::ImageGenerator};
 
 mod bot;
 mod commands;
@@ -60,7 +61,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Bot => {
             let db = Db::connect(&config.postgres.url).await?;
             let llm = AnyProvider::from_config(&config.llm)?;
-            tracing::info!(model = %llm_name(&llm), "starting bot");
+            // Image generation rides on the xAI API; expose the tool
+            // whenever an xAI key is present, regardless of which
+            // provider is primary for chat.
+            let image_gen = config
+                .llm
+                .xai
+                .as_ref()
+                .map(|x| Arc::new(ImageGenerator::new(x.api_key.clone())));
+            tracing::info!(
+                model = %llm_name(&llm),
+                image_gen = image_gen.is_some(),
+                "starting bot"
+            );
             bot::run(
                 config.discord.token.clone(),
                 config.discord.dev_guild_id,
@@ -70,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.default_privacy.clone(),
                 config.bot.clone(),
                 config.storage.clone(),
+                image_gen,
             )
             .await?;
         }

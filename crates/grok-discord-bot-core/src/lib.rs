@@ -18,6 +18,7 @@ pub mod agent;
 pub mod config;
 pub mod db;
 pub mod domain;
+pub mod imagegen;
 pub mod llm;
 pub mod storage;
 

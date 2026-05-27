@@ -89,11 +89,18 @@ all in order so the conversation trace shows every input and output.
 
 ### Client-side tools
 
-The bot's `BotToolExecutor` currently exposes one tool:
+The bot's `BotToolExecutor` exposes:
 
 - **`fetch_messages(channel_id?, limit?, before_message_id?)`** — pulls
   recent messages from a Discord channel for context. The model calls
   this when it needs surrounding conversation that wasn't quoted.
+- **`generate_image(prompt, reference_images?, aspect_ratio?, quality?)`**
+  — calls xAI's Grok Imagine model (`grok-imagine-image` / `-quality`).
+  Reference images may be `https://` URLs (passed through) or
+  `file://images/…` URIs (base64-encoded from disk before sending).
+  The tool saves the result bytes to `images_dir`, returns the
+  `file://` URI to the agent, and the bot attaches the bytes to the
+  outgoing Discord reply. Exposed only when `[llm.xai]` is configured.
 
 Privacy mode constrains the tool:
 - `Open`: returns everything (minus the bot's own messages).

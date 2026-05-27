@@ -771,6 +771,7 @@ dependencies = [
 name = "grok-discord-bot-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "reqwest",
  "serde",
  "serde_json",

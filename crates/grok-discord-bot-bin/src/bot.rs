@@ -21,6 +21,7 @@ use std::sync::Arc;
 use grok_discord_bot_core::{
     AgentRun, AnyProvider, BotConfig, ChatTurn, ContextItem, Conversation, Db, LlmProvider,
     MessageRole, PrivacyMode, StorageConfig, ToolDefinition, ToolError, ToolExecutor, TurnBlock,
+    imagegen::{ImageGenRequest, ImageGenerator, ImageQuality},
     run_agent, storage,
 };
 use serde::Serialize;
@@ -33,6 +34,7 @@ use twilight_model::channel::Message;
 use twilight_model::channel::message::MessageFlags;
 use twilight_model::gateway::event::Event;
 use twilight_model::gateway::payload::incoming::GuildCreate;
+use twilight_model::http::attachment::Attachment as HttpAttachment;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{
     ApplicationMarker, ChannelMarker, GuildMarker, MessageMarker, UserMarker,
@@ -82,6 +84,9 @@ struct State {
     default_privacy: PrivacyMode,
     bot_config: BotConfig,
     images_dir: PathBuf,
+    /// Present only when an xAI API key is configured; gates the
+    /// `generate_image` tool exposure.
+    image_gen: Option<Arc<ImageGenerator>>,
 }
 
 /// Entry point for the `grok bot` subcommand.
@@ -95,6 +100,7 @@ pub async fn run(
     default_privacy: PrivacyMode,
     bot_config: BotConfig,
     storage_config: StorageConfig,
+    image_gen: Option<Arc<ImageGenerator>>,
 ) -> Result<(), BotError> {
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
@@ -127,6 +133,7 @@ pub async fn run(
         default_privacy,
         bot_config,
         images_dir: storage_config.images_dir,
+        image_gen,
     });
 
     let mut shard = Shard::new(ShardId::ONE, discord_token, intents);
@@ -365,9 +372,9 @@ async fn process(
     }
 
     // Tools available to the model for this turn. fetch_messages is
-    // exposed in every mode except ConversationOnly; that mode's whole
-    // point is "don't reach beyond the conversation."
-    let tools = build_tool_definitions(privacy_mode);
+    // exposed in every mode except ConversationOnly; generate_image is
+    // exposed only when an xAI key is configured.
+    let tools = build_tool_definitions(privacy_mode, state.image_gen.is_some());
 
     let executor = BotToolExecutor {
         http: Arc::clone(&state.http),
@@ -376,6 +383,8 @@ async fn process(
         default_channel_id: msg.channel_id,
         guild_id: conversation.discord_guild_id,
         privacy_mode: privacy_mode.clone(),
+        image_gen: state.image_gen.clone(),
+        images_dir: state.images_dir.clone(),
     };
 
     let agent_result = run_agent(
@@ -409,7 +418,14 @@ async fn process(
 
     let reply_text =
         format_reply(&agent_run.content, is_new, &conversation, &state.web_base_url);
-    let reply_msg = post_reply(state, msg, &reply_text, is_new).await?;
+
+    // Collect any images the agent generated this turn for upload as
+    // Discord attachments on the outgoing reply.
+    let generated_attachments =
+        collect_generated_attachments(&state.images_dir, &agent_run.tool_calls).await;
+
+    let reply_msg =
+        post_reply(state, msg, &reply_text, is_new, &generated_attachments).await?;
     let threaded = is_new && reply_text.len() > REPLY_LENGTH_THRESHOLD;
     tracing::info!(
         conversation = %conversation.id,
@@ -690,14 +706,24 @@ async fn quoted_message_allowed(
     }
 }
 
-/// Tool definitions exposed to the model for this turn. `fetch_messages`
-/// is omitted in `ConversationOnly` mode — that mode's whole purpose is
-/// to NOT reach beyond the current conversation.
-fn build_tool_definitions(mode: &PrivacyMode) -> Vec<ToolDefinition> {
-    if matches!(mode, PrivacyMode::ConversationOnly) {
-        return Vec::new();
+/// Tool definitions exposed to the model for this turn.
+///   - `fetch_messages` — declared except in `ConversationOnly` privacy
+///     mode, which deliberately doesn't reach beyond the conversation.
+///   - `generate_image` — declared only when an xAI key is configured
+///     (the only image-gen backend we support today).
+fn build_tool_definitions(mode: &PrivacyMode, image_gen_available: bool) -> Vec<ToolDefinition> {
+    let mut tools = Vec::new();
+    if !matches!(mode, PrivacyMode::ConversationOnly) {
+        tools.push(fetch_messages_tool());
     }
-    vec![ToolDefinition {
+    if image_gen_available {
+        tools.push(generate_image_tool());
+    }
+    tools
+}
+
+fn fetch_messages_tool() -> ToolDefinition {
+    ToolDefinition {
         name: "fetch_messages".to_string(),
         description: "Fetch recent messages from a Discord channel for additional \
 context. Use this when you need to see surrounding conversation that wasn't \
@@ -725,11 +751,52 @@ from the current channel."
             },
             "additionalProperties": false
         }),
-    }]
+    }
 }
 
-/// [`ToolExecutor`] backing `fetch_messages` plus any future tools.
-/// Owned per-turn so it can capture the channel + guild context.
+fn generate_image_tool() -> ToolDefinition {
+    ToolDefinition {
+        name: "generate_image".to_string(),
+        description: "Generate an image with xAI's Grok Imagine model. Use \
+this whenever the user asks for an image, picture, drawing, illustration, or \
+visual. To edit/restyle an image the user attached earlier in this \
+conversation, pass that image's URL in `reference_images` along with your edit \
+prompt. The generated image will be attached to your reply automatically — \
+don't link to it in your text. Returns the saved image's URI so you can \
+reference it in chained generations."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "required": ["prompt"],
+            "properties": {
+                "prompt": {
+                    "type": "string",
+                    "description": "Detailed description of the image to generate."
+                },
+                "reference_images": {
+                    "type": "array",
+                    "description": "Optional list of 0-3 image URIs to use as references. https:// URLs and file:// URIs from prior turns both work. Pass a user's attached image URL here to edit/restyle it.",
+                    "maxItems": 3,
+                    "items": { "type": "string" }
+                },
+                "aspect_ratio": {
+                    "type": "string",
+                    "description": "Optional aspect ratio. Default 1:1.",
+                    "enum": ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "2:1", "1:2"]
+                },
+                "quality": {
+                    "type": "string",
+                    "description": "Quality tier. 'standard' is fast/cheap; 'quality' is slower/higher fidelity. Default 'standard'.",
+                    "enum": ["standard", "quality"]
+                }
+            },
+            "additionalProperties": false
+        }),
+    }
+}
+
+/// [`ToolExecutor`] backing the client-side tools. Owned per-turn so
+/// it can capture the channel + guild + image-gen context.
 struct BotToolExecutor {
     http: Arc<HttpClient>,
     db: Db,
@@ -737,12 +804,15 @@ struct BotToolExecutor {
     default_channel_id: Id<ChannelMarker>,
     guild_id: i64,
     privacy_mode: PrivacyMode,
+    image_gen: Option<Arc<ImageGenerator>>,
+    images_dir: PathBuf,
 }
 
 impl ToolExecutor for BotToolExecutor {
     async fn execute(&self, name: &str, input: Value) -> Result<Value, ToolError> {
         match name {
             "fetch_messages" => self.fetch_messages(input).await,
+            "generate_image" => self.generate_image(input).await,
             other => Err(ToolError::Unknown(other.to_string())),
         }
     }
@@ -844,6 +914,70 @@ impl BotToolExecutor {
         Ok(serde_json::to_value(&out).unwrap_or(Value::Array(vec![])))
     }
 
+    async fn generate_image(&self, input: Value) -> Result<Value, ToolError> {
+        let Some(generator) = self.image_gen.as_ref() else {
+            return Err(ToolError::Execution(
+                "image generation isn't configured on this bot".to_string(),
+            ));
+        };
+
+        let prompt = input
+            .get("prompt")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ToolError::InvalidInput("prompt is required".to_string()))?
+            .to_string();
+        let references: Vec<String> = input
+            .get("reference_images")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let aspect_ratio = input
+            .get("aspect_ratio")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let quality = match input.get("quality").and_then(Value::as_str) {
+            Some("quality") => ImageQuality::Quality,
+            _ => ImageQuality::Standard,
+        };
+
+        let req = ImageGenRequest {
+            prompt: prompt.clone(),
+            references,
+            aspect_ratio,
+            quality,
+            images_dir: self.images_dir.clone(),
+        };
+
+        let generated = generator
+            .generate(req)
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+
+        let extension = storage::extension_for_mime(&generated.mime_type);
+        let uri = storage::save_image_bytes(&generated.bytes, extension, &self.images_dir)
+            .await
+            .map_err(|e| ToolError::Execution(format!("save: {e}")))?;
+
+        tracing::info!(
+            uri = %uri,
+            model = %generated.model,
+            mime = %generated.mime_type,
+            bytes = generated.bytes.len(),
+            "imagegen: generated image"
+        );
+
+        Ok(json!({
+            "image_uri": uri,
+            "model": generated.model,
+            "mime_type": generated.mime_type,
+            "revised_prompt": generated.revised_prompt,
+        }))
+    }
+
     /// Returns true if the message's content should be visible to the
     /// model under the active privacy mode.
     async fn is_visible(&self, m: &Message) -> bool {
@@ -893,14 +1027,55 @@ fn format_reply(
     }
 }
 
+/// Walk the agent's tool-call trace and load any images the model
+/// generated this turn from disk, in order. Each becomes a Discord file
+/// attachment on the outgoing reply.
+async fn collect_generated_attachments(
+    images_dir: &std::path::Path,
+    tool_calls: &[grok_discord_bot_core::ToolCallRecord],
+) -> Vec<HttpAttachment> {
+    let mut attachments: Vec<HttpAttachment> = Vec::new();
+    for (i, call) in tool_calls.iter().enumerate() {
+        if call.tool_name != "generate_image" {
+            continue;
+        }
+        let Some(uri) = call.response.get("image_uri").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(local_path) = storage::file_uri_to_local_path(uri, images_dir) else {
+            continue;
+        };
+        match tokio::fs::read(&local_path).await {
+            Ok(bytes) => {
+                let filename = local_path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("image-{i}.png"));
+                let id = u64::try_from(attachments.len()).unwrap_or(0);
+                attachments.push(HttpAttachment::from_bytes(filename, bytes, id));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    path = %local_path.display(),
+                    "failed to read generated image for Discord attach"
+                );
+            }
+        }
+    }
+    attachments
+}
+
 /// Send the reply. For a new conversation with a long answer we open a
 /// public thread off the user's message and post inside it; otherwise
-/// we reply inline.
+/// we reply inline. Generated images ride along as file attachments.
 async fn post_reply(
     state: &State,
     user_msg: &Message,
     body: &str,
     is_new: bool,
+    generated: &[HttpAttachment],
 ) -> Result<Message, BotError> {
     // Suppress Discord's link-preview embeds on every bot reply. The
     // model's answers frequently include citation URLs (the trace link
@@ -918,26 +1093,28 @@ async fn post_reply(
             .model()
             .await?;
         let trimmed = truncate(body, 1990);
-        let reply = state
+        let mut builder = state
             .http
             .create_message(thread.id)
             .content(&trimmed)
-            .flags(suppress)
-            .await?
-            .model()
-            .await?;
+            .flags(suppress);
+        if !generated.is_empty() {
+            builder = builder.attachments(generated);
+        }
+        let reply = builder.await?.model().await?;
         Ok(reply)
     } else {
         let trimmed = truncate(body, 1990);
-        let reply = state
+        let mut builder = state
             .http
             .create_message(user_msg.channel_id)
             .content(&trimmed)
             .reply(user_msg.id)
-            .flags(suppress)
-            .await?
-            .model()
-            .await?;
+            .flags(suppress);
+        if !generated.is_empty() {
+            builder = builder.attachments(generated);
+        }
+        let reply = builder.await?.model().await?;
         Ok(reply)
     }
 }
@@ -1038,8 +1215,21 @@ mod tests {
 
     #[test]
     fn fetch_tool_definition_only_when_allowed() {
-        assert!(!build_tool_definitions(&PrivacyMode::OptIn).is_empty());
-        assert!(!build_tool_definitions(&PrivacyMode::Open { history_size: 20 }).is_empty());
-        assert!(build_tool_definitions(&PrivacyMode::ConversationOnly).is_empty());
+        let names = |mode: &PrivacyMode, image_gen: bool| -> Vec<String> {
+            build_tool_definitions(mode, image_gen)
+                .into_iter()
+                .map(|t| t.name)
+                .collect()
+        };
+        assert_eq!(names(&PrivacyMode::OptIn, false), vec!["fetch_messages"]);
+        assert_eq!(
+            names(&PrivacyMode::OptIn, true),
+            vec!["fetch_messages", "generate_image"]
+        );
+        assert!(names(&PrivacyMode::ConversationOnly, false).is_empty());
+        assert_eq!(
+            names(&PrivacyMode::ConversationOnly, true),
+            vec!["generate_image"]
+        );
     }
 }

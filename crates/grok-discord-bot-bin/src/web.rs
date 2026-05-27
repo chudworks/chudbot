@@ -195,9 +195,19 @@ fn render_turn(tv: &TurnView) -> Markup {
                 section.tools {
                     h3 { "Tool calls (" (tv.tool_calls.len()) ")" }
                     @for tc in &tv.tool_calls {
+                        @let images = collect_image_uris(&tc.response);
                         article.tool-call {
                             header {
                                 span.tool-name { (tc.tool_name) }
+                            }
+                            @if !images.is_empty() {
+                                div.tool-images {
+                                    @for uri in &images {
+                                        @if let Some(p) = storage::to_web_path(uri) {
+                                            img.context-image src=(p) alt=(tc.tool_name);
+                                        }
+                                    }
+                                }
                             }
                             details {
                                 summary { "Request" }
@@ -237,6 +247,24 @@ fn render_context_body(item: &ContextItem) -> Markup {
         };
     }
     html! { pre { (item.content) } }
+}
+
+/// Walk a JSON value and collect every string we recognise as an image
+/// storage URI. Used to surface images embedded inside tool-call
+/// responses (e.g. `generate_image` returns `{"image_uri": "file://…"}`).
+fn collect_image_uris(value: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    walk_for_image_uris(value, &mut out);
+    out
+}
+
+fn walk_for_image_uris(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) if storage::is_image_uri(s) => out.push(s.clone()),
+        serde_json::Value::Array(arr) => arr.iter().for_each(|v| walk_for_image_uris(v, out)),
+        serde_json::Value::Object(obj) => obj.values().for_each(|v| walk_for_image_uris(v, out)),
+        _ => {}
+    }
 }
 
 fn render_404() -> Markup {
@@ -409,5 +437,15 @@ code {
     border-radius: 6px;
     margin: .25rem 0;
     display: block;
+}
+.tool-images {
+    display: flex;
+    flex-wrap: wrap;
+    gap: .5rem;
+    margin: .5rem 0;
+}
+.tool-images .context-image {
+    max-height: 300px;
+    flex: 0 0 auto;
 }
 "#;
