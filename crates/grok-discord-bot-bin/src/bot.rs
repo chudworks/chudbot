@@ -510,6 +510,23 @@ async fn process(
         "turn: started"
     );
 
+    // Record the user's @mention as a message_link IMMEDIATELY, before
+    // anything that could fail later. Thread continuation depends on
+    // this link existing: when the bot auto-threads its reply, the
+    // thread's channel_id equals this user message id, so an
+    // in-thread @mention later must be able to look up the
+    // conversation from this row even if the rest of the turn dies.
+    state
+        .db
+        .record_message_link(
+            i64::try_from(msg.id.get()).unwrap_or(i64::MAX),
+            conversation.discord_guild_id,
+            conversation.id,
+            turn.id,
+            "user",
+        )
+        .await?;
+
     for item in &initial_context {
         state.db.record_context_item(turn.id, item).await?;
     }
@@ -711,11 +728,24 @@ async fn process(
     } else {
         final_content
     };
-    let reply_text =
-        format_reply(&answer_text, is_new, &conversation, &state.web_base_url);
-
-    let reply_msg =
-        post_reply(state, msg, &reply_text, is_new, &generated_attachments).await?;
+    let formatted = format_reply(&answer_text, is_new, &conversation, &state.web_base_url);
+    let chunks = assemble_chunks(&formatted);
+    let total_chars: usize = chunks.iter().map(|c| c.len()).sum();
+    let threaded = is_new && total_chars > REPLY_LENGTH_THRESHOLD;
+    let reply_msgs = post_reply_chunks(
+        state,
+        msg,
+        &chunks,
+        is_new,
+        &generated_attachments,
+        &conversation,
+        turn.id,
+    )
+    .await?;
+    let reply_msg = reply_msgs
+        .last()
+        .cloned()
+        .expect("post_reply_chunks always returns at least one message");
     if media_gen_failed {
         tracing::warn!(
             conversation = %conversation.id,
@@ -724,12 +754,12 @@ async fn process(
             "media generation was attempted but produced no output; reply marked as failed"
         );
     }
-    let threaded = is_new && reply_text.len() > REPLY_LENGTH_THRESHOLD;
     tracing::info!(
         conversation = %conversation.id,
         turn = %turn.id,
         reply_msg = %reply_msg.id,
         threaded,
+        chunks = reply_msgs.len(),
         reply_chars = agent_run.content.len(),
         tool_calls = agent_run.tool_calls.len(),
         "turn: reply posted"
@@ -743,27 +773,10 @@ async fn process(
             i64::try_from(reply_msg.id.get()).unwrap_or(i64::MAX),
         )
         .await?;
-
-    state
-        .db
-        .record_message_link(
-            i64::try_from(msg.id.get()).unwrap_or(i64::MAX),
-            conversation.discord_guild_id,
-            conversation.id,
-            turn.id,
-            "user",
-        )
-        .await?;
-    state
-        .db
-        .record_message_link(
-            i64::try_from(reply_msg.id.get()).unwrap_or(i64::MAX),
-            conversation.discord_guild_id,
-            conversation.id,
-            turn.id,
-            "assistant",
-        )
-        .await?;
+    // Note: user + assistant message_links are recorded earlier — the
+    // user link right after start_turn (so thread continuation works
+    // even on partial failures), and assistant chunks inside
+    // post_reply_chunks as each one is posted.
 
     if media_gen_failed {
         // Bubble the failure up so handle_message reacts ❌ instead of ✅.
@@ -1651,22 +1664,129 @@ fn parse_snowflake(s: &str) -> Result<u64, String> {
         .map_err(|e| format!("not a valid snowflake: {e}"))
 }
 
+/// Discord hard caps messages at 2000 chars. We aim for a hair under
+/// so multi-byte characters don't push us over the line.
+const DISCORD_MESSAGE_BUDGET: usize = 1990;
+
+/// `body` is the model's answer text. `footer` is an optional final
+/// suffix (today: the trace-link line for new conversations); kept
+/// separate so the splitter can preferentially attach it to the LAST
+/// chunk, falling back to its own chunk only if it won't fit.
+struct FormattedReply {
+    body: String,
+    footer: Option<String>,
+}
+
 fn format_reply(
     answer: &str,
     is_new: bool,
     conversation: &Conversation,
     web_base_url: &str,
-) -> String {
-    let answer = fix_bare_mentions(answer);
-    if is_new {
+) -> FormattedReply {
+    let body = fix_bare_mentions(answer);
+    let footer = is_new.then(|| {
         format!(
-            "{answer}\n\n-# 🔎 [full trace]({base}/c/{id})",
+            "\n\n-# 🔎 [full trace]({base}/c/{id})",
             base = web_base_url.trim_end_matches('/'),
             id = conversation.id,
         )
-    } else {
-        answer
+    });
+    FormattedReply { body, footer }
+}
+
+/// Split `text` into Discord-sized chunks, preferring nice breakpoints
+/// (paragraph → line → sentence → word → hard char boundary). Each
+/// returned chunk's `len()` is <= `max_per_chunk`. The algorithm walks
+/// remaining text repeatedly: from the longest acceptable slice, find
+/// the latest preferred break inside it and emit everything up to that
+/// break as one chunk. Falls through to coarser breaks when no fine
+/// break is available within budget.
+fn split_into_messages(text: &str, max_per_chunk: usize) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
     }
+    if text.len() <= max_per_chunk {
+        return vec![text.to_string()];
+    }
+    let mut chunks: Vec<String> = Vec::new();
+    let mut remaining = text;
+    loop {
+        if remaining.len() <= max_per_chunk {
+            if !remaining.trim().is_empty() {
+                chunks.push(remaining.to_string());
+            }
+            break;
+        }
+        let split_at = find_split_point(remaining, max_per_chunk);
+        // `find_split_point` always returns a valid char boundary > 0.
+        let chunk = remaining[..split_at].trim_end().to_string();
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+        remaining = remaining[split_at..].trim_start();
+    }
+    chunks
+}
+
+/// Locate the best split offset within the first `max` bytes of `s`.
+/// Tries paragraph break → newline → sentence terminator → word →
+/// hard char-boundary cut, in that preference order. Returns a byte
+/// offset on a UTF-8 char boundary, guaranteed > 0 when input is
+/// longer than `max`.
+fn find_split_point(s: &str, max: usize) -> usize {
+    let limit = max.min(s.len());
+    // Walk `limit` back to a char boundary so candidate slicing is safe.
+    let mut limit = limit;
+    while limit > 0 && !s.is_char_boundary(limit) {
+        limit -= 1;
+    }
+    let candidate = &s[..limit];
+
+    if let Some(pos) = candidate.rfind("\n\n") {
+        return pos + 2;
+    }
+    if let Some(pos) = candidate.rfind('\n') {
+        return pos + 1;
+    }
+    for sep in [". ", "! ", "? "] {
+        if let Some(pos) = candidate.rfind(sep) {
+            return pos + sep.len();
+        }
+    }
+    if let Some(pos) = candidate.rfind(' ') {
+        return pos + 1;
+    }
+    // Last resort: hard cut at the (char-aligned) limit. If even that
+    // is 0 (input starts with a multi-byte char larger than `max`),
+    // bump up one char to avoid infinite-looping.
+    if limit > 0 {
+        return limit;
+    }
+    s.chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+}
+
+/// Build the final list of message chunks ready to post, including
+/// the optional footer. The footer joins the last chunk when it fits;
+/// otherwise it becomes its own trailing chunk.
+fn assemble_chunks(reply: &FormattedReply) -> Vec<String> {
+    let mut chunks = split_into_messages(&reply.body, DISCORD_MESSAGE_BUDGET);
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    if let Some(footer) = reply.footer.as_ref() {
+        let last = chunks.last_mut().expect("at least one chunk");
+        if last.len() + footer.len() <= DISCORD_MESSAGE_BUDGET {
+            last.push_str(footer);
+        } else {
+            chunks.push(footer.trim_start().to_string());
+        }
+    }
+    // Discard any chunk that ended up empty after trimming.
+    chunks.retain(|c| !c.is_empty());
+    if chunks.is_empty() {
+        chunks.push(String::new());
+    }
+    chunks
 }
 
 /// Rewrite bare `@<snowflake>` runs into proper Discord mention syntax
@@ -1775,68 +1895,105 @@ fn extension_from_video_url(url: &str) -> &'static str {
     }
 }
 
-/// Send the reply. For a new conversation with a long answer we open a
-/// public thread off the user's message and post inside it; otherwise
-/// we reply inline. Generated images ride along as file attachments.
-async fn post_reply(
+/// Post the reply as one or more Discord messages.
+///
+/// For a new conversation whose total body exceeds the auto-thread
+/// threshold, we open a thread off the user's message and post every
+/// chunk inside it. Otherwise the first chunk is a native Discord
+/// reply to the user; subsequent chunks are plain follow-up messages
+/// in the same channel (Discord renders them adjacent without the
+/// "Replying to…" header repeating on every line).
+///
+/// Attachments — generated images / videos — are always placed on the
+/// LAST chunk so the user sees the prose first and the media at the
+/// end. Returns every posted message so the caller can link them all
+/// into `message_links`.
+#[allow(clippy::too_many_arguments)]
+async fn post_reply_chunks(
     state: &State,
     user_msg: &Message,
-    body: &str,
+    chunks: &[String],
     is_new: bool,
     generated: &[HttpAttachment],
-) -> Result<Message, BotError> {
-    // Suppress Discord's link-preview embeds on every bot reply. The
-    // model's answers frequently include citation URLs (the trace link
-    // + tool-call result links + sources), and an unfurled embed per
-    // URL drowns the channel. Equivalent to a user clicking the little
-    // X on each preview, or wrapping URLs in <…>.
+    conversation: &Conversation,
+    turn_id: Uuid,
+) -> Result<Vec<Message>, BotError> {
+    debug_assert!(!chunks.is_empty(), "must have at least one chunk to post");
     let suppress = MessageFlags::SUPPRESS_EMBEDS;
+    let total_chars: usize = chunks.iter().map(|c| c.len()).sum();
 
-    if is_new && body.len() > REPLY_LENGTH_THRESHOLD {
-        let title = make_thread_title(&user_msg.content);
-        let thread = state
-            .http
-            .create_thread_from_message(user_msg.channel_id, user_msg.id, &title)
-            .await?
-            .model()
-            .await?;
-        let trimmed = truncate(body, 1990);
+    let (target_channel, first_chunk_replies_to_user): (Id<ChannelMarker>, bool) =
+        if is_new && total_chars > REPLY_LENGTH_THRESHOLD {
+            let title = make_thread_title(&user_msg.content);
+            let thread = state
+                .http
+                .create_thread_from_message(user_msg.channel_id, user_msg.id, &title)
+                .await?
+                .model()
+                .await?;
+            (thread.id, false)
+        } else {
+            (user_msg.channel_id, true)
+        };
+
+    let total = chunks.len();
+    let mut posted: Vec<Message> = Vec::with_capacity(total);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_last = i + 1 == total;
         let mut builder = state
             .http
-            .create_message(thread.id)
-            .content(&trimmed)
+            .create_message(target_channel)
+            .content(chunk)
             .flags(suppress);
-        if !generated.is_empty() {
+        if i == 0 && first_chunk_replies_to_user {
+            builder = builder.reply(user_msg.id);
+        }
+        if is_last && !generated.is_empty() {
             builder = builder.attachments(generated);
         }
-        let reply = builder.await?.model().await?;
-        Ok(reply)
-    } else {
-        let trimmed = truncate(body, 1990);
-        let mut builder = state
-            .http
-            .create_message(user_msg.channel_id)
-            .content(&trimmed)
-            .reply(user_msg.id)
-            .flags(suppress);
-        if !generated.is_empty() {
-            builder = builder.attachments(generated);
+        let posted_msg = builder.await?.model().await?;
+
+        // Link each chunk to the conversation as it's posted, so a
+        // partial-failure here still leaves the earlier chunks
+        // discoverable for thread continuation. Best-effort: a DB
+        // hiccup here doesn't fail the overall post.
+        if let Err(err) = state
+            .db
+            .record_message_link(
+                i64::try_from(posted_msg.id.get()).unwrap_or(i64::MAX),
+                conversation.discord_guild_id,
+                conversation.id,
+                turn_id,
+                "assistant",
+            )
+            .await
+        {
+            tracing::warn!(
+                error = %err,
+                message_id = %posted_msg.id,
+                "failed to link posted chunk into conversation"
+            );
         }
-        let reply = builder.await?.model().await?;
-        Ok(reply)
+
+        posted.push(posted_msg);
     }
+    Ok(posted)
 }
 
+/// Hard-cap a string to `max` BYTES, appending a `…` (3 UTF-8 bytes)
+/// when truncation occurs. The returned string's `len()` is always
+/// `<= max`. The cutoff is walked back to a char boundary so we never
+/// slice mid-codepoint.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s.to_string()
-    } else {
-        let mut cutoff = max.saturating_sub(1);
-        while !s.is_char_boundary(cutoff) && cutoff > 0 {
-            cutoff -= 1;
-        }
-        format!("{}…", &s[..cutoff])
+        return s.to_string();
     }
+    let ellipsis_bytes = '…'.len_utf8();
+    let mut cutoff = max.saturating_sub(ellipsis_bytes);
+    while cutoff > 0 && !s.is_char_boundary(cutoff) {
+        cutoff -= 1;
+    }
+    format!("{}…", &s[..cutoff])
 }
 
 fn make_thread_title(content: &str) -> String {
@@ -1913,6 +2070,89 @@ mod tests {
         let t = truncate(s, 6);
         assert!(t.ends_with('…'));
         assert!(t.len() <= 8);
+    }
+
+    fn fake_conversation() -> Conversation {
+        Conversation {
+            id: uuid::Uuid::nil(),
+            created_at: time::OffsetDateTime::now_utc(),
+            discord_guild_id: 0,
+            discord_channel_id: 0,
+            created_by_user_id: 0,
+            root_discord_message_id: 0,
+            title: None,
+            model: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn split_short_input_yields_single_chunk() {
+        let out = split_into_messages("just a sentence.", 100);
+        assert_eq!(out, vec!["just a sentence.".to_string()]);
+    }
+
+    #[test]
+    fn split_prefers_paragraph_breaks() {
+        let body = format!("{}\n\n{}\n\n{}", "a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let out = split_into_messages(&body, 60);
+        // Each "a"/"b"/"c" block is 40 chars; budget 60; paragraph
+        // breaks must keep each block intact in its own chunk.
+        assert_eq!(out.len(), 3);
+        assert!(out[0].chars().all(|c| c == 'a'));
+        assert!(out[1].chars().all(|c| c == 'b'));
+        assert!(out[2].chars().all(|c| c == 'c'));
+    }
+
+    #[test]
+    fn split_falls_through_to_word_boundary() {
+        // No paragraph/sentence breaks; the splitter should still
+        // break on spaces rather than mid-word.
+        let body = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let out = split_into_messages(body, 20);
+        for chunk in &out {
+            assert!(chunk.len() <= 20);
+        }
+        // Each chunk's whitespace-separated tokens must all be real
+        // input words — no half-tokens from cutting mid-word.
+        let input_words: std::collections::HashSet<&str> =
+            body.split_whitespace().collect();
+        for chunk in &out {
+            for word in chunk.split_whitespace() {
+                assert!(input_words.contains(word), "broken word: {word}");
+            }
+        }
+        // Round-trip: chunks rejoined preserve all input words in order.
+        let rejoined = out.join(" ");
+        assert_eq!(
+            rejoined.split_whitespace().collect::<Vec<_>>(),
+            body.split_whitespace().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn assemble_attaches_footer_to_last_chunk_when_it_fits() {
+        let reply = FormattedReply {
+            body: "first paragraph.\n\nsecond paragraph.".to_string(),
+            footer: Some("\n\n-# trace".to_string()),
+        };
+        let chunks = assemble_chunks(&reply);
+        assert!(chunks.last().unwrap().contains("trace"));
+    }
+
+    #[test]
+    fn assemble_keeps_trace_link_when_body_is_very_long() {
+        // Body alone exceeds one Discord message; the splitter
+        // produces multiple chunks and the footer survives at the end.
+        let body = "Lorem ipsum dolor sit amet.\n\n".repeat(120);
+        let conversation = fake_conversation();
+        let reply = format_reply(&body, true, &conversation, "https://example.com");
+        let chunks = assemble_chunks(&reply);
+        assert!(chunks.len() > 1);
+        for chunk in &chunks {
+            assert!(chunk.len() <= DISCORD_MESSAGE_BUDGET, "chunk over budget");
+        }
+        assert!(chunks.last().unwrap().contains("full trace"));
+        assert!(chunks.last().unwrap().contains("https://example.com/c/"));
     }
 
     #[test]
