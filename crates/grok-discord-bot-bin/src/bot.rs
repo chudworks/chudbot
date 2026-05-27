@@ -282,7 +282,25 @@ async fn process(
     msg: &Message,
     privacy_mode: &PrivacyMode,
 ) -> Result<(), BotError> {
+    let preview_chars = msg.content.chars().take(80).collect::<String>();
+    tracing::info!(
+        author = %msg.author.name,
+        author_id = %msg.author.id,
+        channel = %msg.channel_id,
+        guild = ?msg.guild_id,
+        attachments = msg.attachments.len(),
+        preview = %preview_chars,
+        "turn: mention received"
+    );
+
     let (conversation, is_new) = resolve_conversation(state, msg).await?;
+    tracing::info!(
+        conversation = %conversation.id,
+        is_new,
+        model = %conversation.model,
+        "turn: conversation resolved"
+    );
+
     let user_content = strip_mentions(&msg.content, state.bot_user_id);
 
     // Persist any image attachments before recording context items so
@@ -313,6 +331,14 @@ async fn process(
             &user_content,
         )
         .await?;
+    tracing::info!(
+        conversation = %conversation.id,
+        turn = %turn.id,
+        turn_index = turn.turn_index,
+        context_items = initial_context.len(),
+        images = saved_images.len(),
+        "turn: started"
+    );
 
     for item in &initial_context {
         state.db.record_context_item(turn.id, item).await?;
@@ -384,6 +410,16 @@ async fn process(
     let reply_text =
         format_reply(&agent_run.content, is_new, &conversation, &state.web_base_url);
     let reply_msg = post_reply(state, msg, &reply_text, is_new).await?;
+    let threaded = is_new && reply_text.len() > REPLY_LENGTH_THRESHOLD;
+    tracing::info!(
+        conversation = %conversation.id,
+        turn = %turn.id,
+        reply_msg = %reply_msg.id,
+        threaded,
+        reply_chars = agent_run.content.len(),
+        tool_calls = agent_run.tool_calls.len(),
+        "turn: reply posted"
+    );
 
     state
         .db

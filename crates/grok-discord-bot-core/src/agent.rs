@@ -53,7 +53,15 @@ where
     let mut all_tool_calls: Vec<ToolCallRecord> = Vec::new();
     let mut last_model_id = String::new();
 
-    for _ in 0..max_iterations {
+    tracing::info!(
+        provider = provider.name(),
+        messages = messages.len(),
+        client_tools = tools.len(),
+        web_search = enable_web_search,
+        "agent: starting loop"
+    );
+
+    for iteration in 0..max_iterations {
         let response = provider
             .step(StepRequest {
                 messages: messages.clone(),
@@ -71,7 +79,16 @@ where
                 server_tool_calls,
                 model_id,
             } => {
+                let server_calls = server_tool_calls.len();
                 all_tool_calls.extend(server_tool_calls);
+                tracing::info!(
+                    iteration,
+                    model = %model_id,
+                    text_chars = content.len(),
+                    server_tool_calls = server_calls,
+                    total_tool_calls = all_tool_calls.len(),
+                    "agent: final answer received"
+                );
                 return Ok(AgentRun {
                     content,
                     tool_calls: all_tool_calls,
@@ -84,8 +101,19 @@ where
                 server_tool_calls,
                 model_id,
             } => {
+                let server_calls = server_tool_calls.len();
                 all_tool_calls.extend(server_tool_calls);
                 last_model_id = model_id;
+                let tool_names: Vec<&str> =
+                    tool_uses.iter().map(|t| t.name.as_str()).collect();
+                tracing::info!(
+                    iteration,
+                    model = %last_model_id,
+                    client_tool_uses = tool_uses.len(),
+                    server_tool_calls = server_calls,
+                    tools = ?tool_names,
+                    "agent: model requested tools"
+                );
 
                 // Reconstruct the assistant turn so the next step can see it.
                 let mut assistant_blocks: Vec<TurnBlock> = Vec::new();
@@ -109,8 +137,19 @@ where
                 // Execute each tool and build the user-side result turn.
                 let mut result_blocks: Vec<TurnBlock> = Vec::with_capacity(tool_uses.len());
                 for use_req in &tool_uses {
+                    tracing::info!(
+                        tool = %use_req.name,
+                        input = %use_req.input,
+                        "agent: invoking tool"
+                    );
                     let (content_str, is_error, response_json) =
                         execute_one(executor, use_req).await;
+                    tracing::info!(
+                        tool = %use_req.name,
+                        is_error,
+                        response_chars = content_str.len(),
+                        "agent: tool returned"
+                    );
                     all_tool_calls.push(ToolCallRecord {
                         tool_name: use_req.name.clone(),
                         request: use_req.input.clone(),
