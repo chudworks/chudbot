@@ -79,6 +79,7 @@ where
                 server_tool_calls,
                 model_id,
             } => {
+                log_server_tool_calls(iteration, &server_tool_calls);
                 let server_calls = server_tool_calls.len();
                 all_tool_calls.extend(server_tool_calls);
                 tracing::info!(
@@ -101,6 +102,7 @@ where
                 server_tool_calls,
                 model_id,
             } => {
+                log_server_tool_calls(iteration, &server_tool_calls);
                 let server_calls = server_tool_calls.len();
                 all_tool_calls.extend(server_tool_calls);
                 last_model_id = model_id;
@@ -148,6 +150,7 @@ where
                         tool = %use_req.name,
                         is_error,
                         response_chars = content_str.len(),
+                        response = %truncate_for_log(&response_json, 600),
                         "agent: tool returned"
                     );
                     all_tool_calls.push(ToolCallRecord {
@@ -177,6 +180,39 @@ where
         "agent loop hit iteration cap"
     );
     Err(LlmError::TooManyIterations(max_iterations))
+}
+
+/// Emit one info line per server-side tool call (web_search, x_search,
+/// code_interpreter, …). The provider hands these back fully resolved
+/// after each step; surfacing them individually makes it easy to see
+/// what grounding actually fired from `tail -f` without opening the
+/// viewer.
+fn log_server_tool_calls(iteration: u32, calls: &[ToolCallRecord]) {
+    for call in calls {
+        tracing::info!(
+            iteration,
+            tool = %call.tool_name,
+            request = %truncate_for_log(&call.request, 400),
+            response = %truncate_for_log(&call.response, 600),
+            "agent: server tool call"
+        );
+    }
+}
+
+/// Compact a JSON value for log display: serialize then trim with an
+/// ellipsis at the byte boundary. Not character-aware — log fields
+/// don't need to be UTF-8-perfect.
+fn truncate_for_log(value: &serde_json::Value, max: usize) -> String {
+    let s = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
+    if s.len() <= max {
+        s
+    } else {
+        let mut cutoff = max.saturating_sub(1);
+        while cutoff > 0 && !s.is_char_boundary(cutoff) {
+            cutoff -= 1;
+        }
+        format!("{}…", &s[..cutoff])
+    }
 }
 
 /// Run one tool and turn its outcome into (model-facing string, is_error,
