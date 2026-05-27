@@ -29,6 +29,7 @@ use twilight_http::Client as HttpClient;
 use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::channel::Message;
 use twilight_model::gateway::event::Event;
+use twilight_model::gateway::payload::incoming::GuildCreate;
 use twilight_model::id::Id;
 use twilight_model::id::marker::{
     ApplicationMarker, ChannelMarker, GuildMarker, MessageMarker, UserMarker,
@@ -125,7 +126,9 @@ pub async fn run(
     });
 
     let mut shard = Shard::new(ShardId::ONE, discord_token, intents);
-    let watched = EventTypeFlags::MESSAGE_CREATE | EventTypeFlags::INTERACTION_CREATE;
+    let watched = EventTypeFlags::MESSAGE_CREATE
+        | EventTypeFlags::INTERACTION_CREATE
+        | EventTypeFlags::GUILD_CREATE;
 
     while let Some(item) = shard.next_event(watched).await {
         let event = match item {
@@ -156,11 +159,32 @@ pub async fn run(
                     .await;
                 });
             }
+            Event::GuildCreate(boxed) => log_guild_create(&boxed),
             _ => {}
         }
     }
 
     Ok(())
+}
+
+/// Log every guild the bot becomes active in. Fires once per guild
+/// when the gateway connects (and again whenever the bot joins a new
+/// server). Useful for grabbing the `dev_guild_id` you need in
+/// `config.toml` without enabling Developer Mode in the Discord client.
+fn log_guild_create(event: &GuildCreate) {
+    match event {
+        GuildCreate::Available(g) => {
+            tracing::info!(
+                guild_id = %g.id,
+                guild_name = %g.name,
+                member_count = g.member_count.unwrap_or(0),
+                "bot is active in guild"
+            );
+        }
+        GuildCreate::Unavailable(u) => {
+            tracing::warn!(guild_id = %u.id, "guild is unavailable (outage)");
+        }
+    }
 }
 
 /// Top-level handler for one mention. Resolves the privacy mode, gates
