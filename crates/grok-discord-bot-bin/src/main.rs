@@ -36,6 +36,15 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Pin rustls' crypto provider before any TLS work. Several crates
+    // in the tree (sqlx, reqwest, twilight, rustls-platform-verifier)
+    // each enable rustls with potentially different provider features,
+    // which leaves the process-wide default ambiguous and causes a
+    // panic at first TLS handshake. Pick one explicitly.
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     init_tracing();
     let args = Args::parse();
 

@@ -23,7 +23,7 @@ provider = "xai"
 # Required when provider = "xai".
 [llm.xai]
 api_key = "xai-..."
-# Optional, defaults to "grok-4.1-fast".
+# Optional, defaults to "grok-4.3".
 # model = "grok-4.3"
 
 # Required when provider = "anthropic".

@@ -1,8 +1,17 @@
-//! xAI Grok provider. Talks to the OpenAI-compatible
-//! `/v1/chat/completions` endpoint at `api.x.ai`. Supports:
-//!   - server-side web search via `search_parameters` when
-//!     [`StepRequest::enable_web_search`] is set;
-//!   - client-side tools via OpenAI-style `tools` + `tool_calls` rounds.
+//! xAI Grok provider, talking to the **Agent Tools / Responses API** at
+//! `POST https://api.x.ai/v1/responses`.
+//!
+//! This is the modern xAI endpoint, replacing the older
+//! `/v1/chat/completions` + `search_parameters` path which now returns
+//! `410 Live search is deprecated`. The Responses API uses an `input`
+//! array of items (instead of `messages`), an `output` array of typed
+//! blocks (instead of `choices[0].message`), and represents both
+//! server-side and client-side tool calls as top-level output items.
+//!
+//! Server-side tools we enable on `enable_web_search`:
+//!   - `web_search` — general web search with citations.
+//!   - `x_search`   — X / Twitter search; Grok's distinctive grounding
+//!                    surface, included for free alongside web_search.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -26,7 +35,7 @@ pub struct XaiProvider {
 }
 
 impl XaiProvider {
-    /// Construct from a config block. Uses the default `api.x.ai/v1`.
+    /// Construct from a config block.
     pub fn new(config: XaiConfig) -> Self {
         let name = format!("xai/{}", config.model);
         Self {
@@ -51,26 +60,20 @@ impl LlmProvider for XaiProvider {
     }
 
     async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
-        let openai_messages = to_openai_messages(&request.messages);
-        let openai_tools = to_openai_tools(&request.tools);
+        let (instructions, input_items) = to_responses_input(&request.messages);
+        let tools = build_tools(&request.tools, request.enable_web_search);
 
-        let body = XaiRequest {
+        let body = ResponsesRequest {
             model: &self.model,
-            messages: &openai_messages,
-            tools: if openai_tools.is_empty() {
-                None
-            } else {
-                Some(&openai_tools)
-            },
-            search_parameters: request.enable_web_search.then(|| XaiSearchParameters {
-                mode: "on",
-                return_citations: true,
-            }),
+            input: &input_items,
+            instructions: instructions.as_deref(),
+            tools: if tools.is_empty() { None } else { Some(&tools) },
+            max_output_tokens: Some(request.max_tokens),
         };
 
         let resp = self
             .http
-            .post(format!("{}/chat/completions", self.base_url))
+            .post(format!("{}/responses", self.base_url))
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -86,61 +89,25 @@ impl LlmProvider for XaiProvider {
             });
         }
 
-        let parsed: XaiResponse = resp
+        let parsed: ResponsesResponse = resp
             .json()
             .await
             .map_err(|e| LlmError::Decode(e.to_string()))?;
 
         let model_id = parsed.model.unwrap_or_else(|| self.model.clone());
+        let (text, tool_uses, server_tool_calls) =
+            walk_output(&parsed.output, parsed.citations.as_ref());
 
-        // Server-side web search citations attach to the response as a
-        // top-level `citations` array. Record as a single ToolCallRecord.
-        let mut server_tool_calls = Vec::new();
-        if let Some(citations) = parsed.citations {
-            server_tool_calls.push(ToolCallRecord {
-                tool_name: "web_search".to_string(),
-                request: json!({ "mode": "on", "via": "search_parameters" }),
-                response: citations,
-            });
-        }
-
-        let choice = parsed
-            .choices
-            .into_iter()
-            .next()
-            .ok_or_else(|| LlmError::Decode("no choices in response".into()))?;
-
-        let message = choice.message;
-        let finish = choice.finish_reason.unwrap_or_default();
-
-        if finish == "tool_calls" && !message.tool_calls.is_empty() {
-            let mut tool_uses = Vec::with_capacity(message.tool_calls.len());
-            for tc in message.tool_calls {
-                let input: Value = serde_json::from_str(&tc.function.arguments).map_err(|e| {
-                    LlmError::MalformedToolCall(format!(
-                        "could not parse tool arguments json for `{}`: {e}",
-                        tc.function.name
-                    ))
-                })?;
-                tool_uses.push(ToolUseRequest {
-                    id: tc.id,
-                    name: tc.function.name,
-                    input,
-                });
-            }
+        if !tool_uses.is_empty() {
             Ok(StepResponse::UseTools {
-                partial_text: if message.content.is_empty() {
-                    None
-                } else {
-                    Some(message.content)
-                },
+                partial_text: if text.is_empty() { None } else { Some(text) },
                 tool_uses,
                 server_tool_calls,
                 model_id,
             })
         } else {
             Ok(StepResponse::Final {
-                content: message.content,
+                content: text,
                 server_tool_calls,
                 model_id,
             })
@@ -148,140 +115,298 @@ impl LlmProvider for XaiProvider {
     }
 }
 
-/// Convert our [`ChatTurn`]s into OpenAI's flat message list. Tool-result
-/// blocks expand to multiple `role: "tool"` messages (one per result).
-fn to_openai_messages(turns: &[ChatTurn]) -> Vec<Value> {
-    let mut out = Vec::with_capacity(turns.len());
+/// Convert our [`ChatTurn`] history into the Responses API's
+/// `(instructions, input)` pair. System turns are lifted out of the
+/// input list and concatenated into the top-level `instructions` field.
+fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
+    let mut instructions: Vec<String> = Vec::new();
+    let mut input: Vec<Value> = Vec::new();
+
     for turn in turns {
-        let role = turn.role.as_str();
-        // Split blocks: text/tool_uses on the speaker turn, tool_results
-        // emitted as separate "tool" messages.
-        let mut text = String::new();
-        let mut tool_calls: Vec<Value> = Vec::new();
+        if turn.role == MessageRole::System {
+            for block in &turn.blocks {
+                if let TurnBlock::Text(t) = block {
+                    instructions.push(t.clone());
+                }
+            }
+            continue;
+        }
+
+        let role_str = match turn.role {
+            MessageRole::Assistant => "assistant",
+            _ => "user",
+        };
+
+        let mut text_buf = String::new();
+        let mut deferred: Vec<Value> = Vec::new();
+
         for block in &turn.blocks {
             match block {
-                TurnBlock::Text(t) => text.push_str(t),
-                TurnBlock::ToolUse { id, name, input } => {
-                    // OpenAI expects arguments as a STRING (json-encoded).
-                    let args = serde_json::to_string(input).unwrap_or_else(|_| "{}".into());
-                    tool_calls.push(json!({
-                        "id": id,
-                        "type": "function",
-                        "function": { "name": name, "arguments": args },
+                TurnBlock::Text(t) => text_buf.push_str(t),
+                TurnBlock::ToolUse { id, name, input: tool_input } => {
+                    // Echo the assistant's prior tool call back as its own
+                    // input item; the Responses API tracks call_id for
+                    // matching results.
+                    let args = serde_json::to_string(tool_input).unwrap_or_else(|_| "{}".into());
+                    deferred.push(json!({
+                        "type": "function_call",
+                        "call_id": id,
+                        "name": name,
+                        "arguments": args,
                     }));
                 }
-                TurnBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    ..
-                } => {
-                    // Emitted as its own "tool" message below. Skip here.
-                    let _ = (tool_use_id, content);
+                TurnBlock::ToolResult { tool_use_id, content, .. } => {
+                    deferred.push(json!({
+                        "type": "function_call_output",
+                        "call_id": tool_use_id,
+                        "output": content,
+                    }));
                 }
             }
         }
-        // Speaker turn (only if there's text or tool_calls to emit).
-        let has_speaker_content = !text.is_empty() || !tool_calls.is_empty();
-        if has_speaker_content && turn.role != MessageRole::User {
-            // Assistant or system turn with text/tool_calls.
-            let mut msg = serde_json::Map::new();
-            msg.insert("role".into(), Value::String(role.into()));
-            if !text.is_empty() {
-                msg.insert("content".into(), Value::String(text));
-            } else {
-                msg.insert("content".into(), Value::Null);
-            }
-            if !tool_calls.is_empty() {
-                msg.insert("tool_calls".into(), Value::Array(tool_calls));
-            }
-            out.push(Value::Object(msg));
-        } else if turn.role == MessageRole::User && !text.is_empty() {
-            // Plain user message.
-            out.push(json!({ "role": "user", "content": text }));
+
+        if !text_buf.is_empty() {
+            input.push(json!({
+                "role": role_str,
+                "content": text_buf,
+            }));
         }
-        // Tool results — each as its own "tool" message.
-        for block in &turn.blocks {
-            if let TurnBlock::ToolResult {
-                tool_use_id,
-                content,
-                ..
-            } = block
-            {
-                out.push(json!({
-                    "role": "tool",
-                    "tool_call_id": tool_use_id,
-                    "content": content,
-                }));
-            }
-        }
+        input.extend(deferred);
     }
-    out
+
+    let instructions = if instructions.is_empty() {
+        None
+    } else {
+        Some(instructions.join("\n\n"))
+    };
+    (instructions, input)
 }
 
-fn to_openai_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+/// Build the `tools` array — client-side function definitions plus
+/// xAI's server-side `web_search` + `x_search` when enabled.
+fn build_tools(defs: &[ToolDefinition], enable_web_search: bool) -> Vec<Value> {
+    let mut tools: Vec<Value> = Vec::with_capacity(defs.len() + 2);
+    for t in defs {
+        tools.push(json!({
+            "type": "function",
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.input_schema,
+        }));
+    }
+    if enable_web_search {
+        tools.push(json!({ "type": "web_search" }));
+        tools.push(json!({ "type": "x_search" }));
+    }
     tools
-        .iter()
-        .map(|t| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.input_schema,
-                },
-            })
-        })
-        .collect()
+}
+
+/// Walk the `output` array. Returns:
+///   - concatenated assistant text;
+///   - client-side `function_call` items as [`ToolUseRequest`]s;
+///   - server-side tool uses (`web_search_call`, `x_search_call`, etc.)
+///     as [`ToolCallRecord`]s, attaching the top-level `citations`
+///     field to whichever server tool emitted them when we can't tell
+///     them apart (citations are response-wide, not per-block).
+fn walk_output(
+    output: &[Value],
+    citations: Option<&Value>,
+) -> (String, Vec<ToolUseRequest>, Vec<ToolCallRecord>) {
+    let mut text = String::new();
+    let mut tool_uses: Vec<ToolUseRequest> = Vec::new();
+    let mut server_calls: Vec<ToolCallRecord> = Vec::new();
+
+    for item in output {
+        let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "message" => {
+                if let Some(content) = item.get("content").and_then(Value::as_array) {
+                    for block in content {
+                        let block_kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+                        if block_kind == "output_text" || block_kind == "text" {
+                            if let Some(t) = block.get("text").and_then(Value::as_str) {
+                                text.push_str(t);
+                            }
+                        }
+                    }
+                } else if let Some(t) = item.get("content").and_then(Value::as_str) {
+                    text.push_str(t);
+                }
+            }
+            "function_call" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("id").and_then(Value::as_str))
+                    .unwrap_or("")
+                    .to_string();
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let args_str = item
+                    .get("arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                let input: Value = serde_json::from_str(args_str).unwrap_or(Value::Null);
+                tool_uses.push(ToolUseRequest {
+                    id: call_id,
+                    name,
+                    input,
+                });
+            }
+            // Server-side tool calls. xAI emits these as top-level items
+            // (web_search_call, x_search_call, code_interpreter_call, …).
+            // Match anything ending in `_call` and not function_call.
+            other if other.ends_with("_call") => {
+                let tool_name = other.trim_end_matches("_call").to_string();
+                server_calls.push(ToolCallRecord {
+                    tool_name,
+                    request: item.clone(),
+                    response: Value::Null,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Attach response-wide citations to whichever server call could
+    // plausibly have produced them (prefer web_search; fall back to the
+    // first server call; failing that, record a freestanding entry).
+    if let Some(c) = citations {
+        if !server_calls.is_empty() {
+            if let Some(slot) = server_calls.iter_mut().find(|r| r.tool_name == "web_search") {
+                slot.response = c.clone();
+            } else {
+                server_calls[0].response = c.clone();
+            }
+        } else {
+            server_calls.push(ToolCallRecord {
+                tool_name: "web_search".to_string(),
+                request: json!({ "implicit": true }),
+                response: c.clone(),
+            });
+        }
+    }
+
+    (text, tool_uses, server_calls)
 }
 
 #[derive(Serialize)]
-struct XaiRequest<'a> {
+struct ResponsesRequest<'a> {
     model: &'a str,
-    messages: &'a [Value],
+    input: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    instructions: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Value]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    search_parameters: Option<XaiSearchParameters>,
-}
-
-#[derive(Serialize)]
-struct XaiSearchParameters {
-    mode: &'static str,
-    return_citations: bool,
+    max_output_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
-struct XaiResponse {
-    choices: Vec<XaiChoice>,
+struct ResponsesResponse {
+    #[serde(default)]
+    output: Vec<Value>,
     #[serde(default)]
     citations: Option<Value>,
     #[serde(default)]
     model: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct XaiChoice {
-    message: XaiResponseMessage,
-    #[serde(default)]
-    finish_reason: Option<String>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[derive(Deserialize)]
-struct XaiResponseMessage {
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    tool_calls: Vec<XaiToolCall>,
-}
+    #[test]
+    fn lifts_system_into_instructions() {
+        let turns = vec![
+            ChatTurn::text(MessageRole::System, "be helpful"),
+            ChatTurn::text(MessageRole::User, "hi"),
+        ];
+        let (instructions, input) = to_responses_input(&turns);
+        assert_eq!(instructions.as_deref(), Some("be helpful"));
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "hi");
+    }
 
-#[derive(Deserialize)]
-struct XaiToolCall {
-    id: String,
-    function: XaiFunctionCall,
-}
+    #[test]
+    fn encodes_function_call_round_trip() {
+        let turns = vec![
+            ChatTurn::text(MessageRole::User, "fetch please"),
+            ChatTurn {
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    TurnBlock::Text("on it. ".into()),
+                    TurnBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "fetch_messages".into(),
+                        input: json!({ "limit": 10 }),
+                    },
+                ],
+            },
+            ChatTurn {
+                role: MessageRole::User,
+                blocks: vec![TurnBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "[]".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let (_, input) = to_responses_input(&turns);
+        // user text, assistant text, function_call, function_call_output
+        assert_eq!(input.len(), 4);
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "call_1");
+        assert_eq!(input[2]["name"], "fetch_messages");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[3]["output"], "[]");
+    }
 
-#[derive(Deserialize)]
-struct XaiFunctionCall {
-    name: String,
-    arguments: String,
+    #[test]
+    fn parses_message_and_function_call_output() {
+        let output = vec![
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Let me check. "}],
+            }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_42",
+                "name": "fetch_messages",
+                "arguments": "{\"limit\":30}",
+            }),
+        ];
+        let (text, uses, server) = walk_output(&output, None);
+        assert_eq!(text, "Let me check. ");
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].id, "call_42");
+        assert_eq!(uses[0].name, "fetch_messages");
+        assert_eq!(uses[0].input["limit"], 30);
+        assert!(server.is_empty());
+    }
+
+    #[test]
+    fn attaches_citations_to_web_search_call() {
+        let output = vec![
+            json!({"type": "web_search_call", "id": "ws_1", "status": "completed"}),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Found it."}],
+            }),
+        ];
+        let citations = json!([{"url": "https://example.com", "title": "x"}]);
+        let (text, uses, server) = walk_output(&output, Some(&citations));
+        assert_eq!(text, "Found it.");
+        assert!(uses.is_empty());
+        assert_eq!(server.len(), 1);
+        assert_eq!(server[0].tool_name, "web_search");
+        assert_eq!(server[0].response, citations);
+    }
 }

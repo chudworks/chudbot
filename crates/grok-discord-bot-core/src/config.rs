@@ -171,7 +171,9 @@ pub struct XaiConfig {
 }
 
 fn default_xai_model() -> String {
-    "grok-4.1-fast".to_string()
+    // Use the documented flagship; older `grok-4.1-fast` is no longer
+    // listed in xAI's current model catalog.
+    "grok-4.3".to_string()
 }
 
 /// Anthropic Claude configuration.
@@ -243,7 +245,7 @@ mod tests {
         let config: Config = toml::from_str(toml).unwrap();
         config.validate().unwrap();
         assert_eq!(config.llm.provider, LlmProviderKind::Xai);
-        assert_eq!(config.llm.xai.unwrap().model, "grok-4.1-fast");
+        assert_eq!(config.llm.xai.unwrap().model, "grok-4.3");
         assert_eq!(config.web.listen, "0.0.0.0:8080");
         assert!(matches!(config.default_privacy, PrivacyMode::OptIn));
     }
