@@ -277,24 +277,34 @@ async fn moderation_allows(state: &State, content: &str) -> bool {
 }
 
 /// Detect xAI-style safety refusals from a provider error.
-///
-/// xAI returns HTTP 403 with a body like:
-/// `{"code":"...","error":"Content violates usage guidelines. ... \
-/// Failed check: SAFETY_CHECK_TYPE_CSAM"}` when its server-side safety
-/// classifiers refuse a prompt. We treat any 403 whose body mentions
-/// either the safety-check label or the "violates usage guidelines"
-/// phrase as a real refusal — distinct from a transient transport
-/// error, and worth surfacing as ❓ rather than ❌.
 fn is_upstream_safety_refusal(err: &grok_discord_bot_core::LlmError) -> bool {
-    match err {
-        grok_discord_bot_core::LlmError::Api { status, body } => {
-            if *status != 403 {
-                return false;
-            }
-            let lower = body.to_ascii_lowercase();
-            lower.contains("safety_check") || lower.contains("violates usage guidelines")
-        }
-        _ => false,
+    matches!(
+        err,
+        grok_discord_bot_core::LlmError::Api { status: 403, body }
+            if body_indicates_safety_refusal(body)
+    )
+}
+
+/// Substring match for xAI's safety-refusal response bodies — the same
+/// language appears whether the refusal came from the chat API
+/// (response body of a 403) or the image API (error string surfaced
+/// through a tool call's response JSON).
+///
+/// Example body:
+/// `{"error":"Content violates usage guidelines. … Failed check: SAFETY_CHECK_TYPE_CSAM"}`
+fn body_indicates_safety_refusal(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("safety_check") || lower.contains("violates usage guidelines")
+}
+
+/// Synthesize an [`LlmError`] representing a safety refusal that
+/// happened inside a client-side tool call, so the existing
+/// [`is_upstream_safety_refusal`] dispatch in `handle_message` lights up
+/// and reacts ❓.
+fn synthesize_safety_refusal(reason: &str) -> grok_discord_bot_core::LlmError {
+    grok_discord_bot_core::LlmError::Api {
+        status: 403,
+        body: format!("SAFETY_CHECK refusal: {reason}"),
     }
 }
 
@@ -572,6 +582,35 @@ async fn process(
     // Discord attachments on the outgoing reply.
     let generated_attachments =
         collect_generated_attachments(&state.images_dir, &agent_run.tool_calls).await;
+
+    // If any generate_image call was refused by xAI's safety layer,
+    // treat the whole turn as a TOS refusal and bail out with ❓ —
+    // same shape as if the chat call itself had been refused. We do
+    // this BEFORE the generic image_gen_failed path so a safety 403
+    // doesn't get a ❌ + warning-text reply.
+    let image_gen_safety_refused = agent_run.tool_calls.iter().any(|tc| {
+        tc.tool_name == "generate_image"
+            && tc.response
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(body_indicates_safety_refusal)
+                .unwrap_or(false)
+    });
+    if image_gen_safety_refused {
+        tracing::info!(
+            conversation = %conversation.id,
+            turn = %turn.id,
+            "image generation refused by upstream safety; surfacing as TOS refusal"
+        );
+        state
+            .db
+            .fail_turn(turn.id, "image generation refused by upstream safety")
+            .await
+            .ok();
+        return Err(BotError::Llm(synthesize_safety_refusal(
+            "generate_image was refused by xAI's safety policy",
+        )));
+    }
 
     // Detect "model claimed success but generate_image failed" — every
     // generate_image call produced no usable image_uri. We want to NOT
@@ -1476,6 +1515,26 @@ mod tests {
         assert_eq!(fix_bare_mentions("@everyone"), "@everyone");
         assert_eq!(fix_bare_mentions("foo@123 bar"), "foo@123 bar");
         assert_eq!(fix_bare_mentions("user@example.com"), "user@example.com");
+    }
+
+    #[test]
+    fn safety_refusal_detected_in_xai_403_body() {
+        assert!(body_indicates_safety_refusal(
+            r#"{"error":"Content violates usage guidelines. Failed check: SAFETY_CHECK_TYPE_CSAM"}"#
+        ));
+        assert!(body_indicates_safety_refusal(
+            r#"{"error":"Content violates Usage Guidelines"}"#
+        ));
+        assert!(!body_indicates_safety_refusal(
+            r#"{"error":"rate limited"}"#
+        ));
+        assert!(!body_indicates_safety_refusal(r#"unauthorized"#));
+    }
+
+    #[test]
+    fn synthetic_safety_error_round_trips_through_detector() {
+        let err = synthesize_safety_refusal("generate_image was refused");
+        assert!(is_upstream_safety_refusal(&err));
     }
 
     #[test]
