@@ -28,6 +28,7 @@ use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
 use twilight_http::Client as HttpClient;
 use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::channel::Message;
+use twilight_model::channel::message::MessageFlags;
 use twilight_model::gateway::event::Event;
 use twilight_model::gateway::payload::incoming::GuildCreate;
 use twilight_model::id::Id;
@@ -761,6 +762,13 @@ async fn post_reply(
     body: &str,
     is_new: bool,
 ) -> Result<Message, BotError> {
+    // Suppress Discord's link-preview embeds on every bot reply. The
+    // model's answers frequently include citation URLs (the trace link
+    // + tool-call result links + sources), and an unfurled embed per
+    // URL drowns the channel. Equivalent to a user clicking the little
+    // X on each preview, or wrapping URLs in <…>.
+    let suppress = MessageFlags::SUPPRESS_EMBEDS;
+
     if is_new && body.len() > REPLY_LENGTH_THRESHOLD {
         let title = make_thread_title(&user_msg.content);
         let thread = state
@@ -774,6 +782,7 @@ async fn post_reply(
             .http
             .create_message(thread.id)
             .content(&trimmed)
+            .flags(suppress)
             .await?
             .model()
             .await?;
@@ -785,6 +794,7 @@ async fn post_reply(
             .create_message(user_msg.channel_id)
             .content(&trimmed)
             .reply(user_msg.id)
+            .flags(suppress)
             .await?
             .model()
             .await?;
