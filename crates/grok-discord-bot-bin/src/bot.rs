@@ -20,7 +20,8 @@ use std::sync::Arc;
 
 use grok_discord_bot_core::{
     AgentRun, AnyProvider, BotConfig, ChatTurn, ContextItem, Conversation, Db, LlmProvider,
-    MessageRole, PrivacyMode, StorageConfig, ToolDefinition, ToolError, ToolExecutor, TurnBlock,
+    MessageRole, PrivacyMode, StepRequest, StepResponse, StorageConfig, ToolDefinition,
+    ToolError, ToolExecutor, TurnBlock,
     imagegen::{ImageGenRequest, ImageGenerator, ImageQuality},
     run_agent, storage,
 };
@@ -54,6 +55,30 @@ const MAX_OUTPUT_TOKENS: u32 = 4096;
 /// Safety cap on the agent's tool-use loop. Most turns finish in 1-3
 /// iterations; this is a runaway guard.
 const MAX_AGENT_ITERATIONS: u32 = 6;
+
+/// System prompt for the pre-flight moderation classifier. Kept tight
+/// so a fast/cheap call resolves to one of two tokens. Categories
+/// loosely follow Discord's Community Guidelines; we deliberately
+/// leave "edgy / vulgar / opinionated" out of the refusal list — Grok
+/// is supposed to be a bit unhinged and Chud wants that flavor.
+const MODERATION_PROMPT: &str = "You are a Discord TOS compliance classifier. \
+Decide whether the user message violates Discord's Community Guidelines.
+
+Categories that DO violate:
+- CSAM or any sexualization of minors
+- Doxxing (sharing non-public personal info to harm)
+- Credible threats of violence
+- Encouragement of self-harm or suicide
+- Illegal-content arrangements (drug/weapon sales, trafficking)
+- Targeted hate speech against protected groups
+- Malware, phishing, large-scale spam
+
+NOT violations: profanity, edgy jokes, political opinions, criticism, \
+sarcasm, requests to generate edgy art, NSFW jokes without minors, asking \
+about news or current events.
+
+Respond with EXACTLY one token: ALLOW or REFUSE. No punctuation, no \
+explanation.";
 
 /// Errors returned by the bot loop. Logged + surfaced as a ❌ reaction.
 #[derive(Debug, Error)]
@@ -198,6 +223,51 @@ fn log_guild_create(event: &GuildCreate) {
     }
 }
 
+/// Ask the configured LLM whether the user's message violates Discord
+/// TOS. One short call with `temperature=0` and a tight prompt that
+/// asks for a single ALLOW/REFUSE token. **Fails open** — if the call
+/// errors out or returns something unparseable, the message is allowed
+/// through; refusing on transient failure would be worse UX than
+/// occasionally letting a sketchy prompt through.
+async fn moderation_allows(state: &State, content: &str) -> bool {
+    let request = StepRequest {
+        messages: vec![
+            ChatTurn::text(MessageRole::System, MODERATION_PROMPT),
+            ChatTurn::text(
+                MessageRole::User,
+                format!("Message to classify:\n<<<\n{content}\n>>>"),
+            ),
+        ],
+        tools: Vec::new(),
+        enable_web_search: false,
+        max_tokens: 8,
+        temperature: Some(0.0),
+        top_p: None,
+    };
+
+    match state.llm.step(request).await {
+        Ok(StepResponse::Final { content: verdict, .. }) => {
+            let normalized = verdict.trim().to_ascii_uppercase();
+            // Treat anything containing REFUSE as a refusal; anything
+            // else (including empty / unexpected) as ALLOW. We don't
+            // want a borked classifier to silently DOS the bot.
+            let allowed = !normalized.starts_with("REFUSE")
+                && !normalized.contains(" REFUSE")
+                && normalized != "REFUSE";
+            tracing::info!(verdict = %normalized, allowed, "moderation: classified");
+            allowed
+        }
+        Ok(_) => {
+            tracing::warn!("moderation: classifier returned tool-use; failing open");
+            true
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "moderation: classifier errored; failing open");
+            true
+        }
+    }
+}
+
 /// Top-level handler for one mention. Resolves the privacy mode, gates
 /// on ChannelOnly, sets the 👀 reaction, calls [`process`], then
 /// transitions the reaction to ✅ or ❌.
@@ -239,11 +309,33 @@ async fn handle_message(state: Arc<State>, msg: Message) {
     let working = RequestReactionType::Unicode { name: "👀" };
     let done = RequestReactionType::Unicode { name: "✅" };
     let failed = RequestReactionType::Unicode { name: "❌" };
+    let refused = RequestReactionType::Unicode { name: "❓" };
 
     let _ = state
         .http
         .create_reaction(msg.channel_id, msg.id, &working)
         .await;
+
+    // Pre-flight moderation check — refuse without replying if the
+    // message clearly violates Discord TOS.
+    let stripped = strip_mentions(&msg.content, state.bot_user_id);
+    if !stripped.is_empty() && !moderation_allows(&state, &stripped).await {
+        tracing::info!(
+            author = %msg.author.name,
+            channel = %msg.channel_id,
+            preview = %stripped.chars().take(80).collect::<String>(),
+            "turn: refused by moderation"
+        );
+        let _ = state
+            .http
+            .delete_current_user_reaction(msg.channel_id, msg.id, &working)
+            .await;
+        let _ = state
+            .http
+            .create_reaction(msg.channel_id, msg.id, &refused)
+            .await;
+        return;
+    }
 
     let result = process(&state, &msg, &privacy_mode).await;
 
