@@ -371,7 +371,26 @@ async fn handle_message(state: Arc<State>, msg: Message) {
     };
 
     if let PrivacyMode::ChannelOnly { channel_id, .. } = &privacy_mode {
-        if msg.channel_id.get() != *channel_id {
+        let in_allowed_channel = msg.channel_id.get() == *channel_id;
+        // A message inside a Grok-owned thread is by definition rooted
+        // in a channel where the bot already accepted a turn, so it
+        // shouldn't be filtered out even if `msg.channel_id` (which
+        // for a thread message is the thread's own id, not the
+        // parent's) doesn't match the configured allowed channel.
+        let in_grok_thread = if in_allowed_channel {
+            false
+        } else {
+            let channel_as_msg =
+                i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
+            state
+                .db
+                .lookup_conversation_by_message(channel_as_msg)
+                .await
+                .ok()
+                .flatten()
+                .is_some()
+        };
+        if !in_allowed_channel && !in_grok_thread {
             tracing::debug!(
                 channel = %msg.channel_id,
                 allowed = *channel_id,
