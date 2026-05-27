@@ -1215,6 +1215,7 @@ fn format_reply(
     conversation: &Conversation,
     web_base_url: &str,
 ) -> String {
+    let answer = fix_bare_mentions(answer);
     if is_new {
         format!(
             "{answer}\n\n-# 🔎 [full trace]({base}/c/{id})",
@@ -1222,8 +1223,50 @@ fn format_reply(
             id = conversation.id,
         )
     } else {
-        answer.to_string()
+        answer
     }
+}
+
+/// Rewrite bare `@<snowflake>` runs into proper Discord mention syntax
+/// `<@<snowflake>>` so the recipient actually gets pinged. Models that
+/// learn user IDs from `fetch_messages` results tend to emit the raw
+/// `@<digits>` form (verbatim from any chat conversation they were
+/// trained on) which Discord renders as inert text.
+///
+/// We only act on runs of 17-20 ASCII digits (Discord snowflake range
+/// today; the upper bound has headroom for future ID growth) and skip
+/// ones that are already preceded by a literal `<` so we don't
+/// double-wrap an existing `<@id>` mention.
+fn fix_bare_mentions(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '@' {
+            out.push(c);
+            continue;
+        }
+        // Collect the following digit run without consuming non-digits.
+        let mut digits = String::new();
+        while let Some(&d) = chars.peek() {
+            if d.is_ascii_digit() {
+                digits.push(d);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        let is_snowflake = (17..=20).contains(&digits.len());
+        let already_wrapped = out.ends_with('<');
+        if is_snowflake && !already_wrapped {
+            out.push_str("<@");
+            out.push_str(&digits);
+            out.push('>');
+        } else {
+            out.push('@');
+            out.push_str(&digits);
+        }
+    }
+    out
 }
 
 /// Walk the agent's tool-call trace and load any images the model
@@ -1410,6 +1453,39 @@ mod tests {
     fn thread_title_falls_back_when_only_mentions() {
         assert_eq!(make_thread_title("<@123>"), "Grok");
         assert_eq!(make_thread_title("<@123> what is rust"), "what is rust");
+    }
+
+    #[test]
+    fn fix_mentions_wraps_bare_snowflakes() {
+        let id = "238508325464047627"; // 18 digits
+        assert_eq!(
+            fix_bare_mentions(&format!("hey @{id} watch out")),
+            format!("hey <@{id}> watch out")
+        );
+    }
+
+    #[test]
+    fn fix_mentions_leaves_existing_mentions_alone() {
+        let id = "238508325464047627";
+        let input = format!("<@{id}> already wrapped");
+        assert_eq!(fix_bare_mentions(&input), input);
+    }
+
+    #[test]
+    fn fix_mentions_ignores_short_digits_and_words() {
+        assert_eq!(fix_bare_mentions("@everyone"), "@everyone");
+        assert_eq!(fix_bare_mentions("foo@123 bar"), "foo@123 bar");
+        assert_eq!(fix_bare_mentions("user@example.com"), "user@example.com");
+    }
+
+    #[test]
+    fn fix_mentions_handles_multiple() {
+        let a = "238508325464047627";
+        let b = "1335037364980023356";
+        assert_eq!(
+            fix_bare_mentions(&format!("@{a} and @{b} both")),
+            format!("<@{a}> and <@{b}> both")
+        );
     }
 
     #[test]
