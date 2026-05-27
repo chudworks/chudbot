@@ -13,10 +13,11 @@ and the final answer.
   `async-trait`** (see [[feedback-no-async-trait]]).
 - **Web**: `axum` 0.8 + `maud` (inline HTML, no template files)
 - **DB**: Postgres via `sqlx` 0.9 with runtime-checked queries
-- **LLM**: abstracted behind `LlmProvider` trait in `core::llm`. Two
-  implementations: `XaiProvider` and `AnthropicProvider`. Both use their
-  native server-side web search tool (xAI: `search_parameters`;
-  Anthropic: `web_search_20250305`).
+- **LLM**: abstracted behind `LlmProvider::step` in `core::llm`. Two
+  implementations: `XaiProvider` and `AnthropicProvider`. Both support
+  server-side web search (xAI: `search_parameters`; Anthropic:
+  `web_search_20250305`) AND client-side tool calls via the agentic
+  harness in `core::agent`.
 - **Config**: TOML file (`config.toml` by default). No env vars.
 - **Async runtime**: `tokio`
 - **Target platform**: macOS (Chud's Mac Studio), native — no Docker
@@ -67,6 +68,43 @@ Each turn captures (via `context_items`) the exact snapshot of messages
 fed to the model, and (via `tool_calls`) every server-side tool the
 model invoked plus its request/response JSON. The viewer renders both
 verbatim so traces are auditable.
+
+## Agentic harness
+
+`core::agent::run` drives `LlmProvider::step` in a loop:
+
+1. Send chat history (turns + prior tool uses/results) + tool definitions
+   to the provider.
+2. If the model returns `StepResponse::Final`, stop.
+3. If the model returns `StepResponse::UseTools`, execute each tool via
+   the caller-supplied `ToolExecutor`, append both the assistant turn
+   (with tool_use blocks) and a user turn (with tool_result blocks) to
+   history, then loop.
+4. Cap at `MAX_AGENT_ITERATIONS` (6) to prevent runaways.
+
+Every tool call — server-side (web search) and client-side (`fetch_messages`
+or any future tool) — is collected in execution order in `AgentRun.tool_calls`
+and persisted into the `tool_calls` table. The web viewer renders them
+all in order so the conversation trace shows every input and output.
+
+### Client-side tools
+
+The bot's `BotToolExecutor` currently exposes one tool:
+
+- **`fetch_messages(channel_id?, limit?, before_message_id?)`** — pulls
+  recent messages from a Discord channel for context. The model calls
+  this when it needs surrounding conversation that wasn't quoted.
+
+Privacy mode constrains the tool:
+- `Open`: returns everything (minus the bot's own messages).
+- `ChannelOnly`: rejects fetches against any channel other than the
+  configured one.
+- `OptIn`: returns messages from opted-in users at full content;
+  messages from opted-out users come back with `content =
+  "[redacted: ...]"` and `redacted = true`, so the model knows the
+  channel has more activity than it can see.
+- `ConversationOnly`: the tool is not declared at all — the model can
+  only operate from the conversation history it was already given.
 
 ## Privacy model
 

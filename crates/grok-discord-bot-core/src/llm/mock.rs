@@ -1,17 +1,24 @@
-//! Test-only mock provider. Returns canned responses without making any
-//! network calls. Used by tests of the bot/web layers.
+//! Test-only mock provider. Returns a canned final response (or a
+//! scripted sequence of step responses) without making network calls.
 
-use crate::llm::{CompletionRequest, CompletionResponse, LlmError, LlmProvider, ToolCallRecord};
+use std::sync::Mutex;
 
-/// Returns a fixed answer plus a configurable list of tool calls.
-#[derive(Debug, Clone, Default)]
+use crate::llm::{LlmError, LlmProvider, StepRequest, StepResponse, ToolCallRecord};
+
+/// Mock that returns a fixed final answer on every step. Sufficient
+/// for testing the bot's plumbing without exercising the agent loop.
+#[derive(Debug, Default)]
 pub struct MockProvider {
     /// Name reported by [`LlmProvider::name`].
     pub name: String,
-    /// Answer text returned for every request.
+    /// Answer text returned for every step.
     pub answer: String,
-    /// Tool call trace returned alongside the answer.
-    pub tool_calls: Vec<ToolCallRecord>,
+    /// Server-side tool call trace returned alongside the answer.
+    pub server_tool_calls: Vec<ToolCallRecord>,
+    /// Optional scripted sequence of step responses. When set, the
+    /// next step pops the front; when the script is empty, falls back
+    /// to a `Final` response with `answer`.
+    pub script: Mutex<Vec<StepResponse>>,
 }
 
 impl MockProvider {
@@ -20,7 +27,8 @@ impl MockProvider {
         Self {
             name: "mock".to_string(),
             answer: answer.into(),
-            tool_calls: Vec::new(),
+            server_tool_calls: Vec::new(),
+            script: Mutex::new(Vec::new()),
         }
     }
 }
@@ -30,13 +38,15 @@ impl LlmProvider for MockProvider {
         &self.name
     }
 
-    async fn complete(
-        &self,
-        _request: CompletionRequest,
-    ) -> Result<CompletionResponse, LlmError> {
-        Ok(CompletionResponse {
+    async fn step(&self, _request: StepRequest) -> Result<StepResponse, LlmError> {
+        if let Ok(mut script) = self.script.lock() {
+            if !script.is_empty() {
+                return Ok(script.remove(0));
+            }
+        }
+        Ok(StepResponse::Final {
             content: self.answer.clone(),
-            tool_calls: self.tool_calls.clone(),
+            server_tool_calls: self.server_tool_calls.clone(),
             model_id: "mock".to_string(),
         })
     }
@@ -45,22 +55,23 @@ impl LlmProvider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ChatMessage;
+    use crate::llm::{ChatTurn, MessageRole};
 
     #[tokio::test]
-    async fn mock_returns_canned_answer() {
+    async fn mock_returns_canned_final() {
         let p = MockProvider::with_answer("42");
         let resp = p
-            .complete(CompletionRequest {
-                messages: vec![ChatMessage {
-                    role: crate::llm::MessageRole::User,
-                    content: "what is the meaning of life?".into(),
-                }],
+            .step(StepRequest {
+                messages: vec![ChatTurn::text(MessageRole::User, "hi")],
+                tools: Vec::new(),
                 enable_web_search: false,
                 max_tokens: 1024,
             })
             .await
             .unwrap();
-        assert_eq!(resp.content, "42");
+        match resp {
+            StepResponse::Final { content, .. } => assert_eq!(content, "42"),
+            _ => panic!("expected Final"),
+        }
     }
 }

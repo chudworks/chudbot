@@ -1,14 +1,8 @@
-//! Anthropic Claude provider. Talks to `https://api.anthropic.com/v1/messages`,
-//! with the server-side `web_search_20250305` tool enabled when
-//! [`CompletionRequest::enable_web_search`] is set.
-//!
-//! Anthropic's API differs from OpenAI's in two relevant ways:
-//! - The system prompt is a top-level `system` field, not a message with
-//!   `role: system`. We lift system messages out of the chat history.
-//! - The response `content` is an array of blocks
-//!   (`text` / `server_tool_use` / `web_search_tool_result` / …) rather
-//!   than a single string. We concatenate text blocks and pair server
-//!   tool use blocks with their results into [`ToolCallRecord`]s.
+//! Anthropic Claude provider. Talks to `https://api.anthropic.com/v1/messages`.
+//! Supports:
+//!   - server-side web search via the built-in `web_search_20250305` tool;
+//!   - client-side tools declared in the request `tools` array, with
+//!     `tool_use` / `tool_result` blocks for round-trips.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -16,7 +10,8 @@ use std::collections::HashMap;
 
 use crate::config::AnthropicConfig;
 use crate::llm::{
-    CompletionRequest, CompletionResponse, LlmError, LlmProvider, MessageRole, ToolCallRecord,
+    ChatTurn, LlmError, LlmProvider, MessageRole, StepRequest, StepResponse, ToolCallRecord,
+    ToolUseRequest, TurnBlock,
 };
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -35,8 +30,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    /// Construct from a config block. Uses the default
-    /// `api.anthropic.com/v1` base URL.
+    /// Construct from a config block.
     pub fn new(config: AnthropicConfig) -> Self {
         let name = format!("anthropic/{}", config.model);
         Self {
@@ -60,42 +54,32 @@ impl LlmProvider for AnthropicProvider {
         &self.name
     }
 
-    async fn complete(
-        &self,
-        request: CompletionRequest,
-    ) -> Result<CompletionResponse, LlmError> {
-        // Separate system messages from chat messages.
-        let mut system_parts: Vec<&str> = Vec::new();
-        let mut chat: Vec<AnthropicChatMessage<'_>> = Vec::new();
-        for msg in &request.messages {
-            match msg.role {
-                MessageRole::System => system_parts.push(&msg.content),
-                MessageRole::User => chat.push(AnthropicChatMessage {
-                    role: "user",
-                    content: &msg.content,
-                }),
-                MessageRole::Assistant => chat.push(AnthropicChatMessage {
-                    role: "assistant",
-                    content: &msg.content,
-                }),
-            }
-        }
-        let system = (!system_parts.is_empty()).then(|| system_parts.join("\n\n"));
+    async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
+        let (system, anthropic_messages) = to_anthropic_messages(&request.messages);
 
-        let tools: Vec<Value> = if request.enable_web_search {
-            vec![json!({
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect();
+        if request.enable_web_search {
+            tools.push(json!({
                 "type": WEB_SEARCH_TOOL_TYPE,
                 "name": WEB_SEARCH_TOOL_NAME,
                 "max_uses": 5,
-            })]
-        } else {
-            Vec::new()
-        };
+            }));
+        }
 
         let body = AnthropicRequest {
             model: &self.model,
             max_tokens: request.max_tokens,
-            messages: &chat,
+            messages: &anthropic_messages,
             system: system.as_deref(),
             tools: &tools,
         };
@@ -124,27 +108,43 @@ impl LlmProvider for AnthropicProvider {
             .await
             .map_err(|e| LlmError::Decode(e.to_string()))?;
 
-        let (content, tool_calls) = extract_content_and_tool_calls(&parsed.content);
+        let model_id = parsed.model.unwrap_or_else(|| self.model.clone());
+        let stop = parsed.stop_reason.unwrap_or_default();
+        let (text, client_uses, server_tool_calls) = walk_blocks(&parsed.content);
 
-        Ok(CompletionResponse {
-            content,
-            tool_calls,
-            model_id: parsed.model.unwrap_or_else(|| self.model.clone()),
-        })
+        if stop == "tool_use" && !client_uses.is_empty() {
+            Ok(StepResponse::UseTools {
+                partial_text: if text.is_empty() { None } else { Some(text) },
+                tool_uses: client_uses,
+                server_tool_calls,
+                model_id,
+            })
+        } else {
+            Ok(StepResponse::Final {
+                content: text,
+                server_tool_calls,
+                model_id,
+            })
+        }
     }
 }
 
-/// Walk the `content` blocks: concatenate text into the final answer and
-/// pair each `server_tool_use` block with its matching
-/// `web_search_tool_result` (by `tool_use_id`) into a [`ToolCallRecord`].
-fn extract_content_and_tool_calls(blocks: &[Value]) -> (String, Vec<ToolCallRecord>) {
+/// Walk Anthropic content blocks. Returns (concatenated text, client
+/// tool_use requests, server-side tool call records).
+///
+/// Server-side calls (`server_tool_use` + `web_search_tool_result`) are
+/// paired by `tool_use_id` and collapsed into one [`ToolCallRecord`] each.
+/// Client-side `tool_use` blocks are surfaced as [`ToolUseRequest`]s
+/// that the agent loop will dispatch.
+fn walk_blocks(blocks: &[Value]) -> (String, Vec<ToolUseRequest>, Vec<ToolCallRecord>) {
     let mut text = String::new();
-    let mut pending_tool_uses: HashMap<String, (String, Value)> = HashMap::new();
-    let mut tool_calls: Vec<ToolCallRecord> = Vec::new();
+    let mut pending_server_uses: HashMap<String, (String, Value)> = HashMap::new();
+    let mut server_calls: Vec<ToolCallRecord> = Vec::new();
+    let mut client_uses: Vec<ToolUseRequest> = Vec::new();
 
     for block in blocks {
-        let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
-        match block_type {
+        let kind = block.get("type").and_then(Value::as_str).unwrap_or("");
+        match kind {
             "text" => {
                 if let Some(t) = block.get("text").and_then(Value::as_str) {
                     text.push_str(t);
@@ -162,60 +162,134 @@ fn extract_content_and_tool_calls(blocks: &[Value]) -> (String, Vec<ToolCallReco
                     .unwrap_or("server_tool")
                     .to_string();
                 let input = block.get("input").cloned().unwrap_or(Value::Null);
-                pending_tool_uses.insert(id, (name, input));
+                pending_server_uses.insert(id, (name, input));
             }
             "web_search_tool_result" => {
-                let id = block
-                    .get("tool_use_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
                 let response = block.get("content").cloned().unwrap_or(Value::Null);
-                if let Some((name, request)) = pending_tool_uses.remove(id) {
-                    tool_calls.push(ToolCallRecord {
+                if let Some((name, request)) = pending_server_uses.remove(id) {
+                    server_calls.push(ToolCallRecord {
                         tool_name: name,
                         request,
                         response,
                     });
                 } else {
-                    tool_calls.push(ToolCallRecord {
+                    server_calls.push(ToolCallRecord {
                         tool_name: "web_search".to_string(),
                         request: json!({ "tool_use_id": id }),
                         response,
                     });
                 }
             }
+            "tool_use" => {
+                let id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let input = block.get("input").cloned().unwrap_or(Value::Null);
+                client_uses.push(ToolUseRequest { id, name, input });
+            }
             _ => {}
         }
     }
 
-    // Any server_tool_use without a matching result (rare, e.g. errors)
-    // is still recorded so the trace is complete.
-    for (_, (name, request)) in pending_tool_uses {
-        tool_calls.push(ToolCallRecord {
+    // Server tool uses without a matching result are still recorded so
+    // the trace is complete.
+    for (_, (name, request)) in pending_server_uses {
+        server_calls.push(ToolCallRecord {
             tool_name: name,
             request,
             response: Value::Null,
         });
     }
 
-    (text, tool_calls)
+    (text, client_uses, server_calls)
+}
+
+/// Convert our [`ChatTurn`]s into Anthropic's (system, messages) pair.
+/// System messages are lifted out into the top-level `system` field.
+fn to_anthropic_messages(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut messages: Vec<Value> = Vec::new();
+
+    for turn in turns {
+        // System turns get concatenated and lifted out.
+        if turn.role == MessageRole::System {
+            for block in &turn.blocks {
+                if let TurnBlock::Text(t) = block {
+                    system_parts.push(t.clone());
+                }
+            }
+            continue;
+        }
+
+        let role = if turn.role == MessageRole::Assistant {
+            "assistant"
+        } else {
+            "user"
+        };
+
+        let mut content_blocks: Vec<Value> = Vec::new();
+        for block in &turn.blocks {
+            match block {
+                TurnBlock::Text(t) if !t.is_empty() => {
+                    content_blocks.push(json!({ "type": "text", "text": t }));
+                }
+                TurnBlock::Text(_) => {}
+                TurnBlock::ToolUse { id, name, input } => {
+                    content_blocks.push(json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": input,
+                    }));
+                }
+                TurnBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                } => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("type".into(), Value::String("tool_result".into()));
+                    obj.insert("tool_use_id".into(), Value::String(tool_use_id.clone()));
+                    obj.insert("content".into(), Value::String(content.clone()));
+                    if *is_error {
+                        obj.insert("is_error".into(), Value::Bool(true));
+                    }
+                    content_blocks.push(Value::Object(obj));
+                }
+            }
+        }
+
+        if content_blocks.is_empty() {
+            continue;
+        }
+        messages.push(json!({ "role": role, "content": content_blocks }));
+    }
+
+    let system = if system_parts.is_empty() {
+        None
+    } else {
+        Some(system_parts.join("\n\n"))
+    };
+    (system, messages)
 }
 
 #[derive(Serialize)]
 struct AnthropicRequest<'a> {
     model: &'a str,
     max_tokens: u32,
-    messages: &'a [AnthropicChatMessage<'a>],
+    messages: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
     system: Option<&'a str>,
     #[serde(skip_serializing_if = "<[Value]>::is_empty")]
     tools: &'a [Value],
-}
-
-#[derive(Serialize)]
-struct AnthropicChatMessage<'a> {
-    role: &'a str,
-    content: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -223,6 +297,8 @@ struct AnthropicResponse {
     content: Vec<Value>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    stop_reason: Option<String>,
 }
 
 #[cfg(test)]
@@ -230,9 +306,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_text_and_pairs_tool_uses_with_results() {
+    fn pairs_server_tool_use_with_web_search_result() {
         let blocks = vec![
-            json!({"type": "text", "text": "I'll search for that. "}),
+            json!({"type": "text", "text": "Looking that up. "}),
             json!({
                 "type": "server_tool_use",
                 "id": "srvtoolu_1",
@@ -242,15 +318,35 @@ mod tests {
             json!({
                 "type": "web_search_tool_result",
                 "tool_use_id": "srvtoolu_1",
-                "content": [{"type": "web_search_result", "url": "https://blog.rust-lang.org", "title": "Rust 2024"}],
+                "content": [{"type": "web_search_result", "url": "https://x", "title": "y"}],
             }),
-            json!({"type": "text", "text": "Rust 2024 was announced in late 2024."}),
+            json!({"type": "text", "text": "Done."}),
         ];
 
-        let (text, tool_calls) = extract_content_and_tool_calls(&blocks);
-        assert_eq!(text, "I'll search for that. Rust 2024 was announced in late 2024.");
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].tool_name, "web_search");
-        assert_eq!(tool_calls[0].request["query"], "rust 2024 edition");
+        let (text, client_uses, server_calls) = walk_blocks(&blocks);
+        assert_eq!(text, "Looking that up. Done.");
+        assert!(client_uses.is_empty());
+        assert_eq!(server_calls.len(), 1);
+        assert_eq!(server_calls[0].tool_name, "web_search");
+    }
+
+    #[test]
+    fn surfaces_client_tool_use_for_agent_loop() {
+        let blocks = vec![
+            json!({"type": "text", "text": "Let me fetch recent messages."}),
+            json!({
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "fetch_messages",
+                "input": {"limit": 30},
+            }),
+        ];
+
+        let (text, client_uses, server_calls) = walk_blocks(&blocks);
+        assert_eq!(text, "Let me fetch recent messages.");
+        assert!(server_calls.is_empty());
+        assert_eq!(client_uses.len(), 1);
+        assert_eq!(client_uses[0].name, "fetch_messages");
+        assert_eq!(client_uses[0].input["limit"], 30);
     }
 }

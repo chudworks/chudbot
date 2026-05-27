@@ -1,25 +1,28 @@
 //! Discord bot event loop.
 //!
 //! Connects to the gateway with twilight, listens for `MessageCreate`
-//! events, and for any `@<bot>` mention:
+//! and `InteractionCreate` events. For any `@<bot>` mention:
 //!   1. reacts 👀
-//!   2. resolves which conversation this belongs to (Discord reply to a
-//!      bot message → continue; in a bot-owned thread → continue;
-//!      otherwise → create new)
-//!   3. builds the context fed to the LLM, calls it with server-side
-//!      web search enabled, persists the turn + every tool call
-//!   4. replies inline, or in a new thread when the answer is long
-//!   5. reacts ✅ / ❌
+//!   2. resolves which conversation this belongs to
+//!   3. builds the initial context (system prompt, prior turns,
+//!      and — where the privacy mode allows — the Discord-reply-quoted
+//!      message)
+//!   4. drives the model through the agentic loop in [`core::agent`],
+//!      with `fetch_messages` exposed as a client-side tool the model
+//!      can call to pull more channel history on demand
+//!   5. replies inline, or in a new thread when the answer is long
+//!   6. reacts ✅ / ❌
 //!
-//! Each handled message runs in its own task so a slow LLM call doesn't
-//! block the gateway.
+//! Interactions (slash commands) are dispatched to [`crate::commands`].
 
 use std::sync::Arc;
 
 use grok_discord_bot_core::{
-    AnyProvider, ChatMessage, CompletionRequest, ContextItem, Conversation, Db, LlmProvider,
-    MessageRole, PrivacyMode,
+    AgentRun, AnyProvider, ChatTurn, ContextItem, Conversation, Db, LlmProvider, MessageRole,
+    PrivacyMode, ToolDefinition, ToolError, ToolExecutor, TurnBlock, run_agent,
 };
+use serde::Serialize;
+use serde_json::{Value, json};
 use thiserror::Error;
 use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
 use twilight_http::Client as HttpClient;
@@ -27,30 +30,37 @@ use twilight_http::request::channel::reaction::RequestReactionType;
 use twilight_model::channel::Message;
 use twilight_model::gateway::event::Event;
 use twilight_model::id::Id;
-use twilight_model::id::marker::{ApplicationMarker, ChannelMarker, MessageMarker, UserMarker};
+use twilight_model::id::marker::{
+    ApplicationMarker, ChannelMarker, GuildMarker, MessageMarker, UserMarker,
+};
 
 use crate::commands;
 
 const SYSTEM_PROMPT: &str = "You are a helpful AI assistant in a private Discord \
-server. Be direct and concise. When asked to verify a claim or look something up, \
-use the web search tool to ground your answer in current sources. Cite URLs where \
-relevant.";
+server. Be direct and concise. When asked to verify a claim, use the web search \
+tool to ground your answer in current sources and cite URLs. When you need more \
+context about an ongoing conversation in this channel (for example: \"what did \
+they decide?\", \"what's the discussion been about?\"), call the `fetch_messages` \
+tool to pull recent messages from the channel. Don't fetch speculatively — only \
+when you actually need extra context to answer.";
 
 /// Discord messages have a hard 2000-char limit; we auto-thread when the
 /// answer exceeds this. Threading is also skipped for follow-ups inside
 /// an existing conversation — we just reply inline.
 const REPLY_LENGTH_THRESHOLD: usize = 1500;
 
-/// Soft cap on the model's reply tokens. Anthropic requires `max_tokens`;
-/// xAI tolerates an unused field.
+/// Soft cap on the model's reply tokens per step. Anthropic requires
+/// `max_tokens`; xAI tolerates an unused field.
 const MAX_OUTPUT_TOKENS: u32 = 4096;
 
-/// Errors returned by the bot loop. We don't propagate these — each
-/// handler logs and reacts ❌ on failure — but having a typed error
-/// makes the code paths easier to follow.
+/// Safety cap on the agent's tool-use loop. Most turns finish in 1-3
+/// iterations; this is a runaway guard.
+const MAX_AGENT_ITERATIONS: u32 = 6;
+
+/// Errors returned by the bot loop. Logged + surfaced as a ❌ reaction.
 #[derive(Debug, Error)]
 pub enum BotError {
-    /// Underlying HTTP / gateway transport failure.
+    /// Discord HTTP / gateway transport.
     #[error("discord http: {0}")]
     Http(#[from] twilight_http::Error),
     /// Failure deserializing a Discord response body.
@@ -152,8 +162,9 @@ pub async fn run(
     Ok(())
 }
 
-/// Top-level handler for one mention. Sets the 👀 reaction, calls
-/// [`process`], then transitions the reaction to ✅ or ❌.
+/// Top-level handler for one mention. Resolves the privacy mode, gates
+/// on ChannelOnly, sets the 👀 reaction, calls [`process`], then
+/// transitions the reaction to ✅ or ❌.
 async fn handle_message(state: Arc<State>, msg: Message) {
     if msg.author.bot {
         return;
@@ -162,8 +173,6 @@ async fn handle_message(state: Arc<State>, msg: Message) {
         return;
     }
 
-    // Resolve the active privacy mode for this guild. DMs have no
-    // guild_id and use the config-supplied default.
     let guild_id_opt = msg.guild_id.map(|g| i64::try_from(g.get()).unwrap_or(i64::MAX));
     let privacy_mode = match guild_id_opt {
         Some(gid) => match state
@@ -180,8 +189,6 @@ async fn handle_message(state: Arc<State>, msg: Message) {
         None => state.default_privacy.clone(),
     };
 
-    // Design 2: if the bot is confined to a single channel, ignore
-    // mentions anywhere else.
     if let PrivacyMode::ChannelOnly { channel_id, .. } = &privacy_mode {
         if msg.channel_id.get() != *channel_id {
             tracing::debug!(
@@ -197,7 +204,6 @@ async fn handle_message(state: Arc<State>, msg: Message) {
     let done = RequestReactionType::Unicode { name: "✅" };
     let failed = RequestReactionType::Unicode { name: "❌" };
 
-    // Best-effort: even if the reaction request fails, keep going.
     let _ = state
         .http
         .create_reaction(msg.channel_id, msg.id, &working)
@@ -223,8 +229,6 @@ async fn handle_message(state: Arc<State>, msg: Message) {
                 .http
                 .create_reaction(msg.channel_id, msg.id, &failed)
                 .await;
-            // Try to surface the error in-channel so the user knows
-            // something went wrong rather than the bot silently dropping.
             let snippet = err.to_string();
             let snippet = if snippet.len() > 500 {
                 format!("{}…", &snippet[..500])
@@ -241,8 +245,9 @@ async fn handle_message(state: Arc<State>, msg: Message) {
     }
 }
 
-/// Full happy-path: resolve conversation, build context, call LLM,
-/// persist everything, post the reply.
+/// Full happy-path: resolve conversation, build initial context, run
+/// the agent loop with `fetch_messages` available, persist everything,
+/// post the reply.
 async fn process(
     state: &State,
     msg: &Message,
@@ -251,7 +256,7 @@ async fn process(
     let (conversation, is_new) = resolve_conversation(state, msg).await?;
     let user_content = strip_mentions(&msg.content, state.bot_user_id);
 
-    let context =
+    let initial_context =
         build_context(state, msg, &conversation, is_new, &user_content, privacy_mode).await?;
 
     let turn = state
@@ -263,27 +268,42 @@ async fn process(
         )
         .await?;
 
-    for item in &context {
+    for item in &initial_context {
         state.db.record_context_item(turn.id, item).await?;
     }
 
-    let chat = context
+    // Build the LLM-facing chat history from the initial context items.
+    let messages: Vec<ChatTurn> = initial_context
         .iter()
-        .map(|c| ChatMessage {
-            role: MessageRole::from_str_lossy(&c.role),
-            content: c.content.clone(),
-        })
+        .map(|c| ChatTurn::text(MessageRole::from_str_lossy(&c.role), c.content.clone()))
         .collect();
 
-    let response = match state
-        .llm
-        .complete(CompletionRequest {
-            messages: chat,
-            enable_web_search: true,
-            max_tokens: MAX_OUTPUT_TOKENS,
-        })
-        .await
-    {
+    // Tools available to the model for this turn. fetch_messages is
+    // exposed in every mode except ConversationOnly; that mode's whole
+    // point is "don't reach beyond the conversation."
+    let tools = build_tool_definitions(privacy_mode);
+
+    let executor = BotToolExecutor {
+        http: Arc::clone(&state.http),
+        db: state.db.clone(),
+        bot_user_id: state.bot_user_id,
+        default_channel_id: msg.channel_id,
+        guild_id: conversation.discord_guild_id,
+        privacy_mode: privacy_mode.clone(),
+    };
+
+    let agent_result = run_agent(
+        &state.llm,
+        messages,
+        tools,
+        &executor,
+        true, // server-side web search always enabled
+        MAX_OUTPUT_TOKENS,
+        MAX_AGENT_ITERATIONS,
+    )
+    .await;
+
+    let agent_run: AgentRun = match agent_result {
         Ok(r) => r,
         Err(e) => {
             state.db.fail_turn(turn.id, &e.to_string()).await.ok();
@@ -291,21 +311,23 @@ async fn process(
         }
     };
 
-    for (i, tc) in response.tool_calls.iter().enumerate() {
+    // Persist all tool calls (server + client) in execution order.
+    for (i, tc) in agent_run.tool_calls.iter().enumerate() {
         state
             .db
             .record_tool_call(turn.id, i32::try_from(i).unwrap_or(0), tc)
             .await?;
     }
 
-    let reply_text = format_reply(&response.content, is_new, &conversation, &state.web_base_url);
+    let reply_text =
+        format_reply(&agent_run.content, is_new, &conversation, &state.web_base_url);
     let reply_msg = post_reply(state, msg, &reply_text, is_new).await?;
 
     state
         .db
         .complete_turn(
             turn.id,
-            &response.content,
+            &agent_run.content,
             i64::try_from(reply_msg.id.get()).unwrap_or(i64::MAX),
         )
         .await?;
@@ -335,12 +357,7 @@ async fn process(
 }
 
 /// Decide whether this @mention starts a new conversation or continues
-/// an existing one. The continuation paths are:
-///   - Discord reply to a message we have a link for (typically the
-///     bot's prior reply).
-///   - Message posted inside a thread that itself was started off a
-///     message we have a link for (channel_id of the message equals the
-///     parent message id for threads created from messages).
+/// an existing one. See [`Db::lookup_conversation_by_message`].
 async fn resolve_conversation(
     state: &State,
     msg: &Message,
@@ -354,9 +371,6 @@ async fn resolve_conversation(
         }
     }
 
-    // Public threads created off a message share the parent message's id
-    // as their channel id. If this channel_id is in message_links, we're
-    // in a bot-owned thread.
     let channel_id = i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
     if let Some(conv_id) = state.db.lookup_conversation_by_message(channel_id).await? {
         if let Some(conv) = state.db.get_conversation(conv_id).await? {
@@ -380,17 +394,13 @@ async fn resolve_conversation(
     Ok((conv, true))
 }
 
-/// Assemble the prompt fed to the LLM and recorded into `context_items`.
-///
-/// Structure: system prompt → (continuation? prior turns : extra context
-/// per privacy mode) → user's current message.
-///
-/// Privacy modes affect the "extra context" middle section for new
-/// conversations:
-///   - Open / ChannelOnly → bulk-fetch recent channel messages
-///   - OptIn → include the quoted message only if its author has opted
-///     in or the message lives inside a Grok-owned thread
-///   - ConversationOnly → no extra context at all
+/// Assemble the initial prompt for the agent loop. The model can
+/// always pull more channel history on demand via `fetch_messages`, so
+/// this only needs to include:
+///   - the system prompt;
+///   - prior turns of the conversation (when continuing);
+///   - the Discord-reply-quoted message, gated by the privacy mode;
+///   - the user's current `@`-mention.
 async fn build_context(
     state: &State,
     msg: &Message,
@@ -433,60 +443,21 @@ async fn build_context(
                 );
             }
         }
-    } else {
-        match privacy_mode {
-            PrivacyMode::Open { history_size }
-            | PrivacyMode::ChannelOnly { history_size, .. } => {
-                let history =
-                    fetch_channel_history(state, msg.channel_id, msg.id, *history_size).await?;
-                if !history.is_empty() {
-                    push_item(
-                        &mut items,
-                        &mut pos,
-                        "system:channel_history_header".to_string(),
-                        "system",
-                        "Recent messages from this Discord channel are included below \
-                         as context. Each line is of the form \"[author]: content\"."
-                            .to_string(),
-                        None,
-                    );
-                    for m in &history {
-                        let body =
-                            format!("[{author}]: {content}", author = m.author.name, content = m.content);
-                        push_item(
-                            &mut items,
-                            &mut pos,
-                            format!("discord:msg:{}", m.id),
-                            "user",
-                            body,
-                            Some(i64::try_from(m.id.get()).unwrap_or(i64::MAX)),
-                        );
-                    }
-                }
-            }
-            PrivacyMode::OptIn => {
-                if let Some(referenced) = &msg.referenced_message {
-                    if !referenced.author.bot
-                        && is_referenced_visible_opt_in(state, conversation, referenced).await?
-                    {
-                        push_item(
-                            &mut items,
-                            &mut pos,
-                            format!("discord:msg:{}", referenced.id),
-                            "user",
-                            format!(
-                                "[Quoted message from {}]: {}",
-                                referenced.author.name, referenced.content
-                            ),
-                            Some(i64::try_from(referenced.id.get()).unwrap_or(i64::MAX)),
-                        );
-                    }
-                }
-            }
-            PrivacyMode::ConversationOnly => {
-                // Privacy-maxxing: never include external context, even
-                // a Discord-reply quote.
-            }
+    } else if let Some(referenced) = &msg.referenced_message {
+        if !referenced.author.bot
+            && quoted_message_allowed(state, conversation, referenced, privacy_mode).await?
+        {
+            push_item(
+                &mut items,
+                &mut pos,
+                format!("discord:msg:{}", referenced.id),
+                "user",
+                format!(
+                    "[Quoted message from {}]: {}",
+                    referenced.author.name, referenced.content
+                ),
+                Some(i64::try_from(referenced.id.get()).unwrap_or(i64::MAX)),
+            );
         }
     }
 
@@ -520,65 +491,225 @@ fn push_item(
     *pos += 1;
 }
 
-/// For OptIn mode: a quoted (Discord-reply target) message is visible
-/// if its author has opted in for this guild, or if the quoted message
-/// itself lives in a Grok-owned thread (participation implies consent).
-async fn is_referenced_visible_opt_in(
+/// Privacy gate for the quoted message that arrives as part of a
+/// Discord reply. The active mode decides:
+async fn quoted_message_allowed(
     state: &State,
     conversation: &Conversation,
     referenced: &Message,
+    mode: &PrivacyMode,
 ) -> Result<bool, BotError> {
-    // Property 2: messages inside a Grok-owned thread are always
-    // visible. Threads created from a message have channel_id == that
-    // parent message's id, so the thread's existence shows up in
-    // message_links.
-    let channel_as_msg = i64::try_from(referenced.channel_id.get()).unwrap_or(i64::MAX);
-    if state
-        .db
-        .lookup_conversation_by_message(channel_as_msg)
-        .await?
-        .is_some()
-    {
-        return Ok(true);
+    match mode {
+        PrivacyMode::Open { .. } | PrivacyMode::ChannelOnly { .. } => Ok(true),
+        PrivacyMode::ConversationOnly => Ok(false),
+        PrivacyMode::OptIn => {
+            // Messages inside a Grok-owned thread are always visible
+            // (participation implies consent).
+            let channel_as_msg =
+                i64::try_from(referenced.channel_id.get()).unwrap_or(i64::MAX);
+            if state
+                .db
+                .lookup_conversation_by_message(channel_as_msg)
+                .await?
+                .is_some()
+            {
+                return Ok(true);
+            }
+            let author_id = i64::try_from(referenced.author.id.get()).unwrap_or(i64::MAX);
+            Ok(state
+                .db
+                .user_opted_in(conversation.discord_guild_id, author_id)
+                .await?)
+        }
+    }
+}
+
+/// Tool definitions exposed to the model for this turn. `fetch_messages`
+/// is omitted in `ConversationOnly` mode — that mode's whole purpose is
+/// to NOT reach beyond the current conversation.
+fn build_tool_definitions(mode: &PrivacyMode) -> Vec<ToolDefinition> {
+    if matches!(mode, PrivacyMode::ConversationOnly) {
+        return Vec::new();
+    }
+    vec![ToolDefinition {
+        name: "fetch_messages".to_string(),
+        description: "Fetch recent messages from a Discord channel for additional \
+context. Use this when you need to see surrounding conversation that wasn't \
+quoted directly — for example when the user asks \"what was the discussion?\" \
+or \"what did they decide?\". By default this fetches the most recent messages \
+from the current channel."
+            .to_string(),
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "channel_id": {
+                    "type": "string",
+                    "description": "Discord channel ID (snowflake as a string). Omit to use the current channel."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "How many recent messages to fetch (1-100). Defaults to 20.",
+                    "minimum": 1,
+                    "maximum": 100
+                },
+                "before_message_id": {
+                    "type": "string",
+                    "description": "Fetch messages older than this message ID (snowflake as a string). Use for paginating further back."
+                }
+            },
+            "additionalProperties": false
+        }),
+    }]
+}
+
+/// [`ToolExecutor`] backing `fetch_messages` plus any future tools.
+/// Owned per-turn so it can capture the channel + guild context.
+struct BotToolExecutor {
+    http: Arc<HttpClient>,
+    db: Db,
+    bot_user_id: Id<UserMarker>,
+    default_channel_id: Id<ChannelMarker>,
+    guild_id: i64,
+    privacy_mode: PrivacyMode,
+}
+
+impl ToolExecutor for BotToolExecutor {
+    async fn execute(&self, name: &str, input: Value) -> Result<Value, ToolError> {
+        match name {
+            "fetch_messages" => self.fetch_messages(input).await,
+            other => Err(ToolError::Unknown(other.to_string())),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct FetchedMessage {
+    id: String,
+    channel_id: String,
+    author: String,
+    author_id: String,
+    content: String,
+    created_at: String,
+    /// `false` = visible content; `true` = author has not opted in (in
+    /// OptIn mode) and the content has been redacted from the result.
+    redacted: bool,
+}
+
+impl BotToolExecutor {
+    async fn fetch_messages(&self, input: Value) -> Result<Value, ToolError> {
+        let channel_id_input = input
+            .get("channel_id")
+            .and_then(Value::as_str)
+            .map(parse_snowflake)
+            .transpose()
+            .map_err(|e| ToolError::InvalidInput(format!("channel_id: {e}")))?;
+        let channel_id: Id<ChannelMarker> = match channel_id_input {
+            Some(id) => Id::new(id),
+            None => self.default_channel_id,
+        };
+
+        // ChannelOnly mode: don't let the model fetch from arbitrary
+        // channels; it can only see the configured one.
+        if let PrivacyMode::ChannelOnly {
+            channel_id: allowed,
+            ..
+        } = &self.privacy_mode
+        {
+            if channel_id.get() != *allowed {
+                return Err(ToolError::InvalidInput(format!(
+                    "this server is in channel_only mode; fetch_messages can only target channel {allowed}"
+                )));
+            }
+        }
+
+        let limit_i64 = input
+            .get("limit")
+            .and_then(Value::as_i64)
+            .unwrap_or(20)
+            .clamp(1, 100);
+        let limit = limit_i64 as u16;
+
+        let before_input = input
+            .get("before_message_id")
+            .and_then(Value::as_str)
+            .map(parse_snowflake)
+            .transpose()
+            .map_err(|e| ToolError::InvalidInput(format!("before_message_id: {e}")))?;
+
+        // Twilight's `.before()` switches the builder type so we can't
+        // mutate the same variable through both branches.
+        let req = self.http.channel_messages(channel_id);
+        let resp = if let Some(b) = before_input {
+            req.before(Id::<MessageMarker>::new(b)).limit(limit).await
+        } else {
+            req.limit(limit).await
+        }
+        .map_err(|e| ToolError::Execution(format!("discord http: {e}")))?;
+        let raw = resp
+            .models()
+            .await
+            .map_err(|e| ToolError::Execution(format!("discord deserialize: {e}")))?;
+
+        // Reverse to chronological order (Discord returns newest-first).
+        let mut messages: Vec<Message> = raw;
+        messages.reverse();
+
+        let mut out: Vec<FetchedMessage> = Vec::with_capacity(messages.len());
+        for m in messages {
+            if m.author.id == self.bot_user_id {
+                continue;
+            }
+            let visible = self.is_visible(&m).await;
+            out.push(FetchedMessage {
+                id: m.id.get().to_string(),
+                channel_id: m.channel_id.get().to_string(),
+                author: m.author.name.clone(),
+                author_id: m.author.id.get().to_string(),
+                content: if visible {
+                    m.content.clone()
+                } else {
+                    "[redacted: author has not opted in]".to_string()
+                },
+                created_at: m.timestamp.iso_8601().to_string(),
+                redacted: !visible,
+            });
+        }
+
+        Ok(serde_json::to_value(&out).unwrap_or(Value::Array(vec![])))
     }
 
-    // Otherwise, check the author's per-guild opt-in.
-    let author_id = i64::try_from(referenced.author.id.get()).unwrap_or(i64::MAX);
-    state
-        .db
-        .user_opted_in(conversation.discord_guild_id, author_id)
-        .await
-        .map_err(BotError::from)
+    /// Returns true if the message's content should be visible to the
+    /// model under the active privacy mode.
+    async fn is_visible(&self, m: &Message) -> bool {
+        match &self.privacy_mode {
+            PrivacyMode::Open { .. } | PrivacyMode::ChannelOnly { .. } => true,
+            PrivacyMode::ConversationOnly => false,
+            PrivacyMode::OptIn => {
+                let channel_as_msg = i64::try_from(m.channel_id.get()).unwrap_or(i64::MAX);
+                if self
+                    .db
+                    .lookup_conversation_by_message(channel_as_msg)
+                    .await
+                    .unwrap_or(None)
+                    .is_some()
+                {
+                    return true;
+                }
+                let author_id = i64::try_from(m.author.id.get()).unwrap_or(i64::MAX);
+                self.db
+                    .user_opted_in(self.guild_id, author_id)
+                    .await
+                    .unwrap_or(false)
+            }
+        }
+    }
 }
 
-/// Pull `limit` recent messages from `channel_id`, ending just before
-/// `before`. Bot's own messages are filtered out — they're already in
-/// the conversation history (when applicable) and reposting them as
-/// "context" confuses the model.
-async fn fetch_channel_history(
-    state: &State,
-    channel_id: Id<ChannelMarker>,
-    before: Id<MessageMarker>,
-    limit: u32,
-) -> Result<Vec<Message>, BotError> {
-    let capped = limit.min(100) as u16;
-    let mut msgs = state
-        .http
-        .channel_messages(channel_id)
-        .before(before)
-        .limit(capped)
-        .await?
-        .models()
-        .await?;
-    msgs.retain(|m| m.author.id != state.bot_user_id && !m.content.is_empty());
-    // Discord returns newest-first; reverse so the LLM sees them in
-    // chronological order, which is how humans read them.
-    msgs.reverse();
-    Ok(msgs)
+fn parse_snowflake(s: &str) -> Result<u64, String> {
+    s.parse::<u64>()
+        .map_err(|e| format!("not a valid snowflake: {e}"))
 }
 
-/// Append the viewer URL to the answer when starting a new conversation
-/// so the user can click through to the full trace.
 fn format_reply(
     answer: &str,
     is_new: bool,
@@ -613,9 +744,6 @@ async fn post_reply(
             .await?
             .model()
             .await?;
-        // Post the answer inside the new thread. We truncate just under
-        // the 2000-char hard limit; the full content is always in the DB
-        // and viewer.
         let trimmed = truncate(body, 1990);
         let reply = state
             .http
@@ -667,8 +795,7 @@ fn make_thread_title(content: &str) -> String {
 }
 
 /// Drop Discord-style `<@id>`, `<@!id>`, `<#channel_id>`, `<:emoji:id>`
-/// tokens entirely (vs. just deleting the `<` / `>` / `@` characters,
-/// which leaves the numeric ID behind and pollutes thread titles).
+/// tokens entirely.
 fn strip_bracketed_tokens(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -696,6 +823,19 @@ fn strip_mentions(content: &str, bot_user_id: Id<UserMarker>) -> String {
         .to_string()
 }
 
+// Reference the unused marker types so rustc's dead-code linter doesn't
+// complain when only one of them is needed in the future.
+#[allow(dead_code)]
+fn _force_marker_imports(
+    _g: Id<GuildMarker>,
+    _c: Id<ChannelMarker>,
+    _m: Id<MessageMarker>,
+    _u: Id<UserMarker>,
+    _a: Id<ApplicationMarker>,
+    _t: TurnBlock,
+) {
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,5 +859,12 @@ mod tests {
     fn thread_title_falls_back_when_only_mentions() {
         assert_eq!(make_thread_title("<@123>"), "Grok");
         assert_eq!(make_thread_title("<@123> what is rust"), "what is rust");
+    }
+
+    #[test]
+    fn fetch_tool_definition_only_when_allowed() {
+        assert!(!build_tool_definitions(&PrivacyMode::OptIn).is_empty());
+        assert!(!build_tool_definitions(&PrivacyMode::Open { history_size: 20 }).is_empty());
+        assert!(build_tool_definitions(&PrivacyMode::ConversationOnly).is_empty());
     }
 }
