@@ -660,9 +660,9 @@ async fn process(
     }
 
     // Detect "model claimed success but media generation failed" — any
-    // image gen with no image_uri, or any check_video_status that never
-    // reached a 'done' status producing a video_uri. We don't want to
-    // pretend success.
+    // generate_image call with no image_uri in its response, or any
+    // start_video_generation that never reached a check_video_status
+    // result with a video_uri.
     let attempted_image_gen = agent_run
         .tool_calls
         .iter()
@@ -677,26 +677,18 @@ async fn process(
             .iter()
             .any(|tc| tc.tool_name == "generate_image" && tc.response.get("image_uri").is_some());
     let video_gen_failed = attempted_video_gen
-        && !agent_run
-            .tool_calls
-            .iter()
-            .any(|tc| tc.tool_name == "check_video_status" && tc.response.get("video_uri").is_some());
-    let image_gen_failed = image_gen_failed || video_gen_failed;
-    let answer_text = if image_gen_failed {
-        let error_snippet = agent_run
-            .tool_calls
-            .iter()
-            .find(|tc| tc.tool_name == "generate_image")
-            .and_then(|tc| tc.response.get("error"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("(no error message)")
-            .chars()
-            .take(200)
-            .collect::<String>();
-        format!(
-            "⚠️ Image generation failed: `{}`. (Model's claimed text follows.)\n\n{}",
-            error_snippet, agent_run.content
-        )
+        && !agent_run.tool_calls.iter().any(|tc| {
+            tc.tool_name == "check_video_status" && tc.response.get("video_uri").is_some()
+        });
+    let media_gen_failed = image_gen_failed || video_gen_failed;
+    let failure_label = match (image_gen_failed, video_gen_failed) {
+        (true, true) => "Image and video generation",
+        (true, false) => "Image generation",
+        (false, true) => "Video generation",
+        (false, false) => "Media generation",
+    };
+    let answer_text = if media_gen_failed {
+        format!("⚠️ {failure_label} failed.\n\n{}", agent_run.content)
     } else {
         agent_run.content.clone()
     };
@@ -705,11 +697,12 @@ async fn process(
 
     let reply_msg =
         post_reply(state, msg, &reply_text, is_new, &generated_attachments).await?;
-    if image_gen_failed {
+    if media_gen_failed {
         tracing::warn!(
             conversation = %conversation.id,
             turn = %turn.id,
-            "image generation was attempted but produced no images; reply marked as failed"
+            label = failure_label,
+            "media generation was attempted but produced no output; reply marked as failed"
         );
     }
     let threaded = is_new && reply_text.len() > REPLY_LENGTH_THRESHOLD;
@@ -753,10 +746,10 @@ async fn process(
         )
         .await?;
 
-    if image_gen_failed {
+    if media_gen_failed {
         // Bubble the failure up so handle_message reacts ❌ instead of ✅.
         return Err(BotError::Llm(grok_discord_bot_core::LlmError::Transport(
-            "generate_image was attempted but produced no images".to_string(),
+            format!("{failure_label} was attempted but produced no output"),
         )));
     }
     Ok(())
