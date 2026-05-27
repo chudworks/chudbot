@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 llm,
                 config.web.base_url.clone(),
                 config.default_privacy.clone(),
+                config.bot.clone(),
             )
             .await?;
         }

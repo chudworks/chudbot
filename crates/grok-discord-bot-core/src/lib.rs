@@ -21,7 +21,7 @@ pub mod domain;
 pub mod llm;
 
 pub use agent::{AgentRun, run as run_agent};
-pub use config::{Config, ConfigError, PrivacyMode};
+pub use config::{BotConfig, Config, ConfigError, PrivacyMode};
 pub use db::{Db, DbError};
 pub use domain::{Conversation, ContextItem, ConversationView, Turn, TurnView};
 pub use llm::{

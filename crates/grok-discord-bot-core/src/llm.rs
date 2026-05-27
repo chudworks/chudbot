@@ -137,8 +137,14 @@ pub struct StepRequest {
     /// If true, enable the provider's *server-side* web search tool
     /// (orthogonal to the client-side `tools` list).
     pub enable_web_search: bool,
-    /// Soft cap on output tokens. Anthropic requires it; xAI ignores it.
+    /// Soft cap on output tokens. Anthropic requires it; xAI tolerates it.
     pub max_tokens: u32,
+    /// Sampling temperature (0.0-2.0). `None` lets the provider's
+    /// default apply. Higher = more random; lower = more focused.
+    pub temperature: Option<f32>,
+    /// Nucleus sampling probability mass (0.0-1.0). `None` defers to
+    /// the provider's default.
+    pub top_p: Option<f32>,
 }
 
 /// One round-trip result from a provider.

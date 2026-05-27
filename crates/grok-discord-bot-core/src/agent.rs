@@ -33,6 +33,7 @@ pub struct AgentRun {
 
 /// Drive the model through a tool-use loop until it produces a final
 /// answer, or `max_iterations` is hit.
+#[allow(clippy::too_many_arguments)]
 pub async fn run<P, T>(
     provider: &P,
     initial_messages: Vec<ChatTurn>,
@@ -40,6 +41,8 @@ pub async fn run<P, T>(
     executor: &T,
     enable_web_search: bool,
     max_tokens: u32,
+    temperature: Option<f32>,
+    top_p: Option<f32>,
     max_iterations: u32,
 ) -> Result<AgentRun, LlmError>
 where
@@ -57,6 +60,8 @@ where
                 tools: tools.clone(),
                 enable_web_search,
                 max_tokens,
+                temperature,
+                top_p,
             })
             .await?;
 

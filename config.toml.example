@@ -47,3 +47,15 @@ api_key = "sk-ant-..."
 #   - { mode = "conversation_only" }                   # Design 4
 [default_privacy]
 mode = "opt_in"
+
+# Bot persona — system prompt and sampling knobs. All optional; an
+# omitted [bot] block uses sensible defaults. Restart the bot after
+# changing these (the config is read once at startup).
+[bot]
+# system_prompt = """
+# You are Chudbot, a sarcastic and direct AI assistant in a private
+# Discord server. Don't hedge. Use web_search and x_search to ground
+# claims; use fetch_messages when you need surrounding conversation.
+# """
+# temperature = 1.0      # 0.0-2.0; higher = more chaotic, lower = focused
+# top_p = 0.95           # 0.0-1.0; alternative sampling control

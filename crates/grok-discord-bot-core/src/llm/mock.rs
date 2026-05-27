@@ -66,6 +66,8 @@ mod tests {
                 tools: Vec::new(),
                 enable_web_search: false,
                 max_tokens: 1024,
+                temperature: None,
+                top_p: None,
             })
             .await
             .unwrap();

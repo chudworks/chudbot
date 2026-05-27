@@ -69,6 +69,8 @@ impl LlmProvider for XaiProvider {
             instructions: instructions.as_deref(),
             tools: if tools.is_empty() { None } else { Some(&tools) },
             max_output_tokens: Some(request.max_tokens),
+            temperature: request.temperature,
+            top_p: request.top_p,
         };
 
         let resp = self
@@ -303,6 +305,10 @@ struct ResponsesRequest<'a> {
     tools: Option<&'a [Value]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
 }
 
 #[derive(Deserialize)]

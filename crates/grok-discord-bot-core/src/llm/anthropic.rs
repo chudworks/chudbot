@@ -82,6 +82,8 @@ impl LlmProvider for AnthropicProvider {
             messages: &anthropic_messages,
             system: system.as_deref(),
             tools: &tools,
+            temperature: request.temperature,
+            top_p: request.top_p,
         };
 
         let resp = self
@@ -290,6 +292,10 @@ struct AnthropicRequest<'a> {
     system: Option<&'a str>,
     #[serde(skip_serializing_if = "<[Value]>::is_empty")]
     tools: &'a [Value],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f32>,
 }
 
 #[derive(Deserialize)]

@@ -45,7 +45,54 @@ pub struct Config {
     /// guild at runtime via the `/grok-mode set` slash command.
     #[serde(default = "PrivacyMode::opt_in_default")]
     pub default_privacy: PrivacyMode,
+    /// Bot persona — system prompt and sampling knobs the agent runs with.
+    /// Optional; an omitted `[bot]` block applies the default persona.
+    #[serde(default)]
+    pub bot: BotConfig,
 }
+
+/// Persona / sampling settings for the agent loop. Edit `system_prompt`
+/// to give the bot a personality (sarcastic, terse, role-played, etc.);
+/// raise `temperature` to make replies more chaotic or lower it for
+/// more focused answers.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BotConfig {
+    /// Top-level instruction sent to the model on every turn. Wired
+    /// into the xAI Responses API's `instructions` field and lifted out
+    /// of the Anthropic Messages API's chat history into its top-level
+    /// `system` field.
+    #[serde(default = "default_system_prompt")]
+    pub system_prompt: String,
+    /// Sampling temperature (0.0-2.0). `None` lets the provider pick its
+    /// default. Higher = more random; lower = more focused.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Nucleus sampling probability mass (0.0-1.0). `None` lets the
+    /// provider pick its default.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+}
+
+impl Default for BotConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: default_system_prompt(),
+            temperature: None,
+            top_p: None,
+        }
+    }
+}
+
+fn default_system_prompt() -> String {
+    "You are a helpful AI assistant in a private Discord server. Be direct \
+and concise. When asked to verify a claim, use the web_search and x_search \
+tools to ground your answer in current sources and cite URLs. When you need \
+more context about an ongoing conversation in this channel (for example: \
+\"what did they decide?\", \"what's the discussion been about?\"), call the \
+`fetch_messages` tool to pull recent messages from the channel. Don't fetch \
+speculatively — only when you actually need extra context to answer."
+        .to_string()
+    }
 
 /// Privacy / context-gathering policy. The four variants correspond to
 /// the four designs discussed by the group; default is `opt_in`

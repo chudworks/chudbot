@@ -18,8 +18,8 @@
 use std::sync::Arc;
 
 use grok_discord_bot_core::{
-    AgentRun, AnyProvider, ChatTurn, ContextItem, Conversation, Db, LlmProvider, MessageRole,
-    PrivacyMode, ToolDefinition, ToolError, ToolExecutor, TurnBlock, run_agent,
+    AgentRun, AnyProvider, BotConfig, ChatTurn, ContextItem, Conversation, Db, LlmProvider,
+    MessageRole, PrivacyMode, ToolDefinition, ToolError, ToolExecutor, TurnBlock, run_agent,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -37,14 +37,6 @@ use twilight_model::id::marker::{
 };
 
 use crate::commands;
-
-const SYSTEM_PROMPT: &str = "You are a helpful AI assistant in a private Discord \
-server. Be direct and concise. When asked to verify a claim, use the web search \
-tool to ground your answer in current sources and cite URLs. When you need more \
-context about an ongoing conversation in this channel (for example: \"what did \
-they decide?\", \"what's the discussion been about?\"), call the `fetch_messages` \
-tool to pull recent messages from the channel. Don't fetch speculatively — only \
-when you actually need extra context to answer.";
 
 /// Discord messages have a hard 2000-char limit; we auto-thread when the
 /// answer exceeds this. Threading is also skipped for follow-ups inside
@@ -85,6 +77,7 @@ struct State {
     bot_user_id: Id<UserMarker>,
     app_id: Id<ApplicationMarker>,
     default_privacy: PrivacyMode,
+    bot_config: BotConfig,
 }
 
 /// Entry point for the `grok bot` subcommand.
@@ -95,6 +88,7 @@ pub async fn run(
     llm: AnyProvider,
     web_base_url: String,
     default_privacy: PrivacyMode,
+    bot_config: BotConfig,
 ) -> Result<(), BotError> {
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
@@ -124,6 +118,7 @@ pub async fn run(
         bot_user_id: current.id,
         app_id: application.id,
         default_privacy,
+        bot_config,
     });
 
     let mut shard = Shard::new(ShardId::ONE, discord_token, intents);
@@ -325,6 +320,8 @@ async fn process(
         &executor,
         true, // server-side web search always enabled
         MAX_OUTPUT_TOKENS,
+        state.bot_config.temperature,
+        state.bot_config.top_p,
         MAX_AGENT_ITERATIONS,
     )
     .await;
@@ -443,7 +440,7 @@ async fn build_context(
         &mut pos,
         "system".to_string(),
         "system",
-        SYSTEM_PROMPT.to_string(),
+        state.bot_config.system_prompt.clone(),
         None,
     );
 
