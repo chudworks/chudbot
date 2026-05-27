@@ -225,10 +225,11 @@ fn log_guild_create(event: &GuildCreate) {
 
 /// Ask the configured LLM whether the user's message violates Discord
 /// TOS. One short call with `temperature=0` and a tight prompt that
-/// asks for a single ALLOW/REFUSE token. **Fails open** — if the call
-/// errors out or returns something unparseable, the message is allowed
-/// through; refusing on transient failure would be worse UX than
-/// occasionally letting a sketchy prompt through.
+/// asks for a single ALLOW/REFUSE token. **Fails open** on transient
+/// errors so a broken classifier doesn't silently DOS the bot — except
+/// when the upstream itself refuses for safety reasons (e.g. xAI's
+/// server-side SAFETY_CHECK_TYPE_* 403), which IS a refusal signal
+/// and we honor it directly.
 async fn moderation_allows(state: &State, content: &str) -> bool {
     let request = StepRequest {
         messages: vec![
@@ -261,10 +262,39 @@ async fn moderation_allows(state: &State, content: &str) -> bool {
             tracing::warn!("moderation: classifier returned tool-use; failing open");
             true
         }
+        Err(err) if is_upstream_safety_refusal(&err) => {
+            tracing::info!(
+                error = %err,
+                "moderation: upstream refused the classifier prompt itself; treating as REFUSE"
+            );
+            false
+        }
         Err(err) => {
             tracing::warn!(error = %err, "moderation: classifier errored; failing open");
             true
         }
+    }
+}
+
+/// Detect xAI-style safety refusals from a provider error.
+///
+/// xAI returns HTTP 403 with a body like:
+/// `{"code":"...","error":"Content violates usage guidelines. ... \
+/// Failed check: SAFETY_CHECK_TYPE_CSAM"}` when its server-side safety
+/// classifiers refuse a prompt. We treat any 403 whose body mentions
+/// either the safety-check label or the "violates usage guidelines"
+/// phrase as a real refusal — distinct from a transient transport
+/// error, and worth surfacing as ❓ rather than ❌.
+fn is_upstream_safety_refusal(err: &grok_discord_bot_core::LlmError) -> bool {
+    match err {
+        grok_discord_bot_core::LlmError::Api { status, body } => {
+            if *status != 403 {
+                return false;
+            }
+            let lower = body.to_ascii_lowercase();
+            lower.contains("safety_check") || lower.contains("violates usage guidelines")
+        }
+        _ => false,
     }
 }
 
@@ -349,6 +379,16 @@ async fn handle_message(state: Arc<State>, msg: Message) {
             let _ = state
                 .http
                 .create_reaction(msg.channel_id, msg.id, &done)
+                .await;
+        }
+        Err(BotError::Llm(ref llm_err)) if is_upstream_safety_refusal(llm_err) => {
+            tracing::info!(
+                error = %llm_err,
+                "message refused by upstream safety check; reacting ❓"
+            );
+            let _ = state
+                .http
+                .create_reaction(msg.channel_id, msg.id, &refused)
                 .await;
         }
         Err(err) => {
