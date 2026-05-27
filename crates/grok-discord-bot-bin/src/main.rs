@@ -69,13 +69,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.web.base_url.clone(),
                 config.default_privacy.clone(),
                 config.bot.clone(),
+                config.storage.clone(),
             )
             .await?;
         }
         Cmd::Web => {
             let db = Db::connect(&config.postgres.url).await?;
             let listen = SocketAddr::from_str(&config.web.listen)?;
-            web::run(db, listen).await?;
+            web::run(db, listen, config.storage.images_dir.clone()).await?;
         }
         Cmd::Migrate => {
             let db = Db::connect(&config.postgres.url).await?;

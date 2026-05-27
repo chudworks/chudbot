@@ -49,6 +49,13 @@ features = ["builder"]
 [dependencies.axum]
 version = "0.8"
 
+[dependencies.tower-http]
+version = "0.6"
+features = ["fs"]
+
+[dependencies.reqwest]
+workspace = true
+
 [dependencies.maud]
 version = "0.27"
 features = ["axum"]

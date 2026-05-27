@@ -140,11 +140,13 @@ fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
         };
 
         let mut text_buf = String::new();
+        let mut image_urls: Vec<String> = Vec::new();
         let mut deferred: Vec<Value> = Vec::new();
 
         for block in &turn.blocks {
             match block {
                 TurnBlock::Text(t) => text_buf.push_str(t),
+                TurnBlock::Image { url, .. } => image_urls.push(url.clone()),
                 TurnBlock::ToolUse { id, name, input: tool_input } => {
                     // Echo the assistant's prior tool call back as its own
                     // input item; the Responses API tracks call_id for
@@ -167,10 +169,27 @@ fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
             }
         }
 
-        if !text_buf.is_empty() {
+        // Pick the content shape: plain string when text-only, content
+        // array when any image is attached. Both forms are valid input
+        // for the Responses API.
+        if image_urls.is_empty() {
+            if !text_buf.is_empty() {
+                input.push(json!({
+                    "role": role_str,
+                    "content": text_buf,
+                }));
+            }
+        } else {
+            let mut parts: Vec<Value> = Vec::with_capacity(image_urls.len() + 1);
+            if !text_buf.is_empty() {
+                parts.push(json!({ "type": "input_text", "text": text_buf }));
+            }
+            for url in image_urls {
+                parts.push(json!({ "type": "input_image", "image_url": url }));
+            }
             input.push(json!({
                 "role": role_str,
-                "content": text_buf,
+                "content": parts,
             }));
         }
         input.extend(deferred);

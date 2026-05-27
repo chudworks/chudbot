@@ -1,0 +1,166 @@
+//! Media storage abstraction.
+//!
+//! Attachments (images today; eventually maybe audio/video/PDFs) are
+//! referenced in the database by **URI** rather than raw path so we can
+//! add backends without a schema change:
+//!
+//! - `file://images/abc.jpg` — relative path on the local disk under
+//!   `[storage].images_dir` (the only scheme implemented today).
+//! - `s3://bucket/key` — eventual S3-compatible backend.
+//! - `https://…` — direct passthrough (e.g. Discord CDN, used only when
+//!   we explicitly choose not to persist).
+//!
+//! Files written by [`save_image_from_url`] live under `images_dir` with
+//! a UUID basename + extension inferred from `content_type` (or the
+//! source URL as a fallback). Filenames are flat — no per-conversation
+//! nesting — keeping the layout trivial and the URIs short.
+
+use std::path::Path;
+
+use thiserror::Error;
+use uuid::Uuid;
+
+/// URI scheme prefix for files saved under `images_dir`.
+pub const FILE_SCHEME: &str = "file://";
+
+/// Relative path component used in `file://` URIs. Kept stable so the
+/// web viewer can mount its `ServeDir` at `/images/`.
+pub const IMAGES_PREFIX: &str = "images";
+
+/// Errors returned by the storage layer.
+#[derive(Debug, Error)]
+pub enum StorageError {
+    /// Underlying filesystem error.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+    /// Failure downloading the source bytes.
+    #[error("download: {0}")]
+    Download(String),
+    /// Source returned a non-success status.
+    #[error("upstream {status}: {body}")]
+    Upstream {
+        /// HTTP status code.
+        status: u16,
+        /// Truncated response body for diagnostics.
+        body: String,
+    },
+}
+
+/// Download `url`, persist the bytes to `images_dir`, and return the
+/// `file://images/<uuid>.<ext>` URI to record in `context_items`.
+///
+/// `content_type_hint` (e.g. from Discord's attachment metadata) is
+/// preferred for picking the extension; the URL is used as a fallback.
+pub async fn save_image_from_url(
+    http: &reqwest::Client,
+    url: &str,
+    content_type_hint: Option<&str>,
+    images_dir: &Path,
+) -> Result<String, StorageError> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| StorageError::Download(e.to_string()))?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        let mut snippet = body;
+        if snippet.len() > 200 {
+            snippet.truncate(200);
+        }
+        return Err(StorageError::Upstream {
+            status: status.as_u16(),
+            body: snippet,
+        });
+    }
+
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| StorageError::Download(e.to_string()))?;
+
+    let ext = pick_extension(content_type_hint, url);
+    let filename = format!("{}.{ext}", Uuid::new_v4().simple());
+
+    tokio::fs::create_dir_all(images_dir).await?;
+    let path = images_dir.join(&filename);
+    tokio::fs::write(&path, &bytes).await?;
+
+    Ok(format!("{FILE_SCHEME}{IMAGES_PREFIX}/{filename}"))
+}
+
+/// Decide on a file extension. Common image content-types first;
+/// otherwise lift the suffix from the URL's path (stripping any query
+/// string); otherwise fall back to `bin`.
+fn pick_extension(content_type: Option<&str>, url: &str) -> &'static str {
+    if let Some(ct) = content_type {
+        let normalized = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+        match normalized.as_str() {
+            "image/png" => return "png",
+            "image/jpeg" | "image/jpg" => return "jpg",
+            "image/gif" => return "gif",
+            "image/webp" => return "webp",
+            "image/heic" | "image/heif" => return "heic",
+            _ => {}
+        }
+    }
+    let no_query = url.split('?').next().unwrap_or(url);
+    let ext = no_query.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "png",
+        "jpg" | "jpeg" => "jpg",
+        "gif" => "gif",
+        "webp" => "webp",
+        "heic" | "heif" => "heic",
+        _ => "bin",
+    }
+}
+
+/// Detect whether a URI points at a stored image (currently `file://`
+/// pointing under the `images/` prefix). Used by the viewer to decide
+/// whether to render a context item as an `<img>`.
+pub fn is_image_uri(uri: &str) -> bool {
+    if let Some(path) = uri.strip_prefix(FILE_SCHEME) {
+        return path.starts_with(&format!("{IMAGES_PREFIX}/"));
+    }
+    // Future schemes (s3://, https://…cdn.discordapp.com…) plug in here.
+    false
+}
+
+/// Map a stored `file://images/<name>` URI to the web-served path that
+/// matches the viewer's `/images/*` route mount. Returns `None` for
+/// URIs we don't recognise.
+pub fn to_web_path(uri: &str) -> Option<String> {
+    let path = uri.strip_prefix(FILE_SCHEME)?;
+    let filename = path.strip_prefix(&format!("{IMAGES_PREFIX}/"))?;
+    Some(format!("/{IMAGES_PREFIX}/{filename}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extension_from_content_type() {
+        assert_eq!(pick_extension(Some("image/png"), ""), "png");
+        assert_eq!(pick_extension(Some("image/jpeg; charset=binary"), ""), "jpg");
+        assert_eq!(pick_extension(Some("image/webp"), ""), "webp");
+    }
+
+    #[test]
+    fn extension_from_url_fallback() {
+        assert_eq!(pick_extension(None, "https://cdn.discordapp.com/x.PNG?ex=1"), "png");
+        assert_eq!(pick_extension(None, "https://x/y.heic"), "heic");
+        assert_eq!(pick_extension(None, "https://x/y"), "bin");
+    }
+
+    #[test]
+    fn web_path_round_trip() {
+        let uri = "file://images/abc.jpg";
+        assert!(is_image_uri(uri));
+        assert_eq!(to_web_path(uri).as_deref(), Some("/images/abc.jpg"));
+        assert!(!is_image_uri("https://cdn.discordapp.com/x.png"));
+    }
+}

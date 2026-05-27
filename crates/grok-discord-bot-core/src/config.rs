@@ -49,6 +49,35 @@ pub struct Config {
     /// Optional; an omitted `[bot]` block applies the default persona.
     #[serde(default)]
     pub bot: BotConfig,
+    /// Media storage (image attachments today). Optional; defaults
+    /// reasonably for a local single-host deploy.
+    #[serde(default)]
+    pub storage: StorageConfig,
+}
+
+/// Media storage settings. Today only the local `images/` directory is
+/// used; the URI scheme in the DB (`file://images/<name>`) is the seam
+/// for adding more backends later.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct StorageConfig {
+    /// Directory where images saved from Discord attachments live. The
+    /// web viewer mounts `/images/*` at this directory. Path is
+    /// resolved relative to the bot's working directory; the default
+    /// keeps everything inside the repo checkout.
+    #[serde(default = "default_images_dir")]
+    pub images_dir: PathBuf,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            images_dir: default_images_dir(),
+        }
+    }
+}
+
+fn default_images_dir() -> PathBuf {
+    PathBuf::from("images")
 }
 
 /// Persona / sampling settings for the agent loop. Edit `system_prompt`

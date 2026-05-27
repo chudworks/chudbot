@@ -244,6 +244,12 @@ fn to_anthropic_messages(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
                     content_blocks.push(json!({ "type": "text", "text": t }));
                 }
                 TurnBlock::Text(_) => {}
+                TurnBlock::Image { url, .. } => {
+                    content_blocks.push(json!({
+                        "type": "image",
+                        "source": { "type": "url", "url": url },
+                    }));
+                }
                 TurnBlock::ToolUse { id, name, input } => {
                     content_blocks.push(json!({
                         "type": "tool_use",

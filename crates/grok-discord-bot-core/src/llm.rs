@@ -90,6 +90,15 @@ impl ChatTurn {
 pub enum TurnBlock {
     /// Plain text — most common.
     Text(String),
+    /// User-supplied image referenced by URL. Providers fetch the URL
+    /// themselves (xAI's Responses API and Anthropic's Messages API
+    /// both accept URL-typed images directly).
+    Image {
+        /// Image URL (typically Discord's CDN).
+        url: String,
+        /// Optional MIME type hint, e.g. `image/png`.
+        mime_type: Option<String>,
+    },
     /// Assistant asked us to invoke a client-side tool with this input.
     ToolUse {
         /// Provider-supplied id, opaque to us; must be echoed back in

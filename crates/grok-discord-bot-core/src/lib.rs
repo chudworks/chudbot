@@ -19,9 +19,10 @@ pub mod config;
 pub mod db;
 pub mod domain;
 pub mod llm;
+pub mod storage;
 
 pub use agent::{AgentRun, run as run_agent};
-pub use config::{BotConfig, Config, ConfigError, PrivacyMode};
+pub use config::{BotConfig, Config, ConfigError, PrivacyMode, StorageConfig};
 pub use db::{Db, DbError};
 pub use domain::{Conversation, ContextItem, ConversationView, Turn, TurnView};
 pub use llm::{

@@ -15,11 +15,13 @@
 //!
 //! Interactions (slash commands) are dispatched to [`crate::commands`].
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use grok_discord_bot_core::{
     AgentRun, AnyProvider, BotConfig, ChatTurn, ContextItem, Conversation, Db, LlmProvider,
-    MessageRole, PrivacyMode, ToolDefinition, ToolError, ToolExecutor, TurnBlock, run_agent,
+    MessageRole, PrivacyMode, StorageConfig, ToolDefinition, ToolError, ToolExecutor, TurnBlock,
+    run_agent, storage,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -71,6 +73,7 @@ pub enum BotError {
 /// State shared across all message-handler tasks.
 struct State {
     http: Arc<HttpClient>,
+    download_http: reqwest::Client,
     db: Db,
     llm: AnyProvider,
     web_base_url: String,
@@ -78,9 +81,11 @@ struct State {
     app_id: Id<ApplicationMarker>,
     default_privacy: PrivacyMode,
     bot_config: BotConfig,
+    images_dir: PathBuf,
 }
 
 /// Entry point for the `grok bot` subcommand.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     discord_token: String,
     dev_guild_id: Option<u64>,
@@ -89,6 +94,7 @@ pub async fn run(
     web_base_url: String,
     default_privacy: PrivacyMode,
     bot_config: BotConfig,
+    storage_config: StorageConfig,
 ) -> Result<(), BotError> {
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
@@ -112,6 +118,7 @@ pub async fn run(
 
     let state = Arc::new(State {
         http,
+        download_http: reqwest::Client::new(),
         db,
         llm,
         web_base_url,
@@ -119,6 +126,7 @@ pub async fn run(
         app_id: application.id,
         default_privacy,
         bot_config,
+        images_dir: storage_config.images_dir,
     });
 
     let mut shard = Shard::new(ShardId::ONE, discord_token, intents);
@@ -277,8 +285,25 @@ async fn process(
     let (conversation, is_new) = resolve_conversation(state, msg).await?;
     let user_content = strip_mentions(&msg.content, state.bot_user_id);
 
-    let initial_context =
+    // Persist any image attachments before recording context items so
+    // every image gets its own `discord:msg:<id>:image:<i>` context row
+    // for the viewer trace. Keep the original Discord CDN URL in memory
+    // to pass to the LLM (it's still fresh; cheaper than base64).
+    let saved_images = save_image_attachments(state, msg).await;
+
+    let mut initial_context =
         build_context(state, msg, &conversation, is_new, &user_content, privacy_mode).await?;
+
+    let next_pos = initial_context.last().map(|c| c.position + 1).unwrap_or(0);
+    for (i, image) in saved_images.iter().enumerate() {
+        initial_context.push(ContextItem {
+            position: next_pos + i32::try_from(i).unwrap_or(0),
+            source: format!("discord:msg:{}:image:{i}", msg.id),
+            role: "user".to_string(),
+            content: image.stored_uri.clone(),
+            discord_message_id: Some(i64::try_from(msg.id.get()).unwrap_or(i64::MAX)),
+        });
+    }
 
     let turn = state
         .db
@@ -294,10 +319,24 @@ async fn process(
     }
 
     // Build the LLM-facing chat history from the initial context items.
-    let messages: Vec<ChatTurn> = initial_context
+    // Image rows are skipped here and re-attached below as proper
+    // ToolBlock::Image blocks on the user's current turn, using the
+    // original Discord URLs (fresh, no base64 overhead).
+    let mut messages: Vec<ChatTurn> = initial_context
         .iter()
+        .filter(|c| !c.source.contains(":image:"))
         .map(|c| ChatTurn::text(MessageRole::from_str_lossy(&c.role), c.content.clone()))
         .collect();
+    if !saved_images.is_empty() {
+        if let Some(last) = messages.last_mut() {
+            for image in &saved_images {
+                last.blocks.push(TurnBlock::Image {
+                    url: image.live_url.clone(),
+                    mime_type: image.mime_type.clone(),
+                });
+            }
+        }
+    }
 
     // Tools available to the model for this turn. fetch_messages is
     // exposed in every mode except ConversationOnly; that mode's whole
@@ -494,6 +533,74 @@ async fn build_context(
     );
 
     Ok(items)
+}
+
+/// A single image attachment that's been persisted to local disk plus
+/// the live Discord URL we'll hand to the LLM on this turn.
+struct SavedImage {
+    /// `file://images/<uuid>.<ext>` — recorded in `context_items`.
+    stored_uri: String,
+    /// Original Discord CDN URL — used for the in-memory LLM call only.
+    /// Don't store; signed URLs expire after ~24h.
+    live_url: String,
+    /// `content_type` from the Discord attachment metadata, if any.
+    mime_type: Option<String>,
+}
+
+/// Download every image-typed attachment on `msg` to `state.images_dir`.
+/// Failures are logged and skipped — a broken attachment shouldn't fail
+/// the whole reply.
+async fn save_image_attachments(state: &State, msg: &Message) -> Vec<SavedImage> {
+    let mut out = Vec::new();
+    for att in &msg.attachments {
+        if !looks_like_image(att.content_type.as_deref(), &att.filename) {
+            continue;
+        }
+        match storage::save_image_from_url(
+            &state.download_http,
+            &att.url,
+            att.content_type.as_deref(),
+            &state.images_dir,
+        )
+        .await
+        {
+            Ok(stored_uri) => {
+                tracing::info!(
+                    uri = %stored_uri,
+                    filename = %att.filename,
+                    size = att.size,
+                    "saved image attachment"
+                );
+                out.push(SavedImage {
+                    stored_uri,
+                    live_url: att.url.clone(),
+                    mime_type: att.content_type.clone(),
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    url = %att.url,
+                    filename = %att.filename,
+                    "failed to persist image attachment; skipping"
+                );
+            }
+        }
+    }
+    out
+}
+
+fn looks_like_image(content_type: Option<&str>, filename: &str) -> bool {
+    if let Some(ct) = content_type {
+        if ct.starts_with("image/") {
+            return true;
+        }
+    }
+    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif"
+    )
 }
 
 fn push_item(

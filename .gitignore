@@ -1,6 +1,7 @@
 /target
 /.cargo
 /config.toml
+/images
 /.env
 /.env.local
 /.idea

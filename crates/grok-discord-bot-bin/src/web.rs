@@ -5,15 +5,17 @@
 //! anyone with the link can read the trace. No auth, no login.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
 use axum::Router;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use grok_discord_bot_core::{ConversationView, Db, DbError, TurnView};
+use grok_discord_bot_core::{ContextItem, ConversationView, Db, DbError, TurnView, storage};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
 use thiserror::Error;
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 /// Errors returned by the web layer. Map to HTTP responses via
@@ -32,16 +34,21 @@ struct WebState {
 }
 
 /// Entry point for the `grok web` subcommand.
-pub async fn run(db: Db, listen: SocketAddr) -> Result<(), WebError> {
+pub async fn run(db: Db, listen: SocketAddr, images_dir: PathBuf) -> Result<(), WebError> {
+    // Ensure the directory exists so ServeDir doesn't 500 on first hit
+    // before any image has been written.
+    tokio::fs::create_dir_all(&images_dir).await?;
+
     let state = WebState { db };
     let app = Router::new()
         .route("/", get(landing))
         .route("/c/{id}", get(view_conversation))
+        .nest_service("/images", ServeDir::new(&images_dir))
         .fallback(not_found)
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
-    tracing::info!(addr = %listen, "web viewer listening");
+    tracing::info!(addr = %listen, images_dir = %images_dir.display(), "web viewer listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -178,7 +185,7 @@ fn render_turn(tv: &TurnView) -> Markup {
                                 " · "
                                 span.source { (item.source) }
                             }
-                            pre { (item.content) }
+                            (render_context_body(item))
                         }
                     }
                 }
@@ -217,6 +224,19 @@ fn render_turn(tv: &TurnView) -> Markup {
             }
         }
     }
+}
+
+/// Render a context item's content. Image-typed items (per the
+/// `file://images/…` URI scheme or a `:image:` source segment) render
+/// as inline `<img>` tags via the `/images/*` static route; everything
+/// else renders as preformatted text.
+fn render_context_body(item: &ContextItem) -> Markup {
+    if let Some(web_path) = storage::to_web_path(&item.content) {
+        return html! {
+            img.context-image src=(web_path) alt="user attachment";
+        };
+    }
+    html! { pre { (item.content) } }
 }
 
 fn render_404() -> Markup {
@@ -383,4 +403,11 @@ code {
     font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 .empty { color: var(--muted); font-style: italic; }
+.context-image {
+    max-width: 100%;
+    max-height: 400px;
+    border-radius: 6px;
+    margin: .25rem 0;
+    display: block;
+}
 "#;
