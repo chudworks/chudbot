@@ -85,12 +85,16 @@ async fn save_bytes_under(
     Ok(format!("{FILE_SCHEME}{uri_prefix}/{filename}"))
 }
 
-/// Resolve a `file://images/<name>` URI to a filesystem path under
-/// `images_dir`. Returns `None` for URIs we don't recognise.
-pub fn file_uri_to_local_path(uri: &str, images_dir: &Path) -> Option<std::path::PathBuf> {
+/// Resolve a `file://<prefix>/<name>` URI to a filesystem path under
+/// `base_dir`. Strips either the `images/` or `videos/` prefix, so
+/// callers pass whichever base dir corresponds to the URI's media
+/// type. Returns `None` for URIs we don't recognise.
+pub fn file_uri_to_local_path(uri: &str, base_dir: &Path) -> Option<std::path::PathBuf> {
     let path = uri.strip_prefix(FILE_SCHEME)?;
-    let filename = path.strip_prefix(&format!("{IMAGES_PREFIX}/"))?;
-    Some(images_dir.join(filename))
+    let filename = path
+        .strip_prefix(&format!("{IMAGES_PREFIX}/"))
+        .or_else(|| path.strip_prefix(&format!("{VIDEOS_PREFIX}/")))?;
+    Some(base_dir.join(filename))
 }
 
 /// Map a MIME type to an extension we'd write to disk. Falls back to
@@ -227,6 +231,21 @@ mod tests {
         assert_eq!(pick_extension(None, "https://cdn.discordapp.com/x.PNG?ex=1"), "png");
         assert_eq!(pick_extension(None, "https://x/y.heic"), "heic");
         assert_eq!(pick_extension(None, "https://x/y"), "bin");
+    }
+
+    #[test]
+    fn file_uri_to_local_path_handles_both_prefixes() {
+        let dir = Path::new("/tmp/x");
+        assert_eq!(
+            file_uri_to_local_path("file://images/a.png", dir),
+            Some(dir.join("a.png"))
+        );
+        assert_eq!(
+            file_uri_to_local_path("file://videos/b.mp4", dir),
+            Some(dir.join("b.mp4"))
+        );
+        assert_eq!(file_uri_to_local_path("file://other/c", dir), None);
+        assert_eq!(file_uri_to_local_path("https://x/y", dir), None);
     }
 
     #[test]

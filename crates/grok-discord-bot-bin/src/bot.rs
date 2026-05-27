@@ -1118,10 +1118,14 @@ fn check_video_status_tool() -> ToolDefinition {
         name: "check_video_status".to_string(),
         description: "Poll a previously-submitted video generation job. \
 Returns the current status: 'pending' (still rendering), 'done' (URI \
-returned in `video_uri` — it will be auto-attached to your eventual final \
-reply, don't link to it), 'failed' (with error), or 'expired'. The \
+returned in `video_uri`), 'failed' (with error), or 'expired'. The \
 `wait_seconds` parameter (default 15, max 30) lets you sleep before polling \
-to space out checks without burning agent iterations."
+to space out checks without burning agent iterations.
+
+When status=done, the bot will automatically attach the video to your \
+final reply — DO NOT include placeholder text like \"[video attached]\", \
+\"(see attached)\", or link to the URI in your reply. Just write naturally; \
+the user sees the actual video file under your message."
             .to_string(),
         input_schema: json!({
             "type": "object",
