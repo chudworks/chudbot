@@ -68,6 +68,43 @@ fed to the model, and (via `tool_calls`) every server-side tool the
 model invoked plus its request/response JSON. The viewer renders both
 verbatim so traces are auditable.
 
+## Privacy model
+
+Per-guild, configurable at runtime via slash commands. Four "designs"
+(per the group's discussion):
+
+- **`open` (Design 1)** — bulk-fetches recent channel messages on each
+  @mention. Best answers, least privacy.
+- **`channel_only` (Design 2)** — same as open, but only operates in
+  a single configured channel.
+- **`opt_in` (Design 3, default)** — only the user's own `@`-mention,
+  prior turns of the same conversation, and Discord-reply-quoted
+  messages whose author has opted in. The author opt-in is also
+  per-guild.
+- **`conversation_only` (Design 4)** — strictest: just the user's
+  mention and prior turns. Even quoted messages are dropped.
+
+In ALL modes the bot sees the user's `@`-mention itself and the
+conversation history reconstructed from the DB. Those are the floor.
+
+Slash commands:
+- `/grok-privacy {in|out|status}` — anyone, per-user, per-guild.
+- `/grok-mode {show|set}` — admins only, per-guild. The `set`
+  subcommand takes `mode`, optional `channel` (required for
+  `channel_only`), and optional `history_size`.
+
+Per-guild settings live in `guild_settings.privacy_mode` (JSONB —
+serializes the same `PrivacyMode` enum used in config). Missing row
+falls back to `config.default_privacy`.
+
+## Multi-tenancy
+
+The bot is multi-tenant at the data layer. `conversations` carry
+`discord_guild_id`. `message_links` denormalizes it for guild-scoped
+analytics / cleanup. `user_privacy` and `guild_settings` are both
+keyed by guild_id. Other tables (turns, context_items, tool_calls)
+reach guild via `conversations` transitively.
+
 ## Coding Standards
 
 This project follows Chud's Rust style guide in `.claude/rust-style.md`.

@@ -38,5 +38,20 @@ server, the bot:
 5. On a new conversation, includes a link to the viewer where you can
    inspect what the model saw and what tools it ran.
 
-No database is used as the conversation memory — that lives entirely in
-Postgres. Discord is the I/O surface.
+## Privacy
+
+Per-guild and configurable at runtime via slash commands:
+
+- `/grok-privacy {in|out|status}` — per-user opt-in (Design 3).
+- `/grok-mode {show|set}` — admins choose the design for this guild
+  (one of `open`, `channel_only`, `opt_in`, `conversation_only`).
+
+The default for guilds with no explicit mode is `opt_in`. See `CLAUDE.md`
+for the four designs in detail.
+
+## Storage
+
+Everything lives in Postgres. Discord is just the I/O surface; no
+state is recovered from channel scrolling. The data layer is
+multi-tenant — every row reaches a `discord_guild_id`, so the bot can
+serve multiple servers from one instance.

@@ -39,6 +39,65 @@ pub struct Config {
     pub web: WebConfig,
     /// LLM provider selection and per-provider credentials.
     pub llm: LlmConfig,
+    /// Default [`PrivacyMode`] applied to guilds that don't have an
+    /// explicit row in `guild_settings` yet. Optional — defaults to
+    /// [`PrivacyMode::opt_in_default`]. Server admins can override per
+    /// guild at runtime via the `/grok-mode set` slash command.
+    #[serde(default = "PrivacyMode::opt_in_default")]
+    pub default_privacy: PrivacyMode,
+}
+
+/// Privacy / context-gathering policy. The four variants correspond to
+/// the four designs discussed by the group; default is `opt_in`
+/// (Design 3, the "privacy-maxxing opt-in" approach).
+///
+/// In all modes, the bot still sees:
+///   - the user's own `@<bot>` mention (they're addressing it directly);
+///   - prior turns of the same conversation reconstructed from the DB.
+///
+/// What varies is the *extra* context pulled from the surrounding
+/// channel:
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PrivacyMode {
+    /// **Design 1** — open. The bot bulk-fetches recent messages from
+    /// the channel each time it's mentioned, regardless of who sent
+    /// them. Best answers, least privacy.
+    Open {
+        /// Number of recent channel messages to include. Defaults to 20.
+        #[serde(default = "default_history_size")]
+        history_size: u32,
+    },
+    /// **Design 2** — channel-scoped. The bot only responds to mentions
+    /// inside `channel_id` and bulk-fetches history there. Mentions in
+    /// other channels are silently ignored.
+    ChannelOnly {
+        /// Discord channel id the bot is confined to.
+        channel_id: u64,
+        /// Number of recent channel messages to include. Defaults to 20.
+        #[serde(default = "default_history_size")]
+        history_size: u32,
+    },
+    /// **Design 3** — opt-in (default). Quoted messages (Discord
+    /// replies) are only included if their author has opted in via
+    /// `/grok-privacy-in`, or if the message lives in a Grok-owned
+    /// thread. No bulk channel history.
+    OptIn,
+    /// **Design 4** — conversation-only / privacy-maxxing. The bot only
+    /// sees the user's `@`-mention and prior turns of the same
+    /// conversation. Even Discord-reply-quoted messages are excluded.
+    ConversationOnly,
+}
+
+fn default_history_size() -> u32 {
+    20
+}
+
+impl PrivacyMode {
+    /// Default factory used by serde when `[privacy]` is omitted.
+    pub fn opt_in_default() -> Self {
+        Self::OptIn
+    }
 }
 
 /// Discord bot connection settings.
@@ -186,6 +245,39 @@ mod tests {
         assert_eq!(config.llm.provider, LlmProviderKind::Xai);
         assert_eq!(config.llm.xai.unwrap().model, "grok-4.1-fast");
         assert_eq!(config.web.listen, "0.0.0.0:8080");
+        assert!(matches!(config.default_privacy, PrivacyMode::OptIn));
+    }
+
+    #[test]
+    fn parse_channel_only_privacy() {
+        let toml = r#"
+            [discord]
+            token = "abc"
+
+            [postgres]
+            url = "postgres://localhost/grok"
+
+            [web]
+            base_url = "http://localhost:8080"
+
+            [llm]
+            provider = "xai"
+
+            [llm.xai]
+            api_key = "xai-key"
+
+            [default_privacy]
+            mode = "channel_only"
+            channel_id = 123456789
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        match config.default_privacy {
+            PrivacyMode::ChannelOnly { channel_id, history_size } => {
+                assert_eq!(channel_id, 123_456_789);
+                assert_eq!(history_size, 20);
+            }
+            _ => panic!("expected ChannelOnly"),
+        }
     }
 
     #[test]

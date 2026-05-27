@@ -31,3 +31,13 @@ api_key = "xai-..."
 api_key = "sk-ant-..."
 # Optional, defaults to "claude-sonnet-4-6".
 # model = "claude-opus-4-7"
+
+# Bootstrap default for the per-guild privacy mode. Once a guild's
+# admin runs `/grok-mode set`, the DB row takes over for that guild.
+# Variants:
+#   - { mode = "open", history_size = 20 }            # Design 1
+#   - { mode = "channel_only", channel_id = 123, history_size = 20 }  # Design 2
+#   - { mode = "opt_in" }                              # Design 3 (default)
+#   - { mode = "conversation_only" }                   # Design 4
+[default_privacy]
+mode = "opt_in"

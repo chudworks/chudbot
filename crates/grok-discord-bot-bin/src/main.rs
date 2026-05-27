@@ -6,6 +6,7 @@ use clap::{Parser, Subcommand};
 use grok_discord_bot_core::{AnyProvider, Config, Db};
 
 mod bot;
+mod commands;
 mod web;
 
 const VERSION: &str = env!("GIT_VERSION");
@@ -56,6 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 db,
                 llm,
                 config.web.base_url.clone(),
+                config.default_privacy.clone(),
             )
             .await?;
         }

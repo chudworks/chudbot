@@ -8,6 +8,7 @@ use sqlx::migrate::Migrator;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::config::PrivacyMode;
 use crate::domain::{ContextItem, Conversation, ConversationView, Turn, TurnView};
 use crate::llm::ToolCallRecord;
 
@@ -227,16 +228,19 @@ impl Db {
     pub async fn record_message_link(
         &self,
         discord_message_id: i64,
+        discord_guild_id: i64,
         conversation_id: Uuid,
         turn_id: Uuid,
         role: &str,
     ) -> Result<(), DbError> {
         sqlx::query(
-            "INSERT INTO message_links (discord_message_id, conversation_id, turn_id, role) \
-             VALUES ($1, $2, $3, $4) \
+            "INSERT INTO message_links \
+               (discord_message_id, discord_guild_id, conversation_id, turn_id, role) \
+             VALUES ($1, $2, $3, $4, $5) \
              ON CONFLICT (discord_message_id) DO NOTHING",
         )
         .bind(discord_message_id)
+        .bind(discord_guild_id)
         .bind(conversation_id)
         .bind(turn_id)
         .bind(role)
@@ -263,6 +267,116 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(turns)
+    }
+
+    /// Set a user's privacy preference for a specific guild. `true` =
+    /// opt in (Grok may see their messages as quoted-message context);
+    /// `false` = opt out (default; messages excluded from context).
+    /// Preferences are per-guild — a user can opt in on one server
+    /// without affecting their state on another.
+    pub async fn set_user_privacy(
+        &self,
+        discord_guild_id: i64,
+        discord_user_id: i64,
+        opted_in: bool,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO user_privacy \
+               (discord_guild_id, discord_user_id, opted_in, updated_at) \
+             VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (discord_guild_id, discord_user_id) DO UPDATE \
+               SET opted_in = EXCLUDED.opted_in, updated_at = now()",
+        )
+        .bind(discord_guild_id)
+        .bind(discord_user_id)
+        .bind(opted_in)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Look up a user's privacy preference for a guild. Returns
+    /// `Some(bool)` if the user has ever toggled it in that guild, or
+    /// `None` if no row exists (treated as opted-out by the bot).
+    pub async fn get_user_privacy(
+        &self,
+        discord_guild_id: i64,
+        discord_user_id: i64,
+    ) -> Result<Option<bool>, DbError> {
+        let row: Option<(bool,)> = sqlx::query_as(
+            "SELECT opted_in FROM user_privacy \
+             WHERE discord_guild_id = $1 AND discord_user_id = $2",
+        )
+        .bind(discord_guild_id)
+        .bind(discord_user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(b,)| b))
+    }
+
+    /// Convenience wrapper around [`Self::get_user_privacy`] that
+    /// returns the bot-effective answer: missing → false.
+    pub async fn user_opted_in(
+        &self,
+        discord_guild_id: i64,
+        discord_user_id: i64,
+    ) -> Result<bool, DbError> {
+        Ok(self
+            .get_user_privacy(discord_guild_id, discord_user_id)
+            .await?
+            .unwrap_or(false))
+    }
+
+    /// Get the privacy mode configured for a guild. Returns `None` if
+    /// no row exists — callers should fall back to the config-supplied
+    /// default in that case.
+    pub async fn get_guild_privacy_mode(
+        &self,
+        discord_guild_id: i64,
+    ) -> Result<Option<PrivacyMode>, DbError> {
+        let row: Option<(serde_json::Value,)> = sqlx::query_as(
+            "SELECT privacy_mode FROM guild_settings WHERE discord_guild_id = $1",
+        )
+        .bind(discord_guild_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some((value,)) => Ok(Some(serde_json::from_value(value)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Convenience: get the effective privacy mode, falling back to
+    /// `fallback` when no DB row exists.
+    pub async fn guild_privacy_mode_or(
+        &self,
+        discord_guild_id: i64,
+        fallback: &PrivacyMode,
+    ) -> Result<PrivacyMode, DbError> {
+        Ok(self
+            .get_guild_privacy_mode(discord_guild_id)
+            .await?
+            .unwrap_or_else(|| fallback.clone()))
+    }
+
+    /// Replace the guild's privacy mode (upsert).
+    pub async fn set_guild_privacy_mode(
+        &self,
+        discord_guild_id: i64,
+        mode: &PrivacyMode,
+    ) -> Result<(), DbError> {
+        let json = serde_json::to_value(mode)?;
+        sqlx::query(
+            "INSERT INTO guild_settings (discord_guild_id, privacy_mode, updated_at) \
+             VALUES ($1, $2, now()) \
+             ON CONFLICT (discord_guild_id) DO UPDATE \
+               SET privacy_mode = EXCLUDED.privacy_mode, updated_at = now()",
+        )
+        .bind(discord_guild_id)
+        .bind(json)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Aggregate read model for the web viewer.

@@ -69,11 +69,18 @@ CREATE INDEX tool_calls_turn_idx ON tool_calls (turn_id, ordinal);
 -- user prompts and bot replies) to its owning conversation. This is how
 -- we resolve "is this @mention continuing an existing conversation, or
 -- starting a new one?" without paging Discord history.
+--
+-- discord_guild_id is denormalized here so multi-tenant operations
+-- (e.g. "purge all data for guild X") can scope without traversing the
+-- conversation join. The PK stays on discord_message_id since Discord
+-- snowflakes are globally unique.
 CREATE TABLE message_links (
     discord_message_id  BIGINT PRIMARY KEY,
+    discord_guild_id    BIGINT NOT NULL,
     conversation_id     UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     turn_id             UUID NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
     role                TEXT NOT NULL
 );
 
 CREATE INDEX message_links_conversation_idx ON message_links (conversation_id);
+CREATE INDEX message_links_guild_idx ON message_links (discord_guild_id);
