@@ -336,7 +336,21 @@ async fn handle_message(state: Arc<State>, msg: Message) {
     if msg.author.bot {
         return;
     }
-    if !msg.mentions.iter().any(|u| u.id == state.bot_user_id) {
+
+    let is_mention = msg.mentions.iter().any(|u| u.id == state.bot_user_id);
+    if !is_mention {
+        // Log at DEBUG so `RUST_LOG=grok=debug` surfaces "we did
+        // receive this message but ignored it" diagnostics, which is
+        // crucial when triaging "the bot didn't respond" reports.
+        tracing::debug!(
+            channel = %msg.channel_id,
+            guild = ?msg.guild_id.map(|g| g.get()),
+            author = %msg.author.name,
+            mentioned_user_ids = ?msg.mentions.iter().map(|u| u.id.get()).collect::<Vec<_>>(),
+            bot_id = %state.bot_user_id,
+            content_preview = %msg.content.chars().take(80).collect::<String>(),
+            "ignoring message (bot not @-mentioned)"
+        );
         return;
     }
 
@@ -1931,6 +1945,22 @@ async fn post_reply_chunks(
                 .await?
                 .model()
                 .await?;
+            // Explicitly join the thread we just created. Despite the
+            // GUILD_MESSAGES intent technically covering public-thread
+            // messages, in practice MESSAGE_CREATE events for
+            // bot-created threads don't always flow until the bot is a
+            // thread member. Sending the reply below would also
+            // auto-add us, but we hit the join endpoint first so
+            // subsequent @mentions get delivered without waiting for
+            // the first post to land.
+            if let Err(err) = state.http.join_thread(thread.id).await {
+                tracing::warn!(
+                    error = %err,
+                    thread = %thread.id,
+                    "failed to join newly-created thread; in-thread \
+                     follow-ups may not be received"
+                );
+            }
             (thread.id, false)
         } else {
             (user_msg.channel_id, true)
