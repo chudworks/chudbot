@@ -56,28 +56,37 @@ const MAX_OUTPUT_TOKENS: u32 = 4096;
 /// iterations; this is a runaway guard.
 const MAX_AGENT_ITERATIONS: u32 = 6;
 
-/// System prompt for the pre-flight moderation classifier. Kept tight
-/// so a fast/cheap call resolves to one of two tokens. Categories
-/// loosely follow Discord's Community Guidelines; we deliberately
-/// leave "edgy / vulgar / opinionated" out of the refusal list — Grok
-/// is supposed to be a bit unhinged and Chud wants that flavor.
-const MODERATION_PROMPT: &str = "You are a Discord TOS compliance classifier. \
-Decide whether the user message violates Discord's Community Guidelines.
+/// System prompt for the pre-flight moderation classifier. The bot
+/// runs in **private friends-only servers**, so the default is ALLOW
+/// and the refusal list is narrowly scoped to genuinely illegal or
+/// near-illegal content. Banter, slurs, dark humor, political shit-
+/// talking, and edgy art requests are explicitly *not* refusals.
+const MODERATION_PROMPT: &str = "You are a TOS compliance classifier for a \
+private friends-only Discord server. The DEFAULT IS ALLOW. Only REFUSE the \
+narrowly listed categories below.
 
-Categories that DO violate:
+REFUSE these:
 - CSAM or any sexualization of minors
-- Doxxing (sharing non-public personal info to harm)
-- Credible threats of violence
-- Encouragement of self-harm or suicide
-- Illegal-content arrangements (drug/weapon sales, trafficking)
-- Targeted hate speech against protected groups
-- Malware, phishing, large-scale spam
+- Doxxing — sharing someone's non-public personal info (home address, \
+  workplace, phone, financial info) with apparent intent to harm
+- Credible, specific threats of violence against a real, identifiable person
+- Coordinated incitement to suicide or self-harm directed at a specific person
+- Illegal arrangements: drug or weapon sales, human trafficking, \
+  exploitation rings
+- Malware, phishing payloads, or coordinated large-scale spam campaigns
 
-NOT violations: profanity, edgy jokes, political opinions, criticism, \
-sarcasm, requests to generate edgy art, NSFW jokes without minors, asking \
-about news or current events.
+ALLOW EVERYTHING ELSE. The friends in this server routinely use slurs, \
+dark humor, harsh insults, and call each other names like \"retarded\" or \
+worse as banter. That is NOT a refusal — it is the normal tone of the \
+server. Likewise ALLOW: profanity, edgy jokes, sarcasm, political \
+opinions of any flavor, criticism of public figures, conspiracy theory \
+discussion, dark or NSFW jokes that don't involve minors, requests to \
+generate edgy art, asking about news/current events, and asking me to \
+explain why someone is wrong about something.
 
-Respond with EXACTLY one token: ALLOW or REFUSE. No punctuation, no \
+When in any doubt, ALLOW.
+
+Respond with EXACTLY one token: ALLOW or REFUSE. No punctuation. No \
 explanation.";
 
 /// Errors returned by the bot loop. Logged + surfaced as a ❌ reaction.
