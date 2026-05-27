@@ -1056,10 +1056,20 @@ fn start_video_generation_tool() -> ToolDefinition {
     ToolDefinition {
         name: "start_video_generation".to_string(),
         description: "Begin generating a short video with xAI's Grok Imagine \
-Video model. Returns immediately with a `request_id` — the video is NOT yet \
-ready. Follow this up with `check_video_status` polls (typically 2-4 of them, \
-spaced ~15-30s apart) until status=done. Use post_status_message between \
-checks to keep the user informed.
+Video model. Returns IMMEDIATELY with a `request_id` — the video is NOT \
+ready yet. You MUST then poll with `check_video_status` until status=done. \
+Typical render time is **60-120 seconds total**, requiring 3-6 polls.
+
+REQUIRED follow-up pattern after calling this:
+1. Write a brief natural-language status to the user (\"Working on it, \
+   takes a minute or so…\") — this goes through as a Discord reply.
+2. Call check_video_status with wait_seconds=25 or 30.
+3. If status is 'pending', call check_video_status AGAIN (and again, and \
+   again) until status='done' or 'failed'. Do NOT emit a final answer \
+   while the video is still pending — that abandons the job from the \
+   user's perspective and they get nothing.
+4. Once status='done', the video_uri will auto-attach to your final \
+   reply. Write a short final message; the bot attaches the file.
 
 For image-to-video, pass an EXACT image URL in `image_url` (same rules as \
 generate_image — never invent paths). Max duration 15s. 480p is cheap; 720p \
@@ -1095,16 +1105,22 @@ costs more."
 fn check_video_status_tool() -> ToolDefinition {
     ToolDefinition {
         name: "check_video_status".to_string(),
-        description: "Poll a previously-submitted video generation job. \
-Returns the current status: 'pending' (still rendering), 'done' (URI \
-returned in `video_uri`), 'failed' (with error), or 'expired'. The \
-`wait_seconds` parameter (default 15, max 30) lets you sleep before polling \
-to space out checks without burning agent iterations.
+        description: "Poll a previously-submitted video generation job.
 
-When status=done, the bot will automatically attach the video to your \
-final reply — DO NOT include placeholder text like \"[video attached]\", \
-\"(see attached)\", or link to the URI in your reply. Just write naturally; \
-the user sees the actual video file under your message."
+Returns one of:
+- 'pending' — STILL rendering. You MUST call check_video_status again \
+  (after another wait_seconds=25-30 sleep). Videos typically need 3-6 \
+  polls totaling ~60-120s. DO NOT emit a final answer while pending — \
+  the user will get nothing. Just keep polling.
+- 'done' — the URI is in `video_uri`. The bot auto-attaches it to your \
+  final reply. Write a short natural message; do NOT include placeholders \
+  like \"[video attached]\", \"(see attached)\", or link to the URI.
+- 'failed' or 'expired' — the job is dead. Tell the user briefly that it \
+  failed and stop.
+
+`wait_seconds` (default 15, max 30) sleeps before polling so you don't \
+burn agent iterations on rapid-fire empty checks. Pick 25-30 for video \
+gen; smaller for quick post-mortems."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -1474,7 +1490,7 @@ impl BotToolExecutor {
         Ok(json!({
             "request_id": request_id,
             "status": "pending",
-            "hint": "Call check_video_status with this request_id (wait_seconds=15-30) until status becomes 'done'. Post a status message to the user explaining you're generating a video.",
+            "hint": "Video submitted. Required next steps: (1) write a brief natural status to the user, (2) call check_video_status with wait_seconds=25, (3) KEEP calling check_video_status until status='done' — typically takes 3-6 polls and 60-120 seconds total. Do NOT give up after one pending response.",
         }))
     }
 
@@ -1514,7 +1530,7 @@ impl BotToolExecutor {
                 Ok(json!({
                     "request_id": request_id,
                     "status": "pending",
-                    "hint": "Not done yet. Call check_video_status again after another wait_seconds.",
+                    "hint": "Still rendering. You MUST call check_video_status again with the same request_id (wait_seconds=25 is fine). DO NOT emit a final answer yet — that abandons the video and the user gets nothing. Polling 3-6 times over 60-120s is normal.",
                 }))
             }
             JobStatus::Done(video) => {
