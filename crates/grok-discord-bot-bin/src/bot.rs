@@ -24,7 +24,7 @@ use grok_discord_bot_core::{
     ToolDefinition, ToolError, ToolExecutor, TurnBlock,
     imagegen::{ImageGenRequest, ImageGenerator, ImageQuality},
     run_agent, storage,
-    videogen::{JobStatus, VideoGenRequest, VideoGenerator, VideoResolution},
+    videogen::{VideoGenRequest, VideoGenerator, VideoResolution},
 };
 use uuid::Uuid;
 use serde::Serialize;
@@ -42,7 +42,6 @@ use twilight_model::id::Id;
 use twilight_model::id::marker::{
     ApplicationMarker, ChannelMarker, GuildMarker, MessageMarker, UserMarker,
 };
-use std::time::Duration;
 
 use crate::commands;
 
@@ -55,16 +54,9 @@ const REPLY_LENGTH_THRESHOLD: usize = 1500;
 /// `max_tokens`; xAI tolerates an unused field.
 const MAX_OUTPUT_TOKENS: u32 = 4096;
 
-/// Safety cap on the agent's tool-use loop. Bumped from a previous 6
-/// to leave headroom for video generation: the model often does
-/// `start_video_generation` → a couple of `check_video_status` polls →
-/// `post_status_message` → final answer, which is 5+ iterations.
-const MAX_AGENT_ITERATIONS: u32 = 12;
-
-/// Hard cap on how long `check_video_status` will sleep inside one
-/// tool call before polling. Bigger means fewer agent iterations per
-/// video but blocks the request handler longer.
-const MAX_CHECK_WAIT_SECS: u64 = 30;
+/// Safety cap on the agent's tool-use loop. Most turns finish in 1-3
+/// iterations; this is a runaway guard.
+const MAX_AGENT_ITERATIONS: u32 = 8;
 
 /// Discord free-tier upload size cap. Files larger than this are
 /// linked rather than attached (avoids a Discord-side reject).
@@ -634,15 +626,13 @@ async fn process(
     // been refused. We do this BEFORE the generic media-failed path so
     // a safety 403 doesn't get a ❌ + warning-text reply.
     let media_safety_refused = agent_run.tool_calls.iter().any(|tc| {
-        matches!(
-            tc.tool_name.as_str(),
-            "generate_image" | "start_video_generation" | "check_video_status"
-        ) && tc
-            .response
-            .get("error")
-            .and_then(|v| v.as_str())
-            .map(body_indicates_safety_refusal)
-            .unwrap_or(false)
+        matches!(tc.tool_name.as_str(), "generate_image" | "generate_video")
+            && tc
+                .response
+                .get("error")
+                .and_then(|v| v.as_str())
+                .map(body_indicates_safety_refusal)
+                .unwrap_or(false)
     });
     if media_safety_refused {
         tracing::info!(
@@ -671,16 +661,17 @@ async fn process(
     let attempted_video_gen = agent_run
         .tool_calls
         .iter()
-        .any(|tc| tc.tool_name == "start_video_generation");
+        .any(|tc| tc.tool_name == "generate_video");
     let image_gen_failed = attempted_image_gen
         && !agent_run
             .tool_calls
             .iter()
             .any(|tc| tc.tool_name == "generate_image" && tc.response.get("image_uri").is_some());
     let video_gen_failed = attempted_video_gen
-        && !agent_run.tool_calls.iter().any(|tc| {
-            tc.tool_name == "check_video_status" && tc.response.get("video_uri").is_some()
-        });
+        && !agent_run
+            .tool_calls
+            .iter()
+            .any(|tc| tc.tool_name == "generate_video" && tc.response.get("video_uri").is_some());
     let media_gen_failed = image_gen_failed || video_gen_failed;
     let failure_label = match (image_gen_failed, video_gen_failed) {
         (true, true) => "Image and video generation",
@@ -1010,8 +1001,7 @@ fn build_tool_definitions(
         tools.push(generate_image_tool());
     }
     if video_gen_available {
-        tools.push(start_video_generation_tool());
-        tools.push(check_video_status_tool());
+        tools.push(generate_video_tool());
     }
     // Status messages aren't a tool — the model just writes
     // intermediate prose alongside its tool_uses and the bot's
@@ -1052,28 +1042,27 @@ from the current channel."
     }
 }
 
-fn start_video_generation_tool() -> ToolDefinition {
+fn generate_video_tool() -> ToolDefinition {
     ToolDefinition {
-        name: "start_video_generation".to_string(),
-        description: "Begin generating a short video with xAI's Grok Imagine \
-Video model. Returns IMMEDIATELY with a `request_id` — the video is NOT \
-ready yet. You MUST then poll with `check_video_status` until status=done. \
-Typical render time is **60-120 seconds total**, requiring 3-6 polls.
+        name: "generate_video".to_string(),
+        description: "Generate a short video with xAI's Grok Imagine Video \
+model. This is a SYNCHRONOUS call — it submits the job, polls until done, \
+and returns the saved video URI. Typical wait is ~60-120 seconds; the bot \
+handles the polling internally, you just await the result.
 
-REQUIRED follow-up pattern after calling this:
-1. Write a brief natural-language status to the user (\"Working on it, \
-   takes a minute or so…\") — this goes through as a Discord reply.
-2. Call check_video_status with wait_seconds=25 or 30.
-3. If status is 'pending', call check_video_status AGAIN (and again, and \
-   again) until status='done' or 'failed'. Do NOT emit a final answer \
-   while the video is still pending — that abandons the job from the \
-   user's perspective and they get nothing.
-4. Once status='done', the video_uri will auto-attach to your final \
-   reply. Write a short final message; the bot attaches the file.
+Best practice: emit a brief natural-language status message ALONGSIDE this \
+tool call (e.g. \"Working on your video — takes about a minute…\"). That \
+text reaches the user immediately as a Discord reply, then the tool blocks \
+until the video is ready.
+
+When the call returns successfully, the bot auto-attaches the video to \
+your final reply. DO NOT include placeholders like \"[video attached]\", \
+\"(see attached)\", or link to the URI — just write a short natural message; \
+the user sees the actual video file under it.
 
 For image-to-video, pass an EXACT image URL in `image_url` (same rules as \
-generate_image — never invent paths). Max duration 15s. 480p is cheap; 720p \
-costs more."
+generate_image — never invent paths). Max duration 15s. 480p is cheap; \
+720p costs more."
             .to_string(),
         input_schema: json!({
             "type": "object",
@@ -1095,46 +1084,6 @@ costs more."
                 "resolution": {
                     "enum": ["480p", "720p"],
                     "description": "Defaults to 480p (cheaper)."
-                }
-            },
-            "additionalProperties": false
-        }),
-    }
-}
-
-fn check_video_status_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: "check_video_status".to_string(),
-        description: "Poll a previously-submitted video generation job.
-
-Returns one of:
-- 'pending' — STILL rendering. You MUST call check_video_status again \
-  (after another wait_seconds=25-30 sleep). Videos typically need 3-6 \
-  polls totaling ~60-120s. DO NOT emit a final answer while pending — \
-  the user will get nothing. Just keep polling.
-- 'done' — the URI is in `video_uri`. The bot auto-attaches it to your \
-  final reply. Write a short natural message; do NOT include placeholders \
-  like \"[video attached]\", \"(see attached)\", or link to the URI.
-- 'failed' or 'expired' — the job is dead. Tell the user briefly that it \
-  failed and stop.
-
-`wait_seconds` (default 15, max 30) sleeps before polling so you don't \
-burn agent iterations on rapid-fire empty checks. Pick 25-30 for video \
-gen; smaller for quick post-mortems."
-            .to_string(),
-        input_schema: json!({
-            "type": "object",
-            "required": ["request_id"],
-            "properties": {
-                "request_id": {
-                    "type": "string",
-                    "description": "The id returned by start_video_generation."
-                },
-                "wait_seconds": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 30,
-                    "description": "Sleep this many seconds before polling. Default 15."
                 }
             },
             "additionalProperties": false
@@ -1215,8 +1164,7 @@ impl ToolExecutor for BotToolExecutor {
         match name {
             "fetch_messages" => self.fetch_messages(input).await,
             "generate_image" => self.generate_image(input).await,
-            "start_video_generation" => self.start_video_generation(input).await,
-            "check_video_status" => self.check_video_status(input).await,
+            "generate_video" => self.generate_video(input).await,
             other => Err(ToolError::Unknown(other.to_string())),
         }
     }
@@ -1433,7 +1381,13 @@ impl BotToolExecutor {
         }))
     }
 
-    async fn start_video_generation(&self, input: Value) -> Result<Value, ToolError> {
+    /// Generate a video synchronously: submit + poll + download
+    /// happen inside the tool call. The tool blocks for ~60-120s;
+    /// the agent loop sees one tool call go in and one result come
+    /// out. Status messages reach the user via the model's natural
+    /// partial_text alongside this call (which the AgentObserver
+    /// posts as a Discord reply), not via a separate polling tool.
+    async fn generate_video(&self, input: Value) -> Result<Value, ToolError> {
         let Some(generator) = self.video_gen.as_ref() else {
             return Err(ToolError::Execution(
                 "video generation isn't configured on this bot".to_string(),
@@ -1469,111 +1423,85 @@ impl BotToolExecutor {
             resolution,
         };
 
+        // Submit, record the row, then poll-and-download in one
+        // generator.generate() call. State is persisted: the
+        // video_jobs row exists from the moment xAI returns
+        // request_id, so a bot crash mid-poll leaves the request
+        // discoverable for a future restart-resume.
         let request_id = generator
             .submit(&req)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
-
         let job = self
             .db
             .create_video_job(self.turn_id, &request_id, &prompt)
             .await
             .map_err(|e| ToolError::Execution(format!("db: {e}")))?;
-
         tracing::info!(
             request_id = %request_id,
             job_id = %job.id,
             turn = %self.turn_id,
-            "videogen: job submitted and persisted"
+            "videogen: job submitted and persisted; polling inline"
+        );
+
+        // Poll-until-done using the lower-level primitives so we can
+        // update the DB row on terminal transitions without
+        // rebuilding the whole loop.
+        let video_meta = loop {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            let status = generator
+                .check_once(&request_id)
+                .await
+                .map_err(|e| ToolError::Execution(e.to_string()))?;
+            match status {
+                grok_discord_bot_core::videogen::JobStatus::Pending => continue,
+                grok_discord_bot_core::videogen::JobStatus::Done(meta) => break meta,
+                grok_discord_bot_core::videogen::JobStatus::Failed(msg) => {
+                    self.db
+                        .update_video_job_status(&request_id, "failed", None, Some(&msg))
+                        .await
+                        .ok();
+                    return Err(ToolError::Execution(format!(
+                        "video generation failed: {msg}"
+                    )));
+                }
+                grok_discord_bot_core::videogen::JobStatus::Expired => {
+                    self.db
+                        .update_video_job_status(&request_id, "expired", None, Some("expired"))
+                        .await
+                        .ok();
+                    return Err(ToolError::Execution(
+                        "video generation job expired".to_string(),
+                    ));
+                }
+            }
+        };
+
+        let bytes = generator
+            .download_bytes(&video_meta.url)
+            .await
+            .map_err(|e| ToolError::Execution(e.to_string()))?;
+        let extension = extension_from_video_url(&video_meta.url);
+        let uri = storage::save_video_bytes(&bytes, extension, &self.videos_dir)
+            .await
+            .map_err(|e| ToolError::Execution(format!("save: {e}")))?;
+        self.db
+            .update_video_job_status(&request_id, "done", Some(&uri), None)
+            .await
+            .map_err(|e| ToolError::Execution(format!("db: {e}")))?;
+
+        tracing::info!(
+            request_id = %request_id,
+            uri = %uri,
+            bytes = bytes.len(),
+            "videogen: completed and persisted"
         );
 
         Ok(json!({
             "request_id": request_id,
-            "status": "pending",
-            "hint": "Video submitted. Required next steps: (1) write a brief natural status to the user, (2) call check_video_status with wait_seconds=25, (3) KEEP calling check_video_status until status='done' — typically takes 3-6 polls and 60-120 seconds total. Do NOT give up after one pending response.",
+            "video_uri": uri,
+            "duration_seconds": video_meta.duration.unwrap_or(0.0),
         }))
-    }
-
-    async fn check_video_status(&self, input: Value) -> Result<Value, ToolError> {
-        let Some(generator) = self.video_gen.as_ref() else {
-            return Err(ToolError::Execution(
-                "video generation isn't configured on this bot".to_string(),
-            ));
-        };
-        let request_id = input
-            .get("request_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::InvalidInput("request_id is required".to_string()))?
-            .to_string();
-        let wait_secs = input
-            .get("wait_seconds")
-            .and_then(Value::as_u64)
-            .unwrap_or(15)
-            .min(MAX_CHECK_WAIT_SECS);
-
-        if wait_secs > 0 {
-            tracing::info!(request_id = %request_id, wait_secs, "videogen: sleeping before poll");
-            tokio::time::sleep(Duration::from_secs(wait_secs)).await;
-        }
-
-        let status = generator
-            .check_once(&request_id)
-            .await
-            .map_err(|e| ToolError::Execution(e.to_string()))?;
-
-        match status {
-            JobStatus::Pending => {
-                self.db
-                    .update_video_job_status(&request_id, "pending", None, None)
-                    .await
-                    .ok();
-                Ok(json!({
-                    "request_id": request_id,
-                    "status": "pending",
-                    "hint": "Still rendering. You MUST call check_video_status again with the same request_id (wait_seconds=25 is fine). DO NOT emit a final answer yet — that abandons the video and the user gets nothing. Polling 3-6 times over 60-120s is normal.",
-                }))
-            }
-            JobStatus::Done(video) => {
-                let bytes = generator
-                    .download_bytes(&video.url)
-                    .await
-                    .map_err(|e| ToolError::Execution(e.to_string()))?;
-                let extension = extension_from_video_url(&video.url);
-                let uri = storage::save_video_bytes(&bytes, extension, &self.videos_dir)
-                    .await
-                    .map_err(|e| ToolError::Execution(format!("save: {e}")))?;
-                self.db
-                    .update_video_job_status(&request_id, "done", Some(&uri), None)
-                    .await
-                    .map_err(|e| ToolError::Execution(format!("db: {e}")))?;
-                tracing::info!(
-                    request_id = %request_id,
-                    uri = %uri,
-                    bytes = bytes.len(),
-                    "videogen: completed and persisted"
-                );
-                Ok(json!({
-                    "request_id": request_id,
-                    "status": "done",
-                    "video_uri": uri,
-                    "duration_seconds": video.duration.unwrap_or(0.0),
-                }))
-            }
-            JobStatus::Failed(msg) => {
-                self.db
-                    .update_video_job_status(&request_id, "failed", None, Some(&msg))
-                    .await
-                    .ok();
-                Err(ToolError::Execution(format!("video generation failed: {msg}")))
-            }
-            JobStatus::Expired => {
-                self.db
-                    .update_video_job_status(&request_id, "expired", None, Some("expired"))
-                    .await
-                    .ok();
-                Err(ToolError::Execution("video generation job expired".to_string()))
-            }
-        }
     }
 
     /// Returns true if the message's content should be visible to the
@@ -1681,7 +1609,7 @@ async fn collect_generated_attachments(
     for (i, call) in tool_calls.iter().enumerate() {
         let (uri_field, dir, fallback_filename) = match call.tool_name.as_str() {
             "generate_image" => ("image_uri", images_dir, format!("image-{i}.png")),
-            "check_video_status" => ("video_uri", videos_dir, format!("video-{i}.mp4")),
+            "generate_video" => ("video_uri", videos_dir, format!("video-{i}.mp4")),
             _ => continue,
         };
         let Some(uri) = call.response.get(uri_field).and_then(Value::as_str) else {
@@ -1949,12 +1877,7 @@ mod tests {
         // OptIn + image + video keys: full client toolset.
         assert_eq!(
             names(&PrivacyMode::OptIn, true, true),
-            vec![
-                "fetch_messages",
-                "generate_image",
-                "start_video_generation",
-                "check_video_status",
-            ]
+            vec!["fetch_messages", "generate_image", "generate_video"]
         );
 
         // ConversationOnly drops fetch_messages and nothing else
