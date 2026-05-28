@@ -34,7 +34,7 @@ use thiserror::Error;
 use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
 use twilight_http::Client as HttpClient;
 use twilight_http::request::channel::reaction::RequestReactionType;
-use twilight_model::channel::Message;
+use twilight_model::channel::{ChannelType, Message};
 use twilight_model::channel::message::MessageFlags;
 use twilight_model::gateway::event::Event;
 use twilight_model::gateway::payload::incoming::GuildCreate;
@@ -545,6 +545,11 @@ async fn process(
         .guild_id
         .map(|g| i64::try_from(g.get()).unwrap_or(i64::MAX));
     let channel_id_i64 = i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
+    // For channel-scoped persona lookups, threads roll up to their
+    // parent channel — operators set the override on the channel they
+    // can see, not on individual auto-opened threads.
+    let persona_channel_id = parent_channel_id(&state.http, msg.channel_id).await;
+    let persona_channel_id_i64 = i64::try_from(persona_channel_id.get()).unwrap_or(i64::MAX);
     let user_id_i64 = i64::try_from(msg.author.id.get()).unwrap_or(i64::MAX);
 
     let resolved_persona_name = state
@@ -552,7 +557,7 @@ async fn process(
         .resolve_persona(
             conversation_id_for_persona,
             guild_id_for_persona,
-            channel_id_i64,
+            persona_channel_id_i64,
             user_id_i64,
         )
         .await?
@@ -969,6 +974,32 @@ async fn process(
         )));
     }
     Ok(())
+}
+
+/// Map a Discord channel id to the "user-facing" channel id that
+/// persona selections key off of. For threads, that's the parent
+/// channel — operators set `/grok-persona scope:channel` expecting it
+/// to apply to the visible channel and all threads under it. For
+/// non-thread channels, it's the channel itself.
+///
+/// Falls back to the raw channel id on any lookup error so we never
+/// block a turn on a transient Discord API hiccup.
+async fn parent_channel_id(
+    http: &HttpClient,
+    channel_id: Id<ChannelMarker>,
+) -> Id<ChannelMarker> {
+    let Ok(resp) = http.channel(channel_id).await else {
+        return channel_id;
+    };
+    let Ok(channel) = resp.model().await else {
+        return channel_id;
+    };
+    match channel.kind {
+        ChannelType::AnnouncementThread
+        | ChannelType::PublicThread
+        | ChannelType::PrivateThread => channel.parent_id.unwrap_or(channel_id),
+        _ => channel_id,
+    }
 }
 
 /// Look up whether this @mention extends an existing conversation,

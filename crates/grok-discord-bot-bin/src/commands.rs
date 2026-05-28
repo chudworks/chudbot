@@ -22,6 +22,7 @@ use twilight_model::application::interaction::application_command::{
     CommandData, CommandDataOption, CommandOptionValue,
 };
 use twilight_model::application::interaction::{Interaction, InteractionData};
+use twilight_model::channel::ChannelType;
 use twilight_model::channel::message::MessageFlags;
 use twilight_model::guild::Permissions;
 use twilight_model::http::interaction::{InteractionResponse, InteractionResponseType};
@@ -388,15 +389,27 @@ async fn handle_persona_show(
     let guild_id = interaction
         .guild_id
         .map(|g| i64::try_from(g.get()).unwrap_or(i64::MAX));
-    let channel_id = interaction
+    // The raw channel id is the thread the user is sitting in (when in
+    // a thread), used to resolve which conversation they're in. The
+    // parent channel id is what `channel`-scope overrides key off of.
+    let raw_channel_id = interaction
         .channel
         .as_ref()
         .map(|c| i64::try_from(c.id.get()).unwrap_or(i64::MAX));
+    let channel_id = interaction.channel.as_ref().map(|c| {
+        let effective = match c.kind {
+            ChannelType::AnnouncementThread
+            | ChannelType::PublicThread
+            | ChannelType::PrivateThread => c.parent_id.unwrap_or(c.id),
+            _ => c.id,
+        };
+        i64::try_from(effective.get()).unwrap_or(i64::MAX)
+    });
     let user_id = interaction
         .author()
         .map(|u| i64::try_from(u.id.get()).unwrap_or(i64::MAX));
 
-    let conversation_id = match channel_id {
+    let conversation_id = match raw_channel_id {
         Some(cid) => db.lookup_conversation_by_message(cid).await.ok().flatten(),
         None => None,
     };
@@ -620,7 +633,16 @@ async fn build_scope_key(
             if enforce_admin && !interaction_is_admin(interaction) {
                 return Err("Channel-scoped persona requires admin privileges.".into());
             }
-            Ok(i64::try_from(channel.id.get()).unwrap_or(i64::MAX).to_string())
+            // Threads roll up to their parent channel — the operator
+            // expects /grok-persona scope:channel to apply to the
+            // channel they can see, not to one ephemeral thread.
+            let effective_id = match channel.kind {
+                ChannelType::AnnouncementThread
+                | ChannelType::PublicThread
+                | ChannelType::PrivateThread => channel.parent_id.unwrap_or(channel.id),
+                _ => channel.id,
+            };
+            Ok(i64::try_from(effective_id.get()).unwrap_or(i64::MAX).to_string())
         }
         "guild" => {
             let Some(guild_id) = interaction.guild_id else {
