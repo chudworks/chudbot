@@ -39,7 +39,7 @@ enum Cmd {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
     // Pin rustls' crypto provider before any TLS work. Several crates
     // in the tree (sqlx, reqwest, twilight, rustls-platform-verifier)
     // each enable rustls with potentially different provider features,
@@ -58,6 +58,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "grok-discord-bot starting"
     );
 
+    match run(args).await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            report_error(&*e);
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Pretty-print an error and its full source chain to stderr. The first
+/// line carries the top-level Display; each `source()` link below is
+/// indented by two spaces, which preserves the column alignment of
+/// multi-line messages like `toml::de::Error`'s arrow diagrams.
+fn report_error(e: &(dyn std::error::Error + 'static)) {
+    eprintln!("Error: {e}");
+    let mut src = e.source();
+    while let Some(s) = src {
+        eprintln!();
+        eprintln!("Caused by:");
+        for line in s.to_string().lines() {
+            eprintln!("  {line}");
+        }
+        src = s.source();
+    }
+}
+
+async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(&args.config)?;
 
     match args.cmd {

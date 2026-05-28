@@ -28,7 +28,7 @@ use crate::llm::{AnthropicOptions, XaiOptions};
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// File could not be opened or read.
-    #[error("could not read config file at {path}: {source}")]
+    #[error("could not read config file at {}", path.display())]
     Read {
         /// Path that was attempted.
         path: PathBuf,
@@ -37,8 +37,17 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     /// Contents could not be parsed as TOML or did not match the schema.
-    #[error("could not parse config file: {0}")]
-    Parse(#[from] toml::de::Error),
+    /// The underlying [`toml::de::Error`] is the source so its
+    /// line/column-aware Display gets surfaced by the chain walker in the
+    /// binary's error reporter.
+    #[error("could not parse config file {}", path.display())]
+    Parse {
+        /// Path that was being parsed.
+        path: PathBuf,
+        /// Underlying parse error from the `toml` crate.
+        #[source]
+        source: toml::de::Error,
+    },
     /// `default_persona` doesn't name a persona in `[personas.*]`.
     #[error("default_persona = `{0}` is not defined in [personas.*]")]
     UnknownDefaultPersona(String),
@@ -402,7 +411,10 @@ impl Config {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let config: Config = toml::from_str(&contents)?;
+        let config: Config = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
         config.validate()?;
         Ok(config)
     }
