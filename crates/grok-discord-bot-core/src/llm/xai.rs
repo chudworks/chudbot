@@ -13,6 +13,8 @@
 //! - `x_search`   — X / Twitter search; Grok's distinctive grounding
 //!   surface, included for free alongside web_search.
 
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -107,6 +109,7 @@ impl LlmProvider for XaiProvider {
         // request is rebuilt each attempt (`.json` serializes eagerly, so
         // the future owns its body and borrows nothing across awaits).
         let url = format!("{}/responses", self.base_url);
+        let started = Instant::now();
         let resp =
             crate::retry::with_retry(crate::retry::RetryPolicy::default(), "llm[xai]", || {
                 let req = self.http.post(&url).bearer_auth(&self.api_key).json(&body);
@@ -132,8 +135,15 @@ impl LlmProvider for XaiProvider {
             .json()
             .await
             .map_err(|e| LlmError::Decode(e.to_string()))?;
+        let elapsed = started.elapsed();
 
         let model_id = parsed.model.unwrap_or_else(|| request.model.clone());
+
+        // One INFO event per Responses API request, carrying token usage
+        // (incl. `cached_tokens` — xAI's cache hit/miss signal), cost, and
+        // wall-clock latency (retries included). See `log_usage`.
+        log_usage(&model_id, parsed.usage.as_ref(), elapsed);
+
         let (text, tool_uses, server_tool_calls, reasoning_items) =
             walk_output(&parsed.output, parsed.citations.as_ref());
         // The opaque reasoning items, as a JSON array, to carry forward and
@@ -392,6 +402,47 @@ fn walk_output(
     (text, tool_uses, server_calls, reasoning_items)
 }
 
+/// Emit a single INFO-level usage + timing event for one Responses API
+/// request. Token counts and cost come from the response's `usage`
+/// block; `cached_tokens` is the cache hit/miss signal xAI documents.
+///
+/// `usage` is taken as a raw [`Value`] (rather than a typed field on
+/// [`ResponsesResponse`]) on purpose: a schema change in the usage
+/// object degrades to a `warn` log here instead of failing the whole
+/// response decode and dropping the model's answer.
+fn log_usage(model: &str, usage: Option<&Value>, elapsed: Duration) {
+    // Milliseconds fit comfortably in u64; cast keeps tracing on a
+    // primitive Value type (it doesn't take u128).
+    let duration_ms = elapsed.as_millis() as u64;
+    match usage.map(|u| serde_json::from_value::<Usage>(u.clone())) {
+        Some(Ok(u)) => tracing::info!(
+            target: "xai_usage",
+            model = %model,
+            input_tokens = u.input_tokens,
+            cached_tokens = u.input_tokens_details.cached_tokens,
+            output_tokens = u.output_tokens,
+            reasoning_tokens = u.output_tokens_details.reasoning_tokens,
+            total_tokens = u.total_tokens,
+            cost_in_usd_ticks = u.cost_in_usd_ticks,
+            duration_ms,
+            "xai: responses request complete",
+        ),
+        Some(Err(e)) => tracing::warn!(
+            target: "xai_usage",
+            model = %model,
+            duration_ms,
+            error = %e,
+            "xai: responses request complete; could not parse usage block",
+        ),
+        None => tracing::info!(
+            target: "xai_usage",
+            model = %model,
+            duration_ms,
+            "xai: responses request complete; no usage block reported",
+        ),
+    }
+}
+
 /// Responses-API `include` value requesting the model's reasoning be
 /// returned as an encrypted, opaque blob (so it can be replayed verbatim
 /// without us storing plaintext chain-of-thought).
@@ -430,6 +481,42 @@ struct ResponsesResponse {
     citations: Option<Value>,
     #[serde(default)]
     model: Option<String>,
+    /// Raw `usage` block, parsed leniently in `log_usage` so a schema
+    /// drift can't fail the surrounding response decode.
+    #[serde(default)]
+    usage: Option<Value>,
+}
+
+/// Token usage + cost from a Responses API reply; field names mirror
+/// xAI's `usage` object. Every field defaults, so a partial or older
+/// usage block (e.g. a non-reasoning, uncached reply that omits the
+/// detail sub-objects) still parses cleanly.
+#[derive(Deserialize, Debug, Default)]
+struct Usage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    input_tokens_details: TokenDetails,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    output_tokens_details: TokenDetails,
+    #[serde(default)]
+    total_tokens: u64,
+    #[serde(default)]
+    cost_in_usd_ticks: u64,
+}
+
+/// The `*_tokens_details` sub-objects. `cached_tokens` lives under
+/// `input_tokens_details` (the cache-hit signal); `reasoning_tokens`
+/// under `output_tokens_details`. One struct covers both — the field
+/// that's absent for a given side simply stays at its default.
+#[derive(Deserialize, Debug, Default)]
+struct TokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+    #[serde(default)]
+    reasoning_tokens: u64,
 }
 
 #[cfg(test)]
@@ -662,6 +749,56 @@ mod tests {
         assert_eq!(input[1]["encrypted_content"], "BLOB");
         assert_eq!(input[2]["role"], "assistant");
         assert_eq!(input[2]["content"], "the answer");
+    }
+
+    #[test]
+    fn parses_usage_block_from_responses_reply() {
+        // Mirrors the `usage` object xAI returns (see example_xai_response.json).
+        let usage = json!({
+            "input_tokens": 153,
+            "input_tokens_details": { "cached_tokens": 128 },
+            "output_tokens": 602,
+            "output_tokens_details": { "reasoning_tokens": 303 },
+            "total_tokens": 755,
+            "num_sources_used": 0,
+            "num_server_side_tools_used": 0,
+            "cost_in_usd_ticks": 15618500,
+            "context_details": { "input_tokens": 153, "output_tokens": 602 }
+        });
+        let u: Usage = serde_json::from_value(usage).unwrap();
+        assert_eq!(u.input_tokens, 153);
+        assert_eq!(u.input_tokens_details.cached_tokens, 128);
+        assert_eq!(u.output_tokens, 602);
+        assert_eq!(u.output_tokens_details.reasoning_tokens, 303);
+        assert_eq!(u.total_tokens, 755);
+        assert_eq!(u.cost_in_usd_ticks, 15618500);
+    }
+
+    #[test]
+    fn usage_block_tolerates_missing_fields() {
+        // A non-reasoning, uncached reply may omit the detail sub-objects
+        // and cost entirely; every field must still default to zero.
+        let usage = json!({ "input_tokens": 10, "output_tokens": 20, "total_tokens": 30 });
+        let u: Usage = serde_json::from_value(usage).unwrap();
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.input_tokens_details.cached_tokens, 0);
+        assert_eq!(u.output_tokens_details.reasoning_tokens, 0);
+        assert_eq!(u.cost_in_usd_ticks, 0);
+    }
+
+    #[test]
+    fn responses_response_carries_usage_value() {
+        // The `usage` block survives onto ResponsesResponse as a raw Value
+        // for lenient parsing in `log_usage`.
+        let body = json!({
+            "model": "grok-4.3",
+            "output": [],
+            "usage": { "input_tokens": 1, "total_tokens": 2 }
+        });
+        let parsed: ResponsesResponse = serde_json::from_value(body).unwrap();
+        let u: Usage = serde_json::from_value(parsed.usage.unwrap()).unwrap();
+        assert_eq!(u.input_tokens, 1);
+        assert_eq!(u.total_tokens, 2);
     }
 
     #[test]
