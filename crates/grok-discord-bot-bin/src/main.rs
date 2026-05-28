@@ -161,6 +161,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         default_privacy: config.default_privacy,
         web_base_url: config.web.base_url,
         web_frontend_dir: config.web.frontend_dir,
+        web_title_prefix: config.web.title_prefix,
         storage: config.storage,
         download_http: reqwest::Client::new(),
         events: new_event_channel(),

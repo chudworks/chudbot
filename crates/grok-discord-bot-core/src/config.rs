@@ -306,6 +306,12 @@ pub struct WebConfig {
     /// `serve.sh deploy` writes to in production.
     #[serde(default = "default_frontend_dir")]
     pub frontend_dir: PathBuf,
+    /// Prefix prepended to the browser tab title on every viewer page.
+    /// The page-specific part (conversation title, "Viewer", "Not
+    /// found", …) is appended by the frontend, so a value like
+    /// `"Chudbot · "` yields tab titles such as `Chudbot · My chat`.
+    #[serde(default = "default_title_prefix")]
+    pub title_prefix: String,
 }
 
 fn default_listen() -> String {
@@ -314,6 +320,10 @@ fn default_listen() -> String {
 
 fn default_frontend_dir() -> PathBuf {
     PathBuf::from("frontend-build")
+}
+
+fn default_title_prefix() -> String {
+    "grok · ".to_string()
 }
 
 /// Per-provider credentials. The model is no longer part of these

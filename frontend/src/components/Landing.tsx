@@ -1,4 +1,7 @@
+import { usePageTitle } from '../title';
+
 export default function Landing() {
+  usePageTitle('Viewer');
   return (
     <main className="center">
       <h1>grok viewer</h1>

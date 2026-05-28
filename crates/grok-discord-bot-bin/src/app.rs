@@ -111,6 +111,9 @@ pub struct AppState {
     /// Filesystem directory the Axum server serves the React bundle
     /// from. Vite's `dist/` is copied here by `serve.sh deploy`.
     pub web_frontend_dir: PathBuf,
+    /// Prefix the viewer prepends to every browser tab title. Surfaced
+    /// to the frontend via `/api/config`.
+    pub web_title_prefix: String,
     /// Media storage settings (images, videos, avatars dirs).
     pub storage: StorageConfig,
     /// HTTP client used by background tasks (avatar fetcher, image

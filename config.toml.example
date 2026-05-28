@@ -31,6 +31,10 @@ base_url = "http://localhost:1860"
 # Directory the bot serves the built React frontend from. `serve.sh
 # deploy` writes Vite's `dist/` here. Defaults to ./frontend-build.
 # frontend_dir = "frontend-build"
+# Prefix prepended to every browser-tab title in the viewer. The
+# page-specific part (conversation title, "Viewer", "Not found", …) is
+# appended after it. Defaults to "grok · ", e.g. "grok · My chat".
+# title_prefix = "Chudbot · "
 
 # LLM provider credentials. Include only the blocks for providers any of
 # your personas actually use. Both can be present — personas pick freely.

@@ -102,6 +102,7 @@ pub async fn run(app: Arc<AppState>, listen: SocketAddr) -> Result<(), WebError>
 
     // --- API: JSON + SSE, never cached ---
     let api_router = Router::new()
+        .route("/api/config", get(get_site_config))
         .route("/api/conversations/{id}", get(get_conversation))
         .route("/api/conversations/{id}/events", get(conversation_events))
         .layer(cache_layer(CACHE_NO_STORE));
@@ -200,6 +201,14 @@ impl IntoResponse for ApiError {
         };
         (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
+}
+
+/// Static front-end configuration the React bundle reads at startup.
+/// Kept deliberately tiny — just the bits the operator can tune via
+/// `config.toml` that the browser needs to know about (today: the
+/// browser-tab title prefix).
+async fn get_site_config(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "title_prefix": app.web_title_prefix }))
 }
 
 async fn get_conversation(

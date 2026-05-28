@@ -32,7 +32,7 @@ use thiserror::Error;
 use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
 use twilight_http::Client as HttpClient;
 use twilight_http::request::channel::reaction::RequestReactionType;
-use twilight_model::channel::message::MessageFlags;
+use twilight_model::channel::message::{Mention, MessageFlags};
 use twilight_model::channel::{ChannelType, Message};
 use twilight_model::gateway::event::Event;
 use twilight_model::gateway::payload::incoming::GuildCreate;
@@ -653,7 +653,11 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
         "turn: conversation resolved"
     );
 
-    let user_content = strip_mentions(&msg.content, state.bot_user_id);
+    let user_content = resolve_user_mentions(
+        &strip_mentions(&msg.content, state.bot_user_id),
+        msg,
+        state.bot_user_id,
+    );
 
     // Persist any image attachments before recording context items so
     // every image gets its own `discord:msg:<id>:image:<i>` context row
@@ -2391,6 +2395,36 @@ fn strip_mentions(content: &str, bot_user_id: Id<UserMarker>) -> String {
         .replace(&nick, "")
         .trim()
         .to_string()
+}
+
+/// Best display name for a mentioned user: guild nickname → username.
+/// (Unlike [`best_display_name`], a `Mention` carries no `global_name`.)
+fn mention_display_name(m: &Mention) -> &str {
+    if let Some(member) = &m.member
+        && let Some(nick) = &member.nick
+    {
+        return nick;
+    }
+    &m.name
+}
+
+/// Rewrite raw `<@ID>` / `<@!ID>` user mentions into `Name (<@ID>)` so the
+/// model both learns who is referenced *and* keeps the raw mention token it
+/// needs to ping that user back. The bot's own mention is skipped — it has
+/// already been removed by [`strip_mentions`].
+fn resolve_user_mentions(content: &str, msg: &Message, bot_user_id: Id<UserMarker>) -> String {
+    let mut out = content.to_string();
+    for m in &msg.mentions {
+        if m.id == bot_user_id {
+            continue;
+        }
+        let id = m.id.get();
+        let replacement = format!("{} (<@{id}>)", mention_display_name(m));
+        out = out
+            .replace(&format!("<@{id}>"), &replacement)
+            .replace(&format!("<@!{id}>"), &replacement);
+    }
+    out
 }
 
 // Reference the unused marker types so rustc's dead-code linter doesn't

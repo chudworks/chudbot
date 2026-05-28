@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import { useConversation } from '../store';
+import { usePageTitle } from '../title';
 import Turn from './Turn';
 import RelativeTime from './RelativeTime';
 
@@ -49,6 +50,21 @@ export default function ConversationView() {
     };
     return () => source.close();
   }, [id, refresh]);
+
+  // Tab title tracks the load state: the conversation's own title once
+  // it's ready, an interim label otherwise. Called unconditionally
+  // (rules of hooks) before any early return below.
+  const pageTitle =
+    !id
+      ? 'Conversation'
+      : state.kind === 'ready'
+        ? (state.view.conversation.title ?? 'Untitled conversation')
+        : state.kind === 'error'
+          ? state.status === 404
+            ? 'Not found'
+            : 'Error'
+          : 'Loading…';
+  usePageTitle(pageTitle);
 
   if (!id) return <main className="center"><p>missing conversation id</p></main>;
   if (state.kind === 'idle' || (state.kind === 'loading' && storeId !== id)) {
