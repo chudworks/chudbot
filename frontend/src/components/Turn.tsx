@@ -11,10 +11,11 @@ interface Props {
 
 export default function Turn({ turnView, users }: Props) {
   const { turn, context, tool_calls } = turnView;
+  // discord_user_id is a snowflake string and the `users` map is keyed
+  // by the same string, so this lookup is exact (see types.ts on why
+  // IDs are strings, not numbers).
   const user =
-    turn.discord_user_id != null
-      ? users[String(turn.discord_user_id)]
-      : undefined;
+    turn.discord_user_id != null ? users[turn.discord_user_id] : undefined;
   const userLabel =
     displayNameFor(user) ?? turn.discord_user_name ?? 'user';
 

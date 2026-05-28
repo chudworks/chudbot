@@ -276,7 +276,11 @@ fn event_payload(ev: &ConversationEvent) -> Event {
         EventKind::TitleUpdated => ("title_updated", serde_json::json!({})),
         EventKind::UserAvatarUpdated { user_id } => (
             "user_avatar_updated",
-            serde_json::json!({ "user_id": user_id }),
+            // Stringify the snowflake for the same reason the JSON API
+            // does: a bare number would be rounded past 2^53 by the
+            // browser's JSON parser. Consumers compare it against the
+            // (string) user ids in the conversation payload.
+            serde_json::json!({ "user_id": user_id.to_string() }),
         ),
     };
     Event::default().event(name).data(extra.to_string())
