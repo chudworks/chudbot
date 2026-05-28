@@ -248,11 +248,14 @@ async fn conversation_events(
             Some(Ok(Event::default().event("lag").data(format!("{n}"))))
         }
     });
-    // The stream naturally ends when the client disconnects (drops the
-    // SSE response) or when the broadcast channel is closed (process
-    // shutdown). axum::serve's `with_graceful_shutdown` in `run()`
-    // handles the final teardown; per-connection cancellation isn't
-    // needed here.
+    // End the stream when the client disconnects (drops the SSE
+    // response) OR when the process is shutting down. The broadcast
+    // sender lives inside the still-`Arc`'d `AppState`, so it is NOT
+    // dropped on shutdown — without this `take_until`, the stream would
+    // run forever and `axum::serve`'s `with_graceful_shutdown` in
+    // `run()` would block on the open connection for the whole grace
+    // period, making Ctrl+C appear to hang whenever a viewer is open.
+    let filtered = futures::StreamExt::take_until(filtered, app.cancel.clone().cancelled_owned());
 
     // Suppress proxy buffering. Cloudflare and nginx both honor
     // `X-Accel-Buffering: no`; without it some proxies hold SSE
