@@ -11,11 +11,14 @@
 //!     `Cache-Control: public, max-age=31536000, immutable`.
 //!   - `/assets/*` → Vite-emitted JS/CSS bundles with hashed filenames.
 //!     Same long-lived immutable cache headers.
-//!   - everything else → tries to serve a static file under
-//!     `app.web_frontend_dir`; if no such file exists, returns
-//!     `index.html` (SPA fallback). Both index.html and the SPA shell
-//!     are served `no-cache, must-revalidate` so a fresh deploy is
-//!     picked up on the next page load without a hard refresh.
+//!   - everything else → the `spa_index` fallback returns `index.html`
+//!     with a hard `200` (and `no-cache, must-revalidate`) so client
+//!     routes like `/c/<uuid>` resolve and report success. Paths whose
+//!     last segment looks like a file (e.g. `/favicon.ico`) get a real
+//!     `404` instead of being masked as HTML. We deliberately avoid
+//!     tower-http's `ServeDir::not_found_service(ServeFile(index))` SPA
+//!     pattern: in 0.6 it serves index.html's body but leaks the
+//!     original `404` status for multi-segment paths.
 //!
 //! Compression: deliberately not done at origin. Cloudflare in front
 //! of the tunnel compresses dynamically (brotli when the client
@@ -41,7 +44,7 @@ use grok_discord_bot_core::{ConversationView, DbError};
 use thiserror::Error;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
@@ -113,15 +116,10 @@ pub async fn run(app: Arc<AppState>, listen: SocketAddr) -> Result<(), WebError>
 
     // --- Vite-emitted hashed bundles: immutable forever ---
     //
-    // We split the frontend dir into "/assets" (long-cached, hashed
-    // filenames) and the rest (no-cache, index.html + SPA fallback).
-    // Vite always emits hashed files under "assets/" so this is a
-    // clean cut.
-    let assets_dir = app.web_frontend_dir.join("assets");
-    let assets_service = ServeDir::new(&assets_dir);
-    let index_html = app.web_frontend_dir.join("index.html");
-    let spa_fallback =
-        ServeDir::new(&app.web_frontend_dir).not_found_service(ServeFile::new(&index_html));
+    // Vite always emits hashed files under "assets/", so this whole
+    // subtree can be cached aggressively. index.html and the SPA
+    // client routes are handled by the `spa_index` fallback below.
+    let assets_service = ServeDir::new(app.web_frontend_dir.join("assets"));
 
     let router = api_router
         .nest_service(
@@ -148,13 +146,9 @@ pub async fn run(app: Arc<AppState>, listen: SocketAddr) -> Result<(), WebError>
                 .layer(cache_layer(CACHE_IMMUTABLE))
                 .service(assets_service),
         )
-        // Everything else: SPA shell + fallback. Never cached so a
-        // fresh deploy is visible on the next page load.
-        .fallback_service(
-            tower::ServiceBuilder::new()
-                .layer(cache_layer(CACHE_NO_CACHE))
-                .service(spa_fallback),
-        )
+        // Everything else is a single-page-app route → serve the SPA
+        // shell. `spa_index` sets its own status + cache headers.
+        .fallback(spa_index)
         .with_state(Arc::clone(&app));
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -286,4 +280,116 @@ fn event_payload(ev: &ConversationEvent) -> Event {
         ),
     };
     Event::default().event(name).data(extra.to_string())
+}
+
+/// Axum fallback for any route not matched by the API or a static
+/// asset subtree. Serves the SPA shell so client-side routes like
+/// `/c/<uuid>` resolve.
+async fn spa_index(State(app): State<Arc<AppState>>, uri: axum::http::Uri) -> Response {
+    render_spa(&app.web_frontend_dir, uri.path()).await
+}
+
+/// Core of [`spa_index`], split out so it's testable without an
+/// `AppState` / database.
+///
+/// - SPA client routes (path's last segment has no `.`) → `index.html`
+///   with a hard `200` and `no-cache` headers.
+/// - Asset-looking misses (last segment contains a `.`, e.g.
+///   `/favicon.ico`, `/foo.js`) → real `404`, so we don't mask a
+///   missing asset as HTML (which would only break the browser's
+///   parsing and caching).
+async fn render_spa(frontend_dir: &std::path::Path, request_path: &str) -> Response {
+    let last_segment = request_path.rsplit('/').next().unwrap_or("");
+    if last_segment.contains('.') {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let index = frontend_dir.join("index.html");
+    match tokio::fs::read(&index).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("text/html; charset=utf-8"),
+                ),
+                (
+                    header::CACHE_CONTROL,
+                    HeaderValue::from_static(CACHE_NO_CACHE),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::error!(
+                error = %err,
+                path = %index.display(),
+                "failed to read index.html for SPA fallback"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                "frontend not built (index.html missing)",
+            )
+                .into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    /// Make a unique temp dir containing an `index.html`. `marker`
+    /// keeps concurrent tests from colliding on the same path.
+    fn temp_frontend(marker: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("grok_spa_{}_{marker}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), b"<!doctype html><title>spa</title>").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn client_route_serves_index_with_200() {
+        let dir = temp_frontend("client_route");
+        // This is the exact shape that was 404ing in production.
+        let resp = render_spa(&dir, "/c/26765603-92a8-4b4b-b0ad-748383d24708").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(
+            resp.headers().get(header::CACHE_CONTROL).unwrap(),
+            CACHE_NO_CACHE
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        assert!(body.starts_with(b"<!doctype html>"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn root_serves_index_with_200() {
+        let dir = temp_frontend("root");
+        let resp = render_spa(&dir, "/").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn asset_looking_miss_is_404() {
+        let dir = temp_frontend("asset_miss");
+        let resp = render_spa(&dir, "/favicon.ico").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_index_is_404() {
+        let dir = std::env::temp_dir().join(format!("grok_spa_{}_no_index", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let resp = render_spa(&dir, "/c/whatever").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

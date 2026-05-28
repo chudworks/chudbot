@@ -17,6 +17,7 @@ pub struct Conversation {
     /// Stable identifier; appears in the web viewer URL.
     pub id: Uuid,
     /// When the conversation was opened.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// Discord guild ID (server). Zero for DMs.
     pub discord_guild_id: i64,
@@ -31,6 +32,7 @@ pub struct Conversation {
     /// When the background titler last successfully populated `title`.
     /// `None` if it never ran (or hasn't yet — titles are generated
     /// asynchronously after the first turn completes).
+    #[serde(with = "time::serde::rfc3339::option", default)]
     pub title_generated_at: Option<OffsetDateTime>,
     /// LLM provider identifier (e.g. `xai/grok-4.1-fast`).
     pub model: String,
@@ -48,8 +50,10 @@ pub struct Turn {
     /// Zero-based index within the conversation.
     pub turn_index: i32,
     /// When the turn was started.
+    #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     /// When the turn completed (success or failure).
+    #[serde(with = "time::serde::rfc3339::option", default)]
     pub completed_at: Option<OffsetDateTime>,
     /// Discord message ID of the user's prompt.
     pub user_discord_message_id: i64,
@@ -118,8 +122,10 @@ pub struct DiscordUser {
     /// cached avatar. `None` until the fetcher has stored something.
     pub avatar_local_path: Option<String>,
     /// When the fetcher last successfully wrote a file for this user.
+    #[serde(with = "time::serde::rfc3339::option", default)]
     pub last_avatar_fetched_at: Option<OffsetDateTime>,
     /// When this row was last touched by an inbound Discord event.
+    #[serde(with = "time::serde::rfc3339")]
     pub last_seen_at: OffsetDateTime,
 }
 
@@ -141,8 +147,10 @@ pub struct VideoJob {
     /// `file://videos/<uuid>.mp4` URI once status flips to `done`.
     pub video_uri: Option<String>,
     /// When the submit call succeeded.
+    #[serde(with = "time::serde::rfc3339")]
     pub submitted_at: OffsetDateTime,
     /// When status reached a terminal state.
+    #[serde(with = "time::serde::rfc3339::option", default)]
     pub completed_at: Option<OffsetDateTime>,
     /// Upstream error message if `status = 'failed'` or `'expired'`.
     pub error: Option<String>,
@@ -171,4 +179,40 @@ pub struct TurnView {
     pub context: Vec<ContextItem>,
     /// Server-side tool calls, ordered by `ordinal` ascending.
     pub tool_calls: Vec<ToolCallRecord>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::macros::datetime;
+
+    // Locks the wire format for timestamps: the JS frontend parses
+    // these with `new Date(...)`, which only accepts ISO-8601 strings.
+    // Without the `time/serde-well-known` feature + rfc3339 annotations
+    // the default serde repr is a 9-element integer array, which
+    // `new Date(...)` reads as NaN and crashes the viewer. This test
+    // fails loudly if either is ever dropped.
+    #[test]
+    fn timestamps_serialize_as_rfc3339_strings() {
+        let conv = Conversation {
+            id: Uuid::nil(),
+            created_at: datetime!(2026-05-28 17:11:51 UTC),
+            discord_guild_id: 0,
+            discord_channel_id: 0,
+            created_by_user_id: 0,
+            root_discord_message_id: 0,
+            title: None,
+            title_generated_at: Some(datetime!(2026-05-28 17:12:00 UTC)),
+            model: "test".to_string(),
+        };
+        let json = serde_json::to_value(&conv).unwrap();
+        assert_eq!(json["created_at"], "2026-05-28T17:11:51Z");
+        assert_eq!(json["title_generated_at"], "2026-05-28T17:12:00Z");
+        // A null option must stay null (not an array, not absent).
+        let conv2 = Conversation {
+            title_generated_at: None,
+            ..conv
+        };
+        assert!(serde_json::to_value(&conv2).unwrap()["title_generated_at"].is_null());
+    }
 }

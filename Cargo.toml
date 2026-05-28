@@ -43,7 +43,11 @@ features = ["v4", "serde"]
 
 [workspace.dependencies.time]
 version = "0.3"
-features = ["serde", "macros", "formatting", "parsing"]
+# `serde-well-known` gives us `time::serde::rfc3339`, which we use to
+# serialize OffsetDateTime as ISO-8601 strings the JS `Date` parser
+# understands. Without it, the default serde repr is a 9-element int
+# array ([year, ordinal, hour, …]) that `new Date(...)` reads as NaN.
+features = ["serde", "serde-well-known", "macros", "formatting", "parsing"]
 
 [workspace.dependencies.sqlx]
 version = "0.9"

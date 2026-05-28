@@ -23,6 +23,18 @@ export default function RelativeTime({ iso, prefix }: Props) {
     return () => clearInterval(handle);
   }, []);
   const date = new Date(iso);
+  // Guard against an unparseable timestamp. A non-finite Date fed to
+  // Intl.RelativeTimeFormat.format() throws a RangeError, which —
+  // thrown during render with no error boundary — blanks the whole
+  // app. Degrade to showing the raw value instead of crashing.
+  if (Number.isNaN(date.getTime())) {
+    return (
+      <time title={iso}>
+        {prefix}
+        {iso || 'unknown'}
+      </time>
+    );
+  }
   const absolute = date.toLocaleString();
   const relative = relativeFormat(date);
   return (

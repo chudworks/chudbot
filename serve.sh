@@ -71,24 +71,55 @@ start_session() {
         return
     fi
     mkdir -p "$LOG_DIR"
-    # `exec` so `grok` replaces the shell -- when it exits, the pane
-    # exits with its status (no zombie shell). `tee -a` keeps output
-    # visible in the pane AND persists it to a log file for
-    # post-mortem after a crash closes the window.
+    # `exec` so `grok` replaces the left side of the pipe -- when it
+    # exits, the pipeline (and the single-pane session) ends. `tee -a`
+    # keeps output visible in the pane AND persists it to a log file.
+    #
+    # The `trap '' INT` on the tee side is deliberate: `stop` sends
+    # Ctrl-C, which the PTY delivers as SIGINT to the WHOLE foreground
+    # group (grok + tee). Without the trap, tee would die instantly and
+    # every line grok logs during its 30s graceful drain would vanish
+    # into a broken pipe. Ignoring SIGINT on tee (SIG_IGN survives the
+    # exec) keeps it alive until grok finishes draining and closes the
+    # pipe, so the shutdown is fully captured in the log.
     tmux new-session -d -s "$SESSION" -n grok -c "$CHUDBOT_DIR" \
-        "exec $BINARY serve 2>&1 | tee -a $LOG_DIR/grok.log"
+        "exec $BINARY serve 2>&1 | { trap '' INT; exec tee -a $LOG_DIR/grok.log; }"
     echo "started session $SESSION (running: grok serve)"
     echo "logs: $LOG_DIR/grok.log"
     echo "attach with: $0 logs"
 }
 
+# Seconds to wait for a graceful drain before force-killing. Must be
+# comfortably above the binary's own SHUTDOWN_GRACE (30s) so the app
+# gets its full drain window plus a margin for teardown.
+STOP_TIMEOUT=40
+
 stop_session() {
-    if session_alive; then
-        tmux kill-session -t "$SESSION"
-        echo "stopped session $SESSION"
-    else
+    if ! session_alive; then
         echo "session $SESSION not running"
+        return
     fi
+    # `tmux kill-session` tears down the PTY and the processes get
+    # SIGHUP, which the binary does NOT treat as a graceful shutdown.
+    # Send an actual Ctrl-C instead: the pane's line discipline turns
+    # it into SIGINT for the foreground process group (grok + tee),
+    # which `grok serve` catches and drains in-flight work for up to
+    # 30s before exiting. When grok exits the pipeline ends and the
+    # single-pane session closes on its own.
+    echo "sending Ctrl-C to $SESSION (graceful drain, up to ${STOP_TIMEOUT}s)..."
+    tmux send-keys -t "$SESSION" C-c || true
+
+    local waited=0
+    while session_alive; do
+        if (( waited >= STOP_TIMEOUT )); then
+            echo "still running after ${STOP_TIMEOUT}s; force-killing session"
+            tmux kill-session -t "$SESSION" || true
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    echo "stopped session $SESSION"
 }
 
 build_frontend() {

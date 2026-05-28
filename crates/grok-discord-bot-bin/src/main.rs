@@ -201,8 +201,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     // marks the tracker as "no longer accepting new work from outside
     // the running tasks" so the eventual `wait()` can return.
 
-    tokio::signal::ctrl_c().await?;
-    tracing::info!("shutdown signal received");
+    shutdown_signal().await;
 
     app.cancel.cancel();
     app.tracker.close();
@@ -216,6 +215,33 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Wait for a shutdown signal. Resolves on either SIGINT (Ctrl+C, which
+/// is what `serve.sh stop` sends via `tmux send-keys C-c`) or SIGTERM
+/// (a plain `kill`, systemd, or a container stop). Handling both means
+/// the graceful drain runs no matter how the process is asked to stop.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install SIGINT handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => tracing::info!("received SIGINT; shutting down"),
+        () = terminate => tracing::info!("received SIGTERM; shutting down"),
+    }
 }
 
 fn init_tracing() {
