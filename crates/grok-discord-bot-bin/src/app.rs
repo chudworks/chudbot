@@ -117,6 +117,11 @@ pub struct AppState {
     /// Optional on-disk favicon served at `/favicon.ico`. `None` means
     /// the route 404s and browsers show their default icon.
     pub web_favicon_path: Option<PathBuf>,
+    /// Whether the web access logger trusts `X-Forwarded-For` for the
+    /// client IP. `true` behind a trusted proxy (Cloudflare tunnel);
+    /// `false` falls back to the TCP peer address. See
+    /// [`grok_discord_bot_core::WebConfig::trust_forwarded_for`].
+    pub web_trust_forwarded_for: bool,
     /// Media storage settings (images, videos, avatars dirs).
     pub storage: StorageConfig,
     /// Operator-supplied global system-prompt addendum (e.g. Discord

@@ -65,6 +65,12 @@ features = ["fs", "set-header"]
 [dependencies.tower]
 version = "0.5"
 
+# Pulled in transitively by axum/hyper already; declared directly so the
+# access-log middleware can read `Body::size_hint` to report request /
+# response byte counts without buffering the body.
+[dependencies.http-body]
+version = "1"
+
 [dependencies.reqwest]
 workspace = true
 

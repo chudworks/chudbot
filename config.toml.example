@@ -52,6 +52,13 @@ base_url = "http://localhost:1860"
 # deploy. A multi-resolution .ico is ideal; any browser-supported image
 # works. Unset → browsers show their default icon.
 # favicon_path = "/home/chud/chudbot/chudbot.ico"
+# Whether the access logger trusts the X-Forwarded-For header for the
+# client IP. Defaults to true, which is correct behind the Cloudflare
+# tunnel (it sets the header). Set to false for a directly exposed
+# deploy with no trusted proxy — otherwise clients can spoof their
+# logged IP. When false (or the header is absent) the IP comes from the
+# TCP peer address.
+# trust_forwarded_for = true
 
 # LLM provider credentials. Include only the blocks for providers any of
 # your personas actually use. Both can be present — personas pick freely.

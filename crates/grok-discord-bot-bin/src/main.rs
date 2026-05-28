@@ -163,6 +163,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         web_frontend_dir: config.web.frontend_dir,
         web_title_prefix: config.web.title_prefix,
         web_favicon_path: config.web.favicon_path,
+        web_trust_forwarded_for: config.web.trust_forwarded_for,
         storage: config.storage,
         extra_system_prompt: config.extra_system_prompt,
         download_http: reqwest::Client::new(),

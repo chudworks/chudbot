@@ -328,6 +328,16 @@ pub struct WebConfig {
     /// any image format the browser accepts works.
     #[serde(default)]
     pub favicon_path: Option<PathBuf>,
+    /// Whether the access logger should trust the `X-Forwarded-For`
+    /// header to determine the client IP. Defaults to `true`, which is
+    /// correct for the production deploy behind a Cloudflare tunnel
+    /// (the tunnel sets the header). Set to `false` for a directly
+    /// exposed deploy with no trusted proxy in front — otherwise a
+    /// client can spoof its logged IP by sending the header itself.
+    /// When `false` (or the header is absent), the IP comes from the
+    /// TCP peer address.
+    #[serde(default = "default_trust_forwarded_for")]
+    pub trust_forwarded_for: bool,
 }
 
 fn default_listen() -> String {
@@ -340,6 +350,10 @@ fn default_frontend_dir() -> PathBuf {
 
 fn default_title_prefix() -> String {
     "grok · ".to_string()
+}
+
+fn default_trust_forwarded_for() -> bool {
+    true
 }
 
 /// Per-provider credentials. The model is no longer part of these

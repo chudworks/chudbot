@@ -784,6 +784,7 @@ dependencies = [
  "clap",
  "futures",
  "grok-discord-bot-core",
+ "http-body",
  "reqwest",
  "rustls",
  "serde",

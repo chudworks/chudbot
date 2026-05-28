@@ -30,17 +30,19 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{Path, State};
+use axum::extract::{ConnectInfo, Path, Request, State};
 use axum::http::{HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures::Stream;
 use grok_discord_bot_core::{ConversationView, DbError};
+use http_body::Body as _;
 use thiserror::Error;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -155,7 +157,13 @@ pub async fn run(app: Arc<AppState>, listen: SocketAddr) -> Result<(), WebError>
         // Everything else is a single-page-app route → serve the SPA
         // shell. `spa_index` sets its own status + cache headers.
         .fallback(spa_index)
-        .with_state(Arc::clone(&app));
+        .with_state(Arc::clone(&app))
+        // Access log wraps the whole router (added last → outermost),
+        // so every request — API, media, SPA fallback — gets one line.
+        .layer(middleware::from_fn_with_state(
+            app.web_trust_forwarded_for,
+            access_log,
+        ));
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(
@@ -168,13 +176,102 @@ pub async fn run(app: Arc<AppState>, listen: SocketAddr) -> Result<(), WebError>
     );
 
     let cancel = app.cancel.clone();
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            cancel.cancelled().await;
-            tracing::info!("web server: cancellation requested, shutting down");
-        })
-        .await?;
+    // `into_make_service_with_connect_info` injects the TCP peer address
+    // as a `ConnectInfo<SocketAddr>` request extension, which the access
+    // logger reads when it isn't trusting `X-Forwarded-For`.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        cancel.cancelled().await;
+        tracing::info!("web server: cancellation requested, shutting down");
+    })
+    .await?;
     Ok(())
+}
+
+/// Longest User-Agent prefix we keep in the access log. The full string
+/// (e.g. `Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0)
+/// Gecko/20100101 Firefox/151.0`) is noise; the leading product token
+/// (`Mozilla/5.0`) is enough to tell humans from bots at a glance.
+const UA_MAX_LEN: usize = 48;
+
+/// Per-request access log middleware. Emits one `web::access` info line
+/// per request with method, path, client IP, status, wall-clock
+/// duration, request/response byte counts, and a trimmed User-Agent.
+///
+/// Body sizes come from `Body::size_hint().exact()`, so they're only
+/// known for length-delimited bodies (most responses, and requests with
+/// a `Content-Length`); streaming responses (the SSE endpoint) report
+/// `0` since their bytes are produced after this middleware returns.
+async fn access_log(
+    State(trust_forwarded_for): State<bool>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let remote = client_ip(&req, trust_forwarded_for);
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(short_user_agent)
+        .unwrap_or_else(|| "-".to_owned());
+    let input_bytes = req.body().size_hint().exact().unwrap_or(0);
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let duration = start.elapsed();
+
+    let output_bytes = response.body().size_hint().exact().unwrap_or(0);
+
+    tracing::info!(
+        target: "web::access",
+        %method,
+        path,
+        remote,
+        status = response.status().as_u16(),
+        duration_ms = duration.as_millis(),
+        input_bytes,
+        output_bytes,
+        user_agent,
+        "request"
+    );
+
+    response
+}
+
+/// Resolve the client IP for logging. When `trust_forwarded_for` is set
+/// and an `X-Forwarded-For` header is present, use its first entry (the
+/// original client; later entries are intermediary proxies). Otherwise
+/// fall back to the TCP peer address from `ConnectInfo`.
+fn client_ip(req: &Request, trust_forwarded_for: bool) -> String {
+    if trust_forwarded_for {
+        if let Some(ip) = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return ip.to_owned();
+        }
+    }
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .unwrap_or_else(|| "-".to_owned())
+}
+
+/// Trim a User-Agent down to its leading product token, capped at
+/// [`UA_MAX_LEN`] bytes. Keeps the log readable without parsing the full
+/// browser/OS soup.
+fn short_user_agent(ua: &str) -> String {
+    let token = ua.split_whitespace().next().unwrap_or(ua);
+    token.chars().take(UA_MAX_LEN).collect()
 }
 
 /// Build a `Cache-Control: <value>` layer to slap on a route group.
