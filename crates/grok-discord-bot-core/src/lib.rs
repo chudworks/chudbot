@@ -24,7 +24,7 @@ pub mod storage;
 pub mod videogen;
 
 pub use agent::{AgentObserver, AgentRun, NoopObserver, run as run_agent};
-pub use config::{BotConfig, Config, ConfigError, PrivacyMode, StorageConfig};
+pub use config::{Config, ConfigError, LlmProviderKind, Persona, PrivacyMode, StorageConfig};
 pub use db::{Db, DbError};
 pub use domain::{Conversation, ContextItem, ConversationView, Turn, TurnView, VideoJob};
 pub use llm::{

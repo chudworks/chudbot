@@ -57,6 +57,9 @@ pub struct Turn {
     pub status: String,
     /// Error message if `status = 'failed'`.
     pub error: Option<String>,
+    /// Persona name active when this turn ran. `None` for turns
+    /// written before the personas feature shipped.
+    pub persona_name: Option<String>,
 }
 
 /// One row in `context_items`: a single message snapshot that was sent

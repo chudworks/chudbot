@@ -17,7 +17,9 @@ and the final answer.
   implementations: `XaiProvider` and `AnthropicProvider`. Both support
   server-side web search (xAI: `search_parameters`; Anthropic:
   `web_search_20250305`) AND client-side tool calls via the agentic
-  harness in `core::agent`.
+  harness in `core::agent`. Providers are **model-agnostic** — the
+  specific model id is supplied per call via `StepRequest::model`, so a
+  single provider instance serves any persona that uses that provider.
 - **Config**: TOML file (`config.toml` by default). No env vars.
 - **Async runtime**: `tokio`
 - **Target platform**: macOS (Chud's Mac Studio), native — no Docker
@@ -64,10 +66,16 @@ first reply in a new conversation includes the viewer URL
 (`$WEB_BASE_URL/c/<uuid>`). Web viewer auth: **none** — security relies
 on the unguessable UUID. Status emojis: 👀 working, ✅ success, ❌ error.
 
-Each turn captures (via `context_items`) the exact snapshot of messages
-fed to the model, and (via `tool_calls`) every server-side tool the
-model invoked plus its request/response JSON. The viewer renders both
-verbatim so traces are auditable.
+Each turn persists the inputs that are NOVEL to that turn in
+`context_items`: the user's `@`-mention, any Discord-reply-quoted
+message, and image attachments. The system prompt (constant; in the
+bot config) and prior turns' user/assistant text (already columns on
+`turns`) are NOT re-stamped per turn — they'd just duplicate data
+already on disk and grow the table quadratically with conversation
+length. Server-side tool calls and their request/response JSON go
+into `tool_calls`. The web viewer renders the stored rows verbatim
+plus the prior turns from the `turns` table, so traces stay auditable
+without the duplication.
 
 ## Agentic harness
 
@@ -124,6 +132,41 @@ Privacy mode constrains the tool:
 - `ConversationOnly`: the tool is not declared at all — the model can
   only operate from the conversation history it was already given.
 
+## Personas
+
+The TOML config defines named personas under `[personas.*]`. Each
+persona ties together a system prompt, a provider (`xai` or
+`anthropic`), a model id, and optional `temperature` / `top_p`. The
+default fallback is `default_persona = "<name>"` at the top of the
+config; that name must be a key in the personas table.
+
+The provider blocks (`[llm.xai]`, `[llm.anthropic]`) supply only the
+api key — the model is no longer there. Include only the provider
+blocks the configured personas actually use; validation rejects a
+persona that references a provider with no credentials.
+
+At runtime, persona selection lives in `persona_selections(scope, key
+→ persona_name)`. Resolution is **most-specific-wins**:
+`conversation → user-in-guild → channel → guild → default_persona`.
+Each lookup is one PK probe; worst case is four cheap queries per turn.
+
+Slash command:
+- `/grok-persona list` — show available personas and their (provider, model).
+- `/grok-persona show` — show the full resolution chain at the call site.
+- `/grok-persona set name:<persona> scope:<conversation|user|channel|guild>`
+  — pin a persona for the given scope. `channel` and `guild` require
+  admin; `user` and `conversation` are self-service. `conversation`
+  needs to be run inside a Grok-owned thread (so the bot can map the
+  channel back to a conversation id).
+- `/grok-persona clear scope:<...>` — remove an override.
+
+Each turn stamps `turns.persona_name` with the resolved persona before
+the agent runs, so the web viewer can show which persona answered each
+turn even when a conversation mixes personas across turns.
+
+Mid-conversation persona switches change *future* turns only — prior
+turns are replayed verbatim from `turns.{user,assistant}_content`.
+
 ## Privacy model
 
 Per-guild, configurable at runtime via slash commands. Four "designs"
@@ -148,6 +191,7 @@ Slash commands:
 - `/grok-mode {show|set}` — admins only, per-guild. The `set`
   subcommand takes `mode`, optional `channel` (required for
   `channel_only`), and optional `history_size`.
+- `/grok-persona {set|show|list|clear}` — see the Personas section.
 
 Per-guild settings live in `guild_settings.privacy_mode` (JSONB —
 serializes the same `PrivacyMode` enum used in config). Missing row

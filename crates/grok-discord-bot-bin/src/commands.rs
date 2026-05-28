@@ -1,16 +1,21 @@
 //! Slash command registration and dispatch.
 //!
-//! Two top-level commands are registered globally on startup:
+//! Top-level commands registered globally on startup:
 //!   - `/grok-privacy {in|out|status}` — per-user, anyone can run.
 //!   - `/grok-mode {show|set}` — guild admins only; sets the
 //!     guild-wide context-gathering policy (one of four "designs").
+//!   - `/grok-persona {set|show|list|clear}` — picks which persona the
+//!     bot uses, scoped per-conversation, per-user, per-channel, or
+//!     per-guild. Guild and channel scopes require admin; user and
+//!     conversation scopes are self-service.
 //!
 //! Commands invoked from DMs (no `guild_id`) return a polite error
-//! since both privacy preferences and mode settings are per-guild.
+//! when the requested scope is per-guild.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use grok_discord_bot_core::{Db, PrivacyMode};
+use grok_discord_bot_core::{Db, Persona, PrivacyMode};
 use twilight_http::Client as HttpClient;
 use twilight_model::application::command::{Command, CommandOptionType};
 use twilight_model::application::interaction::application_command::{
@@ -94,7 +99,54 @@ pub fn definitions() -> Vec<Command> {
     )
     .build();
 
-    vec![privacy, mode]
+    let persona = CommandBuilder::new(
+        "grok-persona",
+        "Pick which persona the bot uses; scope it per-conversation, per-user, per-channel, or per-guild",
+        twilight_model::application::command::CommandType::ChatInput,
+    )
+    .option(
+        SubCommandBuilder::new("set", "Pick a persona for a scope")
+            .option(
+                StringBuilder::new("name", "Persona name from config")
+                    .required(true),
+            )
+            .option(
+                StringBuilder::new("scope", "Which scope this override applies to")
+                    .required(true)
+                    .choices([
+                        ("Just this conversation (thread)", "conversation"),
+                        ("Just me (this server)", "user"),
+                        ("This channel (admin)", "channel"),
+                        ("Whole server (admin)", "guild"),
+                    ]),
+            )
+            .build(),
+    )
+    .option(
+        SubCommandBuilder::new(
+            "show",
+            "Show which persona is active here and where it came from",
+        )
+        .build(),
+    )
+    .option(SubCommandBuilder::new("list", "List available personas from config").build())
+    .option(
+        SubCommandBuilder::new("clear", "Remove a persona override")
+            .option(
+                StringBuilder::new("scope", "Scope whose override to clear")
+                    .required(true)
+                    .choices([
+                        ("Conversation (thread)", "conversation"),
+                        ("Me (this server)", "user"),
+                        ("Channel (admin)", "channel"),
+                        ("Server (admin)", "guild"),
+                    ]),
+            )
+            .build(),
+    )
+    .build();
+
+    vec![privacy, mode, persona]
 }
 
 /// Push the command set to Discord. Idempotent — Discord replaces the
@@ -132,10 +184,13 @@ pub async fn register(
 
 /// Top-level interaction dispatcher. Routes to the right command handler
 /// and replies with an ephemeral message (visible only to the invoker).
+#[allow(clippy::too_many_arguments)]
 pub async fn handle(
     http: Arc<HttpClient>,
     db: Db,
     default_privacy: PrivacyMode,
+    personas: HashMap<String, Persona>,
+    default_persona: String,
     app_id: Id<ApplicationMarker>,
     interaction: Interaction,
 ) {
@@ -146,9 +201,12 @@ pub async fn handle(
     let response = match data.name.as_str() {
         "grok-privacy" => handle_privacy(&db, &interaction, data).await,
         "grok-mode" => handle_mode(&db, &default_privacy, &interaction, data).await,
+        "grok-persona" => {
+            handle_persona(&db, &personas, &default_persona, &interaction, data).await
+        }
         other => {
             tracing::warn!(name = other, "unknown slash command");
-            ephemeral("Unknown command — try `/grok-privacy` or `/grok-mode`.")
+            ephemeral("Unknown command — try `/grok-privacy`, `/grok-mode`, or `/grok-persona`.")
         }
     };
 
@@ -279,6 +337,323 @@ async fn handle_mode(
             }
         }
         other => ephemeral(&format!("Unknown subcommand `{other}`.")),
+    }
+}
+
+async fn handle_persona(
+    db: &Db,
+    personas: &HashMap<String, Persona>,
+    default_persona: &str,
+    interaction: &Interaction,
+    data: &CommandData,
+) -> InteractionResponse {
+    let Some(sub) = data.options.first() else {
+        return ephemeral("Missing subcommand.");
+    };
+
+    match sub.name.as_str() {
+        "list" => persona_list_response(personas, default_persona),
+        "show" => handle_persona_show(db, personas, default_persona, interaction).await,
+        "set" => handle_persona_set(db, personas, interaction, sub).await,
+        "clear" => handle_persona_clear(db, interaction, sub).await,
+        other => ephemeral(&format!("Unknown subcommand `{other}`.")),
+    }
+}
+
+fn persona_list_response(
+    personas: &HashMap<String, Persona>,
+    default_persona: &str,
+) -> InteractionResponse {
+    let mut names: Vec<&String> = personas.keys().collect();
+    names.sort();
+    let mut out = String::from("**Available personas**\n");
+    for name in names {
+        let p = &personas[name];
+        let marker = if name == default_persona { " (default)" } else { "" };
+        out.push_str(&format!(
+            "• `{name}`{marker} — `{}` / `{}`\n",
+            p.provider.as_str(),
+            p.model,
+        ));
+    }
+    ephemeral(&out)
+}
+
+async fn handle_persona_show(
+    db: &Db,
+    personas: &HashMap<String, Persona>,
+    default_persona: &str,
+    interaction: &Interaction,
+) -> InteractionResponse {
+    let guild_id = interaction
+        .guild_id
+        .map(|g| i64::try_from(g.get()).unwrap_or(i64::MAX));
+    let channel_id = interaction
+        .channel
+        .as_ref()
+        .map(|c| i64::try_from(c.id.get()).unwrap_or(i64::MAX));
+    let user_id = interaction
+        .author()
+        .map(|u| i64::try_from(u.id.get()).unwrap_or(i64::MAX));
+
+    let conversation_id = match channel_id {
+        Some(cid) => db.lookup_conversation_by_message(cid).await.ok().flatten(),
+        None => None,
+    };
+
+    let mut lines = vec!["**Persona resolution here**".to_string()];
+
+    let conv_pick = match conversation_id {
+        Some(cid) => db
+            .get_persona_selection("conversation", &cid.to_string())
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    lines.push(format!(
+        "• conversation: {}",
+        conv_pick
+            .as_deref()
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| "—".into())
+    ));
+
+    let user_pick = match (guild_id, user_id) {
+        (Some(g), Some(u)) => db
+            .get_persona_selection("user", &format!("{g}:{u}"))
+            .await
+            .ok()
+            .flatten(),
+        _ => None,
+    };
+    lines.push(format!(
+        "• user: {}",
+        user_pick
+            .as_deref()
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| "—".into())
+    ));
+
+    let channel_pick = match channel_id {
+        Some(c) => db
+            .get_persona_selection("channel", &c.to_string())
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    lines.push(format!(
+        "• channel: {}",
+        channel_pick
+            .as_deref()
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| "—".into())
+    ));
+
+    let guild_pick = match guild_id {
+        Some(g) => db
+            .get_persona_selection("guild", &g.to_string())
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    lines.push(format!(
+        "• guild: {}",
+        guild_pick
+            .as_deref()
+            .map(|n| format!("`{n}`"))
+            .unwrap_or_else(|| "—".into())
+    ));
+
+    lines.push(format!("• fallback: `{default_persona}` (from config)"));
+
+    let active_name = conv_pick
+        .or(user_pick)
+        .or(channel_pick)
+        .or(guild_pick)
+        .unwrap_or_else(|| default_persona.to_string());
+    let active = personas.get(&active_name);
+    let active_line = match active {
+        Some(p) => format!(
+            "\n**Active**: `{active_name}` — `{}` / `{}`",
+            p.provider.as_str(),
+            p.model,
+        ),
+        None => format!(
+            "\n**Active**: `{active_name}` ⚠️ (not in current config — falling back to `{default_persona}`)",
+        ),
+    };
+
+    let mut out = lines.join("\n");
+    out.push_str(&active_line);
+    ephemeral(&out)
+}
+
+async fn handle_persona_set(
+    db: &Db,
+    personas: &HashMap<String, Persona>,
+    interaction: &Interaction,
+    sub: &CommandDataOption,
+) -> InteractionResponse {
+    let options = match &sub.value {
+        CommandOptionValue::SubCommand(opts) => opts.as_slice(),
+        _ => return ephemeral("Malformed subcommand."),
+    };
+    let Some(name) = find_string(options, "name") else {
+        return ephemeral("Missing `name`.");
+    };
+    let Some(scope) = find_string(options, "scope") else {
+        return ephemeral("Missing `scope`.");
+    };
+    if !personas.contains_key(name) {
+        let mut listed: Vec<&String> = personas.keys().collect();
+        listed.sort();
+        let avail = listed
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return ephemeral(&format!("Unknown persona `{name}`. Available: {avail}"));
+    }
+
+    let key_result = build_scope_key(db, interaction, scope, true).await;
+    let key = match key_result {
+        Ok(k) => k,
+        Err(msg) => return ephemeral(&msg),
+    };
+
+    match db.set_persona_selection(scope, &key, name).await {
+        Ok(()) => ephemeral(&format!(
+            "✅ Set persona for **{}** to `{name}`.",
+            scope_description(scope)
+        )),
+        Err(err) => {
+            tracing::error!(error = %err, "set_persona_selection failed");
+            ephemeral("Sorry — couldn't save that. Try again.")
+        }
+    }
+}
+
+async fn handle_persona_clear(
+    db: &Db,
+    interaction: &Interaction,
+    sub: &CommandDataOption,
+) -> InteractionResponse {
+    let options = match &sub.value {
+        CommandOptionValue::SubCommand(opts) => opts.as_slice(),
+        _ => return ephemeral("Malformed subcommand."),
+    };
+    let Some(scope) = find_string(options, "scope") else {
+        return ephemeral("Missing `scope`.");
+    };
+    let key = match build_scope_key(db, interaction, scope, true).await {
+        Ok(k) => k,
+        Err(msg) => return ephemeral(&msg),
+    };
+    match db.clear_persona_selection(scope, &key).await {
+        Ok(true) => ephemeral(&format!(
+            "✅ Cleared persona override for **{}**.",
+            scope_description(scope)
+        )),
+        Ok(false) => ephemeral(&format!(
+            "No override was set for **{}**.",
+            scope_description(scope)
+        )),
+        Err(err) => {
+            tracing::error!(error = %err, "clear_persona_selection failed");
+            ephemeral("Sorry — couldn't clear that. Try again.")
+        }
+    }
+}
+
+/// Compute the `persona_selections.key` for a given scope from the
+/// interaction context, returning a human-readable error string when
+/// the scope can't be resolved (e.g. conversation scope outside a
+/// Grok thread). When `enforce_admin` is true, scopes that require
+/// admin privileges (`channel`, `guild`) are gated on the invoking
+/// user's permissions.
+async fn build_scope_key(
+    db: &Db,
+    interaction: &Interaction,
+    scope: &str,
+    enforce_admin: bool,
+) -> Result<String, String> {
+    match scope {
+        "conversation" => {
+            let Some(channel) = interaction.channel.as_ref() else {
+                return Err("Couldn't determine the channel for this interaction.".into());
+            };
+            let channel_id = i64::try_from(channel.id.get()).unwrap_or(i64::MAX);
+            match db.lookup_conversation_by_message(channel_id).await {
+                Ok(Some(conv_id)) => Ok(conv_id.to_string()),
+                Ok(None) => Err(
+                    "No conversation is bound to this channel. Run this inside a thread the bot \
+                     opened for an answer."
+                        .into(),
+                ),
+                Err(err) => {
+                    tracing::error!(error = %err, "conversation lookup failed");
+                    Err("Couldn't read conversation state. Try again.".into())
+                }
+            }
+        }
+        "user" => {
+            let Some(guild_id) = interaction.guild_id else {
+                return Err(
+                    "User-scoped persona only makes sense in a server. Run this from a channel."
+                        .into(),
+                );
+            };
+            let Some(user) = interaction.author() else {
+                return Err("Couldn't determine your user id — try again.".into());
+            };
+            let gid = i64::try_from(guild_id.get()).unwrap_or(i64::MAX);
+            let uid = i64::try_from(user.id.get()).unwrap_or(i64::MAX);
+            Ok(format!("{gid}:{uid}"))
+        }
+        "channel" => {
+            let Some(channel) = interaction.channel.as_ref() else {
+                return Err("Couldn't determine the channel for this interaction.".into());
+            };
+            if enforce_admin && !interaction_is_admin(interaction) {
+                return Err("Channel-scoped persona requires admin privileges.".into());
+            }
+            Ok(i64::try_from(channel.id.get()).unwrap_or(i64::MAX).to_string())
+        }
+        "guild" => {
+            let Some(guild_id) = interaction.guild_id else {
+                return Err(
+                    "Guild-scoped persona only makes sense in a server. Run this from a channel."
+                        .into(),
+                );
+            };
+            if enforce_admin && !interaction_is_admin(interaction) {
+                return Err("Guild-scoped persona requires admin privileges.".into());
+            }
+            Ok(i64::try_from(guild_id.get()).unwrap_or(i64::MAX).to_string())
+        }
+        other => Err(format!("Unknown scope `{other}`.")),
+    }
+}
+
+fn interaction_is_admin(interaction: &Interaction) -> bool {
+    interaction
+        .member
+        .as_ref()
+        .and_then(|m| m.permissions)
+        .map(|p| p.contains(Permissions::ADMINISTRATOR))
+        .unwrap_or(false)
+}
+
+fn scope_description(scope: &str) -> &'static str {
+    match scope {
+        "conversation" => "this conversation",
+        "user" => "you in this server",
+        "channel" => "this channel",
+        "guild" => "this server",
+        _ => "this scope",
     }
 }
 

@@ -26,7 +26,7 @@ pub mod anthropic;
 pub mod mock;
 pub mod xai;
 
-use crate::config::{AnthropicConfig, LlmConfig, LlmProviderKind, XaiConfig};
+use crate::config::{AnthropicConfig, LlmProviderKind, XaiConfig};
 
 /// Role of a message in a chat conversation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -138,6 +138,10 @@ pub struct ToolDefinition {
 /// Input to [`LlmProvider::step`].
 #[derive(Debug, Clone)]
 pub struct StepRequest {
+    /// Model id to route this call to (e.g. `grok-4.3`,
+    /// `claude-sonnet-4-6`). Per-request so a single provider instance
+    /// can serve multiple personas using the same provider.
+    pub model: String,
     /// Full history through the current point, including prior tool
     /// uses/results from earlier iterations.
     pub messages: Vec<ChatTurn>,
@@ -271,7 +275,9 @@ pub enum LlmError {
 /// Shared interface for one round-trip to the model. Drive the
 /// iteration via [`crate::agent::run`].
 pub trait LlmProvider: Send + Sync {
-    /// Short, stable identifier (e.g. `xai/grok-4.1-fast`).
+    /// Short, stable identifier — just the provider name (e.g. `xai`,
+    /// `anthropic`). The specific model used per call comes from
+    /// [`StepRequest::model`].
     fn name(&self) -> &str;
 
     /// One round-trip. The caller must include every prior turn
@@ -283,7 +289,9 @@ pub trait LlmProvider: Send + Sync {
     ) -> impl std::future::Future<Output = Result<StepResponse, LlmError>> + Send;
 }
 
-/// Static-dispatch union of every supported provider.
+/// Static-dispatch union of every supported provider. Each variant is
+/// model-agnostic — pick the model per request via
+/// [`StepRequest::model`].
 #[derive(Debug, Clone)]
 pub enum AnyProvider {
     /// xAI Grok.
@@ -293,20 +301,12 @@ pub enum AnyProvider {
 }
 
 impl AnyProvider {
-    /// Construct from validated [`LlmConfig`].
-    pub fn from_config(config: &LlmConfig) -> Result<Self, LlmError> {
-        match config.provider {
-            LlmProviderKind::Xai => {
-                let cfg = config.xai.as_ref().ok_or(LlmError::MissingConfig("xai"))?;
-                Ok(Self::Xai(xai::XaiProvider::new(cfg.clone())))
-            }
-            LlmProviderKind::Anthropic => {
-                let cfg = config
-                    .anthropic
-                    .as_ref()
-                    .ok_or(LlmError::MissingConfig("anthropic"))?;
-                Ok(Self::Anthropic(anthropic::AnthropicProvider::new(cfg.clone())))
-            }
+    /// Provider kind discriminator, useful for looking up which
+    /// provider a persona maps to.
+    pub fn kind(&self) -> LlmProviderKind {
+        match self {
+            Self::Xai(_) => LlmProviderKind::Xai,
+            Self::Anthropic(_) => LlmProviderKind::Anthropic,
         }
     }
 }

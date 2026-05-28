@@ -75,6 +75,7 @@ pub struct AgentRun {
 #[allow(clippy::too_many_arguments)]
 pub async fn run<P, T, O>(
     provider: &P,
+    model: String,
     initial_messages: Vec<ChatTurn>,
     tools: Vec<ToolDefinition>,
     executor: &T,
@@ -96,6 +97,7 @@ where
 
     tracing::info!(
         provider = provider.name(),
+        model = %model,
         messages = messages.len(),
         client_tools = tools.len(),
         web_search = enable_web_search,
@@ -105,6 +107,7 @@ where
     for iteration in 0..max_iterations {
         let response = match provider
             .step(StepRequest {
+                model: model.clone(),
                 messages: messages.clone(),
                 tools: tools.clone(),
                 enable_web_search,

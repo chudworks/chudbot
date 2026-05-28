@@ -15,12 +15,13 @@
 //!
 //! Interactions (slash commands) are dispatched to [`crate::commands`].
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use grok_discord_bot_core::{
-    AgentObserver, AgentRun, AnyProvider, BotConfig, ChatTurn, ContextItem, Conversation, Db,
-    LlmProvider, MessageRole, PrivacyMode, StepRequest, StepResponse, StorageConfig,
+    AgentRun, AnyProvider, ChatTurn, ContextItem, Conversation, Db, LlmProvider, LlmProviderKind,
+    MessageRole, NoopObserver, Persona, PrivacyMode, StepRequest, StepResponse, StorageConfig,
     ToolDefinition, ToolError, ToolExecutor, TurnBlock,
     imagegen::{ImageGenRequest, ImageGenerator, ImageQuality},
     run_agent, storage,
@@ -45,10 +46,20 @@ use twilight_model::id::marker::{
 
 use crate::commands;
 
-/// Discord messages have a hard 2000-char limit; we auto-thread when the
-/// answer exceeds this. Threading is also skipped for follow-ups inside
-/// an existing conversation — we just reply inline.
+/// Auto-thread when the new-conversation reply is heavy enough that
+/// inlining it would dominate the channel. We trigger threading on
+/// EITHER signal:
+///   - total characters across all chunks > [`REPLY_LENGTH_THRESHOLD`]
+///   - "rendered" line count > [`REPLY_RENDERED_LINES_THRESHOLD`]
+/// "Rendered" counts each `\n`-delimited line plus extra rows for
+/// lines that auto-wrap on a typical Discord client (~80 chars wide).
+/// The line-based check catches replies like a 10-row numbered list
+/// where the char count is low but the vertical footprint is huge.
+/// Threading is also skipped for follow-ups inside an existing
+/// conversation — we just reply inline.
 const REPLY_LENGTH_THRESHOLD: usize = 1500;
+const REPLY_RENDERED_LINES_THRESHOLD: usize = 20;
+const REPLY_WRAP_WIDTH: usize = 80;
 
 /// Soft cap on the model's reply tokens per step. Anthropic requires
 /// `max_tokens`; xAI tolerates an unused field.
@@ -117,12 +128,20 @@ struct State {
     http: Arc<HttpClient>,
     download_http: reqwest::Client,
     db: Db,
-    llm: AnyProvider,
+    /// One provider per kind we have credentials for. A persona's
+    /// `provider` field keys into this map at turn time so xAI and
+    /// Anthropic personas can coexist in the same deployment.
+    providers: HashMap<LlmProviderKind, AnyProvider>,
     web_base_url: String,
     bot_user_id: Id<UserMarker>,
     app_id: Id<ApplicationMarker>,
     default_privacy: PrivacyMode,
-    bot_config: BotConfig,
+    /// Personas keyed by name. Each pairs a system prompt with a
+    /// (provider, model) pair and optional sampling knobs.
+    personas: HashMap<String, Persona>,
+    /// Floor fallback when no `persona_selections` row matches the
+    /// resolution chain. Always a valid key in `personas`.
+    default_persona: String,
     images_dir: PathBuf,
     videos_dir: PathBuf,
     /// Present only when an xAI API key is configured; gates the
@@ -138,10 +157,11 @@ pub async fn run(
     discord_token: String,
     dev_guild_id: Option<u64>,
     db: Db,
-    llm: AnyProvider,
+    providers: HashMap<LlmProviderKind, AnyProvider>,
+    personas: HashMap<String, Persona>,
+    default_persona: String,
     web_base_url: String,
     default_privacy: PrivacyMode,
-    bot_config: BotConfig,
     storage_config: StorageConfig,
     image_gen: Option<Arc<ImageGenerator>>,
     video_gen: Option<Arc<VideoGenerator>>,
@@ -170,12 +190,13 @@ pub async fn run(
         http,
         download_http: reqwest::Client::new(),
         db,
-        llm,
+        providers,
         web_base_url,
         bot_user_id: current.id,
         app_id: application.id,
         default_privacy,
-        bot_config,
+        personas,
+        default_persona,
         images_dir: storage_config.images_dir,
         videos_dir: storage_config.videos_dir,
         image_gen,
@@ -210,6 +231,8 @@ pub async fn run(
                         Arc::clone(&state.http),
                         state.db.clone(),
                         state.default_privacy.clone(),
+                        state.personas.clone(),
+                        state.default_persona.clone(),
                         state.app_id,
                         boxed.0,
                     )
@@ -252,7 +275,23 @@ fn log_guild_create(event: &GuildCreate) {
 /// server-side SAFETY_CHECK_TYPE_* 403), which IS a refusal signal
 /// and we honor it directly.
 async fn moderation_allows(state: &State, content: &str) -> bool {
+    // Route the classifier through the default persona's provider +
+    // model. That's the bot's baseline voice and the cheapest stable
+    // route — we don't want a persona override to silently change the
+    // moderation surface.
+    let persona = state
+        .personas
+        .get(&state.default_persona)
+        .expect("default_persona is validated at startup");
+    let Some(provider) = state.providers.get(&persona.provider) else {
+        tracing::warn!(
+            provider = persona.provider.as_str(),
+            "moderation: default persona's provider is not initialized; failing open"
+        );
+        return true;
+    };
     let request = StepRequest {
+        model: persona.model.clone(),
         messages: vec![
             ChatTurn::text(MessageRole::System, MODERATION_PROMPT),
             ChatTurn::text(
@@ -267,7 +306,7 @@ async fn moderation_allows(state: &State, content: &str) -> bool {
         top_p: None,
     };
 
-    match state.llm.step(request).await {
+    match provider.step(request).await {
         Ok(StepResponse::Final { content: verdict, .. }) => {
             let normalized = verdict.trim().to_ascii_uppercase();
             // Treat anything containing REFUSE as a refusal; anything
@@ -496,11 +535,86 @@ async fn process(
         "turn: mention received"
     );
 
-    let (conversation, is_new) = resolve_conversation(state, msg).await?;
+    // Two-phase conversation resolution: first look up whether this
+    // message extends an existing conversation, then resolve the persona
+    // (which can be conversation-scoped), then either fetch or create
+    // the conversation row stamped with the right persona's model.
+    let existing = lookup_existing_conversation(state, msg).await?;
+    let conversation_id_for_persona = existing.as_ref().map(|c| c.id);
+    let guild_id_for_persona = msg
+        .guild_id
+        .map(|g| i64::try_from(g.get()).unwrap_or(i64::MAX));
+    let channel_id_i64 = i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
+    let user_id_i64 = i64::try_from(msg.author.id.get()).unwrap_or(i64::MAX);
+
+    let resolved_persona_name = state
+        .db
+        .resolve_persona(
+            conversation_id_for_persona,
+            guild_id_for_persona,
+            channel_id_i64,
+            user_id_i64,
+        )
+        .await?
+        .unwrap_or_else(|| state.default_persona.clone());
+    // If the stored persona name no longer exists in config (e.g. the
+    // operator renamed/removed it), fall back to default rather than
+    // panic. The user can fix the override later with /grok-persona.
+    let (persona_name, persona) = match state.personas.get(&resolved_persona_name) {
+        Some(p) => (resolved_persona_name, p),
+        None => {
+            tracing::warn!(
+                stored = %resolved_persona_name,
+                "persona resolved to a name not in current config; using default"
+            );
+            (
+                state.default_persona.clone(),
+                state
+                    .personas
+                    .get(&state.default_persona)
+                    .expect("default_persona validated at startup"),
+            )
+        }
+    };
+    let Some(provider) = state.providers.get(&persona.provider) else {
+        tracing::error!(
+            persona = %persona_name,
+            provider = persona.provider.as_str(),
+            "no provider initialized for resolved persona; this should have failed validation"
+        );
+        return Err(BotError::Llm(grok_discord_bot_core::LlmError::Transport(
+            format!(
+                "persona `{persona_name}` references provider `{}` but no credentials are loaded",
+                persona.provider.as_str()
+            ),
+        )));
+    };
+
+    let (conversation, is_new) = match existing {
+        Some(c) => (c, false),
+        None => {
+            let conv = state
+                .db
+                .create_conversation(
+                    msg.guild_id
+                        .map(|g| i64::try_from(g.get()).unwrap_or(0))
+                        .unwrap_or(0),
+                    channel_id_i64,
+                    user_id_i64,
+                    i64::try_from(msg.id.get()).unwrap_or(i64::MAX),
+                    &persona.model,
+                    None,
+                )
+                .await?;
+            (conv, true)
+        }
+    };
     tracing::info!(
         conversation = %conversation.id,
         is_new,
-        model = %conversation.model,
+        persona = %persona_name,
+        provider = persona.provider.as_str(),
+        model = %persona.model,
         "turn: conversation resolved"
     );
 
@@ -512,8 +626,16 @@ async fn process(
     // to pass to the LLM (it's still fresh; cheaper than base64).
     let saved_images = save_image_attachments(state, msg).await;
 
-    let mut initial_context =
-        build_context(state, msg, &conversation, is_new, &user_content, privacy_mode).await?;
+    let mut initial_context = build_context(
+        state,
+        msg,
+        &conversation,
+        is_new,
+        &user_content,
+        privacy_mode,
+        &persona.system_prompt,
+    )
+    .await?;
 
     let next_pos = initial_context.last().map(|c| c.position + 1).unwrap_or(0);
     for (i, image) in saved_images.iter().enumerate() {
@@ -534,6 +656,16 @@ async fn process(
             &user_content,
         )
         .await?;
+    // Stamp the persona on the turn *before* the agent runs so the
+    // model used is recoverable even if a later step fails. The web
+    // viewer picks this up via the `persona_name` column on `turns`.
+    if let Err(err) = state.db.set_turn_persona(turn.id, &persona_name).await {
+        tracing::warn!(
+            turn = %turn.id,
+            error = %err,
+            "failed to stamp persona on turn row; continuing"
+        );
+    }
     tracing::info!(
         conversation = %conversation.id,
         turn = %turn.id,
@@ -560,7 +692,17 @@ async fn process(
         )
         .await?;
 
-    for item in &initial_context {
+    // Persist only items that are NOVEL to this turn — the user's
+    // @-mention, any Discord-quoted message, and saved image
+    // attachments. The system prompt is constant (lives in the bot
+    // config) and prior-turn user/assistant content is already stored
+    // verbatim in the `turns` table, so re-stamping them into
+    // `context_items` every turn would just duplicate data and grow
+    // the table quadratically with conversation length.
+    for item in initial_context
+        .iter()
+        .filter(|i| i.source.starts_with("discord:msg:"))
+    {
         state.db.record_context_item(turn.id, item).await?;
     }
 
@@ -629,18 +771,20 @@ async fn process(
         video_gen: state.video_gen.clone(),
         images_dir: state.images_dir.clone(),
         videos_dir: state.videos_dir.clone(),
+        last_status_text: Mutex::new(None),
     };
 
     let agent_run: AgentRun = run_agent(
-        &state.llm,
+        provider,
+        persona.model.clone(),
         messages,
         tools,
         &executor,
-        &executor, // observer (same struct implements both traits)
-        true,      // server-side web search always enabled
+        &NoopObserver,
+        true, // server-side web search always enabled
         MAX_OUTPUT_TOKENS,
-        state.bot_config.temperature,
-        state.bot_config.top_p,
+        persona.temperature,
+        persona.top_p,
         MAX_AGENT_ITERATIONS,
     )
     .await;
@@ -763,8 +907,8 @@ async fn process(
     };
     let formatted = format_reply(&answer_text, is_new, &conversation, &state.web_base_url);
     let chunks = assemble_chunks(&formatted);
-    let total_chars: usize = chunks.iter().map(|c| c.len()).sum();
-    let threaded = is_new && total_chars > REPLY_LENGTH_THRESHOLD;
+    let total_rendered_lines: usize = chunks.iter().map(|c| rendered_line_count(c)).sum();
+    let threaded = should_open_thread(is_new, &chunks);
     let reply_msgs = post_reply_chunks(
         state,
         msg,
@@ -794,6 +938,7 @@ async fn process(
         threaded,
         chunks = reply_msgs.len(),
         reply_chars = agent_run.content.len(),
+        rendered_lines = total_rendered_lines,
         tool_calls = agent_run.tool_calls.len(),
         "turn: reply posted"
     );
@@ -826,17 +971,26 @@ async fn process(
     Ok(())
 }
 
-/// Decide whether this @mention starts a new conversation or continues
-/// an existing one. See [`Db::lookup_conversation_by_message`].
-async fn resolve_conversation(
+/// Look up whether this @mention extends an existing conversation,
+/// without creating one. Returns `None` when the message is a fresh
+/// root and the caller needs to create a new conversation row.
+///
+/// Lookup order:
+///   1. Discord reply parent — if the user replied to a bot/user
+///      message we already tracked, that conversation continues.
+///   2. Channel id — when the bot opened a thread for an answer, the
+///      thread's channel id matches the user's original message id and
+///      lives in `message_links`; @mentions inside the thread should
+///      continue the same conversation.
+async fn lookup_existing_conversation(
     state: &State,
     msg: &Message,
-) -> Result<(Conversation, bool), BotError> {
+) -> Result<Option<Conversation>, BotError> {
     if let Some(referenced) = &msg.referenced_message {
         let parent_id = i64::try_from(referenced.id.get()).unwrap_or(i64::MAX);
         if let Some(conv_id) = state.db.lookup_conversation_by_message(parent_id).await? {
             if let Some(conv) = state.db.get_conversation(conv_id).await? {
-                return Ok((conv, false));
+                return Ok(Some(conv));
             }
         }
     }
@@ -844,24 +998,11 @@ async fn resolve_conversation(
     let channel_id = i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
     if let Some(conv_id) = state.db.lookup_conversation_by_message(channel_id).await? {
         if let Some(conv) = state.db.get_conversation(conv_id).await? {
-            return Ok((conv, false));
+            return Ok(Some(conv));
         }
     }
 
-    let conv = state
-        .db
-        .create_conversation(
-            msg.guild_id
-                .map(|g| i64::try_from(g.get()).unwrap_or(0))
-                .unwrap_or(0),
-            i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX),
-            i64::try_from(msg.author.id.get()).unwrap_or(i64::MAX),
-            i64::try_from(msg.id.get()).unwrap_or(i64::MAX),
-            state.llm.name(),
-            None,
-        )
-        .await?;
-    Ok((conv, true))
+    Ok(None)
 }
 
 /// Assemble the initial prompt for the agent loop. The model can
@@ -878,6 +1019,7 @@ async fn build_context(
     is_new: bool,
     user_content: &str,
     privacy_mode: &PrivacyMode,
+    system_prompt: &str,
 ) -> Result<Vec<ContextItem>, BotError> {
     let mut items = Vec::new();
     let mut pos: i32 = 0;
@@ -887,7 +1029,7 @@ async fn build_context(
         &mut pos,
         "system".to_string(),
         "system",
-        state.bot_config.system_prompt.clone(),
+        system_prompt.to_string(),
         None,
     );
 
@@ -1085,8 +1227,6 @@ fn build_tool_definitions(
     // post_status_message is always available. The model is meant to
     // call it in the same response as a slow tool (generate_video
     // especially) so the user gets a status update before the wait.
-    // We also surface any natural intermediate text via AgentObserver,
-    // but in practice grok-4.3 leans on the explicit tool more reliably.
     tools.push(post_status_message_tool());
     tools
 }
@@ -1275,6 +1415,12 @@ struct BotToolExecutor {
     video_gen: Option<Arc<VideoGenerator>>,
     images_dir: PathBuf,
     videos_dir: PathBuf,
+    /// Last `post_status_message` text actually posted this turn.
+    /// Used to silently drop duplicate/near-duplicate consecutive
+    /// status messages — the model sometimes re-narrates the same
+    /// line across multiple agent loop iterations, which spams the
+    /// channel.
+    last_status_text: Mutex<Option<String>>,
 }
 
 impl ToolExecutor for BotToolExecutor {
@@ -1286,57 +1432,6 @@ impl ToolExecutor for BotToolExecutor {
             "post_status_message" => self.post_status_message(input).await,
             other => Err(ToolError::Unknown(other.to_string())),
         }
-    }
-}
-
-impl AgentObserver for BotToolExecutor {
-    /// Post the model's intermediate text — text it emitted alongside
-    /// a `tool_uses` step — as a Discord reply. This is how status
-    /// messages reach the channel; the model just narrates and we
-    /// surface it, no dedicated tool required.
-    async fn on_partial_text(&self, text: &str) {
-        let trimmed = truncate(text, 1990);
-        if trimmed.trim().is_empty() {
-            return;
-        }
-        let create_result = self
-            .http
-            .create_message(self.default_channel_id)
-            .content(&trimmed)
-            .reply(self.user_msg_id)
-            .flags(twilight_model::channel::message::MessageFlags::SUPPRESS_EMBEDS)
-            .await;
-        let posted = match create_result {
-            Ok(resp) => match resp.model().await {
-                Ok(m) => m,
-                Err(err) => {
-                    tracing::warn!(error = %err, "failed to deserialize intermediate reply");
-                    return;
-                }
-            },
-            Err(err) => {
-                tracing::warn!(error = %err, "failed to post intermediate reply");
-                return;
-            }
-        };
-        // Link this message to the conversation so the viewer trace
-        // shows every reply the bot posted this turn.
-        let _ = self
-            .db
-            .record_message_link(
-                i64::try_from(posted.id.get()).unwrap_or(i64::MAX),
-                self.guild_id,
-                self.conversation_id,
-                self.turn_id,
-                "assistant_status",
-            )
-            .await;
-        tracing::info!(
-            message_id = %posted.id,
-            turn = %self.turn_id,
-            chars = trimmed.len(),
-            "agent: intermediate reply posted"
-        );
     }
 }
 
@@ -1503,9 +1598,8 @@ impl BotToolExecutor {
     /// Generate a video synchronously: submit + poll + download
     /// happen inside the tool call. The tool blocks for ~60-120s;
     /// the agent loop sees one tool call go in and one result come
-    /// out. Status messages reach the user via the model's natural
-    /// partial_text alongside this call (which the AgentObserver
-    /// posts as a Discord reply), not via a separate polling tool.
+    /// out. Status messages reach the user via `post_status_message`
+    /// fired in the same response as this call.
     async fn generate_video(&self, input: Value) -> Result<Value, ToolError> {
         let Some(generator) = self.video_gen.as_ref() else {
             return Err(ToolError::Execution(
@@ -1632,6 +1726,30 @@ impl BotToolExecutor {
         if trimmed.trim().is_empty() {
             return Err(ToolError::InvalidInput("text is empty".to_string()));
         }
+
+        // Drop near-duplicates of the previous status this turn. The
+        // model sometimes re-emits the same "Generating…" line on
+        // every loop iteration, which spams the channel. Compare
+        // case-insensitively after trimming trailing punctuation/
+        // ellipses so "Generating the image…" and "Generating the
+        // image..." collapse together.
+        let normalized = normalize_status_for_dedup(&trimmed);
+        {
+            let mut last = self.last_status_text.lock().unwrap();
+            if last.as_deref() == Some(normalized.as_str()) {
+                tracing::info!(
+                    turn = %self.turn_id,
+                    chars = trimmed.len(),
+                    "status message suppressed (duplicate of previous)"
+                );
+                return Ok(json!({
+                    "skipped": true,
+                    "reason": "duplicate of previous status this turn",
+                }));
+            }
+            *last = Some(normalized);
+        }
+
         let posted = self
             .http
             .create_message(self.default_channel_id)
@@ -1953,10 +2071,9 @@ async fn post_reply_chunks(
 ) -> Result<Vec<Message>, BotError> {
     debug_assert!(!chunks.is_empty(), "must have at least one chunk to post");
     let suppress = MessageFlags::SUPPRESS_EMBEDS;
-    let total_chars: usize = chunks.iter().map(|c| c.len()).sum();
 
     let (target_channel, first_chunk_replies_to_user): (Id<ChannelMarker>, bool) =
-        if is_new && total_chars > REPLY_LENGTH_THRESHOLD {
+        if should_open_thread(is_new, chunks) {
             let title = make_thread_title(&user_msg.content);
             let thread = state
                 .http
@@ -2033,6 +2150,54 @@ async fn post_reply_chunks(
 /// when truncation occurs. The returned string's `len()` is always
 /// `<= max`. The cutoff is walked back to a char boundary so we never
 /// slice mid-codepoint.
+/// Decide whether a new-conversation reply should open a thread.
+/// Threading triggers if EITHER the raw character count or the
+/// approximate visual-row count exceeds its threshold (see the
+/// constants for rationale). Follow-ups in an existing conversation
+/// (`is_new = false`) always reply inline.
+fn should_open_thread(is_new: bool, chunks: &[String]) -> bool {
+    if !is_new {
+        return false;
+    }
+    let total_chars: usize = chunks.iter().map(|c| c.len()).sum();
+    if total_chars > REPLY_LENGTH_THRESHOLD {
+        return true;
+    }
+    let total_rendered_lines: usize = chunks.iter().map(|c| rendered_line_count(c)).sum();
+    total_rendered_lines > REPLY_RENDERED_LINES_THRESHOLD
+}
+
+/// Approximate the number of visual rows a Discord client would
+/// render the given text as. Counts `\n`-separated logical lines and
+/// adds extra rows for lines that exceed [`REPLY_WRAP_WIDTH`] chars
+/// (which most clients soft-wrap). Used by the auto-thread heuristic
+/// so tall replies — like a 10-row numbered list — get threaded even
+/// when their raw char count is modest.
+fn rendered_line_count(text: &str) -> usize {
+    text.split('\n')
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 {
+                1
+            } else {
+                chars.div_ceil(REPLY_WRAP_WIDTH)
+            }
+        })
+        .sum()
+}
+
+/// Normalize a status string for duplicate-detection: lowercase, trim,
+/// strip trailing ellipses / dots / spaces. Two strings that differ
+/// only in `...` vs `…` vs a trailing space collapse to the same key.
+fn normalize_status_for_dedup(s: &str) -> String {
+    let lower = s.to_lowercase();
+    let trimmed = lower.trim();
+    let cleaned = trimmed.trim_end_matches(|c: char| {
+        c == '.' || c == '…' || c.is_whitespace()
+    });
+    cleaned.to_string()
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -2299,5 +2464,56 @@ mod tests {
             names(&PrivacyMode::ConversationOnly, true, false),
             vec!["generate_image", "post_status_message"]
         );
+    }
+
+    #[test]
+    fn rendered_lines_counts_short_lines_individually() {
+        let body = "a\nb\nc\nd\ne";
+        assert_eq!(rendered_line_count(body), 5);
+    }
+
+    #[test]
+    fn rendered_lines_adds_rows_for_wrap() {
+        let line = "x".repeat(REPLY_WRAP_WIDTH * 3); // wraps to 3 rows
+        assert_eq!(rendered_line_count(&line), 3);
+        // mixed: 1 short + 1 that wraps 2x
+        let mixed = format!("hi\n{}", "y".repeat(REPLY_WRAP_WIDTH + 1));
+        assert_eq!(rendered_line_count(&mixed), 1 + 2);
+    }
+
+    #[test]
+    fn rendered_lines_counts_blank_lines() {
+        assert_eq!(rendered_line_count("a\n\nb"), 3);
+    }
+
+    #[test]
+    fn should_open_thread_respects_both_signals() {
+        // Follow-up: never threads.
+        let big = vec!["x".repeat(REPLY_LENGTH_THRESHOLD + 100)];
+        assert!(!should_open_thread(false, &big));
+        // New + big char count: threads.
+        assert!(should_open_thread(true, &big));
+        // New + tall but small: threads on line count.
+        let tall = vec!["a\n".repeat(REPLY_RENDERED_LINES_THRESHOLD + 5)];
+        assert!(tall[0].len() < REPLY_LENGTH_THRESHOLD);
+        assert!(should_open_thread(true, &tall));
+        // New + small + short: inline.
+        assert!(!should_open_thread(true, &["hi".to_string()]));
+    }
+
+    #[test]
+    fn top10_style_reply_exceeds_line_threshold_but_not_char_threshold() {
+        // Approximation of the screenshot: 3 numbered lists of 10
+        // short entries plus a few headers/blank lines. Char count
+        // sits well under REPLY_LENGTH_THRESHOLD, but the line
+        // count alone should be enough to thread.
+        let body = "**GDP:**\n\n".to_string()
+            + &(1..=10).map(|i| format!("{i}. Country\n")).collect::<String>()
+            + "\n**Population:**\n\n"
+            + &(1..=10).map(|i| format!("{i}. Country\n")).collect::<String>()
+            + "\n**Best:**\n\n"
+            + &(1..=5).map(|i| format!("{i}. Country\n")).collect::<String>();
+        assert!(body.len() < REPLY_LENGTH_THRESHOLD);
+        assert!(rendered_line_count(&body) > REPLY_RENDERED_LINES_THRESHOLD);
     }
 }

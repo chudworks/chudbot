@@ -19,26 +19,22 @@ const API_VERSION: &str = "2023-06-01";
 const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20250305";
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
-/// Anthropic Claude provider.
+/// Anthropic Claude provider. Model-agnostic — the specific model id
+/// is supplied per request via [`StepRequest::model`].
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     http: reqwest::Client,
     api_key: String,
-    model: String,
     base_url: String,
-    name: String,
 }
 
 impl AnthropicProvider {
     /// Construct from a config block.
     pub fn new(config: AnthropicConfig) -> Self {
-        let name = format!("anthropic/{}", config.model);
         Self {
             http: reqwest::Client::new(),
             api_key: config.api_key,
-            model: config.model,
             base_url: DEFAULT_BASE_URL.to_string(),
-            name,
         }
     }
 
@@ -51,7 +47,7 @@ impl AnthropicProvider {
 
 impl LlmProvider for AnthropicProvider {
     fn name(&self) -> &str {
-        &self.name
+        "anthropic"
     }
 
     async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
@@ -77,7 +73,7 @@ impl LlmProvider for AnthropicProvider {
         }
 
         let body = AnthropicRequest {
-            model: &self.model,
+            model: &request.model,
             max_tokens: request.max_tokens,
             messages: &anthropic_messages,
             system: system.as_deref(),
@@ -110,7 +106,7 @@ impl LlmProvider for AnthropicProvider {
             .await
             .map_err(|e| LlmError::Decode(e.to_string()))?;
 
-        let model_id = parsed.model.unwrap_or_else(|| self.model.clone());
+        let model_id = parsed.model.unwrap_or_else(|| request.model.clone());
         let stop = parsed.stop_reason.unwrap_or_default();
         let (text, client_uses, server_tool_calls) = walk_blocks(&parsed.content);
 

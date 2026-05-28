@@ -1,7 +1,18 @@
 //! TOML-backed configuration. Loaded once at startup, then passed by
 //! reference (or per-section by value) into the subcommand entry points.
+//!
+//! The `[personas.*]` table is the source of truth for *which* model to
+//! call and *with what system prompt*. Each persona names a provider
+//! (`xai` or `anthropic`), a specific model id, and the prompt /
+//! sampling parameters to use. The `[llm.<provider>]` blocks supply the
+//! provider-level credentials shared across personas. Selection at
+//! runtime is per-guild / per-channel / per-user / per-conversation,
+//! resolved against `persona_selections` in the database; the
+//! `default_persona` here is the floor fallback when nothing more
+//! specific applies.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -20,10 +31,20 @@ pub enum ConfigError {
     /// Contents could not be parsed as TOML or did not match the schema.
     #[error("could not parse config file: {0}")]
     Parse(#[from] toml::de::Error),
-    /// The selected LLM provider has no matching `[llm.<provider>]` section.
-    #[error("config selects llm provider `{provider}` but no `[llm.{provider}]` section was found")]
-    MissingProviderSection {
-        /// Provider name from `llm.provider`.
+    /// `default_persona` doesn't name a persona in `[personas.*]`.
+    #[error("default_persona = `{0}` is not defined in [personas.*]")]
+    UnknownDefaultPersona(String),
+    /// No personas at all.
+    #[error("at least one persona must be defined in [personas.*]")]
+    NoPersonas,
+    /// A persona references a provider with no `[llm.<provider>]` block.
+    #[error(
+        "persona `{persona}` uses provider `{provider}` but no `[llm.{provider}]` section was found"
+    )]
+    MissingProviderForPersona {
+        /// Persona name that triggered the failure.
+        persona: String,
+        /// Provider name referenced by that persona.
         provider: String,
     },
 }
@@ -37,7 +58,9 @@ pub struct Config {
     pub postgres: PostgresConfig,
     /// Web viewer.
     pub web: WebConfig,
-    /// LLM provider selection and per-provider credentials.
+    /// Per-provider credentials. Either `[llm.xai]` or `[llm.anthropic]`
+    /// (or both) must be present, depending on which providers the
+    /// configured personas use.
     pub llm: LlmConfig,
     /// Default [`PrivacyMode`] applied to guilds that don't have an
     /// explicit row in `guild_settings` yet. Optional — defaults to
@@ -45,10 +68,14 @@ pub struct Config {
     /// guild at runtime via the `/grok-mode set` slash command.
     #[serde(default = "PrivacyMode::opt_in_default")]
     pub default_privacy: PrivacyMode,
-    /// Bot persona — system prompt and sampling knobs the agent runs with.
-    /// Optional; an omitted `[bot]` block applies the default persona.
-    #[serde(default)]
-    pub bot: BotConfig,
+    /// Persona name used as the floor fallback when no more-specific
+    /// selection is recorded in `persona_selections`. Must be a key in
+    /// [`Self::personas`].
+    pub default_persona: String,
+    /// Named personas. Each ties together a model, a system prompt, and
+    /// optional sampling knobs. Runtime selection picks one of these by
+    /// name; see `persona_selections` in the DB for scope.
+    pub personas: HashMap<String, Persona>,
     /// Media storage (image attachments today). Optional; defaults
     /// reasonably for a local single-host deploy.
     #[serde(default)]
@@ -87,17 +114,19 @@ fn default_videos_dir() -> PathBuf {
     PathBuf::from("videos")
 }
 
-/// Persona / sampling settings for the agent loop. Edit `system_prompt`
-/// to give the bot a personality (sarcastic, terse, role-played, etc.);
-/// raise `temperature` to make replies more chaotic or lower it for
-/// more focused answers.
+/// One named persona. The bot consults this on every turn to decide
+/// which provider+model to call and what system prompt + sampling knobs
+/// to use. Personas can mix providers freely; each one names its own.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct BotConfig {
+pub struct Persona {
+    /// Which provider to route this persona's calls through.
+    pub provider: LlmProviderKind,
+    /// Model id for that provider (e.g. `grok-4.3`, `claude-sonnet-4-6`).
+    pub model: String,
     /// Top-level instruction sent to the model on every turn. Wired
     /// into the xAI Responses API's `instructions` field and lifted out
     /// of the Anthropic Messages API's chat history into its top-level
     /// `system` field.
-    #[serde(default = "default_system_prompt")]
     pub system_prompt: String,
     /// Sampling temperature (0.0-2.0). `None` lets the provider pick its
     /// default. Higher = more random; lower = more focused.
@@ -108,27 +137,6 @@ pub struct BotConfig {
     #[serde(default)]
     pub top_p: Option<f32>,
 }
-
-impl Default for BotConfig {
-    fn default() -> Self {
-        Self {
-            system_prompt: default_system_prompt(),
-            temperature: None,
-            top_p: None,
-        }
-    }
-}
-
-fn default_system_prompt() -> String {
-    "You are a helpful AI assistant in a private Discord server. Be direct \
-and concise. When asked to verify a claim, use the web_search and x_search \
-tools to ground your answer in current sources and cite URLs. When you need \
-more context about an ongoing conversation in this channel (for example: \
-\"what did they decide?\", \"what's the discussion been about?\"), call the \
-`fetch_messages` tool to pull recent messages from the channel. Don't fetch \
-speculatively — only when you actually need extra context to answer."
-        .to_string()
-    }
 
 /// Privacy / context-gathering policy. The four variants correspond to
 /// the four designs discussed by the group; default is `opt_in`
@@ -219,19 +227,19 @@ fn default_listen() -> String {
     "0.0.0.0:8080".to_string()
 }
 
-/// LLM provider selection plus per-provider config blocks.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// Per-provider credentials. The model is no longer part of these
+/// blocks — personas pick that. A provider block only needs to exist
+/// if at least one persona references it.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct LlmConfig {
-    /// Which provider to route requests through.
-    pub provider: LlmProviderKind,
-    /// xAI provider settings; required when `provider = "xai"`.
+    /// xAI provider credentials.
     pub xai: Option<XaiConfig>,
-    /// Anthropic provider settings; required when `provider = "anthropic"`.
+    /// Anthropic provider credentials.
     pub anthropic: Option<AnthropicConfig>,
 }
 
-/// Discriminator for which LLM provider to use at runtime.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+/// Discriminator for which LLM provider a persona uses.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum LlmProviderKind {
     /// xAI / Grok.
@@ -250,34 +258,18 @@ impl LlmProviderKind {
     }
 }
 
-/// xAI Grok configuration.
+/// xAI Grok credentials.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct XaiConfig {
     /// API key issued at console.x.ai.
     pub api_key: String,
-    /// Model id, e.g. `grok-4.1-fast` or `grok-4.3`.
-    #[serde(default = "default_xai_model")]
-    pub model: String,
 }
 
-fn default_xai_model() -> String {
-    // Use the documented flagship; older `grok-4.1-fast` is no longer
-    // listed in xAI's current model catalog.
-    "grok-4.3".to_string()
-}
-
-/// Anthropic Claude configuration.
+/// Anthropic Claude credentials.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AnthropicConfig {
     /// API key.
     pub api_key: String,
-    /// Model id, e.g. `claude-sonnet-4-6`.
-    #[serde(default = "default_anthropic_model")]
-    pub model: String,
-}
-
-fn default_anthropic_model() -> String {
-    "claude-sonnet-4-6".to_string()
 }
 
 impl Config {
@@ -294,19 +286,41 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
-        match self.llm.provider {
-            LlmProviderKind::Xai if self.llm.xai.is_none() => {
-                Err(ConfigError::MissingProviderSection {
-                    provider: "xai".into(),
-                })
-            }
-            LlmProviderKind::Anthropic if self.llm.anthropic.is_none() => {
-                Err(ConfigError::MissingProviderSection {
-                    provider: "anthropic".into(),
-                })
-            }
-            _ => Ok(()),
+        if self.personas.is_empty() {
+            return Err(ConfigError::NoPersonas);
         }
+        if !self.personas.contains_key(&self.default_persona) {
+            return Err(ConfigError::UnknownDefaultPersona(
+                self.default_persona.clone(),
+            ));
+        }
+        for (name, persona) in &self.personas {
+            let present = match persona.provider {
+                LlmProviderKind::Xai => self.llm.xai.is_some(),
+                LlmProviderKind::Anthropic => self.llm.anthropic.is_some(),
+            };
+            if !present {
+                return Err(ConfigError::MissingProviderForPersona {
+                    persona: name.clone(),
+                    provider: persona.provider.as_str().to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Look up a persona by name, falling back to `default_persona`
+    /// when missing. Panics only if the config has no default persona
+    /// at all — which `validate` already guarantees can't happen.
+    pub fn persona_or_default(&self, name: Option<&str>) -> &Persona {
+        if let Some(n) = name {
+            if let Some(p) = self.personas.get(n) {
+                return p;
+            }
+        }
+        self.personas
+            .get(&self.default_persona)
+            .expect("validate() guarantees default_persona is present")
     }
 }
 
@@ -314,35 +328,47 @@ impl Config {
 mod tests {
     use super::*;
 
+    // NOTE: `default_persona` is a top-level scalar so it must appear
+    // BEFORE any `[section]` headers — otherwise the TOML parser
+    // attaches it to whichever section was opened last.
+    const MINIMAL_CONFIG: &str = r#"
+        default_persona = "default"
+
+        [discord]
+        token = "abc"
+
+        [postgres]
+        url = "postgres://localhost/grok"
+
+        [web]
+        base_url = "http://localhost:8080"
+
+        [llm.xai]
+        api_key = "xai-key"
+
+        [personas.default]
+        provider = "xai"
+        model = "grok-4.3"
+        system_prompt = "You are a helpful AI."
+    "#;
+
     #[test]
     fn parse_minimal_xai_config() {
-        let toml = r#"
-            [discord]
-            token = "abc"
-
-            [postgres]
-            url = "postgres://localhost/grok"
-
-            [web]
-            base_url = "http://localhost:8080"
-
-            [llm]
-            provider = "xai"
-
-            [llm.xai]
-            api_key = "xai-key"
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
+        let config: Config = toml::from_str(MINIMAL_CONFIG).unwrap();
         config.validate().unwrap();
-        assert_eq!(config.llm.provider, LlmProviderKind::Xai);
-        assert_eq!(config.llm.xai.unwrap().model, "grok-4.3");
+        assert_eq!(config.default_persona, "default");
+        let persona = &config.personas["default"];
+        assert_eq!(persona.provider, LlmProviderKind::Xai);
+        assert_eq!(persona.model, "grok-4.3");
         assert_eq!(config.web.listen, "0.0.0.0:8080");
         assert!(matches!(config.default_privacy, PrivacyMode::OptIn));
     }
 
     #[test]
-    fn parse_channel_only_privacy() {
+    fn parse_multiple_personas() {
         let toml = r#"
+            default_persona = "snark"
+
             [discord]
             token = "abc"
 
@@ -352,11 +378,55 @@ mod tests {
             [web]
             base_url = "http://localhost:8080"
 
-            [llm]
+            [llm.xai]
+            api_key = "xai-key"
+
+            [llm.anthropic]
+            api_key = "anth-key"
+
+            [personas.default]
             provider = "xai"
+            model = "grok-4.3"
+            system_prompt = "Be helpful."
+
+            [personas.snark]
+            provider = "anthropic"
+            model = "claude-sonnet-4-6"
+            system_prompt = "Be sardonic."
+            temperature = 1.2
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.default_persona, "snark");
+        assert_eq!(config.personas.len(), 2);
+        assert_eq!(
+            config.personas["snark"].provider,
+            LlmProviderKind::Anthropic
+        );
+        assert_eq!(config.personas["snark"].temperature, Some(1.2));
+    }
+
+    #[test]
+    fn parse_channel_only_privacy() {
+        let toml = r#"
+            default_persona = "default"
+
+            [discord]
+            token = "abc"
+
+            [postgres]
+            url = "postgres://localhost/grok"
+
+            [web]
+            base_url = "http://localhost:8080"
 
             [llm.xai]
             api_key = "xai-key"
+
+            [personas.default]
+            provider = "xai"
+            model = "grok-4.3"
+            system_prompt = "help"
 
             [default_privacy]
             mode = "channel_only"
@@ -373,8 +443,37 @@ mod tests {
     }
 
     #[test]
-    fn provider_section_missing_is_an_error() {
+    fn unknown_default_persona_is_an_error() {
         let toml = r#"
+            default_persona = "missing"
+
+            [discord]
+            token = "abc"
+
+            [postgres]
+            url = "postgres://localhost/grok"
+
+            [web]
+            base_url = "http://localhost:8080"
+
+            [llm.xai]
+            api_key = "xai-key"
+
+            [personas.default]
+            provider = "xai"
+            model = "grok-4.3"
+            system_prompt = "x"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, ConfigError::UnknownDefaultPersona(_)));
+    }
+
+    #[test]
+    fn persona_without_provider_block_is_an_error() {
+        let toml = r#"
+            default_persona = "default"
+
             [discord]
             token = "abc"
 
@@ -385,10 +484,14 @@ mod tests {
             base_url = "http://localhost:8080"
 
             [llm]
+
+            [personas.default]
             provider = "anthropic"
+            model = "claude-sonnet-4-6"
+            system_prompt = "x"
         "#;
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
-        assert!(matches!(err, ConfigError::MissingProviderSection { .. }));
+        assert!(matches!(err, ConfigError::MissingProviderForPersona { .. }));
     }
 }

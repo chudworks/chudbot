@@ -38,7 +38,7 @@ impl LlmProvider for MockProvider {
         &self.name
     }
 
-    async fn step(&self, _request: StepRequest) -> Result<StepResponse, LlmError> {
+    async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
         if let Ok(mut script) = self.script.lock() {
             if !script.is_empty() {
                 return Ok(script.remove(0));
@@ -47,7 +47,7 @@ impl LlmProvider for MockProvider {
         Ok(StepResponse::Final {
             content: self.answer.clone(),
             server_tool_calls: self.server_tool_calls.clone(),
-            model_id: "mock".to_string(),
+            model_id: request.model,
         })
     }
 }
@@ -62,6 +62,7 @@ mod tests {
         let p = MockProvider::with_answer("42");
         let resp = p
             .step(StepRequest {
+                model: "mock".into(),
                 messages: vec![ChatTurn::text(MessageRole::User, "hi")],
                 tools: Vec::new(),
                 enable_web_search: false,

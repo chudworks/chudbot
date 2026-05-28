@@ -180,6 +180,9 @@ fn render_turn(tv: &TurnView) -> Markup {
                     "failed" => span.badge.err { "failed" },
                     other => span.badge { (other) },
                 }
+                @if let Some(p) = &tv.turn.persona_name {
+                    " · persona " code { (p) }
+                }
             }
 
             div.user {

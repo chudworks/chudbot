@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -5,7 +6,7 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use grok_discord_bot_core::{
-    AnyProvider, Config, Db, imagegen::ImageGenerator, videogen::VideoGenerator,
+    AnyProvider, Config, Db, LlmProviderKind, imagegen::ImageGenerator, videogen::VideoGenerator,
 };
 
 mod bot;
@@ -62,10 +63,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     match args.cmd {
         Cmd::Bot => {
             let db = Db::connect(&config.postgres.url).await?;
-            let llm = AnyProvider::from_config(&config.llm)?;
+            // Build one provider instance per kind we have credentials
+            // for. Personas pick a (provider, model) pair at turn time
+            // and route through the matching entry here.
+            let mut providers: HashMap<LlmProviderKind, AnyProvider> = HashMap::new();
+            if let Some(cfg) = config.llm.xai.clone() {
+                providers.insert(LlmProviderKind::Xai, AnyProvider::from(cfg));
+            }
+            if let Some(cfg) = config.llm.anthropic.clone() {
+                providers.insert(LlmProviderKind::Anthropic, AnyProvider::from(cfg));
+            }
             // Image generation rides on the xAI API; expose the tool
             // whenever an xAI key is present, regardless of which
-            // provider is primary for chat.
+            // providers any persona happens to use for chat.
             let image_gen = config
                 .llm
                 .xai
@@ -77,7 +87,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_ref()
                 .map(|x| Arc::new(VideoGenerator::new(x.api_key.clone())));
             tracing::info!(
-                model = %llm_name(&llm),
+                providers = ?providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+                personas = ?config.personas.keys().collect::<Vec<_>>(),
+                default_persona = %config.default_persona,
                 image_gen = image_gen.is_some(),
                 video_gen = video_gen.is_some(),
                 "starting bot"
@@ -86,10 +98,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.discord.token.clone(),
                 config.discord.dev_guild_id,
                 db,
-                llm,
+                providers,
+                config.personas.clone(),
+                config.default_persona.clone(),
                 config.web.base_url.clone(),
                 config.default_privacy.clone(),
-                config.bot.clone(),
                 config.storage.clone(),
                 image_gen,
                 video_gen,
@@ -115,11 +128,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-fn llm_name(p: &AnyProvider) -> &str {
-    use grok_discord_bot_core::LlmProvider;
-    p.name()
 }
 
 fn init_tracing() {

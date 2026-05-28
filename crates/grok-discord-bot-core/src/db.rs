@@ -132,7 +132,7 @@ impl Db {
                $3, $4) \
              RETURNING id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error",
+               assistant_content, status, error, persona_name",
         )
         .bind(id)
         .bind(conversation_id)
@@ -163,6 +163,22 @@ impl Db {
         .bind(assistant_discord_message_id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Stamp the persona that answered a turn. Written before
+    /// completion so the model used for the run is recoverable even
+    /// when the turn later fails.
+    pub async fn set_turn_persona(
+        &self,
+        turn_id: Uuid,
+        persona_name: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE turns SET persona_name = $2 WHERE id = $1")
+            .bind(turn_id)
+            .bind(persona_name)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -258,7 +274,7 @@ impl Db {
         let turns = sqlx::query_as::<_, Turn>(
             "SELECT id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error \
+               assistant_content, status, error, persona_name \
              FROM turns \
              WHERE conversation_id = $1 AND status = 'completed' \
              ORDER BY turn_index ASC",
@@ -449,6 +465,110 @@ impl Db {
         Ok(())
     }
 
+    /// Resolve which persona name applies for a given Discord call
+    /// site. Tries the most specific scope first (per-conversation), then
+    /// falls back through user-in-guild → channel → guild. Returns
+    /// `None` when nothing matches; callers should then fall back to
+    /// the config's `default_persona`.
+    ///
+    /// Each branch is a single PK probe against `persona_selections`,
+    /// so the worst case is four cheap lookups per turn. We don't try
+    /// to coalesce these into one query: the table is tiny, the keys
+    /// have different shapes, and the early-return semantics keep the
+    /// code obvious.
+    pub async fn resolve_persona(
+        &self,
+        conversation_id: Option<Uuid>,
+        guild_id: Option<i64>,
+        channel_id: i64,
+        user_id: i64,
+    ) -> Result<Option<String>, DbError> {
+        if let Some(cid) = conversation_id {
+            if let Some(name) = self
+                .get_persona_selection("conversation", &cid.to_string())
+                .await?
+            {
+                return Ok(Some(name));
+            }
+        }
+        if let Some(gid) = guild_id {
+            let user_key = format!("{gid}:{user_id}");
+            if let Some(name) = self.get_persona_selection("user", &user_key).await? {
+                return Ok(Some(name));
+            }
+        }
+        if let Some(name) = self
+            .get_persona_selection("channel", &channel_id.to_string())
+            .await?
+        {
+            return Ok(Some(name));
+        }
+        if let Some(gid) = guild_id {
+            if let Some(name) = self
+                .get_persona_selection("guild", &gid.to_string())
+                .await?
+            {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read a single `persona_selections` row by composite key.
+    pub async fn get_persona_selection(
+        &self,
+        scope: &str,
+        key: &str,
+    ) -> Result<Option<String>, DbError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT persona_name FROM persona_selections WHERE scope = $1 AND key = $2",
+        )
+        .bind(scope)
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(n,)| n))
+    }
+
+    /// Set (upsert) the persona for a given scope key. The set of
+    /// valid `scope` values is `conversation | user | channel | guild`;
+    /// `key` shape depends on scope (see migrations/0005_personas.sql).
+    pub async fn set_persona_selection(
+        &self,
+        scope: &str,
+        key: &str,
+        persona_name: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO persona_selections (scope, key, persona_name, updated_at) \
+             VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (scope, key) DO UPDATE \
+               SET persona_name = EXCLUDED.persona_name, updated_at = now()",
+        )
+        .bind(scope)
+        .bind(key)
+        .bind(persona_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a persona override. Returns `true` if a row was deleted.
+    pub async fn clear_persona_selection(
+        &self,
+        scope: &str,
+        key: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "DELETE FROM persona_selections WHERE scope = $1 AND key = $2",
+        )
+        .bind(scope)
+        .bind(key)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Aggregate read model for the web viewer.
     pub async fn fetch_conversation_view(
         &self,
@@ -461,7 +581,7 @@ impl Db {
         let turns = sqlx::query_as::<_, Turn>(
             "SELECT id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error \
+               assistant_content, status, error, persona_name \
              FROM turns WHERE conversation_id = $1 ORDER BY turn_index ASC",
         )
         .bind(id)

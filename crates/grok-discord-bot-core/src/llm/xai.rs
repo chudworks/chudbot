@@ -24,26 +24,22 @@ use crate::llm::{
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 
-/// xAI Grok provider.
+/// xAI Grok provider. Model-agnostic — the specific model id is
+/// supplied per request via [`StepRequest::model`].
 #[derive(Debug, Clone)]
 pub struct XaiProvider {
     http: reqwest::Client,
     api_key: String,
-    model: String,
     base_url: String,
-    name: String,
 }
 
 impl XaiProvider {
     /// Construct from a config block.
     pub fn new(config: XaiConfig) -> Self {
-        let name = format!("xai/{}", config.model);
         Self {
             http: reqwest::Client::new(),
             api_key: config.api_key,
-            model: config.model,
             base_url: DEFAULT_BASE_URL.to_string(),
-            name,
         }
     }
 
@@ -56,7 +52,7 @@ impl XaiProvider {
 
 impl LlmProvider for XaiProvider {
     fn name(&self) -> &str {
-        &self.name
+        "xai"
     }
 
     async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
@@ -64,7 +60,7 @@ impl LlmProvider for XaiProvider {
         let tools = build_tools(&request.tools, request.enable_web_search);
 
         let body = ResponsesRequest {
-            model: &self.model,
+            model: &request.model,
             input: &input_items,
             instructions: instructions.as_deref(),
             tools: if tools.is_empty() { None } else { Some(&tools) },
@@ -96,7 +92,7 @@ impl LlmProvider for XaiProvider {
             .await
             .map_err(|e| LlmError::Decode(e.to_string()))?;
 
-        let model_id = parsed.model.unwrap_or_else(|| self.model.clone());
+        let model_id = parsed.model.unwrap_or_else(|| request.model.clone());
         let (text, tool_uses, server_tool_calls) =
             walk_output(&parsed.output, parsed.citations.as_ref());
 

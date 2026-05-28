@@ -1,6 +1,11 @@
 # grok-discord-bot configuration. Copy this file to `config.toml` and
 # fill in the secrets. config.toml is gitignored.
 
+# Floor-fallback persona. Must match a key under `[personas.*]` below.
+# Top-level scalar — keep this BEFORE any `[section]` headers so the
+# TOML parser doesn't attach it to whichever section was opened last.
+default_persona = "default"
+
 [discord]
 # Bot token from https://discord.com/developers/applications
 token = "MTIzNDU2..."
@@ -22,21 +27,13 @@ base_url = "http://localhost:8080"
 # host:port the Axum server binds. Optional, defaults to 0.0.0.0:8080.
 # listen = "127.0.0.1:8080"
 
-[llm]
-# Which provider to route requests through: "xai" or "anthropic".
-provider = "xai"
-
-# Required when provider = "xai".
+# Provider credentials. Include only the blocks for providers any of
+# your personas actually use. Both can be present — personas pick freely.
 [llm.xai]
 api_key = "xai-..."
-# Optional, defaults to "grok-4.3".
-# model = "grok-4.3"
 
-# Required when provider = "anthropic".
-[llm.anthropic]
-api_key = "sk-ant-..."
-# Optional, defaults to "claude-sonnet-4-6".
-# model = "claude-opus-4-7"
+# [llm.anthropic]
+# api_key = "sk-ant-..."
 
 # Bootstrap default for the per-guild privacy mode. Once a guild's
 # admin runs `/grok-mode set`, the DB row takes over for that guild.
@@ -57,14 +54,30 @@ mode = "opt_in"
 # images_dir = "images"
 # videos_dir = "videos"
 
-# Bot persona — system prompt and sampling knobs. All optional; an
-# omitted [bot] block uses sensible defaults. Restart the bot after
-# changing these (the config is read once at startup).
-[bot]
-# system_prompt = """
-# You are Chudbot, a sarcastic and direct AI assistant in a private
-# Discord server. Don't hedge. Use web_search and x_search to ground
-# claims; use fetch_messages when you need surrounding conversation.
-# """
-# temperature = 1.0      # 0.0-2.0; higher = more chaotic, lower = focused
+# Personas. Each one pairs a system prompt + sampling knobs with a
+# specific (provider, model) pair. Users / channels / guilds /
+# conversations can be pinned to a persona at runtime via the
+# `/grok-persona set` slash command; resolution order is most-specific
+# wins, falling back to `default_persona` at the top of this file when
+# nothing matches.
+
+[personas.default]
+provider = "xai"
+model = "grok-4.3"
+system_prompt = """
+You are a helpful AI assistant in a private Discord server. Be direct
+and concise. Use web_search and x_search to ground claims; use
+fetch_messages when you need surrounding conversation.
+"""
+# temperature = 0.7      # 0.0-2.0; higher = more chaotic, lower = focused
 # top_p = 0.95           # 0.0-1.0; alternative sampling control
+
+# Example second persona — uncomment + add the [llm.anthropic] block
+# above to enable.
+# [personas.snark]
+# provider = "anthropic"
+# model = "claude-sonnet-4-6"
+# system_prompt = """
+# You are Chudbot, a sardonic and direct AI assistant. Don't hedge.
+# """
+# temperature = 1.0
