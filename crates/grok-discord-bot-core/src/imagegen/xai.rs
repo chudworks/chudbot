@@ -3,12 +3,18 @@
 //! Two endpoints, picked automatically by [`XaiImageProvider::generate`]
 //! based on whether the request carries reference images:
 //!   - `POST /v1/images/generations` — pure text-to-image.
-//!   - `POST /v1/images/edits` — text + 1-3 reference images.
+//!   - `POST /v1/images/edits` — text + 1-3 reference images. A single
+//!     reference goes in `image: {url, type:"image_url"}`; two or three
+//!     go in an `images` array of the same objects (the two fields are
+//!     mutually exclusive, and multi-image prompts reference them as
+//!     `<IMAGE_0>`, `<IMAGE_1>`, …).
 //!
 //! References can be supplied as:
-//!   - `https://…` URLs — passed through; xAI fetches them.
+//!   - `https://…` URLs — passed through as the `url`; xAI fetches them.
 //!   - `file://images/<name>` URIs — resolved to local disk, the bytes
-//!     are read here, base64-encoded as a data URI, and inlined.
+//!     are read here, base64-encoded as a `data:` URI, and inlined as the
+//!     `url`. This is what the bot hands the model for conversation
+//!     images, so editing works without our own server being reachable.
 //!   - `data:image/…;base64,…` — passed through unchanged.
 //!
 //! The response always uses `response_format = b64_json` so the bytes
@@ -67,20 +73,15 @@ impl ImageProvider for XaiImageProvider {
         }
 
         let model = resolve_model(request.model.as_deref());
-        let is_edit = !resolved_refs.is_empty();
+        let ref_count = resolved_refs.len();
+        let is_edit = ref_count > 0;
 
-        let mut body = json!({
-            "model": model,
-            "prompt": request.prompt,
-            "response_format": "b64_json",
-            "n": 1,
-        });
-        if let Some(ar) = &request.aspect_ratio {
-            body["aspect_ratio"] = json!(ar);
-        }
-        if is_edit {
-            body["images"] = Value::Array(resolved_refs.into_iter().map(Value::String).collect());
-        }
+        let body = build_request_body(
+            model,
+            &request.prompt,
+            request.aspect_ratio.as_deref(),
+            resolved_refs,
+        );
 
         let endpoint = if is_edit {
             format!("{}/images/edits", self.base_url)
@@ -92,7 +93,7 @@ impl ImageProvider for XaiImageProvider {
             endpoint = %endpoint,
             model = %model,
             aspect_ratio = ?request.aspect_ratio,
-            references = if is_edit { body["images"].as_array().map(|a| a.len()).unwrap_or(0) } else { 0 },
+            references = ref_count,
             "imagegen[xai]: requesting image"
         );
 
@@ -147,6 +148,42 @@ impl ImageProvider for XaiImageProvider {
             revised_prompt: first.revised_prompt,
         })
     }
+}
+
+/// Build the JSON request body for `/images/generations` or
+/// `/images/edits`. With no references it's a plain generation; with
+/// references it becomes an edit, encoding them per xAI's schema:
+/// exactly one reference → `image: {url, type:"image_url"}`; two or
+/// three → an `images` array of the same objects (the two fields are
+/// mutually exclusive). `resolved_refs` already hold the final `url`
+/// strings (public https or base64 `data:` URIs).
+fn build_request_body(
+    model: &str,
+    prompt: &str,
+    aspect_ratio: Option<&str>,
+    resolved_refs: Vec<String>,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "prompt": prompt,
+        "response_format": "b64_json",
+        "n": 1,
+    });
+    if let Some(ar) = aspect_ratio {
+        body["aspect_ratio"] = json!(ar);
+    }
+    let ref_count = resolved_refs.len();
+    if ref_count > 0 {
+        let mut refs = resolved_refs
+            .into_iter()
+            .map(|url| json!({ "url": url, "type": "image_url" }));
+        if ref_count == 1 {
+            body["image"] = refs.next().unwrap_or(Value::Null);
+        } else {
+            body["images"] = Value::Array(refs.collect());
+        }
+    }
+    body
 }
 
 /// Translate the agent-supplied model string into an xAI model id.
@@ -234,6 +271,52 @@ mod tests {
         // Unknown values pass through so the caller sees xAI's own
         // "model not found" error rather than a silent substitution.
         assert_eq!(resolve_model(Some("future-model-x")), "future-model-x");
+    }
+
+    #[test]
+    fn generation_body_has_no_image_fields() {
+        let body = build_request_body("grok-imagine-image", "a cat", Some("16:9"), vec![]);
+        assert_eq!(body["prompt"], "a cat");
+        assert_eq!(body["aspect_ratio"], "16:9");
+        assert!(body.get("image").is_none());
+        assert!(body.get("images").is_none());
+    }
+
+    #[test]
+    fn single_reference_uses_image_object() {
+        let body = build_request_body(
+            "grok-imagine-image-quality",
+            "whiten the teeth, keep everything else identical",
+            None,
+            vec!["data:image/jpeg;base64,AAAA".to_string()],
+        );
+        // Singular `image` object, not an `images` array, not a bare string.
+        assert_eq!(
+            body["image"],
+            json!({ "url": "data:image/jpeg;base64,AAAA", "type": "image_url" })
+        );
+        assert!(body.get("images").is_none());
+    }
+
+    #[test]
+    fn multiple_references_use_images_array() {
+        let body = build_request_body(
+            "grok-imagine-image-quality",
+            "combine <IMAGE_0> and <IMAGE_1>",
+            None,
+            vec![
+                "https://x/a.png".to_string(),
+                "https://x/b.png".to_string(),
+            ],
+        );
+        assert!(body.get("image").is_none());
+        assert_eq!(
+            body["images"],
+            json!([
+                { "url": "https://x/a.png", "type": "image_url" },
+                { "url": "https://x/b.png", "type": "image_url" },
+            ])
+        );
     }
 
     #[test]

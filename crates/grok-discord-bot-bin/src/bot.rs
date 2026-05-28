@@ -802,29 +802,49 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
             c.content.clone(),
         ));
     }
-    if !saved_images.is_empty()
-        && let Some(last) = messages.last_mut()
-    {
-        // Inject the attachment URLs as TEXT into the user's turn
-        // so the model can pass them verbatim to tools like
-        // generate_image. Without this hint, the model sees the
-        // images via the structured input_image content block but
-        // doesn't treat the URL as a quotable string and tends to
-        // invent paths instead.
-        let url_list = saved_images
-            .iter()
-            .map(|i| format!("- {}", i.live_url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let annotation = format!(
-            "\n\n[Images attached to this message — when calling \
-                 generate_image to edit one of them, pass the exact URL \
-                 below as a reference_images entry. Do not invent paths.]\n{url_list}"
-        );
-        match last.blocks.first_mut() {
-            Some(TurnBlock::Text(text)) => text.push_str(&annotation),
-            _ => last.blocks.insert(0, TurnBlock::Text(annotation)),
+    // Reference annotation: list every image currently in context — prior
+    // turns AND this message — by its stable `file://` id, so the model
+    // can pass one to `generate_image`'s `reference_images` to edit or
+    // restyle it. The pixels are already *visible* (prior turns as
+    // served-URL image blocks attached above; this turn's uploads as
+    // live-URL blocks below), but vision blocks aren't quotable strings —
+    // the model needs the ids in text. `file://` is the most robust
+    // reference: `generate_image` base64-encodes it from disk, so editing
+    // works without our server being publicly reachable and never trips
+    // over Discord's CDN expiry. Both prior (`turn:*:image:*`) and current
+    // (`discord:msg:*:image:*`) image rows carry the `file://` URI in
+    // `content`, so one filter covers them.
+    let reference_lines: Vec<String> = initial_context
+        .iter()
+        .filter(|c| c.source.contains(":image:"))
+        .map(|c| {
+            let origin = if c.source.starts_with("turn:") {
+                "from earlier in this conversation"
+            } else {
+                "attached to this message"
+            };
+            format!("- {} ({origin})", c.content)
+        })
+        .collect();
+    if let Some(last) = messages.last_mut() {
+        if !reference_lines.is_empty() {
+            let annotation = format!(
+                "\n\n[Images in this conversation you can edit or restyle with \
+                 generate_image — pass the exact file:// id below as a \
+                 reference_images entry (never invent paths). When you pass two \
+                 or three references, refer to them in your prompt as <IMAGE_0>, \
+                 <IMAGE_1>, … in the order you list them.]\n{}",
+                reference_lines.join("\n")
+            );
+            match last.blocks.first_mut() {
+                Some(TurnBlock::Text(text)) => text.push_str(&annotation),
+                _ => last.blocks.insert(0, TurnBlock::Text(annotation)),
+            }
         }
+        // Vision for this turn's uploads: the live Discord URL is fresh and
+        // reachable without our own server, so the model can *see* them
+        // even in local dev. (Prior-turn images were already attached as
+        // served-URL blocks during message assembly.)
         for image in &saved_images {
             last.blocks.push(TurnBlock::Image {
                 url: image.live_url.clone(),
@@ -1549,12 +1569,18 @@ visual. Takes ~3-10 seconds.
 Best practice: call `post_status_message` in the SAME RESPONSE as this \
 tool (e.g. \"Cooking up that image…\") so the user knows you're working.
 
-To edit/restyle an image the user attached, pass its EXACT URL string in \
-`reference_images`. The URL appears in the user's turn (look for lines \
-starting with `https://cdn.discordapp.com/...` or `file://images/...`). \
-NEVER invent or guess a path — `reference_images` must contain only URLs \
-that appear verbatim in the conversation. If you can't find a real URL, \
-omit `reference_images` and generate from text alone.
+To edit, restyle, or combine images already in the conversation (e.g. \
+\"make my teeth whiter\", \"turn this photo into a pencil sketch\"), pass \
+their EXACT `file://images/...` id(s) in `reference_images`. Those ids are \
+listed in the bracketed \"Images in this conversation you can edit\" note on \
+the user's turn — pick the one(s) the user is referring to (you can see the \
+images themselves above). NEVER invent or guess a path; only use ids that \
+appear verbatim in that note. When you pass two or three references, refer \
+to them in your prompt as <IMAGE_0>, <IMAGE_1>, … matching the order you \
+list them. For a faithful edit, describe the whole desired result and what \
+to preserve (e.g. \"the same person and photo, only the teeth whitened\") — \
+the model regenerates rather than masking, so spell out what stays the same. \
+If no real id applies, omit `reference_images` and generate from text alone.
 
 The generated image is attached to your reply automatically — don't link to \
 it in your text. Returns the saved image's URI so you can reference it in \
@@ -1570,7 +1596,7 @@ chained generations on later turns."
                 },
                 "reference_images": {
                     "type": "array",
-                    "description": "Optional list of 0-3 image URIs to use as references. https:// URLs and file:// URIs from prior turns both work. Pass a user's attached image URL here to edit/restyle it.",
+                    "description": "Optional list of 1-3 image ids to edit/restyle/combine. Use the exact file://images/... ids from the 'Images in this conversation you can edit' note on the user's turn (https:// URLs also work). For 2-3 refs, the prompt references them as <IMAGE_0>, <IMAGE_1>, … in this array's order.",
                     "maxItems": 3,
                     "items": { "type": "string" }
                 },
