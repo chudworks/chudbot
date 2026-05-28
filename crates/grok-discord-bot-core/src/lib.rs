@@ -24,11 +24,16 @@ pub mod storage;
 pub mod videogen;
 
 pub use agent::{AgentObserver, AgentRun, NoopObserver, run as run_agent};
-pub use config::{Config, ConfigError, LlmProviderKind, Persona, PrivacyMode, StorageConfig};
+pub use config::{
+    Config, ConfigError, ImageProviderKind, LlmProviderKind, Persona, PrivacyMode, StorageConfig,
+    VideoProviderKind,
+};
 pub use db::{Db, DbError};
 pub use domain::{Conversation, ContextItem, ConversationView, Turn, TurnView, VideoJob};
+pub use imagegen::{AnyImageProvider, ImageProvider};
 pub use llm::{
     AnthropicOptions, AnyProvider, ChatTurn, LlmError, LlmProvider, MessageRole, ProviderOptions,
     StepRequest, StepResponse, ToolCallRecord, ToolDefinition, ToolError, ToolExecutor,
     ToolUseRequest, TurnBlock, XaiOptions,
 };
+pub use videogen::{AnyVideoProvider, VideoProvider};

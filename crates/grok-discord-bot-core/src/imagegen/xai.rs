@@ -1,6 +1,6 @@
-//! xAI Grok Imagine client.
+//! xAI Grok Imagine implementation of [`ImageProvider`].
 //!
-//! Two endpoints, picked automatically by [`ImageGenerator::generate`]
+//! Two endpoints, picked automatically by [`XaiImageProvider::generate`]
 //! based on whether the request carries reference images:
 //!   - `POST /v1/images/generations` — pure text-to-image.
 //!   - `POST /v1/images/edits` — text + 1-3 reference images.
@@ -16,100 +16,27 @@
 //! signed-URL TTL). Decoded bytes are returned to the caller, which is
 //! expected to persist them via `core::storage::save_image_bytes`.
 
-use std::path::PathBuf;
-
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
-use thiserror::Error;
+
+use super::{GeneratedImage, ImageGenError, ImageGenRequest, ImageProvider};
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
 const STANDARD_MODEL: &str = "grok-imagine-image";
 const QUALITY_MODEL: &str = "grok-imagine-image-quality";
 
-/// Errors returned by [`ImageGenerator`].
-#[derive(Debug, Error)]
-pub enum ImageGenError {
-    /// Network/transport failure.
-    #[error("transport: {0}")]
-    Transport(String),
-    /// xAI returned a non-success status.
-    #[error("api {status}: {body}")]
-    Api {
-        /// HTTP status code.
-        status: u16,
-        /// Truncated response body.
-        body: String,
-    },
-    /// Response couldn't be decoded to the expected shape.
-    #[error("decode: {0}")]
-    Decode(String),
-    /// A reference image URI couldn't be resolved (file missing, etc.).
-    #[error("reference image: {0}")]
-    Reference(String),
-}
-
-/// Quality tier the agent picks per request. Maps to the underlying
-/// model name.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ImageQuality {
-    /// `grok-imagine-image` — cheap and fast (~$0.02/image).
-    #[default]
-    Standard,
-    /// `grok-imagine-image-quality` — higher fidelity (~$0.05/image).
-    Quality,
-}
-
-impl ImageQuality {
-    /// xAI model id for this tier.
-    pub fn model(&self) -> &'static str {
-        match self {
-            Self::Standard => STANDARD_MODEL,
-            Self::Quality => QUALITY_MODEL,
-        }
-    }
-}
-
-/// Input to [`ImageGenerator::generate`].
+/// xAI Grok Imagine client. Holds an API key and a `reqwest` handle —
+/// safe to clone (reqwest's client is internally `Arc`-wrapped).
 #[derive(Debug, Clone)]
-pub struct ImageGenRequest {
-    /// Text prompt describing the desired image.
-    pub prompt: String,
-    /// 0-3 reference images (URLs or `file://` URIs). Non-empty list
-    /// switches the call to `/v1/images/edits`.
-    pub references: Vec<String>,
-    /// Aspect ratio (e.g. `"16:9"`). `None` lets xAI pick a default.
-    pub aspect_ratio: Option<String>,
-    /// Quality tier.
-    pub quality: ImageQuality,
-    /// `images_dir` is needed to resolve `file://` references to disk.
-    pub images_dir: PathBuf,
-}
-
-/// Output of [`ImageGenerator::generate`].
-#[derive(Debug, Clone)]
-pub struct GeneratedImage {
-    /// Raw bytes of the generated image (PNG/JPEG/WebP/etc.).
-    pub bytes: Vec<u8>,
-    /// MIME type reported by xAI, e.g. `image/jpeg`.
-    pub mime_type: String,
-    /// Model name xAI reported using.
-    pub model: String,
-    /// Optional revised prompt the model used internally.
-    pub revised_prompt: Option<String>,
-}
-
-/// HTTP client for xAI's image endpoints.
-#[derive(Debug, Clone)]
-pub struct ImageGenerator {
+pub struct XaiImageProvider {
     http: reqwest::Client,
     api_key: String,
     base_url: String,
 }
 
-impl ImageGenerator {
+impl XaiImageProvider {
     /// Construct from an xAI API key.
     pub fn new(api_key: String) -> Self {
         Self {
@@ -124,9 +51,14 @@ impl ImageGenerator {
         self.base_url = base_url;
         self
     }
+}
 
-    /// Generate (or edit) a single image. Returns the first result.
-    pub async fn generate(
+impl ImageProvider for XaiImageProvider {
+    fn name(&self) -> &str {
+        "xai"
+    }
+
+    async fn generate(
         &self,
         request: ImageGenRequest,
     ) -> Result<GeneratedImage, ImageGenError> {
@@ -137,7 +69,7 @@ impl ImageGenerator {
             resolved_refs.push(resolve_reference(r, &request.images_dir).await?);
         }
 
-        let model = request.quality.model();
+        let model = resolve_model(request.model.as_deref());
         let is_edit = !resolved_refs.is_empty();
 
         let mut body = json!({
@@ -150,11 +82,9 @@ impl ImageGenerator {
             body["aspect_ratio"] = json!(ar);
         }
         if is_edit {
-            // The edits endpoint takes a single `image` (one reference)
-            // or `images` (multiple). Newer xAI docs use `image` for
-            // single and an array for multiple; we always send an array
-            // for consistency.
-            body["images"] = Value::Array(resolved_refs.into_iter().map(Value::String).collect());
+            body["images"] = Value::Array(
+                resolved_refs.into_iter().map(Value::String).collect(),
+            );
         }
 
         let endpoint = if is_edit {
@@ -168,7 +98,7 @@ impl ImageGenerator {
             model = %model,
             aspect_ratio = ?request.aspect_ratio,
             references = if is_edit { body["images"].as_array().map(|a| a.len()).unwrap_or(0) } else { 0 },
-            "imagegen: requesting image"
+            "imagegen[xai]: requesting image"
         );
 
         let resp = self
@@ -221,6 +151,22 @@ impl ImageGenerator {
             model: parsed.model.unwrap_or_else(|| model.to_string()),
             revised_prompt: first.revised_prompt,
         })
+    }
+}
+
+/// Translate the agent-supplied model string into an xAI model id.
+///
+/// Accepts the short-hand quality tiers (`"standard"`, `"quality"`),
+/// the full xAI model ids, or `None` (defaults to `standard`). Anything
+/// else is forwarded verbatim — xAI returns a clear API error for
+/// unknown model ids, which is more informative than us rejecting it
+/// here.
+fn resolve_model(s: Option<&str>) -> &str {
+    let Some(raw) = s else { return STANDARD_MODEL };
+    match raw.to_ascii_lowercase().as_str() {
+        "standard" => STANDARD_MODEL,
+        "quality" => QUALITY_MODEL,
+        _ => raw,
     }
 }
 
@@ -284,6 +230,18 @@ struct ImagesResponseItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_model_aliases() {
+        assert_eq!(resolve_model(None), STANDARD_MODEL);
+        assert_eq!(resolve_model(Some("standard")), STANDARD_MODEL);
+        assert_eq!(resolve_model(Some("STANDARD")), STANDARD_MODEL);
+        assert_eq!(resolve_model(Some("quality")), QUALITY_MODEL);
+        assert_eq!(resolve_model(Some("grok-imagine-image")), STANDARD_MODEL);
+        // Unknown values pass through so the caller sees xAI's own
+        // "model not found" error rather than a silent substitution.
+        assert_eq!(resolve_model(Some("future-model-x")), "future-model-x");
+    }
 
     #[test]
     fn http_url_passes_through() {

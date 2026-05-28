@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use grok_discord_bot_core::{
-    AnyProvider, Config, Db, LlmProviderKind, imagegen::ImageGenerator, videogen::VideoGenerator,
+    AnyImageProvider, AnyProvider, AnyVideoProvider, Config, Db, ImageProviderKind,
+    LlmProviderKind, VideoProviderKind,
 };
 
 mod bot;
@@ -73,25 +73,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(cfg) = config.llm.anthropic.clone() {
                 providers.insert(LlmProviderKind::Anthropic, AnyProvider::from(cfg));
             }
-            // Image generation rides on the xAI API; expose the tool
-            // whenever an xAI key is present, regardless of which
-            // providers any persona happens to use for chat.
-            let image_gen = config
-                .llm
-                .xai
-                .as_ref()
-                .map(|x| Arc::new(ImageGenerator::new(x.api_key.clone())));
-            let video_gen = config
-                .llm
-                .xai
-                .as_ref()
-                .map(|x| Arc::new(VideoGenerator::new(x.api_key.clone())));
+            // Image and video providers follow the same pattern: build
+            // one instance per `[image.<kind>]` / `[video.<kind>]` block
+            // that's actually configured. Personas pick a kind at turn
+            // time; a persona that names a kind with no matching block
+            // is rejected at config-validation time, so the map lookups
+            // here are always satisfied at runtime.
+            let mut image_providers: HashMap<ImageProviderKind, AnyImageProvider> = HashMap::new();
+            if let Some(cfg) = config.image.xai.clone() {
+                image_providers.insert(ImageProviderKind::Xai, AnyImageProvider::from(cfg));
+            }
+            let mut video_providers: HashMap<VideoProviderKind, AnyVideoProvider> = HashMap::new();
+            if let Some(cfg) = config.video.xai.clone() {
+                video_providers.insert(VideoProviderKind::Xai, AnyVideoProvider::from(cfg));
+            }
             tracing::info!(
                 providers = ?providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
                 personas = ?config.personas.keys().collect::<Vec<_>>(),
                 default_persona = %config.default_persona,
-                image_gen = image_gen.is_some(),
-                video_gen = video_gen.is_some(),
+                image_providers = ?image_providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+                video_providers = ?video_providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
                 "starting bot"
             );
             bot::run(
@@ -104,8 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.web.base_url.clone(),
                 config.default_privacy.clone(),
                 config.storage.clone(),
-                image_gen,
-                video_gen,
+                image_providers,
+                video_providers,
             )
             .await?;
         }

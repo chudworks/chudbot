@@ -27,13 +27,25 @@ base_url = "http://localhost:8080"
 # host:port the Axum server binds. Optional, defaults to 0.0.0.0:8080.
 # listen = "127.0.0.1:8080"
 
-# Provider credentials. Include only the blocks for providers any of
+# LLM provider credentials. Include only the blocks for providers any of
 # your personas actually use. Both can be present — personas pick freely.
 [llm.xai]
 api_key = "xai-..."
 
 # [llm.anthropic]
 # api_key = "sk-ant-..."
+
+# Image generation backend credentials. Symmetric with [llm.*]: include
+# only the blocks for backends a persona's `image_provider` field names.
+# A persona with no `image_provider` simply has no `generate_image` tool.
+# Today xAI Grok Imagine is the only backend wired in; the `ImageProvider`
+# trait in `core::imagegen` is the seam for adding more.
+[image.xai]
+api_key = "xai-..."  # typically the same key as [llm.xai]
+
+# Video generation backend credentials. Same shape as `image`.
+[video.xai]
+api_key = "xai-..."
 
 # Bootstrap default for the per-guild privacy mode. Once a guild's
 # admin runs `/grok-mode set`, the DB row takes over for that guild.
@@ -71,6 +83,12 @@ fetch_messages when you need surrounding conversation.
 """
 # temperature = 0.7      # 0.0-2.0; higher = more chaotic, lower = focused
 # top_p = 0.95           # 0.0-1.0; alternative sampling control
+# Optional: name a backend for the `generate_image` / `generate_video`
+# tools. The matching `[image.<kind>]` / `[video.<kind>]` block must be
+# configured above; omitting these simply hides the corresponding tool
+# from this persona.
+image_provider = "xai"
+video_provider = "xai"
 
 # Example second persona — uncomment + add the [llm.anthropic] block
 # above to enable.
@@ -89,5 +107,7 @@ fetch_messages when you need surrounding conversation.
 # provider = "xai"
 # model = "grok-4.3"
 # system_prompt = "You are a careful researcher. Cite your sources."
+# image_provider = "xai"
 # [personas.researcher.xai]
 # reasoning_effort = "high"
+

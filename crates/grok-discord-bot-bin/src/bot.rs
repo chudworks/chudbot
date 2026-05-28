@@ -20,12 +20,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use grok_discord_bot_core::{
-    AgentRun, AnyProvider, ChatTurn, ContextItem, Conversation, Db, LlmProvider, LlmProviderKind,
-    MessageRole, NoopObserver, Persona, PrivacyMode, ProviderOptions, StepRequest, StepResponse,
-    StorageConfig, ToolDefinition, ToolError, ToolExecutor, TurnBlock,
-    imagegen::{ImageGenRequest, ImageGenerator, ImageQuality},
+    AgentRun, AnyImageProvider, AnyProvider, AnyVideoProvider, ChatTurn, ContextItem, Conversation,
+    Db, ImageProvider, ImageProviderKind, LlmProvider, LlmProviderKind, MessageRole, NoopObserver,
+    Persona, PrivacyMode, ProviderOptions, StepRequest, StepResponse, StorageConfig,
+    ToolDefinition, ToolError, ToolExecutor, TurnBlock, VideoProvider, VideoProviderKind,
+    imagegen::ImageGenRequest,
     run_agent, storage,
-    videogen::{VideoGenRequest, VideoGenerator, VideoResolution},
+    videogen::VideoGenRequest,
 };
 use uuid::Uuid;
 use serde::Serialize;
@@ -144,11 +145,13 @@ struct State {
     default_persona: String,
     images_dir: PathBuf,
     videos_dir: PathBuf,
-    /// Present only when an xAI API key is configured; gates the
-    /// `generate_image` tool exposure.
-    image_gen: Option<Arc<ImageGenerator>>,
-    /// Same gating; xAI's video endpoints share the chat key.
-    video_gen: Option<Arc<VideoGenerator>>,
+    /// One image provider per configured `[image.<kind>]` block. The
+    /// per-turn persona's `image_provider` field keys into this map;
+    /// when the persona doesn't name one (or names one with no
+    /// matching block), the `generate_image` tool isn't exposed.
+    image_providers: HashMap<ImageProviderKind, AnyImageProvider>,
+    /// Same shape for video.
+    video_providers: HashMap<VideoProviderKind, AnyVideoProvider>,
 }
 
 /// Entry point for the `grok bot` subcommand.
@@ -163,8 +166,8 @@ pub async fn run(
     web_base_url: String,
     default_privacy: PrivacyMode,
     storage_config: StorageConfig,
-    image_gen: Option<Arc<ImageGenerator>>,
-    video_gen: Option<Arc<VideoGenerator>>,
+    image_providers: HashMap<ImageProviderKind, AnyImageProvider>,
+    video_providers: HashMap<VideoProviderKind, AnyVideoProvider>,
 ) -> Result<(), BotError> {
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
@@ -199,8 +202,8 @@ pub async fn run(
         default_persona,
         images_dir: storage_config.images_dir,
         videos_dir: storage_config.videos_dir,
-        image_gen,
-        video_gen,
+        image_providers,
+        video_providers,
     });
 
     let mut shard = Shard::new(ShardId::ONE, discord_token, intents);
@@ -755,15 +758,27 @@ async fn process(
         }
     }
 
+    // Resolve the per-turn media providers from the persona. A persona
+    // that doesn't name an image/video provider (or names one with no
+    // matching `[image.<kind>]` / `[video.<kind>]` credentials block)
+    // simply doesn't get the corresponding tool — same as before, just
+    // now decided per-persona instead of per-deployment.
+    let image_provider: Option<AnyImageProvider> = persona
+        .image_provider
+        .and_then(|kind| state.image_providers.get(&kind).cloned());
+    let video_provider: Option<AnyVideoProvider> = persona
+        .video_provider
+        .and_then(|kind| state.video_providers.get(&kind).cloned());
+
     // Tools available to the model for this turn:
     //   - fetch_messages: every mode except ConversationOnly
-    //   - generate_image / start_video_generation / check_video_status:
-    //     only when an xAI key is configured
+    //   - generate_image / generate_video: only when the resolved
+    //     persona names a backend that's actually configured
     //   - post_status_message: always available
     let tools = build_tool_definitions(
         privacy_mode,
-        state.image_gen.is_some(),
-        state.video_gen.is_some(),
+        image_provider.is_some(),
+        video_provider.is_some(),
     );
 
     let executor = BotToolExecutor {
@@ -776,8 +791,8 @@ async fn process(
         conversation_id: conversation.id,
         turn_id: turn.id,
         privacy_mode: privacy_mode.clone(),
-        image_gen: state.image_gen.clone(),
-        video_gen: state.video_gen.clone(),
+        image_provider,
+        video_provider,
         images_dir: state.images_dir.clone(),
         videos_dir: state.videos_dir.clone(),
         last_status_text: Mutex::new(None),
@@ -1450,8 +1465,12 @@ struct BotToolExecutor {
     conversation_id: Uuid,
     turn_id: Uuid,
     privacy_mode: PrivacyMode,
-    image_gen: Option<Arc<ImageGenerator>>,
-    video_gen: Option<Arc<VideoGenerator>>,
+    /// Resolved image backend for the *current* persona, or `None` if
+    /// the persona doesn't have one — in which case the
+    /// `generate_image` tool isn't declared this turn either.
+    image_provider: Option<AnyImageProvider>,
+    /// Same for video.
+    video_provider: Option<AnyVideoProvider>,
     images_dir: PathBuf,
     videos_dir: PathBuf,
     /// Last `post_status_message` text actually posted this turn.
@@ -1571,9 +1590,9 @@ impl BotToolExecutor {
     }
 
     async fn generate_image(&self, input: Value) -> Result<Value, ToolError> {
-        let Some(generator) = self.image_gen.as_ref() else {
+        let Some(provider) = self.image_provider.as_ref() else {
             return Err(ToolError::Execution(
-                "image generation isn't configured on this bot".to_string(),
+                "image generation isn't configured for this persona".to_string(),
             ));
         };
 
@@ -1595,20 +1614,24 @@ impl BotToolExecutor {
             .get("aspect_ratio")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let quality = match input.get("quality").and_then(Value::as_str) {
-            Some("quality") => ImageQuality::Quality,
-            _ => ImageQuality::Standard,
-        };
+        // Free-form model knob — each provider interprets the string
+        // against its own catalog. xAI accepts `"standard"` / `"quality"`
+        // and the underlying ids; future backends define their own.
+        let model = input
+            .get("quality")
+            .or_else(|| input.get("model"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         let req = ImageGenRequest {
             prompt: prompt.clone(),
             references,
             aspect_ratio,
-            quality,
+            model,
             images_dir: self.images_dir.clone(),
         };
 
-        let generated = generator
+        let generated = provider
             .generate(req)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -1640,9 +1663,9 @@ impl BotToolExecutor {
     /// out. Status messages reach the user via `post_status_message`
     /// fired in the same response as this call.
     async fn generate_video(&self, input: Value) -> Result<Value, ToolError> {
-        let Some(generator) = self.video_gen.as_ref() else {
+        let Some(provider) = self.video_provider.as_ref() else {
             return Err(ToolError::Execution(
-                "video generation isn't configured on this bot".to_string(),
+                "video generation isn't configured for this persona".to_string(),
             ));
         };
         let prompt = input
@@ -1662,10 +1685,14 @@ impl BotToolExecutor {
             .get("aspect_ratio")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let resolution = match input.get("resolution").and_then(Value::as_str) {
-            Some("720p") => VideoResolution::P720,
-            _ => VideoResolution::P480,
-        };
+        let resolution = input
+            .get("resolution")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let model = input
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string);
 
         let req = VideoGenRequest {
             prompt: prompt.clone(),
@@ -1673,14 +1700,14 @@ impl BotToolExecutor {
             duration_seconds: duration,
             aspect_ratio,
             resolution,
+            model,
         };
 
-        // Submit, record the row, then poll-and-download in one
-        // generator.generate() call. State is persisted: the
-        // video_jobs row exists from the moment xAI returns
-        // request_id, so a bot crash mid-poll leaves the request
-        // discoverable for a future restart-resume.
-        let request_id = generator
+        // Submit, record the row, then poll-and-download. State is
+        // persisted: the video_jobs row exists from the moment the
+        // backend returns request_id, so a bot crash mid-poll leaves
+        // the request discoverable for a future restart-resume.
+        let request_id = provider
             .submit(&req)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -1701,7 +1728,7 @@ impl BotToolExecutor {
         // rebuilding the whole loop.
         let video_meta = loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-            let status = generator
+            let status = provider
                 .check_once(&request_id)
                 .await
                 .map_err(|e| ToolError::Execution(e.to_string()))?;
@@ -1729,7 +1756,7 @@ impl BotToolExecutor {
             }
         };
 
-        let bytes = generator
+        let bytes = provider
             .download_bytes(&video_meta.url)
             .await
             .map_err(|e| ToolError::Execution(e.to_string()))?;

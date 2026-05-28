@@ -10,6 +10,12 @@
 //! resolved against `persona_selections` in the database; the
 //! `default_persona` here is the floor fallback when nothing more
 //! specific applies.
+//!
+//! Image and video generation are modular in the same way. Personas can
+//! opt into a specific image / video backend via `image_provider =` and
+//! `video_provider =`; backend credentials live under `[image.<kind>]`
+//! and `[video.<kind>]`. A persona that doesn't name a backend simply
+//! doesn't expose the `generate_image` / `generate_video` tools.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -49,6 +55,26 @@ pub enum ConfigError {
         /// Provider name referenced by that persona.
         provider: String,
     },
+    /// A persona names an image provider with no matching credential block.
+    #[error(
+        "persona `{persona}` uses image_provider `{provider}` but no `[image.{provider}]` section was found"
+    )]
+    MissingImageProviderForPersona {
+        /// Persona name that triggered the failure.
+        persona: String,
+        /// Image provider kind referenced by that persona.
+        provider: String,
+    },
+    /// A persona names a video provider with no matching credential block.
+    #[error(
+        "persona `{persona}` uses video_provider `{provider}` but no `[video.{provider}]` section was found"
+    )]
+    MissingVideoProviderForPersona {
+        /// Persona name that triggered the failure.
+        persona: String,
+        /// Video provider kind referenced by that persona.
+        provider: String,
+    },
 }
 
 /// Top-level configuration object.
@@ -64,6 +90,13 @@ pub struct Config {
     /// (or both) must be present, depending on which providers the
     /// configured personas use.
     pub llm: LlmConfig,
+    /// Image generation backends. Optional; include only the blocks for
+    /// the backends any persona's `image_provider` field references.
+    #[serde(default)]
+    pub image: ImageConfig,
+    /// Video generation backends. Optional; same shape as `image`.
+    #[serde(default)]
+    pub video: VideoConfig,
     /// Default [`PrivacyMode`] applied to guilds that don't have an
     /// explicit row in `guild_settings` yet. Optional — defaults to
     /// [`PrivacyMode::opt_in_default`]. Server admins can override per
@@ -149,6 +182,16 @@ pub struct Persona {
     /// Anthropic.
     #[serde(default)]
     pub anthropic: Option<AnthropicOptions>,
+    /// Optional image generation backend for this persona. When set,
+    /// the `generate_image` tool is exposed and routed through the
+    /// matching `[image.<kind>]` credentials block. When unset, the
+    /// persona simply has no image generation tool.
+    #[serde(default)]
+    pub image_provider: Option<ImageProviderKind>,
+    /// Optional video generation backend for this persona. Same
+    /// semantics as [`Self::image_provider`].
+    #[serde(default)]
+    pub video_provider: Option<VideoProviderKind>,
 }
 
 /// Privacy / context-gathering policy. The four variants correspond to
@@ -285,6 +328,72 @@ pub struct AnthropicConfig {
     pub api_key: String,
 }
 
+/// Image generation backend credentials. Each field is a separate
+/// `[image.<kind>]` block; presence gates whether a persona referencing
+/// that kind can actually serve image requests.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct ImageConfig {
+    /// xAI Grok Imagine credentials.
+    pub xai: Option<XaiImageConfig>,
+}
+
+/// xAI Grok Imagine credentials. Typically the same key as
+/// `[llm.xai]`, but stored separately so deployments can mix-and-match
+/// (e.g. swap to a different image backend without dropping LLM access).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct XaiImageConfig {
+    /// API key issued at console.x.ai.
+    pub api_key: String,
+}
+
+/// Video generation backend credentials. Symmetric with [`ImageConfig`].
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct VideoConfig {
+    /// xAI Grok Imagine Video credentials.
+    pub xai: Option<XaiVideoConfig>,
+}
+
+/// xAI Grok Imagine Video credentials.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct XaiVideoConfig {
+    /// API key issued at console.x.ai.
+    pub api_key: String,
+}
+
+/// Discriminator for which image generation backend a persona uses.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageProviderKind {
+    /// xAI Grok Imagine (`grok-imagine-image` family).
+    Xai,
+}
+
+impl ImageProviderKind {
+    /// Lowercase string form, suitable for log fields and config lookups.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Xai => "xai",
+        }
+    }
+}
+
+/// Discriminator for which video generation backend a persona uses.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum VideoProviderKind {
+    /// xAI Grok Imagine Video.
+    Xai,
+}
+
+impl VideoProviderKind {
+    /// Lowercase string form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Xai => "xai",
+        }
+    }
+}
+
 impl Config {
     /// Load and validate a config from `path`.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -317,6 +426,28 @@ impl Config {
                     persona: name.clone(),
                     provider: persona.provider.as_str().to_string(),
                 });
+            }
+            if let Some(kind) = persona.image_provider {
+                let configured = match kind {
+                    ImageProviderKind::Xai => self.image.xai.is_some(),
+                };
+                if !configured {
+                    return Err(ConfigError::MissingImageProviderForPersona {
+                        persona: name.clone(),
+                        provider: kind.as_str().to_string(),
+                    });
+                }
+            }
+            if let Some(kind) = persona.video_provider {
+                let configured = match kind {
+                    VideoProviderKind::Xai => self.video.xai.is_some(),
+                };
+                if !configured {
+                    return Err(ConfigError::MissingVideoProviderForPersona {
+                        persona: name.clone(),
+                        provider: kind.as_str().to_string(),
+                    });
+                }
             }
         }
         Ok(())
@@ -506,5 +637,81 @@ mod tests {
         let config: Config = toml::from_str(toml).unwrap();
         let err = config.validate().unwrap_err();
         assert!(matches!(err, ConfigError::MissingProviderForPersona { .. }));
+    }
+
+    #[test]
+    fn persona_naming_image_provider_without_block_is_an_error() {
+        // Persona names `image_provider = "xai"` but no `[image.xai]`
+        // credentials block is configured, so validation rejects it.
+        let toml = r#"
+            default_persona = "default"
+
+            [discord]
+            token = "abc"
+
+            [postgres]
+            url = "postgres://localhost/grok"
+
+            [web]
+            base_url = "http://localhost:8080"
+
+            [llm.xai]
+            api_key = "xai-key"
+
+            [personas.default]
+            provider = "xai"
+            model = "grok-4.3"
+            system_prompt = "x"
+            image_provider = "xai"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::MissingImageProviderForPersona { ref provider, .. }
+                if provider == "xai"
+        ));
+    }
+
+    #[test]
+    fn persona_with_matching_image_block_validates() {
+        let toml = r#"
+            default_persona = "default"
+
+            [discord]
+            token = "abc"
+
+            [postgres]
+            url = "postgres://localhost/grok"
+
+            [web]
+            base_url = "http://localhost:8080"
+
+            [llm.xai]
+            api_key = "xai-key"
+
+            [image.xai]
+            api_key = "xai-image-key"
+
+            [video.xai]
+            api_key = "xai-video-key"
+
+            [personas.default]
+            provider = "xai"
+            model = "grok-4.3"
+            system_prompt = "x"
+            image_provider = "xai"
+            video_provider = "xai"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            config.personas["default"].image_provider,
+            Some(ImageProviderKind::Xai)
+        );
+        assert_eq!(
+            config.personas["default"].video_provider,
+            Some(VideoProviderKind::Xai)
+        );
     }
 }

@@ -103,20 +103,22 @@ The bot's `BotToolExecutor` exposes:
   recent messages from a Discord channel for context. The model calls
   this when it needs surrounding conversation that wasn't quoted.
 - **`generate_image(prompt, reference_images?, aspect_ratio?, quality?)`**
-  — calls xAI's Grok Imagine model (`grok-imagine-image` / `-quality`).
-  Reference images may be `https://` URLs (passed through) or
-  `file://images/…` URIs (base64-encoded from disk before sending).
-  The tool saves the result bytes to `images_dir`, returns the
-  `file://` URI to the agent, and the bot attaches the bytes to the
-  outgoing Discord reply. Exposed only when `[llm.xai]` is configured.
-- **`start_video_generation(prompt, image_url?, duration_seconds?, aspect_ratio?, resolution?)`**
-  / **`check_video_status(request_id, wait_seconds?)`** — agent-driven
-  polling pair for `grok-imagine-video`. `start` submits and returns
-  immediately with a `request_id` (persisted to `video_jobs`); `check`
-  sleeps `wait_seconds` (max 30) and polls once, returning `pending`
-  or `done` with the saved `file://videos/…` URI. The model is
-  expected to interleave `post_status_message` calls between polls to
-  keep the user updated.
+  — routed through the persona's configured `image_provider`. Reference
+  images may be `https://` URLs (passed through) or `file://images/…`
+  URIs (base64-encoded from disk before sending if the backend wants
+  inline data). The tool saves the result bytes to `images_dir`, returns
+  the `file://` URI to the agent, and the bot attaches the bytes to the
+  outgoing Discord reply. Exposed only for personas that name a
+  backend whose `[image.<kind>]` credentials are configured. The
+  `quality` field is a free-form model string — xAI maps `"standard"`
+  and `"quality"` to its own model ids; other backends define their own.
+- **`generate_video(prompt, image_url?, duration_seconds?, aspect_ratio?, resolution?, model?)`**
+  — synchronous submit + poll + download. Routed through the persona's
+  `video_provider`. Tool blocks for ~60-120s; the bot persists a
+  `video_jobs` row at submit time so a crash mid-poll leaves the
+  request discoverable. The model is expected to call
+  `post_status_message` in the SAME response so the user sees a status
+  line before the wait.
 - **`post_status_message(text)`** — posts an intermediate Discord
   reply to the user. Always exposed. Used by the model to narrate
   long-running operations without hardcoded boilerplate.
@@ -176,6 +178,32 @@ turn even when a conversation mixes personas across turns.
 
 Mid-conversation persona switches change *future* turns only — prior
 turns are replayed verbatim from `turns.{user,assistant}_content`.
+
+## Image / video provider modularity
+
+Image and video generation use the same trait-+-enum pattern as the LLM
+layer:
+
+- `core::imagegen::ImageProvider` (native async fn, no `async-trait`).
+  Today's only impl is `XaiImageProvider`; static dispatch via
+  `AnyImageProvider` so adding e.g. DALL-E 3, Flux via Fal.ai, or
+  Stable Diffusion via Replicate is a one-impl drop-in.
+- `core::videogen::VideoProvider` — same shape with `submit` /
+  `check_once` / `download_bytes` primitives so the bot can interleave
+  status messages between polls. `XaiVideoProvider` today; Runway /
+  Pika / Sora drop in by implementing the trait and adding an
+  `AnyVideoProvider` variant.
+
+Credentials live in `[image.<kind>]` / `[video.<kind>]` blocks. Personas
+opt into a specific backend via `image_provider = "<kind>"` /
+`video_provider = "<kind>"`. A persona that doesn't name a backend
+simply doesn't expose the corresponding tool. Validation rejects a
+persona that names a backend with no matching credentials block.
+
+The per-request `model` field on `ImageGenRequest` / `VideoGenRequest`
+is free-form — each backend interprets the string against its own
+catalog. xAI's image side accepts `"standard"` / `"quality"`; future
+backends are free to expose their own tier names.
 
 ## Privacy model
 
