@@ -95,6 +95,34 @@ into `tool_calls`. The web viewer renders the stored rows verbatim
 plus the prior turns from the `turns` table, so traces stay auditable
 without the duplication.
 
+**Cross-turn images.** Prior turns' *text* is replayed from the `turns`
+columns, but images would otherwise be lost (they live only as
+`context_items` / `tool_calls` rows, neither of which feeds the model).
+So `build_context` calls `Db::load_conversation_image_uris` to gather
+both user-uploaded attachments and `generate_image` outputs from earlier
+completed turns and re-attaches each as a `TurnBlock::Image` on the user
+message it belonged to. These replayed image rows are NOT persisted, so
+they can't feed back into the query. Prior-turn images are served from
+our own storage via `storage::to_public_url(uri, base_url)` — the single
+URL-minting seam (today `{base_url}/images/<name>` via the Axum
+`ServeDir`; the `s3://` branch is where a CDN/signed URL goes later) —
+because Discord's CDN links expire. The provider fetches that URL
+server-side, so cross-turn image vision needs `web.base_url` publicly
+reachable (true in prod; local-`localhost` dev can't serve prior-turn
+images to the model, though the current turn still works via the live
+Discord URL). Replay is capped at `MAX_REPLAYED_IMAGES` (most recent
+first; drops are logged).
+
+**Prompt caching.** The Anthropic provider stamps two ephemeral
+`cache_control` breakpoints per request — one on the system prompt
+(anchoring the stable `tools + system` prefix) and one on the final
+message block (extending the cache over the whole history, images
+included). Since the agent loop re-sends the full prefix on every
+iteration and every later turn re-sends all prior turns + replayed
+images, the matched prefix bills at 0.1x instead of full input price.
+This is the primary cost control for keeping images in context. xAI
+caches automatically (cached-input pricing), so it needs no breakpoints.
+
 ## Agentic harness
 
 `core::agent::run` drives `LlmProvider::step` in a loop:

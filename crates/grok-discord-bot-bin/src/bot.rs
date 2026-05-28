@@ -15,6 +15,7 @@
 //!
 //! Interactions (slash commands) are dispatched to [`crate::commands`].
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -68,6 +69,14 @@ const MAX_OUTPUT_TOKENS: u32 = 4096;
 /// Safety cap on the agent's tool-use loop. Most turns finish in 1-3
 /// iterations; this is a runaway guard.
 const MAX_AGENT_ITERATIONS: u32 = 8;
+
+/// Cap on how many prior-turn images (user-uploaded + model-generated)
+/// are replayed into the model context, keeping the most recent. Images
+/// are the priciest part of the context; this bounds a long thread's
+/// per-turn image bill. Prompt caching makes re-sending the survivors
+/// cheap, but the count still needs a ceiling. Dropped images are
+/// logged so a silent truncation never looks like full coverage.
+const MAX_REPLAYED_IMAGES: usize = 8;
 
 /// Discord free-tier upload size cap. Files larger than this are
 /// linked rather than attached (avoids a Discord-side reject).
@@ -757,14 +766,42 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
     state.publish(conversation.id, EventKind::ContextItemAdded);
 
     // Build the LLM-facing chat history from the initial context items.
-    // Image rows are skipped here and re-attached below as proper
-    // ToolBlock::Image blocks on the user's current turn, using the
-    // original Discord URLs (fresh, no base64 overhead).
-    let mut messages: Vec<ChatTurn> = initial_context
-        .iter()
-        .filter(|c| !c.source.contains(":image:"))
-        .map(|c| ChatTurn::text(MessageRole::from_str_lossy(&c.role), c.content.clone()))
-        .collect();
+    // Text items map 1:1 to chat turns. Image items attach as
+    // `TurnBlock::Image` to the user turn they belong to — which is
+    // always the message we just pushed, because `build_context` orders
+    // each turn's image rows immediately after its user-text row:
+    //   - `turn:<id>:image:*` are prior-turn images, served from our own
+    //     storage so the URL outlives Discord's expiring CDN links;
+    //   - `discord:msg:*:image:*` are this turn's freshly-uploaded
+    //     attachments, attached below with the live Discord URL.
+    let mut messages: Vec<ChatTurn> = Vec::new();
+    for c in &initial_context {
+        if c.source.starts_with("turn:") && c.source.contains(":image:") {
+            match (
+                messages.last_mut(),
+                storage::to_public_url(&c.content, &state.web_base_url),
+            ) {
+                (Some(last), Some(url)) => last.blocks.push(TurnBlock::Image {
+                    url,
+                    mime_type: None,
+                }),
+                (_, None) => tracing::warn!(
+                    uri = %c.content,
+                    "skipping replay image: URI has no servable public URL"
+                ),
+                (None, _) => {}
+            }
+            continue;
+        }
+        if c.source.contains(":image:") {
+            // This turn's upload — handled by the `saved_images` block below.
+            continue;
+        }
+        messages.push(ChatTurn::text(
+            MessageRole::from_str_lossy(&c.role),
+            c.content.clone(),
+        ));
+    }
     if !saved_images.is_empty()
         && let Some(last) = messages.last_mut()
     {
@@ -1143,6 +1180,31 @@ async fn build_context(
 
     if !is_new {
         let history = state.db.load_conversation_history(conversation.id).await?;
+
+        // Replayable images from earlier turns (user-uploaded + model-
+        // generated), capped to the most recent N. Capping from the
+        // chronological front drops the OLDEST first. Grouped by turn so
+        // each image re-attaches to the user message it belongs to; the
+        // message-assembly step turns these rows into `Image` blocks.
+        let mut replay = state
+            .db
+            .load_conversation_image_uris(conversation.id)
+            .await?;
+        if replay.len() > MAX_REPLAYED_IMAGES {
+            let dropped = replay.len() - MAX_REPLAYED_IMAGES;
+            tracing::info!(
+                conversation = %conversation.id,
+                dropped,
+                cap = MAX_REPLAYED_IMAGES,
+                "replaying only the most recent images; older ones dropped from context"
+            );
+            replay.drain(0..dropped);
+        }
+        let mut images_by_turn: HashMap<Uuid, Vec<String>> = HashMap::new();
+        for img in replay {
+            images_by_turn.entry(img.turn_id).or_default().push(img.uri);
+        }
+
         for turn in history {
             // Prefix prior turns' user text with the historical display
             // name pinned on the turn row. Falls back to "user" for
@@ -1156,6 +1218,23 @@ async fn build_context(
                 format!("[{prior_name}]: {}", turn.user_content),
                 Some(turn.user_discord_message_id),
             );
+            // Re-attach this turn's surviving images immediately after
+            // its user text. `content` carries the stored `file://` URI;
+            // message assembly resolves it to a served URL. These rows
+            // are NOT persisted (only `discord:msg:` items are), so they
+            // never feed back into `load_conversation_image_uris`.
+            if let Some(uris) = images_by_turn.get(&turn.id) {
+                for (i, uri) in uris.iter().enumerate() {
+                    push_item(
+                        &mut items,
+                        &mut pos,
+                        format!("turn:{}:image:{i}", turn.id),
+                        "user",
+                        uri.clone(),
+                        None,
+                    );
+                }
+            }
             if let Some(answer) = turn.assistant_content {
                 push_item(
                     &mut items,

@@ -229,6 +229,29 @@ pub fn to_web_path(uri: &str) -> Option<String> {
     }
 }
 
+/// Resolve a stored media URI to an absolute, publicly-fetchable URL —
+/// the form we hand to an LLM provider so it can fetch the bytes
+/// server-side (Anthropic / xAI both fetch image URLs themselves).
+///
+/// This is the single place that mints public media URLs, so it's also
+/// the **one seam to change** when moving storage off local disk:
+/// - `file://images/<name>` → `<base_url>/images/<name>`, served by our
+///   own Axum `ServeDir`. (`base_url` must be reachable by the provider;
+///   in prod it's the public viewer URL.)
+/// - `https://…` → passed through unchanged (e.g. an external CDN we
+///   chose not to persist).
+/// - `s3://…` → not yet implemented; this is where a signed/CDN URL
+///   would be produced once an S3 backend lands. Returns `None` today.
+pub fn to_public_url(uri: &str, base_url: &str) -> Option<String> {
+    if let Some(path) = to_web_path(uri) {
+        return Some(format!("{}{}", base_url.trim_end_matches('/'), path));
+    }
+    if uri.starts_with("https://") || uri.starts_with("http://") {
+        return Some(uri.to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +312,25 @@ mod tests {
         assert_eq!(to_web_path("file://other/abc"), None);
         assert!(!is_image_uri("file://other/abc"));
         assert!(!is_video_uri("file://other/abc"));
+    }
+
+    #[test]
+    fn public_url_minting() {
+        // Local file → joined under base_url; trailing slash on base is
+        // tolerated and not doubled.
+        assert_eq!(
+            to_public_url("file://images/abc.jpg", "https://grok.example.com").as_deref(),
+            Some("https://grok.example.com/images/abc.jpg")
+        );
+        assert_eq!(
+            to_public_url("file://images/abc.jpg", "https://grok.example.com/").as_deref(),
+            Some("https://grok.example.com/images/abc.jpg")
+        );
+        // https passthrough; s3 / unknown schemes are not yet servable.
+        assert_eq!(
+            to_public_url("https://cdn/x.png", "https://grok.example.com").as_deref(),
+            Some("https://cdn/x.png")
+        );
+        assert_eq!(to_public_url("s3://bucket/key", "https://grok.example.com"), None);
     }
 }

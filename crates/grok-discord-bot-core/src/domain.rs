@@ -188,6 +188,24 @@ pub struct ContextItem {
     pub discord_message_id: Option<i64>,
 }
 
+/// One image to replay into a later turn's model context. Produced by
+/// [`crate::Db::load_conversation_image_uris`] from both user-uploaded
+/// image `context_items` and `generate_image` tool-call outputs, so the
+/// model can still "see" images from earlier turns. Not persisted — the
+/// per-turn viewer trace reads its rows directly; this is purely the
+/// in-memory replay set.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ReplayImage {
+    /// Turn the image belonged to; its bytes get re-attached to that
+    /// turn's user message on replay.
+    pub turn_id: Uuid,
+    /// Turn index, used only to order images chronologically so the
+    /// most-recent-N cap drops the oldest first.
+    pub turn_index: i32,
+    /// Stored media URI (`file://images/<uuid>.<ext>`).
+    pub uri: String,
+}
+
 /// Cached identity of one Discord user the bot has interacted with.
 /// Backs the web viewer's per-message avatar + name rendering. Rows
 /// are upserted from every `MessageCreate` event so this row tracks

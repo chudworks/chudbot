@@ -51,7 +51,7 @@ impl LlmProvider for AnthropicProvider {
     }
 
     async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
-        let (system, anthropic_messages) = to_anthropic_messages(&request.messages);
+        let (system, mut anthropic_messages) = to_anthropic_messages(&request.messages);
 
         let mut tools: Vec<Value> = request
             .tools
@@ -72,11 +72,34 @@ impl LlmProvider for AnthropicProvider {
             }));
         }
 
+        // Prompt caching. Two ephemeral (5-minute) breakpoints over the
+        // request prefix, which Anthropic hashes in the order
+        // tools → system → messages:
+        //   1. on the system prompt, anchoring the most stable prefix
+        //      (tools + system) — it never changes within a conversation;
+        //   2. on the final message block, extending the cache to cover
+        //      the whole conversation history (text AND image blocks).
+        // Our agent loop re-sends the entire prefix on every tool-use
+        // iteration, and every later turn re-sends all prior turns +
+        // their replayed images. With these breakpoints the second and
+        // subsequent sends bill the matched prefix at 0.1x instead of
+        // full input price — the single biggest lever on image cost.
+        // Below the model's minimum cacheable size a breakpoint is
+        // silently ignored, so this is safe even for tiny prompts.
+        let system_field = system.map(|s| {
+            json!([{
+                "type": "text",
+                "text": s,
+                "cache_control": { "type": "ephemeral" },
+            }])
+        });
+        mark_last_block_ephemeral(&mut anthropic_messages);
+
         let body = AnthropicRequest {
             model: &request.model,
             max_tokens: request.max_tokens,
             messages: &anthropic_messages,
-            system: system.as_deref(),
+            system: system_field,
             tools: &tools,
             temperature: request.temperature,
             top_p: request.top_p,
@@ -293,14 +316,32 @@ struct AnthropicRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     messages: &'a [Value],
+    // A content-block array (`[{type:text,…,cache_control:…}]`) rather
+    // than a bare string, so the system prompt can carry a cache
+    // breakpoint. Anthropic accepts either form.
     #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
+    system: Option<Value>,
     #[serde(skip_serializing_if = "<[Value]>::is_empty")]
     tools: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+}
+
+/// Tag the last content block of the last message with an ephemeral
+/// cache breakpoint, so the entire conversation prefix up to it becomes
+/// cacheable. No-op if there are no messages or the last message has no
+/// block array (e.g. a string-content message we never emit). Any block
+/// type — text, image, or tool_result — is a valid breakpoint anchor.
+fn mark_last_block_ephemeral(messages: &mut [Value]) {
+    if let Some(last) = messages.last_mut()
+        && let Some(content) = last.get_mut("content").and_then(Value::as_array_mut)
+        && let Some(block) = content.last_mut()
+        && let Some(obj) = block.as_object_mut()
+    {
+        obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+    }
 }
 
 #[derive(Deserialize)]
@@ -359,5 +400,32 @@ mod tests {
         assert_eq!(client_uses.len(), 1);
         assert_eq!(client_uses[0].name, "fetch_messages");
         assert_eq!(client_uses[0].input["limit"], 30);
+    }
+
+    #[test]
+    fn cache_breakpoint_lands_on_final_block() {
+        let mut messages = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "hi"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "hello"}]}),
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "url", "url": "https://x/y.png"}},
+            ]}),
+        ];
+        mark_last_block_ephemeral(&mut messages);
+
+        // Breakpoint sits on the very last block (the image) of the last
+        // message, and nowhere else.
+        let last = messages.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(last[1]["cache_control"], json!({ "type": "ephemeral" }));
+        assert!(last[0].get("cache_control").is_none());
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_breakpoint_no_op_on_empty() {
+        let mut messages: Vec<Value> = vec![];
+        mark_last_block_ephemeral(&mut messages); // must not panic
+        assert!(messages.is_empty());
     }
 }

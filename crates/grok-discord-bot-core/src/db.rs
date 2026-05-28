@@ -10,7 +10,8 @@ use uuid::Uuid;
 
 use crate::config::PrivacyMode;
 use crate::domain::{
-    ContextItem, Conversation, ConversationView, DiscordUser, Turn, TurnView, VideoJob,
+    ContextItem, Conversation, ConversationView, DiscordUser, ReplayImage, Turn, TurnView,
+    VideoJob,
 };
 use crate::llm::ToolCallRecord;
 
@@ -371,6 +372,45 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         Ok(turns)
+    }
+
+    /// Load every replayable image in a conversation, across all
+    /// completed turns, in chronological (turn-index) order. Two
+    /// sources are merged:
+    ///   - user-uploaded attachments, stored as image `context_items`
+    ///     (`source LIKE 'discord:msg:%:image:%'`, `content` = URI);
+    ///   - model-generated images, recovered from `generate_image`
+    ///     tool-call outputs (`response->>'image_uri'`).
+    ///
+    /// The bot re-attaches these to the model context on later turns so
+    /// the model can still see earlier images (history otherwise carries
+    /// only text). Image rows for prior turns are never persisted, so
+    /// this query can't feed on its own output — it only reads the
+    /// genuinely-novel uploads/generations each turn recorded.
+    pub async fn load_conversation_image_uris(
+        &self,
+        conversation_id: Uuid,
+    ) -> Result<Vec<ReplayImage>, DbError> {
+        let images = sqlx::query_as::<_, ReplayImage>(
+            "SELECT t.id AS turn_id, t.turn_index AS turn_index, ci.content AS uri \
+               FROM context_items ci \
+               JOIN turns t ON t.id = ci.turn_id \
+              WHERE t.conversation_id = $1 AND t.status = 'completed' \
+                    AND ci.source LIKE 'discord:msg:%:image:%' \
+             UNION ALL \
+             SELECT t.id AS turn_id, t.turn_index AS turn_index, \
+                    tc.response->>'image_uri' AS uri \
+               FROM tool_calls tc \
+               JOIN turns t ON t.id = tc.turn_id \
+              WHERE t.conversation_id = $1 AND t.status = 'completed' \
+                    AND tc.tool_name = 'generate_image' \
+                    AND tc.response->>'image_uri' IS NOT NULL \
+             ORDER BY turn_index ASC",
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(images)
     }
 
     /// Set a user's privacy preference for a specific guild. `true` =
