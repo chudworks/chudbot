@@ -114,6 +114,9 @@ pub struct AppState {
     /// Prefix the viewer prepends to every browser tab title. Surfaced
     /// to the frontend via `/api/config`.
     pub web_title_prefix: String,
+    /// Optional on-disk favicon served at `/favicon.ico`. `None` means
+    /// the route 404s and browsers show their default icon.
+    pub web_favicon_path: Option<PathBuf>,
     /// Media storage settings (images, videos, avatars dirs).
     pub storage: StorageConfig,
     /// HTTP client used by background tasks (avatar fetcher, image

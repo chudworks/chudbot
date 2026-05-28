@@ -312,6 +312,15 @@ pub struct WebConfig {
     /// `"Chudbot · "` yields tab titles such as `Chudbot · My chat`.
     #[serde(default = "default_title_prefix")]
     pub title_prefix: String,
+    /// Optional path to a favicon file served verbatim at
+    /// `/favicon.ico` (the URL browsers request automatically). Keep it
+    /// OUTSIDE `frontend_dir` — `serve.sh deploy` atomically replaces
+    /// that whole directory, so anything inside it is wiped each
+    /// deploy. When unset, `/favicon.ico` 404s and browsers fall back
+    /// to their default icon. A multi-resolution `.ico` is ideal, but
+    /// any image format the browser accepts works.
+    #[serde(default)]
+    pub favicon_path: Option<PathBuf>,
 }
 
 fn default_listen() -> String {

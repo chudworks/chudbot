@@ -35,6 +35,12 @@ base_url = "http://localhost:1860"
 # page-specific part (conversation title, "Viewer", "Not found", …) is
 # appended after it. Defaults to "grok · ", e.g. "grok · My chat".
 # title_prefix = "Chudbot · "
+# Optional favicon served at /favicon.ico (browsers request it
+# automatically). MUST live outside frontend_dir — `serve.sh deploy`
+# replaces that whole directory, so a file inside it is wiped each
+# deploy. A multi-resolution .ico is ideal; any browser-supported image
+# works. Unset → browsers show their default icon.
+# favicon_path = "/home/chud/chudbot/chudbot.ico"
 
 # LLM provider credentials. Include only the blocks for providers any of
 # your personas actually use. Both can be present — personas pick freely.

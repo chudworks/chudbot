@@ -147,6 +147,11 @@ pub async fn run(app: Arc<AppState>, listen: SocketAddr) -> Result<(), WebError>
                 .layer(cache_layer(CACHE_IMMUTABLE))
                 .service(assets_service),
         )
+        // Favicon: served from an operator-configured path that lives
+        // outside `frontend_dir` so it survives `serve.sh deploy`.
+        // Browsers request `/favicon.ico` automatically, so no markup
+        // change is needed. Sets its own cache header.
+        .route("/favicon.ico", get(get_favicon))
         // Everything else is a single-page-app route → serve the SPA
         // shell. `spa_index` sets its own status + cache headers.
         .fallback(spa_index)
@@ -293,6 +298,53 @@ fn event_payload(ev: &ConversationEvent) -> Event {
         ),
     };
     Event::default().event(name).data(extra.to_string())
+}
+
+/// Serve the operator-configured favicon at `/favicon.ico`. Returns
+/// `404` when no `[web].favicon_path` is set or the file can't be read,
+/// which is exactly the no-favicon default (browsers fall back to their
+/// own icon). The content type is guessed from the file extension so an
+/// operator can point this at a `.ico` or a `.png` interchangeably.
+async fn get_favicon(State(app): State<Arc<AppState>>) -> Response {
+    let Some(path) = app.web_favicon_path.as_deref() else {
+        return (StatusCode::NOT_FOUND, "no favicon configured").into_response();
+    };
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            let content_type = match path.extension().and_then(|e| e.to_str()) {
+                Some("png") => "image/png",
+                Some("svg") => "image/svg+xml",
+                Some("gif") => "image/gif",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                // `.ico` and anything else fall through to the classic
+                // favicon media type.
+                _ => "image/x-icon",
+            };
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+                    // `no-cache` (revalidate, don't blind-cache) so swapping
+                    // the file shows up without users hard-refreshing —
+                    // browsers cache favicons aggressively otherwise.
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static(CACHE_NO_CACHE),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                path = %path.display(),
+                "configured favicon_path could not be read"
+            );
+            (StatusCode::NOT_FOUND, "favicon not found").into_response()
+        }
+    }
 }
 
 /// Axum fallback for any route not matched by the API or a static
