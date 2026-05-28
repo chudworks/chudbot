@@ -3,6 +3,11 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Unauthenticated, UUID-gated conversation traces: never index.
+         The server also sends X-Robots-Tag on every response (which
+         covers crawlers that don't run JS); this is the belt-and-
+         suspenders for those that render the page. -->
+    <meta name="robots" content="noindex, nofollow, noarchive, nosnippet" />
     <title>grok</title>
   </head>
   <body>

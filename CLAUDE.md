@@ -148,14 +148,24 @@ caches automatically (cached-input pricing), so it needs no breakpoints.
 1. Send chat history (turns + prior tool uses/results) + tool definitions
    to the provider.
 2. If the model returns `StepResponse::Final`, stop.
-3. If the model returns `StepResponse::UseTools`, execute each tool via
-   the caller-supplied `ToolExecutor`, append both the assistant turn
-   (with tool_use blocks) and a user turn (with tool_result blocks) to
-   history, then loop.
+3. If the model returns `StepResponse::UseTools`, execute all the
+   requested tools **concurrently** (unordered parallelism via a
+   `FuturesUnordered`) through the caller-supplied `ToolExecutor`, then
+   append both the assistant turn (with tool_use blocks) and a single
+   user turn (with one tool_result block per tool_use) to history, then
+   loop. The tool-use protocol requires every `tool_result` for an
+   assistant turn to come back together in the next user message, so the
+   loop fans out, awaits all results, and makes ONE follow-up request —
+   the parallelism is pure latency overlap (e.g. a `post_status_message`
+   posts while a `generate_image` renders). Each tool is supervised
+   independently: a failure becomes an `is_error` tool_result fed back to
+   the model, never an abort of its siblings. Completions land in
+   arbitrary order but are slotted back into declared order so the trace
+   stays deterministic.
 4. Cap at `MAX_AGENT_ITERATIONS` (6) to prevent runaways.
 
 Every tool call — server-side (web search) and client-side (`fetch_messages`
-or any future tool) — is collected in execution order in `AgentRun.tool_calls`
+or any future tool) — is collected in declared order in `AgentRun.tool_calls`
 and persisted into the `tool_calls` table. The web viewer renders them
 all in order so the conversation trace shows every input and output.
 

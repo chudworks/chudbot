@@ -14,6 +14,8 @@
 //! returned in [`AgentRun::tool_calls`], so the caller can persist them
 //! into the `tool_calls` table for the web viewer.
 
+use futures::stream::{FuturesUnordered, StreamExt};
+
 use crate::llm::{
     ChatTurn, LlmProvider, MessageRole, ProviderOptions, StepRequest, StepResponse, ToolCallRecord,
     ToolDefinition, ToolExecutor, ToolUseRequest, TurnBlock,
@@ -233,33 +235,66 @@ where
                     blocks: assistant_blocks,
                 });
 
-                // Execute each tool and build the user-side result turn.
+                // Execute every tool the model asked for CONCURRENTLY.
+                // The tool-use protocol (both Anthropic and xAI) requires
+                // all `tool_result` blocks answering this assistant turn to
+                // come back together in the NEXT user message — there's no
+                // way to drip them in one at a time — so we fan the calls
+                // out with unordered parallelism, await every result, then
+                // assemble a single result turn and make one follow-up
+                // request. Each future logs and is supervised independently
+                // (`execute_one` turns a tool failure into an `is_error`
+                // result rather than aborting its siblings), so one slow or
+                // failing tool can't block or sink the others.
+                //
+                // Completions land in arbitrary order, but we slot each into
+                // its declared position so the persisted trace and the
+                // `tool_result` ordering stay deterministic regardless of
+                // which tool finished first.
+                let mut slots: Vec<Option<(ToolCallRecord, TurnBlock)>> =
+                    (0..tool_uses.len()).map(|_| None).collect();
+                let mut pending: FuturesUnordered<_> = tool_uses
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, use_req)| async move {
+                        tracing::info!(
+                            tool = %use_req.name,
+                            input = %use_req.input,
+                            "agent: invoking tool"
+                        );
+                        let (content_str, is_error, response_json) =
+                            execute_one(executor, use_req).await;
+                        tracing::info!(
+                            tool = %use_req.name,
+                            is_error,
+                            response_chars = content_str.len(),
+                            response = %truncate_for_log(&response_json, 600),
+                            "agent: tool returned"
+                        );
+                        (idx, use_req, content_str, is_error, response_json)
+                    })
+                    .collect();
+                while let Some((idx, use_req, content_str, is_error, response_json)) =
+                    pending.next().await
+                {
+                    slots[idx] = Some((
+                        ToolCallRecord {
+                            tool_name: use_req.name.clone(),
+                            request: use_req.input.clone(),
+                            response: response_json,
+                        },
+                        TurnBlock::ToolResult {
+                            tool_use_id: use_req.id.clone(),
+                            content: content_str,
+                            is_error,
+                        },
+                    ));
+                }
+
                 let mut result_blocks: Vec<TurnBlock> = Vec::with_capacity(tool_uses.len());
-                for use_req in &tool_uses {
-                    tracing::info!(
-                        tool = %use_req.name,
-                        input = %use_req.input,
-                        "agent: invoking tool"
-                    );
-                    let (content_str, is_error, response_json) =
-                        execute_one(executor, use_req).await;
-                    tracing::info!(
-                        tool = %use_req.name,
-                        is_error,
-                        response_chars = content_str.len(),
-                        response = %truncate_for_log(&response_json, 600),
-                        "agent: tool returned"
-                    );
-                    all_tool_calls.push(ToolCallRecord {
-                        tool_name: use_req.name.clone(),
-                        request: use_req.input.clone(),
-                        response: response_json,
-                    });
-                    result_blocks.push(TurnBlock::ToolResult {
-                        tool_use_id: use_req.id.clone(),
-                        content: content_str,
-                        is_error,
-                    });
+                for (record, block) in slots.into_iter().flatten() {
+                    all_tool_calls.push(record);
+                    result_blocks.push(block);
                 }
                 messages.push(ChatTurn {
                     role: MessageRole::User,
@@ -334,5 +369,136 @@ async fn execute_one<T: ToolExecutor>(
             let response = serde_json::json!({ "error": msg });
             (msg, true, response)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use serde_json::json;
+    use tokio::sync::Barrier;
+
+    use super::*;
+    use crate::llm::ToolError;
+    use crate::llm::mock::MockProvider;
+
+    fn tool_use(id: &str, name: &str) -> ToolUseRequest {
+        ToolUseRequest {
+            id: id.to_string(),
+            name: name.to_string(),
+            input: json!({}),
+        }
+    }
+
+    /// Drive `run` over a single `UseTools` step that names the given
+    /// tools, followed by a final answer. Returns the resulting run.
+    async fn run_with_tools<T: ToolExecutor>(tool_uses: Vec<ToolUseRequest>, executor: &T) -> AgentRun {
+        let provider = MockProvider {
+            name: "mock".to_string(),
+            answer: "done".to_string(),
+            server_tool_calls: Vec::new(),
+            script: Mutex::new(vec![StepResponse::UseTools {
+                partial_text: None,
+                tool_uses,
+                server_tool_calls: Vec::new(),
+                model_id: "mock".to_string(),
+                provider_state: None,
+            }]),
+        };
+        run(
+            &provider,
+            "mock".to_string(),
+            vec![ChatTurn::text(MessageRole::User, "hi")],
+            Vec::new(),
+            executor,
+            &NoopObserver,
+            false,
+            1024,
+            None,
+            None,
+            ProviderOptions::default(),
+            None,
+            6,
+        )
+        .await
+    }
+
+    /// Executor that blocks every call on a shared 2-party barrier, so
+    /// the run can only finish if the two tools are in flight at the same
+    /// time — sequential execution would wait on the barrier forever. To
+    /// prove the trace stays in declared order regardless of completion
+    /// order, the *first*-declared tool sleeps after the barrier so it
+    /// finishes *last*.
+    struct BarrierExecutor {
+        barrier: Arc<Barrier>,
+    }
+
+    impl ToolExecutor for BarrierExecutor {
+        async fn execute(&self, name: &str, _input: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            self.barrier.wait().await;
+            if name == "tool_a" {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+            }
+            Ok(json!({ "ran": name }))
+        }
+    }
+
+    #[tokio::test]
+    async fn executes_tool_calls_concurrently_and_preserves_declared_order() {
+        let executor = BarrierExecutor {
+            barrier: Arc::new(Barrier::new(2)),
+        };
+        // If the loop ran the tools sequentially the barrier would never
+        // release; the timeout converts that hang into a clear failure.
+        let run = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_with_tools(vec![tool_use("1", "tool_a"), tool_use("2", "tool_b")], &executor),
+        )
+        .await
+        .expect("agent run deadlocked — tools were not executed concurrently");
+
+        assert!(run.error.is_none());
+        assert_eq!(run.content, "done");
+        let names: Vec<&str> = run.tool_calls.iter().map(|c| c.tool_name.as_str()).collect();
+        // tool_b completes first (tool_a sleeps post-barrier) yet the
+        // declared order is preserved in the persisted trace.
+        assert_eq!(names, ["tool_a", "tool_b"]);
+    }
+
+    /// Executor that fails one named tool and succeeds the rest.
+    struct FlakyExecutor;
+
+    impl ToolExecutor for FlakyExecutor {
+        async fn execute(&self, name: &str, _input: serde_json::Value) -> Result<serde_json::Value, ToolError> {
+            if name == "bad" {
+                Err(ToolError::Execution("boom".to_string()))
+            } else {
+                Ok(json!({ "ran": name }))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn one_tool_failure_does_not_sink_its_siblings() {
+        let run = run_with_tools(
+            vec![tool_use("1", "good"), tool_use("2", "bad"), tool_use("3", "good2")],
+            &FlakyExecutor,
+        )
+        .await;
+
+        // The whole run still reaches a clean final answer — a single tool
+        // failure is reported back to the model, not propagated.
+        assert!(run.error.is_none());
+        assert_eq!(run.content, "done");
+        let names: Vec<&str> = run.tool_calls.iter().map(|c| c.tool_name.as_str()).collect();
+        assert_eq!(names, ["good", "bad", "good2"]);
+        // The failed tool's record carries the error payload; the others
+        // carry their results.
+        assert_eq!(run.tool_calls[1].response, json!({ "error": "execution failed: boom" }));
+        assert_eq!(run.tool_calls[0].response, json!({ "ran": "good" }));
+        assert_eq!(run.tool_calls[2].response, json!({ "ran": "good2" }));
     }
 }

@@ -11,6 +11,8 @@
 //!     `Cache-Control: public, max-age=31536000, immutable`.
 //!   - `/assets/*` → Vite-emitted JS/CSS bundles with hashed filenames.
 //!     Same long-lived immutable cache headers.
+//!   - `/robots.txt` → a site-wide `Disallow: /` (plus explicit blocks
+//!     for AI crawlers that ignore the `*` group). See below.
 //!   - everything else → the `spa_index` fallback returns `index.html`
 //!     with a hard `200` (and `no-cache, must-revalidate`) so client
 //!     routes like `/c/<uuid>` resolve and report success. Paths whose
@@ -19,6 +21,23 @@
 //!     tower-http's `ServeDir::not_found_service(ServeFile(index))` SPA
 //!     pattern: in 0.6 it serves index.html's body but leaks the
 //!     original `404` status for multi-segment paths.
+//!
+//! Search-engine / crawler policy: this host is unauthenticated and
+//! every conversation trace is guarded only by an unguessable UUID, so
+//! NOTHING here should ever be indexed, cached, or scraped for training.
+//! We enforce that in three layers, strongest first:
+//!   1. `X-Robots-Tag: noindex, nofollow, noarchive, nosnippet` on EVERY
+//!      response ([`x_robots_layer`]). Unlike a `<meta>` tag this also
+//!      covers non-HTML bytes (images/videos) and crawlers that never run
+//!      our JS — it is the load-bearing control.
+//!   2. A hard `403` for any request whose User-Agent matches a known
+//!      search-engine / AI / SEO crawler ([`block_crawlers`]). Social
+//!      link-unfurl bots (Discord, Slack, Twitter, …) are intentionally
+//!      NOT blocked so pasting a viewer URL into chat still previews.
+//!   3. `/robots.txt` for the polite, compliant crawlers.
+//!
+//! The frontend's `index.html` also carries a `<meta name="robots">` tag
+//! as a fourth, JS-rendered-crawler fallback.
 //!
 //! Compression: deliberately not done at origin. Cloudflare in front
 //! of the tunnel compresses dynamically (brotli when the client
@@ -35,7 +54,7 @@ use std::time::{Duration, Instant};
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -81,6 +100,116 @@ const CACHE_NO_CACHE: &str = "no-cache, must-revalidate";
 /// `Cache-Control` for the JSON API. Conversations mutate constantly;
 /// caching is actively harmful here.
 const CACHE_NO_STORE: &str = "no-store";
+
+/// `X-Robots-Tag` stamped on every response. `noindex` keeps the URL
+/// out of result pages, `nofollow` stops crawlers following links out of
+/// it, `noarchive` suppresses the "cached" copy, `nosnippet` blocks any
+/// text/preview excerpt. Applies to non-HTML bytes too, which is the
+/// whole reason we set it as a header rather than only a `<meta>` tag.
+const X_ROBOTS_TAG: &str = "noindex, nofollow, noarchive, nosnippet";
+
+/// Body served at `/robots.txt`. A wildcard `Disallow: /` covers
+/// well-behaved search engines; the named groups below exist because
+/// several AI / answer-engine crawlers (per their own docs) only honor a
+/// directive addressed to their specific product token and ignore the
+/// `*` group for training opt-out. Keep this list and
+/// [`CRAWLER_UA_TOKENS`] roughly in sync.
+const ROBOTS_TXT: &str = "\
+# This host serves unauthenticated, UUID-gated conversation traces.
+# Nothing here may be indexed, archived, or used for model training.
+User-agent: *
+Disallow: /
+
+User-agent: GPTBot
+Disallow: /
+
+User-agent: OAI-SearchBot
+Disallow: /
+
+User-agent: ChatGPT-User
+Disallow: /
+
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: PerplexityBot
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: meta-externalagent
+Disallow: /
+";
+
+/// Lowercased substrings that flag a search-engine, AI, or SEO crawler.
+/// We hard-`403` any request whose User-Agent contains one of these (see
+/// [`block_crawlers`]). Social-media link-unfurl bots (Discordbot,
+/// Slackbot, Twitterbot, facebookexternalhit, TelegramBot, WhatsApp,
+/// LinkedInBot) are DELIBERATELY absent: they build share previews, not
+/// search-index entries, and blocking them would break the preview when
+/// a viewer URL is pasted into a chat — which is exactly how these links
+/// are meant to be shared. Match is case-insensitive substring, so e.g.
+/// `"googlebot"` also catches `Googlebot-Image`.
+const CRAWLER_UA_TOKENS: &[&str] = &[
+    // Major search engines.
+    "googlebot",
+    "google-inspectiontool",
+    "storebot-google",
+    "bingbot",
+    "bingpreview",
+    "msnbot",
+    "slurp", // Yahoo
+    "duckduckbot",
+    "duckassistbot",
+    "baiduspider",
+    "yandex",
+    "sogou",
+    "exabot",
+    "seznambot",
+    "petalbot", // Huawei
+    "applebot", // also catches Applebot-Extended
+    "ia_archiver",
+    "archive.org_bot",
+    // AI / answer-engine crawlers.
+    "gptbot",
+    "oai-searchbot",
+    "chatgpt-user",
+    "ccbot", // Common Crawl (feeds many training sets)
+    "claudebot",
+    "claude-web",
+    "anthropic-ai",
+    "perplexitybot",
+    "perplexity-user",
+    "amazonbot",
+    "bytespider", // ByteDance
+    "meta-externalagent",
+    "cohere-ai",
+    "diffbot",
+    "google-extended",
+    // Aggressive SEO / backlink scrapers.
+    "semrushbot",
+    "ahrefsbot",
+    "mj12bot",
+    "dotbot",
+    "dataforseobot",
+    "blexbot",
+];
 
 /// Entry point for the web half of `grok serve`. Builds the router,
 /// binds `listen`, and serves until the shared cancellation token
@@ -154,12 +283,25 @@ pub async fn run(app: Arc<AppState>, listen: SocketAddr) -> Result<(), WebError>
         // Browsers request `/favicon.ico` automatically, so no markup
         // change is needed. Sets its own cache header.
         .route("/favicon.ico", get(get_favicon))
+        // Crawler opt-out for the polite, compliant bots. Sets its own
+        // cache header; intentionally NOT behind `block_crawlers` (see
+        // that fn) so a blocked crawler can still read the Disallow.
+        .route("/robots.txt", get(get_robots))
         // Everything else is a single-page-app route → serve the SPA
         // shell. `spa_index` sets its own status + cache headers.
         .fallback(spa_index)
         .with_state(Arc::clone(&app))
+        // Stamp `X-Robots-Tag: noindex…` on every response. Innermost of
+        // the cross-cutting layers so it lands on real content; a 403
+        // from `block_crawlers` short-circuits before this, but a 403 is
+        // not indexable anyway. This is the load-bearing no-index control
+        // (covers images/videos and JS-less crawlers, unlike a <meta>).
+        .layer(x_robots_layer())
+        // Hard-403 known search-engine / AI / SEO crawler User-Agents.
+        .layer(middleware::from_fn(block_crawlers))
         // Access log wraps the whole router (added last → outermost),
-        // so every request — API, media, SPA fallback — gets one line.
+        // so every request — API, media, SPA fallback, even a blocked
+        // crawler's 403 — gets exactly one line.
         .layer(middleware::from_fn_with_state(
             app.web_trust_forwarded_for,
             access_log,
@@ -272,6 +414,52 @@ fn short_user_agent(ua: &str) -> String {
 /// Build a `Cache-Control: <value>` layer to slap on a route group.
 fn cache_layer(value: &'static str) -> SetResponseHeaderLayer<HeaderValue> {
     SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static(value))
+}
+
+/// Build the `X-Robots-Tag: <X_ROBOTS_TAG>` layer applied to the whole
+/// router. `overriding` (not `if_not_present`) so no handler can
+/// accidentally weaken it.
+fn x_robots_layer() -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::overriding(
+        HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static(X_ROBOTS_TAG),
+    )
+}
+
+/// True when `user_agent` looks like a crawler we want to hard-block.
+/// Case-insensitive substring match against [`CRAWLER_UA_TOKENS`].
+fn is_blocked_crawler(user_agent: &str) -> bool {
+    let ua = user_agent.to_ascii_lowercase();
+    CRAWLER_UA_TOKENS.iter().any(|token| ua.contains(token))
+}
+
+/// Middleware that returns `403` for known search-engine / AI / SEO
+/// crawler User-Agents before they reach any handler. `/robots.txt` is
+/// exempt so a compliant crawler can still fetch the site-wide
+/// `Disallow` (and so we never answer a robots.txt fetch with a status
+/// that some crawlers read as "retry later" rather than "stay out").
+/// UA spoofing trivially defeats this, which is why [`x_robots_layer`]
+/// and the unguessable UUID — not this — are the real protections; this
+/// is defense-in-depth that also keeps crawl traffic off the box.
+async fn block_crawlers(req: Request, next: Next) -> Response {
+    if req.uri().path() != "/robots.txt"
+        && let Some(ua) = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+        && is_blocked_crawler(ua)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            [(
+                HeaderName::from_static("x-robots-tag"),
+                HeaderValue::from_static(X_ROBOTS_TAG),
+            )],
+            "crawling and indexing of this host are not permitted\n",
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Per-handler error type. Convert to a JSON response that the React
@@ -447,6 +635,27 @@ async fn get_favicon(State(app): State<Arc<AppState>>) -> Response {
     }
 }
 
+/// Serve `/robots.txt`. Static body ([`ROBOTS_TXT`]); cached for a day
+/// so we're not re-serving it on every crawler pass, but short enough
+/// that an operator edit propagates without a long wait.
+async fn get_robots() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+        ],
+        ROBOTS_TXT,
+    )
+        .into_response()
+}
+
 /// Axum fallback for any route not matched by the API or a static
 /// asset subtree. Serves the SPA shell so client-side routes like
 /// `/c/<uuid>` resolve.
@@ -504,6 +713,55 @@ async fn render_spa(frontend_dir: &std::path::Path, request_path: &str) -> Respo
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use test_case::test_case;
+
+    // Search-engine + AI crawlers: blocked.
+    #[test_case("Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)" ; "googlebot")]
+    #[test_case("Mozilla/5.0 (compatible; Googlebot-Image/1.0; +http://www.google.com/bot.html)" ; "googlebot image variant")]
+    #[test_case("Mozilla/5.0 (compatible; bingbot/2.0; +http://www.bing.com/bingbot.htm)" ; "bingbot")]
+    #[test_case("Mozilla/5.0 (compatible; YandexBot/3.0)" ; "yandex")]
+    #[test_case("Baiduspider+(+http://www.baidu.com/search/spider.htm)" ; "baidu")]
+    #[test_case("GPTBot/1.0 (+https://openai.com/gptbot)" ; "gptbot")]
+    #[test_case("Mozilla/5.0 (compatible; ClaudeBot/1.0; +claudebot@anthropic.com)" ; "claudebot")]
+    #[test_case("CCBot/2.0 (https://commoncrawl.org/faq/)" ; "ccbot")]
+    #[test_case("Mozilla/5.0 (compatible; PerplexityBot/1.0)" ; "perplexity")]
+    #[test_case("Mozilla/5.0 (compatible; SemrushBot/7~bl)" ; "semrush")]
+    #[test_case("GOOGLEBOT" ; "case insensitive")]
+    fn blocked_crawler_user_agents(ua: &str) {
+        assert!(is_blocked_crawler(ua), "expected {ua:?} to be blocked");
+    }
+
+    // Real browsers + social link-unfurl bots: allowed. Blocking the
+    // unfurlers would kill the Discord/Slack/etc. preview that is the
+    // whole point of sharing a viewer URL.
+    #[test_case("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36" ; "chrome")]
+    #[test_case("Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0) Gecko/20100101 Firefox/151.0" ; "firefox")]
+    #[test_case("Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)" ; "discord unfurl")]
+    #[test_case("Slackbot-LinkExpanding 1.0 (+https://api.slack.com/robots)" ; "slack unfurl")]
+    #[test_case("Twitterbot/1.0" ; "twitter unfurl")]
+    #[test_case("facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)" ; "facebook unfurl")]
+    #[test_case("TelegramBot (like TwitterBot)" ; "telegram unfurl")]
+    #[test_case("" ; "empty ua")]
+    fn allowed_user_agents(ua: &str) {
+        assert!(!is_blocked_crawler(ua), "expected {ua:?} to be allowed");
+    }
+
+    #[tokio::test]
+    async fn robots_txt_disallows_everything() {
+        let resp = get_robots().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("User-agent: *"));
+        assert!(text.contains("Disallow: /"));
+        // AI crawlers that only honor a named group must be addressed.
+        assert!(text.contains("GPTBot"));
+        assert!(text.contains("ClaudeBot"));
+    }
 
     /// Make a unique temp dir containing an `index.html`. `marker`
     /// keeps concurrent tests from colliding on the same path.
