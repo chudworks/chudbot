@@ -92,6 +92,10 @@ impl LlmProvider for XaiProvider {
             // multi-turn cache misses; non-reasoning models simply emit no
             // reasoning items, so requesting it is harmless.
             include: REASONING_INCLUDE,
+            // Don't let xAI retain the response server-side. We persist the
+            // full trace ourselves (turns + tool_calls) and replay history
+            // explicitly each request, so server-side storage buys nothing.
+            store: false,
         };
 
         if tracing::enabled!(tracing::Level::DEBUG) {
@@ -471,6 +475,9 @@ struct ResponsesRequest<'a> {
     /// that produce no reasoning.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     include: &'a [&'a str],
+    /// Whether xAI retains the response server-side. We keep our own
+    /// trace and replay history explicitly, so this is always `false`.
+    store: bool,
 }
 
 #[derive(Deserialize)]
@@ -609,6 +616,7 @@ mod tests {
             reasoning: Some(&reasoning),
             prompt_cache_key: None,
             include: &[],
+            store: false,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["reasoning"]["effort"], "high");
@@ -627,6 +635,7 @@ mod tests {
             reasoning: None,
             prompt_cache_key: None,
             include: &[],
+            store: false,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert!(v.get("reasoning").is_none(), "got {v}");
@@ -664,6 +673,7 @@ mod tests {
             reasoning: None,
             prompt_cache_key: Some("conv-123"),
             include: &[],
+            store: false,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["prompt_cache_key"], "conv-123");
@@ -682,6 +692,7 @@ mod tests {
             reasoning: None,
             prompt_cache_key: None,
             include: &[],
+            store: false,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert!(v.get("prompt_cache_key").is_none(), "got {v}");
@@ -700,6 +711,7 @@ mod tests {
             reasoning: None,
             prompt_cache_key: None,
             include: REASONING_INCLUDE,
+            store: false,
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["include"][0], "reasoning.encrypted_content");
@@ -749,6 +761,25 @@ mod tests {
         assert_eq!(input[1]["encrypted_content"], "BLOB");
         assert_eq!(input[2]["role"], "assistant");
         assert_eq!(input[2]["content"], "the answer");
+    }
+
+    #[test]
+    fn store_is_always_false() {
+        let body = ResponsesRequest {
+            model: "grok-4.3",
+            input: &[],
+            instructions: None,
+            tools: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            reasoning: None,
+            prompt_cache_key: None,
+            include: &[],
+            store: false,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["store"], false);
     }
 
     #[test]
