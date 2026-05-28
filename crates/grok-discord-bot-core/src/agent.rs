@@ -31,10 +31,7 @@ pub trait AgentObserver: Send + Sync {
     /// `partial_text` alongside one or more tool_uses. Implementations
     /// should be best-effort (log errors, don't propagate) — failing
     /// to post a status shouldn't abort the whole turn.
-    fn on_partial_text(
-        &self,
-        text: &str,
-    ) -> impl std::future::Future<Output = ()> + Send;
+    fn on_partial_text(&self, text: &str) -> impl std::future::Future<Output = ()> + Send;
 }
 
 /// No-op observer for tests and callers that don't care about
@@ -170,8 +167,7 @@ where
                 let server_calls = server_tool_calls.len();
                 all_tool_calls.extend(server_tool_calls);
                 last_model_id = model_id;
-                let tool_names: Vec<&str> =
-                    tool_uses.iter().map(|t| t.name.as_str()).collect();
+                let tool_names: Vec<&str> = tool_uses.iter().map(|t| t.name.as_str()).collect();
                 tracing::info!(
                     iteration,
                     model = %last_model_id,
@@ -185,18 +181,18 @@ where
                 // Surface the model's intermediate narration before we
                 // execute its tool calls. This is the natural,
                 // post_status_message-free path.
-                if let Some(text) = partial_text.as_ref() {
-                    if !text.trim().is_empty() {
-                        observer.on_partial_text(text).await;
-                    }
+                if let Some(text) = partial_text.as_ref()
+                    && !text.trim().is_empty()
+                {
+                    observer.on_partial_text(text).await;
                 }
 
                 // Reconstruct the assistant turn so the next step can see it.
                 let mut assistant_blocks: Vec<TurnBlock> = Vec::new();
-                if let Some(text) = partial_text {
-                    if !text.is_empty() {
-                        assistant_blocks.push(TurnBlock::Text(text));
-                    }
+                if let Some(text) = partial_text
+                    && !text.is_empty()
+                {
+                    assistant_blocks.push(TurnBlock::Text(text));
                 }
                 for u in &tool_uses {
                     assistant_blocks.push(TurnBlock::ToolUse {
@@ -302,8 +298,7 @@ async fn execute_one<T: ToolExecutor>(
 ) -> (String, bool, serde_json::Value) {
     match executor.execute(&req.name, req.input.clone()).await {
         Ok(value) => {
-            let as_string =
-                serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
+            let as_string = serde_json::to_string(&value).unwrap_or_else(|_| value.to_string());
             (as_string, false, value)
         }
         Err(err) => {

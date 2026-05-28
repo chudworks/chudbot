@@ -3,6 +3,10 @@
 /config.toml
 /images
 /videos
+/avatars
+/frontend-build
+/frontend/node_modules
+/frontend/dist
 /.env
 /.env.local
 /.idea

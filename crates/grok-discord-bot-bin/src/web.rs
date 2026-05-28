@@ -1,25 +1,54 @@
-//! Axum web viewer.
+//! Axum HTTP server: JSON API + SSE event stream + static React bundle.
 //!
-//! Renders one conversation per URL at `/c/{uuid}`. The UUID is the
-//! only access control — links posted into Discord are unguessable, and
-//! anyone with the link can read the trace. No auth, no login.
+//! Route layout:
+//!   - `/api/conversations/{uuid}` → full [`ConversationView`] as JSON.
+//!   - `/api/conversations/{uuid}/events` → text/event-stream that
+//!     emits one event per [`ConversationEvent`] whose `conversation_id`
+//!     matches (and globals like avatar updates).
+//!   - `/images/*`, `/videos/*`, `/avatars/*` → media `ServeDir`s.
+//!     File names embed a UUID (images/videos) or `<user_id>_<hash>`
+//!     (avatars) so contents at a given URL are stable — served with
+//!     `Cache-Control: public, max-age=31536000, immutable`.
+//!   - `/assets/*` → Vite-emitted JS/CSS bundles with hashed filenames.
+//!     Same long-lived immutable cache headers.
+//!   - everything else → tries to serve a static file under
+//!     `app.web_frontend_dir`; if no such file exists, returns
+//!     `index.html` (SPA fallback). Both index.html and the SPA shell
+//!     are served `no-cache, must-revalidate` so a fresh deploy is
+//!     picked up on the next page load without a hard refresh.
+//!
+//! Compression: deliberately not done at origin. Cloudflare in front
+//! of the tunnel compresses dynamically (brotli when the client
+//! supports it, gzip otherwise) — doing it ourselves would duplicate
+//! that work and lock the CDN into whatever encoding we chose. Our
+//! `Cache-Control` values also intentionally avoid `no-transform` so
+//! Cloudflare is free to compress / minify on the way out.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse, Response};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use grok_discord_bot_core::{ContextItem, ConversationView, Db, DbError, TurnView, storage};
-use maud::{DOCTYPE, Markup, PreEscaped, html};
+use futures::Stream;
+use grok_discord_bot_core::{ConversationView, DbError};
 use thiserror::Error;
-use tower_http::services::ServeDir;
+use tokio_stream::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
+use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
-/// Errors returned by the web layer. Map to HTTP responses via
-/// [`IntoResponse`].
+use crate::app::{AppState, ConversationEvent};
+
+/// Errors returned by the web layer's startup path. Per-request errors
+/// use [`ApiError`] instead.
 #[derive(Debug, Error)]
 pub enum WebError {
     /// Failure binding or serving over TCP.
@@ -27,465 +56,234 @@ pub enum WebError {
     Io(#[from] std::io::Error),
 }
 
-/// State injected into every handler. Cheap to clone.
-#[derive(Clone)]
-struct WebState {
-    db: Db,
-}
+/// Interval at which SSE connections emit a comment-only keepalive
+/// frame. Cloudflare's default idle timeout for non-WebSocket
+/// connections is ~100s; 30s gives a comfortable margin.
+const SSE_KEEPALIVE: Duration = Duration::from_secs(30);
 
-/// Entry point for the `grok web` subcommand.
-pub async fn run(
-    db: Db,
-    listen: SocketAddr,
-    images_dir: PathBuf,
-    videos_dir: PathBuf,
-) -> Result<(), WebError> {
-    // Ensure the dirs exist so ServeDir doesn't 500 on first hit
-    // before any media has been written.
-    tokio::fs::create_dir_all(&images_dir).await?;
-    tokio::fs::create_dir_all(&videos_dir).await?;
+/// `Cache-Control` for content whose URL is stable forever (Vite
+/// hashed bundles, UUID-named media, hash-named avatars). One year is
+/// what Cloudflare's docs recommend for `immutable`-tagged assets.
+const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 
-    let state = WebState { db };
-    let app = Router::new()
-        .route("/", get(landing))
-        .route("/c/{id}", get(view_conversation))
-        .nest_service("/images", ServeDir::new(&images_dir))
-        .nest_service("/videos", ServeDir::new(&videos_dir))
-        .fallback(not_found)
-        .with_state(state);
+/// `Cache-Control` for index.html and any SPA fallback. We want
+/// browsers to revalidate on every page load so a new deploy ships
+/// to users without a hard refresh. The hashed asset URLs inside the
+/// HTML are then served from the long-lived cache, so no actual
+/// bandwidth is wasted.
+const CACHE_NO_CACHE: &str = "no-cache, must-revalidate";
+
+/// `Cache-Control` for the JSON API. Conversations mutate constantly;
+/// caching is actively harmful here.
+const CACHE_NO_STORE: &str = "no-store";
+
+/// Entry point for the web half of `grok serve`. Builds the router,
+/// binds `listen`, and serves until the shared cancellation token
+/// fires.
+pub async fn run(app: Arc<AppState>, listen: SocketAddr) -> Result<(), WebError> {
+    // Make sure every static-served directory exists so ServeDir
+    // doesn't 500 the first time someone hits a missing file. The
+    // frontend dir is treated as fatal-if-missing — if it doesn't
+    // exist, the operator has skipped the `bun run build` step.
+    tokio::fs::create_dir_all(&app.storage.images_dir).await?;
+    tokio::fs::create_dir_all(&app.storage.videos_dir).await?;
+    tokio::fs::create_dir_all(&app.storage.avatars_dir).await?;
+    if !app.web_frontend_dir.exists() {
+        tracing::warn!(
+            frontend_dir = %app.web_frontend_dir.display(),
+            "frontend_dir does not exist — SPA routes will return empty / 404. \
+             Run `serve.sh deploy` (or `bun run build` in frontend/ then copy \
+             dist/ to this path) before hitting the viewer."
+        );
+    }
+
+    // --- API: JSON + SSE, never cached ---
+    let api_router = Router::new()
+        .route("/api/conversations/{id}", get(get_conversation))
+        .route("/api/conversations/{id}/events", get(conversation_events))
+        .layer(cache_layer(CACHE_NO_STORE));
+
+    // --- Media (uploaded + generated): immutable forever ---
+    //
+    // ServeDir alone doesn't set Cache-Control; we wrap each one with
+    // a SetResponseHeaderLayer that injects the immutable header.
+    let images_service = ServeDir::new(&app.storage.images_dir);
+    let videos_service = ServeDir::new(&app.storage.videos_dir);
+    let avatars_service = ServeDir::new(&app.storage.avatars_dir);
+
+    // --- Vite-emitted hashed bundles: immutable forever ---
+    //
+    // We split the frontend dir into "/assets" (long-cached, hashed
+    // filenames) and the rest (no-cache, index.html + SPA fallback).
+    // Vite always emits hashed files under "assets/" so this is a
+    // clean cut.
+    let assets_dir = app.web_frontend_dir.join("assets");
+    let assets_service = ServeDir::new(&assets_dir);
+    let index_html = app.web_frontend_dir.join("index.html");
+    let spa_fallback =
+        ServeDir::new(&app.web_frontend_dir).not_found_service(ServeFile::new(&index_html));
+
+    let router = api_router
+        .nest_service(
+            "/images",
+            tower::ServiceBuilder::new()
+                .layer(cache_layer(CACHE_IMMUTABLE))
+                .service(images_service),
+        )
+        .nest_service(
+            "/videos",
+            tower::ServiceBuilder::new()
+                .layer(cache_layer(CACHE_IMMUTABLE))
+                .service(videos_service),
+        )
+        .nest_service(
+            "/avatars",
+            tower::ServiceBuilder::new()
+                .layer(cache_layer(CACHE_IMMUTABLE))
+                .service(avatars_service),
+        )
+        .nest_service(
+            "/assets",
+            tower::ServiceBuilder::new()
+                .layer(cache_layer(CACHE_IMMUTABLE))
+                .service(assets_service),
+        )
+        // Everything else: SPA shell + fallback. Never cached so a
+        // fresh deploy is visible on the next page load.
+        .fallback_service(
+            tower::ServiceBuilder::new()
+                .layer(cache_layer(CACHE_NO_CACHE))
+                .service(spa_fallback),
+        )
+        .with_state(Arc::clone(&app));
 
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(
         addr = %listen,
-        images_dir = %images_dir.display(),
-        videos_dir = %videos_dir.display(),
-        "web viewer listening"
+        images_dir = %app.storage.images_dir.display(),
+        videos_dir = %app.storage.videos_dir.display(),
+        avatars_dir = %app.storage.avatars_dir.display(),
+        frontend_dir = %app.web_frontend_dir.display(),
+        "web server listening"
     );
-    axum::serve(listener, app).await?;
+
+    let cancel = app.cancel.clone();
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            cancel.cancelled().await;
+            tracing::info!("web server: cancellation requested, shutting down");
+        })
+        .await?;
     Ok(())
 }
 
-/// Per-request error type. Distinct from [`WebError`] (which only covers
-/// startup) so individual handlers can return either DB errors or
-/// not-found cleanly.
+/// Build a `Cache-Control: <value>` layer to slap on a route group.
+fn cache_layer(value: &'static str) -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static(value))
+}
+
+/// Per-handler error type. Convert to a JSON response that the React
+/// frontend can branch on.
 #[derive(Debug, Error)]
-enum HandlerError {
+enum ApiError {
     #[error(transparent)]
     Db(#[from] DbError),
     #[error("conversation not found")]
     NotFound,
 }
 
-impl IntoResponse for HandlerError {
+impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let (status, body) = match self {
-            HandlerError::NotFound => {
-                (StatusCode::NOT_FOUND, render_404().into_string())
-            }
-            HandlerError::Db(err) => {
-                tracing::error!(error = %err, "db error in handler");
+        let (status, message) = match &self {
+            ApiError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            ApiError::Db(err) => {
+                tracing::error!(error = %err, "db error in api handler");
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    render_error("Something went wrong loading this conversation.")
-                        .into_string(),
+                    "internal server error".to_string(),
                 )
             }
         };
-        (status, Html(body)).into_response()
+        (status, Json(serde_json::json!({ "error": message }))).into_response()
     }
 }
 
-async fn landing() -> Html<String> {
-    Html(
-        html! {
-            (DOCTYPE)
-            html {
-                head {
-                    (head_common("grok"))
-                }
-                body {
-                    main.center {
-                        h1 { "grok viewer" }
-                        p {
-                            "Conversation traces are accessed by their unguessable \
-                             UUID, surfaced as a link in Discord when the bot \
-                             opens a new conversation."
-                        }
-                    }
-                }
-            }
-        }
-        .into_string(),
-    )
-}
-
-async fn view_conversation(
+async fn get_conversation(
+    State(app): State<Arc<AppState>>,
     Path(id): Path<Uuid>,
-    State(state): State<WebState>,
-) -> Result<Html<String>, HandlerError> {
-    let view = state
+) -> Result<Json<ConversationView>, ApiError> {
+    let view = app
         .db
         .fetch_conversation_view(id)
         .await?
-        .ok_or(HandlerError::NotFound)?;
-    Ok(Html(render_conversation(&view).into_string()))
+        .ok_or(ApiError::NotFound)?;
+    Ok(Json(view))
 }
 
-async fn not_found() -> Response {
-    (StatusCode::NOT_FOUND, Html(render_404().into_string())).into_response()
-}
-
-fn render_conversation(view: &ConversationView) -> Markup {
-    let title = view
-        .conversation
-        .title
-        .clone()
-        .unwrap_or_else(|| "Untitled conversation".to_string());
-    let model = &view.conversation.model;
-    let created = view.conversation.created_at;
-
-    html! {
-        (DOCTYPE)
-        html {
-            head {
-                (head_common(&title))
-            }
-            body {
-                header.conv-header {
-                    h1 { (title) }
-                    p.meta {
-                        "Started " (created) " · model " code { (model) }
-                    }
-                }
-                main.conv {
-                    @for tv in &view.turns {
-                        (render_turn(tv))
-                    }
-                    @if view.turns.is_empty() {
-                        p.empty { "No turns yet." }
-                    }
-                }
-            }
+/// SSE stream of [`ConversationEvent`]s for one conversation. Filters
+/// the broadcast channel to events whose `conversation_id` matches the
+/// URL parameter, plus globals (avatar updates apply to any open
+/// view). Lagged subscribers (broadcast buffer overflow) emit a
+/// special `event: lag` frame so the frontend can decide to do a
+/// manual refetch; in practice it refetches on any event anyway.
+async fn conversation_events(
+    State(app): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse {
+    let rx = app.events.subscribe();
+    let stream: BroadcastStream<ConversationEvent> = BroadcastStream::new(rx);
+    let filtered = stream.filter_map(move |item| match item {
+        Ok(ev) if ev.conversation_id == id || ev.is_global() => Some(Ok(event_payload(&ev))),
+        Ok(_) => None,
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+            tracing::warn!(conversation_id = %id, skipped = n, "sse stream lagged");
+            Some(Ok(Event::default().event("lag").data(format!("{n}"))))
         }
-    }
+    });
+    // The stream naturally ends when the client disconnects (drops the
+    // SSE response) or when the broadcast channel is closed (process
+    // shutdown). axum::serve's `with_graceful_shutdown` in `run()`
+    // handles the final teardown; per-connection cancellation isn't
+    // needed here.
+
+    // Suppress proxy buffering. Cloudflare and nginx both honor
+    // `X-Accel-Buffering: no`; without it some proxies hold SSE
+    // frames until the connection closes.
+    let mut response = Sse::new(typed_stream(filtered))
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    response
 }
 
-fn render_turn(tv: &TurnView) -> Markup {
-    html! {
-        section.turn {
-            h2 {
-                "Turn " (tv.turn.turn_index + 1)
-                @match tv.turn.status.as_str() {
-                    "completed" => span.badge.ok { "completed" },
-                    "failed" => span.badge.err { "failed" },
-                    other => span.badge { (other) },
-                }
-                @if let Some(p) = &tv.turn.persona_name {
-                    " · persona " code { (p) }
-                }
-            }
-
-            div.user {
-                h3 { "User" }
-                pre { (tv.turn.user_content) }
-            }
-
-            @if !tv.context.is_empty() {
-                details.context {
-                    summary { "Context fed to model (" (tv.context.len()) " items)" }
-                    @for item in &tv.context {
-                        article.context-item {
-                            header {
-                                span.role { (item.role) }
-                                " · "
-                                span.source { (item.source) }
-                            }
-                            (render_context_body(item))
-                        }
-                    }
-                }
-            }
-
-            @if !tv.tool_calls.is_empty() {
-                section.tools {
-                    h3 { "Tool calls (" (tv.tool_calls.len()) ")" }
-                    @for tc in &tv.tool_calls {
-                        @let media = collect_media_uris(&tc.response);
-                        article.tool-call {
-                            header {
-                                span.tool-name { (tc.tool_name) }
-                            }
-                            @if !media.is_empty() {
-                                div.tool-images {
-                                    @for m in &media {
-                                        @match m {
-                                            MediaUri::Image(uri) => @if let Some(p) = storage::to_web_path(uri) {
-                                                img.context-image src=(p) alt=(tc.tool_name);
-                                            },
-                                            MediaUri::Video(uri) => @if let Some(p) = storage::to_web_path(uri) {
-                                                video.context-video controls src=(p) {}
-                                            },
-                                        }
-                                    }
-                                }
-                            }
-                            details {
-                                summary { "Request" }
-                                pre { (PreEscaped(pretty_json(&tc.request))) }
-                            }
-                            details {
-                                summary { "Response" }
-                                pre { (PreEscaped(pretty_json(&tc.response))) }
-                            }
-                        }
-                    }
-                }
-            }
-
-            div.assistant {
-                h3 { "Assistant" }
-                @if let Some(content) = &tv.turn.assistant_content {
-                    pre { (content) }
-                } @else if tv.turn.status == "failed" {
-                    pre.err { (tv.turn.error.as_deref().unwrap_or("(no error message)")) }
-                } @else {
-                    em { "(no response yet)" }
-                }
-            }
-        }
-    }
+// Helper to keep the SSE handler's return type clean (axum needs the
+// stream item to be `Result<Event, _>`; collapsing the closure type
+// requires a function-shaped boundary).
+fn typed_stream<S>(s: S) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = Result<Event, Infallible>>,
+{
+    s
 }
 
-/// Render a context item's content. Media-typed items (per the
-/// `file://images/…` or `file://videos/…` URI schemes) render as
-/// inline `<img>` / `<video>` tags via the `/images/*` and `/videos/*`
-/// static routes; everything else renders as preformatted text.
-fn render_context_body(item: &ContextItem) -> Markup {
-    if storage::is_image_uri(&item.content) {
-        if let Some(web_path) = storage::to_web_path(&item.content) {
-            return html! { img.context-image src=(web_path) alt="user attachment"; };
-        }
-    }
-    if storage::is_video_uri(&item.content) {
-        if let Some(web_path) = storage::to_web_path(&item.content) {
-            return html! { video.context-video controls src=(web_path) {} };
-        }
-    }
-    html! { pre { (item.content) } }
+/// Format a [`ConversationEvent`] as an SSE frame. Event name is the
+/// kind discriminator; data is a small JSON object the frontend can
+/// inspect if it wants kind-specific behavior (it doesn't, today).
+fn event_payload(ev: &ConversationEvent) -> Event {
+    use crate::app::EventKind;
+    let (name, extra) = match ev.kind {
+        EventKind::Created => ("created", serde_json::json!({})),
+        EventKind::TurnStarted => ("turn_started", serde_json::json!({})),
+        EventKind::TurnUpdated => ("turn_updated", serde_json::json!({})),
+        EventKind::ToolCallRecorded => ("tool_call_recorded", serde_json::json!({})),
+        EventKind::ContextItemAdded => ("context_item_added", serde_json::json!({})),
+        EventKind::TitleUpdated => ("title_updated", serde_json::json!({})),
+        EventKind::UserAvatarUpdated { user_id } => (
+            "user_avatar_updated",
+            serde_json::json!({ "user_id": user_id }),
+        ),
+    };
+    Event::default().event(name).data(extra.to_string())
 }
-
-/// Media URI found in a JSON value, with kind tag so the renderer
-/// knows whether to emit `<img>` or `<video>`.
-#[derive(Debug, Clone)]
-enum MediaUri {
-    Image(String),
-    Video(String),
-}
-
-/// Walk a JSON value and collect every string we recognise as a media
-/// storage URI. Used to surface generated content embedded inside
-/// tool-call responses (`generate_image` → `image_uri`,
-/// `check_video_status` → `video_uri`, etc.).
-fn collect_media_uris(value: &serde_json::Value) -> Vec<MediaUri> {
-    let mut out = Vec::new();
-    walk_for_media_uris(value, &mut out);
-    out
-}
-
-fn walk_for_media_uris(value: &serde_json::Value, out: &mut Vec<MediaUri>) {
-    match value {
-        serde_json::Value::String(s) if storage::is_image_uri(s) => {
-            out.push(MediaUri::Image(s.clone()));
-        }
-        serde_json::Value::String(s) if storage::is_video_uri(s) => {
-            out.push(MediaUri::Video(s.clone()));
-        }
-        serde_json::Value::Array(arr) => arr.iter().for_each(|v| walk_for_media_uris(v, out)),
-        serde_json::Value::Object(obj) => obj.values().for_each(|v| walk_for_media_uris(v, out)),
-        _ => {}
-    }
-}
-
-fn render_404() -> Markup {
-    html! {
-        (DOCTYPE)
-        html {
-            head {
-                (head_common("not found"))
-            }
-            body {
-                main.center {
-                    h1 { "404" }
-                    p { "No conversation here. The link may be wrong or the row was deleted." }
-                }
-            }
-        }
-    }
-}
-
-fn render_error(detail: &str) -> Markup {
-    html! {
-        (DOCTYPE)
-        html {
-            head {
-                (head_common("error"))
-            }
-            body {
-                main.center {
-                    h1 { "500" }
-                    p { (detail) }
-                }
-            }
-        }
-    }
-}
-
-fn head_common(title: &str) -> Markup {
-    html! {
-        meta charset="utf-8";
-        meta name="viewport" content="width=device-width, initial-scale=1";
-        title { (title) " · grok" }
-        style { (PreEscaped(STYLE)) }
-    }
-}
-
-fn pretty_json(value: &serde_json::Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-}
-
-const STYLE: &str = r#"
-:root {
-    color-scheme: light dark;
-    --fg: #1a1a1a;
-    --bg: #fafafa;
-    --muted: #666;
-    --border: #ddd;
-    --card: #ffffff;
-    --code-bg: #f1f1f1;
-    --accent: #5b6cff;
-    --err: #c0392b;
-    --ok: #27ae60;
-}
-@media (prefers-color-scheme: dark) {
-    :root {
-        --fg: #eaeaea;
-        --bg: #111;
-        --muted: #999;
-        --border: #2a2a2a;
-        --card: #1a1a1a;
-        --code-bg: #202020;
-    }
-}
-* { box-sizing: border-box; }
-body {
-    margin: 0;
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    color: var(--fg);
-    background: var(--bg);
-}
-header.conv-header, main.conv, main.center {
-    max-width: 860px;
-    margin: 0 auto;
-    padding: 2rem 1.25rem;
-}
-main.center { text-align: center; }
-header.conv-header {
-    border-bottom: 1px solid var(--border);
-    padding-bottom: 1rem;
-    margin-bottom: 1rem;
-}
-header.conv-header h1 { margin: 0 0 .5rem; font-size: 1.6rem; }
-.meta { color: var(--muted); font-size: .9rem; margin: 0; }
-section.turn {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 1rem 1.25rem;
-    margin-bottom: 1.25rem;
-}
-section.turn h2 {
-    font-size: 1.05rem;
-    margin: 0 0 .75rem;
-    display: flex;
-    align-items: center;
-    gap: .5rem;
-}
-.badge {
-    font-size: .75rem;
-    font-weight: normal;
-    padding: 2px 8px;
-    border-radius: 999px;
-    background: var(--code-bg);
-    color: var(--muted);
-}
-.badge.ok { background: rgba(39,174,96,.12); color: var(--ok); }
-.badge.err { background: rgba(192,57,43,.12); color: var(--err); }
-.user h3, .assistant h3, .tools h3 {
-    font-size: .85rem;
-    text-transform: uppercase;
-    letter-spacing: .04em;
-    color: var(--muted);
-    margin: 1rem 0 .35rem;
-}
-pre {
-    background: var(--code-bg);
-    padding: .75rem 1rem;
-    border-radius: 6px;
-    overflow-x: auto;
-    white-space: pre-wrap;
-    word-break: break-word;
-    margin: 0;
-    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-pre.err { color: var(--err); }
-details {
-    margin: .5rem 0;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: .5rem .75rem;
-}
-details summary {
-    cursor: pointer;
-    color: var(--muted);
-    font-size: .85rem;
-}
-details[open] summary { margin-bottom: .5rem; }
-.context-item, .tool-call {
-    margin: .5rem 0;
-    padding: .5rem .75rem;
-    border-left: 3px solid var(--border);
-    background: var(--bg);
-}
-.context-item header, .tool-call header {
-    font-size: .8rem;
-    color: var(--muted);
-    margin-bottom: .35rem;
-}
-.role { font-weight: 600; color: var(--accent); }
-.tool-name { font-weight: 600; color: var(--accent); }
-code {
-    background: var(--code-bg);
-    padding: 1px 6px;
-    border-radius: 4px;
-    font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
-}
-.empty { color: var(--muted); font-style: italic; }
-.context-image, .context-video {
-    max-width: 100%;
-    max-height: 400px;
-    border-radius: 6px;
-    margin: .25rem 0;
-    display: block;
-}
-.tool-images {
-    display: flex;
-    flex-wrap: wrap;
-    gap: .5rem;
-    margin: .5rem 0;
-}
-.tool-images .context-image,
-.tool-images .context-video {
-    max-height: 300px;
-    flex: 0 0 auto;
-}
-"#;

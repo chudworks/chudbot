@@ -13,6 +13,9 @@ grok-discord-bot-core = { path = "../grok-discord-bot-core" }
 thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
@@ -51,14 +54,19 @@ version = "0.8"
 
 [dependencies.tower-http]
 version = "0.6"
-features = ["fs"]
+# We deliberately do NOT enable compression-* features. Cloudflare in
+# front of the tunnel compresses on the way to clients with full
+# negotiation (brotli when supported, gzip otherwise), and it's
+# wasteful to do that work twice. Our Cache-Control values are also
+# carefully kept free of `no-transform` so the CDN is allowed to
+# compress / minify as it sees fit.
+features = ["fs", "set-header"]
+
+[dependencies.tower]
+version = "0.5"
 
 [dependencies.reqwest]
 workspace = true
-
-[dependencies.maud]
-version = "0.27"
-features = ["axum"]
 
 [dependencies.rustls]
 version = "0.23"

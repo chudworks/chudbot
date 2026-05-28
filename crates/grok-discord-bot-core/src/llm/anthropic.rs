@@ -163,7 +163,10 @@ fn walk_blocks(blocks: &[Value]) -> (String, Vec<ToolUseRequest>, Vec<ToolCallRe
                 pending_server_uses.insert(id, (name, input));
             }
             "web_search_tool_result" => {
-                let id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                let id = block
+                    .get("tool_use_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 let response = block.get("content").cloned().unwrap_or(Value::Null);
                 if let Some((name, request)) = pending_server_uses.remove(id) {
                     server_calls.push(ToolCallRecord {

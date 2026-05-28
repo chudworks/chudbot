@@ -9,9 +9,9 @@
 //! server-side and client-side tool calls as top-level output items.
 //!
 //! Server-side tools we enable on `enable_web_search`:
-//!   - `web_search` — general web search with citations.
-//!   - `x_search`   — X / Twitter search; Grok's distinctive grounding
-//!                    surface, included for free alongside web_search.
+//! - `web_search` — general web search with citations.
+//! - `x_search`   — X / Twitter search; Grok's distinctive grounding
+//!   surface, included for free alongside web_search.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -155,7 +155,11 @@ fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
             match block {
                 TurnBlock::Text(t) => text_buf.push_str(t),
                 TurnBlock::Image { url, .. } => image_urls.push(url.clone()),
-                TurnBlock::ToolUse { id, name, input: tool_input } => {
+                TurnBlock::ToolUse {
+                    id,
+                    name,
+                    input: tool_input,
+                } => {
                     // Echo the assistant's prior tool call back as its own
                     // input item; the Responses API tracks call_id for
                     // matching results.
@@ -167,7 +171,11 @@ fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
                         "arguments": args,
                     }));
                 }
-                TurnBlock::ToolResult { tool_use_id, content, .. } => {
+                TurnBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } => {
                     deferred.push(json!({
                         "type": "function_call_output",
                         "call_id": tool_use_id,
@@ -252,10 +260,10 @@ fn walk_output(
                 if let Some(content) = item.get("content").and_then(Value::as_array) {
                     for block in content {
                         let block_kind = block.get("type").and_then(Value::as_str).unwrap_or("");
-                        if block_kind == "output_text" || block_kind == "text" {
-                            if let Some(t) = block.get("text").and_then(Value::as_str) {
-                                text.push_str(t);
-                            }
+                        if (block_kind == "output_text" || block_kind == "text")
+                            && let Some(t) = block.get("text").and_then(Value::as_str)
+                        {
+                            text.push_str(t);
                         }
                     }
                 } else if let Some(t) = item.get("content").and_then(Value::as_str) {
@@ -305,7 +313,10 @@ fn walk_output(
     // first server call; failing that, record a freestanding entry).
     if let Some(c) = citations {
         if !server_calls.is_empty() {
-            if let Some(slot) = server_calls.iter_mut().find(|r| r.tool_name == "web_search") {
+            if let Some(slot) = server_calls
+                .iter_mut()
+                .find(|r| r.tool_name == "web_search")
+            {
                 slot.response = c.clone();
             } else {
                 server_calls[0].response = c.clone();

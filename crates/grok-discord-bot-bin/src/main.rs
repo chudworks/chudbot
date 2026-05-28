@@ -1,24 +1,39 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use grok_discord_bot_core::{
     AnyImageProvider, AnyProvider, AnyVideoProvider, Config, Db, ImageProviderKind,
     LlmProviderKind, VideoProviderKind,
 };
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
+mod app;
+mod avatars;
 mod bot;
 mod commands;
+mod titles;
 mod web;
 
+use app::{AppState, new_event_channel};
+
 const VERSION: &str = env!("GIT_VERSION");
+
+/// How long the `serve` shutdown handler waits for in-flight tasks
+/// (turn handlers, title generation, avatar fetches, slash command
+/// dispatchers) to drain after Ctrl+C before exiting anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Parser)]
 #[command(name = "grok")]
 #[command(version = VERSION)]
-#[command(about = "Discord bot integrating xAI Grok / Anthropic Claude, with a companion web viewer")]
+#[command(about = "Discord bot + companion web viewer, integrating xAI Grok / Anthropic Claude")]
 struct Args {
     /// Path to the TOML config file.
     #[arg(long, short, default_value = "config.toml", global = true)]
@@ -30,16 +45,16 @@ struct Args {
 
 #[derive(Debug, Subcommand)]
 enum Cmd {
-    /// Run the Discord bot gateway loop.
-    Bot,
-    /// Run the web viewer HTTP server.
-    Web,
+    /// Run both the Discord gateway loop and the web viewer in one
+    /// process. Background work (title generation, avatar caching) is
+    /// drained on Ctrl+C with a 30s grace period.
+    Serve,
     /// Apply pending database migrations.
     Migrate,
 }
 
 #[tokio::main]
-async fn main() -> std::process::ExitCode {
+async fn main() -> ExitCode {
     // Pin rustls' crypto provider before any TLS work. Several crates
     // in the tree (sqlx, reqwest, twilight, rustls-platform-verifier)
     // each enable rustls with potentially different provider features,
@@ -59,10 +74,10 @@ async fn main() -> std::process::ExitCode {
     );
 
     match run(args).await {
-        Ok(()) => std::process::ExitCode::SUCCESS,
+        Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             report_error(&*e);
-            std::process::ExitCode::FAILURE
+            ExitCode::FAILURE
         }
     }
 }
@@ -88,71 +103,116 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(&args.config)?;
 
     match args.cmd {
-        Cmd::Bot => {
-            let db = Db::connect(&config.postgres.url).await?;
-            // Build one provider instance per kind we have credentials
-            // for. Personas pick a (provider, model) pair at turn time
-            // and route through the matching entry here.
-            let mut providers: HashMap<LlmProviderKind, AnyProvider> = HashMap::new();
-            if let Some(cfg) = config.llm.xai.clone() {
-                providers.insert(LlmProviderKind::Xai, AnyProvider::from(cfg));
-            }
-            if let Some(cfg) = config.llm.anthropic.clone() {
-                providers.insert(LlmProviderKind::Anthropic, AnyProvider::from(cfg));
-            }
-            // Image and video providers follow the same pattern: build
-            // one instance per `[image.<kind>]` / `[video.<kind>]` block
-            // that's actually configured. Personas pick a kind at turn
-            // time; a persona that names a kind with no matching block
-            // is rejected at config-validation time, so the map lookups
-            // here are always satisfied at runtime.
-            let mut image_providers: HashMap<ImageProviderKind, AnyImageProvider> = HashMap::new();
-            if let Some(cfg) = config.image.xai.clone() {
-                image_providers.insert(ImageProviderKind::Xai, AnyImageProvider::from(cfg));
-            }
-            let mut video_providers: HashMap<VideoProviderKind, AnyVideoProvider> = HashMap::new();
-            if let Some(cfg) = config.video.xai.clone() {
-                video_providers.insert(VideoProviderKind::Xai, AnyVideoProvider::from(cfg));
-            }
-            tracing::info!(
-                providers = ?providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
-                personas = ?config.personas.keys().collect::<Vec<_>>(),
-                default_persona = %config.default_persona,
-                image_providers = ?image_providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
-                video_providers = ?video_providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
-                "starting bot"
-            );
-            bot::run(
-                config.discord.token.clone(),
-                config.discord.dev_guild_id,
-                db,
-                providers,
-                config.personas.clone(),
-                config.default_persona.clone(),
-                config.web.base_url.clone(),
-                config.default_privacy.clone(),
-                config.storage.clone(),
-                image_providers,
-                video_providers,
-            )
-            .await?;
-        }
-        Cmd::Web => {
-            let db = Db::connect(&config.postgres.url).await?;
-            let listen = SocketAddr::from_str(&config.web.listen)?;
-            web::run(
-                db,
-                listen,
-                config.storage.images_dir.clone(),
-                config.storage.videos_dir.clone(),
-            )
-            .await?;
-        }
+        Cmd::Serve => serve(config).await,
         Cmd::Migrate => {
             let db = Db::connect(&config.postgres.url).await?;
             db.migrate().await?;
             tracing::info!("migrations applied");
+            Ok(())
         }
+    }
+}
+
+/// Build the shared [`AppState`], spawn the bot and web halves on the
+/// shared [`TaskTracker`], and block until Ctrl+C. On signal, the
+/// cancellation token is fired and the tracker is given
+/// [`SHUTDOWN_GRACE`] to drain in-flight tasks.
+async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Db::connect(&config.postgres.url).await?;
+
+    let mut providers: HashMap<LlmProviderKind, AnyProvider> = HashMap::new();
+    if let Some(cfg) = config.llm.xai.clone() {
+        providers.insert(LlmProviderKind::Xai, AnyProvider::from(cfg));
+    }
+    if let Some(cfg) = config.llm.anthropic.clone() {
+        providers.insert(LlmProviderKind::Anthropic, AnyProvider::from(cfg));
+    }
+
+    let mut image_providers: HashMap<ImageProviderKind, AnyImageProvider> = HashMap::new();
+    if let Some(cfg) = config.image.xai.clone() {
+        image_providers.insert(ImageProviderKind::Xai, AnyImageProvider::from(cfg));
+    }
+
+    let mut video_providers: HashMap<VideoProviderKind, AnyVideoProvider> = HashMap::new();
+    if let Some(cfg) = config.video.xai.clone() {
+        video_providers.insert(VideoProviderKind::Xai, AnyVideoProvider::from(cfg));
+    }
+
+    let listen: SocketAddr = SocketAddr::from_str(&config.web.listen)?;
+
+    tracing::info!(
+        providers = ?providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+        image_providers = ?image_providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+        video_providers = ?video_providers.keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+        personas = ?config.personas.keys().collect::<Vec<_>>(),
+        default_persona = %config.default_persona,
+        listen = %listen,
+        frontend_dir = %config.web.frontend_dir.display(),
+        "starting serve"
+    );
+
+    let app = Arc::new(AppState {
+        db,
+        providers,
+        image_providers,
+        video_providers,
+        personas: config.personas,
+        default_persona: config.default_persona,
+        default_privacy: config.default_privacy,
+        web_base_url: config.web.base_url,
+        web_frontend_dir: config.web.frontend_dir,
+        storage: config.storage,
+        download_http: reqwest::Client::new(),
+        events: new_event_channel(),
+        cancel: CancellationToken::new(),
+        tracker: TaskTracker::new(),
+    });
+
+    // Both halves of the binary live on the same tracker so a Ctrl+C
+    // drains them together. We clone the tracker/cancel out of `app`
+    // before passing `app` into the spawned futures to avoid a
+    // borrow-and-move conflict on the `app.tracker.spawn(...)` form.
+    let tracker = app.tracker.clone();
+
+    {
+        let app_clone = Arc::clone(&app);
+        tracker.spawn(async move {
+            if let Err(err) = web::run(app_clone, listen).await {
+                tracing::error!(error = %err, "web server exited with error");
+            }
+        });
+    }
+
+    {
+        let app_clone = Arc::clone(&app);
+        let token = config.discord.token.clone();
+        let dev_guild_id = config.discord.dev_guild_id;
+        tracker.spawn(async move {
+            if let Err(err) = bot::run(app_clone, token, dev_guild_id).await {
+                tracing::error!(error = %err, "bot loop exited with error");
+            }
+        });
+    }
+
+    // Close the tracker to new spawns from THIS scope — background
+    // tasks spawned later (e.g. avatar fetcher, title gen) get tracked
+    // via `app.tracker.spawn(...)` and the `tracker.wait()` below will
+    // wait for those too. `close()` doesn't stop new spawns; it just
+    // marks the tracker as "no longer accepting new work from outside
+    // the running tasks" so the eventual `wait()` can return.
+
+    tokio::signal::ctrl_c().await?;
+    tracing::info!("shutdown signal received");
+
+    app.cancel.cancel();
+    app.tracker.close();
+
+    match tokio::time::timeout(SHUTDOWN_GRACE, app.tracker.wait()).await {
+        Ok(()) => tracing::info!("all background tasks drained cleanly"),
+        Err(_) => tracing::warn!(
+            grace_seconds = SHUTDOWN_GRACE.as_secs(),
+            "shutdown grace period exceeded; exiting with in-flight work"
+        ),
     }
 
     Ok(())

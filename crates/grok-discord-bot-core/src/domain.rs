@@ -1,6 +1,8 @@
 //! Conversation domain types. These mirror the Postgres schema and are
 //! the source of truth for the web viewer's data model.
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -26,6 +28,10 @@ pub struct Conversation {
     pub root_discord_message_id: i64,
     /// Optional human-readable title (inferred from first prompt).
     pub title: Option<String>,
+    /// When the background titler last successfully populated `title`.
+    /// `None` if it never ran (or hasn't yet — titles are generated
+    /// asynchronously after the first turn completes).
+    pub title_generated_at: Option<OffsetDateTime>,
     /// LLM provider identifier (e.g. `xai/grok-4.1-fast`).
     pub model: String,
 }
@@ -60,6 +66,13 @@ pub struct Turn {
     /// Persona name active when this turn ran. `None` for turns
     /// written before the personas feature shipped.
     pub persona_name: Option<String>,
+    /// Discord user id of whoever sent the prompt. `None` for turns
+    /// written before the identity-tracking feature shipped.
+    pub discord_user_id: Option<i64>,
+    /// Display name (or username if no display name was set) of that
+    /// user *at the time the turn was recorded* — names can change but
+    /// the historical attribution stays pinned to the turn.
+    pub discord_user_name: Option<String>,
 }
 
 /// One row in `context_items`: a single message snapshot that was sent
@@ -80,6 +93,34 @@ pub struct ContextItem {
     pub content: String,
     /// Original Discord message ID, when applicable.
     pub discord_message_id: Option<i64>,
+}
+
+/// Cached identity of one Discord user the bot has interacted with.
+/// Backs the web viewer's per-message avatar + name rendering. Rows
+/// are upserted from every `MessageCreate` event so this row tracks
+/// the *current* known identity (not historical — turns carry their
+/// own historical name snapshot).
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct DiscordUser {
+    /// Discord user id (snowflake) cast to i64 for Postgres.
+    pub id: i64,
+    /// Username (the global, lowercase one, e.g. "chud").
+    pub username: String,
+    /// Per-server display name or global name override. `None` means
+    /// the user has no display name and the viewer should fall back to
+    /// `username`.
+    pub display_name: Option<String>,
+    /// Discord avatar hash. `None` means the user has the default
+    /// (auto-generated) avatar; the fetcher renders that via the
+    /// `embed/avatars/{(id >> 22) % 6}.png` endpoint instead.
+    pub avatar_hash: Option<String>,
+    /// Filesystem path (relative to `storage.avatars_dir`) of the
+    /// cached avatar. `None` until the fetcher has stored something.
+    pub avatar_local_path: Option<String>,
+    /// When the fetcher last successfully wrote a file for this user.
+    pub last_avatar_fetched_at: Option<OffsetDateTime>,
+    /// When this row was last touched by an inbound Discord event.
+    pub last_seen_at: OffsetDateTime,
 }
 
 /// One outstanding (or completed) video generation job submitted to
@@ -115,6 +156,10 @@ pub struct ConversationView {
     pub conversation: Conversation,
     /// Turns, ordered by [`Turn::turn_index`] ascending.
     pub turns: Vec<TurnView>,
+    /// All Discord users whose ids appear on any turn in this view,
+    /// keyed by user id. Lets the frontend render avatars + names
+    /// without an N+1 fetch per turn.
+    pub users: HashMap<i64, DiscordUser>,
 }
 
 /// One turn plus its context and tool calls. Used only for rendering.

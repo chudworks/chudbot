@@ -58,9 +58,7 @@ pub fn definitions() -> Vec<Command> {
         )
         .build(),
     )
-    .option(
-        SubCommandBuilder::new("status", "Show your current privacy preference here").build(),
-    )
+    .option(SubCommandBuilder::new("status", "Show your current privacy preference here").build())
     .build();
 
     let mode = CommandBuilder::new(
@@ -69,9 +67,7 @@ pub fn definitions() -> Vec<Command> {
         twilight_model::application::command::CommandType::ChatInput,
     )
     .default_member_permissions(Permissions::ADMINISTRATOR)
-    .option(
-        SubCommandBuilder::new("show", "Show the active privacy mode for this server").build(),
-    )
+    .option(SubCommandBuilder::new("show", "Show the active privacy mode for this server").build())
     .option(
         SubCommandBuilder::new("set", "Change the privacy mode for this server")
             .option(
@@ -243,9 +239,9 @@ async fn handle_privacy(
 
     match sub.name.as_str() {
         "in" => match db.set_user_privacy(guild_id_i64, user_id_i64, true).await {
-            Ok(()) => ephemeral(
-                "✅ Opted **in**. Grok may now use your quoted messages as context here.",
-            ),
+            Ok(()) => {
+                ephemeral("✅ Opted **in**. Grok may now use your quoted messages as context here.")
+            }
             Err(err) => {
                 tracing::error!(error = %err, "set_user_privacy in failed");
                 ephemeral("Sorry — couldn't save that. Try again.")
@@ -295,7 +291,10 @@ async fn handle_mode(
 
     match sub.name.as_str() {
         "show" => {
-            match db.guild_privacy_mode_or(guild_id_i64, default_privacy).await {
+            match db
+                .guild_privacy_mode_or(guild_id_i64, default_privacy)
+                .await
+            {
                 Ok(mode) => ephemeral(&format!(
                     "Current mode: `{}`\n\n```\n{}\n```",
                     privacy_mode_short_name(&mode),
@@ -317,8 +316,7 @@ async fn handle_mode(
                 None => return ephemeral("Missing required `mode` option."),
             };
             let channel_id = find_channel(options, "channel");
-            let history_size =
-                find_integer(options, "history_size").map(|n| n.max(1) as u32);
+            let history_size = find_integer(options, "history_size").map(|n| n.max(1) as u32);
 
             let new_mode = match build_mode(mode_str, channel_id, history_size) {
                 Ok(m) => m,
@@ -370,7 +368,11 @@ fn persona_list_response(
     let mut out = String::from("**Available personas**\n");
     for name in names {
         let p = &personas[name];
-        let marker = if name == default_persona { " (default)" } else { "" };
+        let marker = if name == default_persona {
+            " (default)"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "• `{name}`{marker} — `{}` / `{}`\n",
             p.provider.as_str(),
@@ -642,7 +644,9 @@ async fn build_scope_key(
                 | ChannelType::PrivateThread => channel.parent_id.unwrap_or(channel.id),
                 _ => channel.id,
             };
-            Ok(i64::try_from(effective_id.get()).unwrap_or(i64::MAX).to_string())
+            Ok(i64::try_from(effective_id.get())
+                .unwrap_or(i64::MAX)
+                .to_string())
         }
         "guild" => {
             let Some(guild_id) = interaction.guild_id else {
@@ -654,7 +658,9 @@ async fn build_scope_key(
             if enforce_admin && !interaction_is_admin(interaction) {
                 return Err("Guild-scoped persona requires admin privileges.".into());
             }
-            Ok(i64::try_from(guild_id.get()).unwrap_or(i64::MAX).to_string())
+            Ok(i64::try_from(guild_id.get())
+                .unwrap_or(i64::MAX)
+                .to_string())
         }
         other => Err(format!("Unknown scope `{other}`.")),
     }
@@ -717,24 +723,33 @@ fn pretty_mode(mode: &PrivacyMode) -> String {
 }
 
 fn find_string<'a>(options: &'a [CommandDataOption], name: &str) -> Option<&'a str> {
-    options.iter().find(|o| o.name == name).and_then(|o| match &o.value {
-        CommandOptionValue::String(s) => Some(s.as_str()),
-        _ => None,
-    })
+    options
+        .iter()
+        .find(|o| o.name == name)
+        .and_then(|o| match &o.value {
+            CommandOptionValue::String(s) => Some(s.as_str()),
+            _ => None,
+        })
 }
 
 fn find_integer(options: &[CommandDataOption], name: &str) -> Option<i64> {
-    options.iter().find(|o| o.name == name).and_then(|o| match &o.value {
-        CommandOptionValue::Integer(n) => Some(*n),
-        _ => None,
-    })
+    options
+        .iter()
+        .find(|o| o.name == name)
+        .and_then(|o| match &o.value {
+            CommandOptionValue::Integer(n) => Some(*n),
+            _ => None,
+        })
 }
 
 fn find_channel(options: &[CommandDataOption], name: &str) -> Option<u64> {
-    options.iter().find(|o| o.name == name).and_then(|o| match &o.value {
-        CommandOptionValue::Channel(id) => Some(id.get()),
-        _ => None,
-    })
+    options
+        .iter()
+        .find(|o| o.name == name)
+        .and_then(|o| match &o.value {
+            CommandOptionValue::Channel(id) => Some(id.get()),
+            _ => None,
+        })
 }
 
 fn ephemeral(content: &str) -> InteractionResponse {

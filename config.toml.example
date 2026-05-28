@@ -23,9 +23,14 @@ url = "postgres://chud@localhost/grok"
 [web]
 # Public base URL of the viewer; used to build the link the bot posts
 # into Discord on new conversations.
-base_url = "http://localhost:8080"
-# host:port the Axum server binds. Optional, defaults to 0.0.0.0:8080.
-# listen = "127.0.0.1:8080"
+base_url = "http://localhost:1860"
+# host:port the Axum server binds. Defaults to 127.0.0.1:1860 — exposed
+# only via loopback, matching the Cloudflare-tunnel deploy. Set to
+# 0.0.0.0:<port> only if you want LAN/public exposure without a tunnel.
+# listen = "127.0.0.1:1860"
+# Directory the bot serves the built React frontend from. `serve.sh
+# deploy` writes Vite's `dist/` here. Defaults to ./frontend-build.
+# frontend_dir = "frontend-build"
 
 # LLM provider credentials. Include only the blocks for providers any of
 # your personas actually use. Both can be present — personas pick freely.
@@ -60,11 +65,13 @@ mode = "opt_in"
 # Where to persist media. Files are saved as `<dir>/<uuid>.<ext>` and
 # referenced in the DB by `file://images/<name>` or `file://videos/<name>`
 # URIs (so future backends like s3:// can drop in without a schema
-# change). Paths are relative to the bot's working directory; both
-# defaults are gitignored.
+# change). Paths are relative to the bot's working directory; defaults
+# are gitignored. `avatars_dir` holds cached Discord profile pictures
+# keyed as `<user_id>_<hash>.<ext>` and is served at `/avatars/`.
 [storage]
 # images_dir = "images"
 # videos_dir = "videos"
+# avatars_dir = "avatars"
 
 # Personas. Each one pairs a system prompt + sampling knobs with a
 # specific (provider, model) pair. Users / channels / guilds /

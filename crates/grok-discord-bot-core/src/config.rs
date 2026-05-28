@@ -139,6 +139,12 @@ pub struct StorageConfig {
     /// `/videos/*` at this directory.
     #[serde(default = "default_videos_dir")]
     pub videos_dir: PathBuf,
+    /// Directory where cached Discord avatars live. The web viewer
+    /// mounts `/avatars/*` at this directory. Files are named
+    /// `<user_id>_<avatar_hash>.<ext>` so a hash change cleanly
+    /// supersedes the old file without manual eviction.
+    #[serde(default = "default_avatars_dir")]
+    pub avatars_dir: PathBuf,
 }
 
 impl Default for StorageConfig {
@@ -146,6 +152,7 @@ impl Default for StorageConfig {
         Self {
             images_dir: default_images_dir(),
             videos_dir: default_videos_dir(),
+            avatars_dir: default_avatars_dir(),
         }
     }
 }
@@ -156,6 +163,10 @@ fn default_images_dir() -> PathBuf {
 
 fn default_videos_dir() -> PathBuf {
     PathBuf::from("videos")
+}
+
+fn default_avatars_dir() -> PathBuf {
+    PathBuf::from("avatars")
 }
 
 /// One named persona. The bot consults this on every turn to decide
@@ -283,13 +294,26 @@ pub struct WebConfig {
     /// Public base URL of the viewer; used to build links posted into
     /// Discord (e.g. `https://grok.example.com`).
     pub base_url: String,
-    /// `host:port` the Axum server listens on.
+    /// `host:port` the Axum server listens on. Defaults to
+    /// `127.0.0.1:1860` so the server is reachable only via loopback —
+    /// matches the production deploy behind a Cloudflare tunnel.
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Directory containing the built React frontend (Vite's `dist/`).
+    /// The Axum server serves any file that matches here as static
+    /// content and falls back to `index.html` for SPA routes (e.g.
+    /// `/c/<uuid>`). Defaults to `./frontend-build`, which is what
+    /// `serve.sh deploy` writes to in production.
+    #[serde(default = "default_frontend_dir")]
+    pub frontend_dir: PathBuf,
 }
 
 fn default_listen() -> String {
-    "0.0.0.0:8080".to_string()
+    "127.0.0.1:1860".to_string()
+}
+
+fn default_frontend_dir() -> PathBuf {
+    PathBuf::from("frontend-build")
 }
 
 /// Per-provider credentials. The model is no longer part of these
@@ -406,11 +430,10 @@ impl VideoProviderKind {
 impl Config {
     /// Load and validate a config from `path`.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
-        let contents =
-            std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-                path: path.to_path_buf(),
-                source,
-            })?;
+        let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let config: Config = toml::from_str(&contents).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             source,
@@ -469,10 +492,10 @@ impl Config {
     /// when missing. Panics only if the config has no default persona
     /// at all — which `validate` already guarantees can't happen.
     pub fn persona_or_default(&self, name: Option<&str>) -> &Persona {
-        if let Some(n) = name {
-            if let Some(p) = self.personas.get(n) {
-                return p;
-            }
+        if let Some(n) = name
+            && let Some(p) = self.personas.get(n)
+        {
+            return p;
         }
         self.personas
             .get(&self.default_persona)
@@ -516,7 +539,8 @@ mod tests {
         let persona = &config.personas["default"];
         assert_eq!(persona.provider, LlmProviderKind::Xai);
         assert_eq!(persona.model, "grok-4.3");
-        assert_eq!(config.web.listen, "0.0.0.0:8080");
+        assert_eq!(config.web.listen, "127.0.0.1:1860");
+        assert_eq!(config.web.frontend_dir, PathBuf::from("frontend-build"));
         assert!(matches!(config.default_privacy, PrivacyMode::OptIn));
     }
 
@@ -590,7 +614,10 @@ mod tests {
         "#;
         let config: Config = toml::from_str(toml).unwrap();
         match config.default_privacy {
-            PrivacyMode::ChannelOnly { channel_id, history_size } => {
+            PrivacyMode::ChannelOnly {
+                channel_id,
+                history_size,
+            } => {
                 assert_eq!(channel_id, 123_456_789);
                 assert_eq!(history_size, 20);
             }

@@ -9,7 +9,9 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::config::PrivacyMode;
-use crate::domain::{ContextItem, Conversation, ConversationView, Turn, TurnView, VideoJob};
+use crate::domain::{
+    ContextItem, Conversation, ConversationView, DiscordUser, Turn, TurnView, VideoJob,
+};
 use crate::llm::ToolCallRecord;
 
 /// Migrations baked in at compile time from the workspace's
@@ -72,7 +74,8 @@ impl Db {
                 root_discord_message_id, title, model) \
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
              RETURNING id, created_at, discord_guild_id, discord_channel_id, \
-               created_by_user_id, root_discord_message_id, title, model",
+               created_by_user_id, root_discord_message_id, title, title_generated_at, \
+               model",
         )
         .bind(id)
         .bind(discord_guild_id)
@@ -90,7 +93,7 @@ impl Db {
     pub async fn get_conversation(&self, id: Uuid) -> Result<Option<Conversation>, DbError> {
         let conv = sqlx::query_as::<_, Conversation>(
             "SELECT id, created_at, discord_guild_id, discord_channel_id, \
-              created_by_user_id, root_discord_message_id, title, model \
+              created_by_user_id, root_discord_message_id, title, title_generated_at, model \
              FROM conversations WHERE id = $1",
         )
         .bind(id)
@@ -116,28 +119,35 @@ impl Db {
     }
 
     /// Start a new turn in `conversation_id`. Assigns the next
-    /// `turn_index` atomically.
+    /// `turn_index` atomically and pins the Discord user's identity to
+    /// the row so historical attribution survives username changes.
     pub async fn start_turn(
         &self,
         conversation_id: Uuid,
         user_discord_message_id: i64,
         user_content: &str,
+        discord_user_id: i64,
+        discord_user_name: &str,
     ) -> Result<Turn, DbError> {
         let id = Uuid::new_v4();
         let turn = sqlx::query_as::<_, Turn>(
             "INSERT INTO turns \
-               (id, conversation_id, turn_index, user_discord_message_id, user_content) \
+               (id, conversation_id, turn_index, user_discord_message_id, user_content, \
+                discord_user_id, discord_user_name) \
              VALUES ($1, $2, \
                COALESCE((SELECT MAX(turn_index) + 1 FROM turns WHERE conversation_id = $2), 0), \
-               $3, $4) \
+               $3, $4, $5, $6) \
              RETURNING id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error, persona_name",
+               assistant_content, status, error, persona_name, \
+               discord_user_id, discord_user_name",
         )
         .bind(id)
         .bind(conversation_id)
         .bind(user_discord_message_id)
         .bind(user_content)
+        .bind(discord_user_id)
+        .bind(discord_user_name)
         .fetch_one(&self.pool)
         .await?;
         Ok(turn)
@@ -169,11 +179,7 @@ impl Db {
     /// Stamp the persona that answered a turn. Written before
     /// completion so the model used for the run is recoverable even
     /// when the turn later fails.
-    pub async fn set_turn_persona(
-        &self,
-        turn_id: Uuid,
-        persona_name: &str,
-    ) -> Result<(), DbError> {
+    pub async fn set_turn_persona(&self, turn_id: Uuid, persona_name: &str) -> Result<(), DbError> {
         sqlx::query("UPDATE turns SET persona_name = $2 WHERE id = $1")
             .bind(turn_id)
             .bind(persona_name)
@@ -265,6 +271,87 @@ impl Db {
         Ok(())
     }
 
+    /// Set a conversation's title and stamp `title_generated_at = now()`.
+    /// Called by the background titler after the first turn completes.
+    pub async fn set_conversation_title(
+        &self,
+        conversation_id: Uuid,
+        title: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE conversations \
+             SET title = $2, title_generated_at = now() \
+             WHERE id = $1",
+        )
+        .bind(conversation_id)
+        .bind(title)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Upsert a Discord user's identity. Username / display name /
+    /// avatar hash are overwritten with the latest values; the local
+    /// avatar path and fetched-at timestamp are *preserved* (only the
+    /// avatar fetcher writes those, via [`Self::mark_avatar_fetched`]).
+    ///
+    /// Returns the post-upsert row so the caller can compare against
+    /// what it sent and decide whether to enqueue an avatar refetch.
+    pub async fn upsert_discord_user(
+        &self,
+        id: i64,
+        username: &str,
+        display_name: Option<&str>,
+        avatar_hash: Option<&str>,
+    ) -> Result<DiscordUser, DbError> {
+        let user = sqlx::query_as::<_, DiscordUser>(
+            "INSERT INTO discord_users (id, username, display_name, avatar_hash) \
+             VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (id) DO UPDATE \
+               SET username = EXCLUDED.username, \
+                   display_name = EXCLUDED.display_name, \
+                   avatar_hash = EXCLUDED.avatar_hash, \
+                   last_seen_at = now() \
+             RETURNING id, username, display_name, avatar_hash, \
+               avatar_local_path, last_avatar_fetched_at, last_seen_at",
+        )
+        .bind(id)
+        .bind(username)
+        .bind(display_name)
+        .bind(avatar_hash)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(user)
+    }
+
+    /// Fetch a Discord user by id.
+    pub async fn get_discord_user(&self, id: i64) -> Result<Option<DiscordUser>, DbError> {
+        let user = sqlx::query_as::<_, DiscordUser>(
+            "SELECT id, username, display_name, avatar_hash, \
+               avatar_local_path, last_avatar_fetched_at, last_seen_at \
+             FROM discord_users WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(user)
+    }
+
+    /// Record that the avatar for `user_id` was just fetched and saved
+    /// to `local_path` (relative to `storage.avatars_dir`).
+    pub async fn mark_avatar_fetched(&self, user_id: i64, local_path: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE discord_users \
+             SET avatar_local_path = $2, last_avatar_fetched_at = now() \
+             WHERE id = $1",
+        )
+        .bind(user_id)
+        .bind(local_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Load all completed turns of a conversation in index order.
     /// Used by the bot to build chat history when continuing a thread.
     pub async fn load_conversation_history(
@@ -274,7 +361,8 @@ impl Db {
         let turns = sqlx::query_as::<_, Turn>(
             "SELECT id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error, persona_name \
+               assistant_content, status, error, persona_name, \
+               discord_user_id, discord_user_name \
              FROM turns \
              WHERE conversation_id = $1 AND status = 'completed' \
              ORDER BY turn_index ASC",
@@ -350,12 +438,11 @@ impl Db {
         &self,
         discord_guild_id: i64,
     ) -> Result<Option<PrivacyMode>, DbError> {
-        let row: Option<(serde_json::Value,)> = sqlx::query_as(
-            "SELECT privacy_mode FROM guild_settings WHERE discord_guild_id = $1",
-        )
-        .bind(discord_guild_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT privacy_mode FROM guild_settings WHERE discord_guild_id = $1")
+                .bind(discord_guild_id)
+                .fetch_optional(&self.pool)
+                .await?;
         match row {
             Some((value,)) => Ok(Some(serde_json::from_value(value)?)),
             None => Ok(None),
@@ -421,10 +508,7 @@ impl Db {
 
     /// Look up a job by its xAI `request_id`. The `check_video_status`
     /// tool uses this to associate a polling response with its row.
-    pub async fn get_video_job(
-        &self,
-        request_id: &str,
-    ) -> Result<Option<VideoJob>, DbError> {
+    pub async fn get_video_job(&self, request_id: &str) -> Result<Option<VideoJob>, DbError> {
         let row = sqlx::query_as::<_, VideoJob>(
             "SELECT id, turn_id, request_id, prompt, status, video_uri, \
                submitted_at, completed_at, error \
@@ -483,13 +567,12 @@ impl Db {
         channel_id: i64,
         user_id: i64,
     ) -> Result<Option<String>, DbError> {
-        if let Some(cid) = conversation_id {
-            if let Some(name) = self
+        if let Some(cid) = conversation_id
+            && let Some(name) = self
                 .get_persona_selection("conversation", &cid.to_string())
                 .await?
-            {
-                return Ok(Some(name));
-            }
+        {
+            return Ok(Some(name));
         }
         if let Some(gid) = guild_id {
             let user_key = format!("{gid}:{user_id}");
@@ -503,13 +586,12 @@ impl Db {
         {
             return Ok(Some(name));
         }
-        if let Some(gid) = guild_id {
-            if let Some(name) = self
+        if let Some(gid) = guild_id
+            && let Some(name) = self
                 .get_persona_selection("guild", &gid.to_string())
                 .await?
-            {
-                return Ok(Some(name));
-            }
+        {
+            return Ok(Some(name));
         }
         Ok(None)
     }
@@ -554,18 +636,12 @@ impl Db {
     }
 
     /// Remove a persona override. Returns `true` if a row was deleted.
-    pub async fn clear_persona_selection(
-        &self,
-        scope: &str,
-        key: &str,
-    ) -> Result<bool, DbError> {
-        let result = sqlx::query(
-            "DELETE FROM persona_selections WHERE scope = $1 AND key = $2",
-        )
-        .bind(scope)
-        .bind(key)
-        .execute(&self.pool)
-        .await?;
+    pub async fn clear_persona_selection(&self, scope: &str, key: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM persona_selections WHERE scope = $1 AND key = $2")
+            .bind(scope)
+            .bind(key)
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -581,7 +657,8 @@ impl Db {
         let turns = sqlx::query_as::<_, Turn>(
             "SELECT id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error, persona_name \
+               assistant_content, status, error, persona_name, \
+               discord_user_id, discord_user_name \
              FROM turns WHERE conversation_id = $1 ORDER BY turn_index ASC",
         )
         .bind(id)
@@ -589,7 +666,13 @@ impl Db {
         .await?;
 
         let mut turn_views = Vec::with_capacity(turns.len());
+        let mut user_ids: Vec<i64> = Vec::new();
         for turn in turns {
+            if let Some(uid) = turn.discord_user_id
+                && !user_ids.contains(&uid)
+            {
+                user_ids.push(uid);
+            }
             let context = sqlx::query_as::<_, ContextItem>(
                 "SELECT position, source, role, content, discord_message_id \
                  FROM context_items WHERE turn_id = $1 ORDER BY position ASC",
@@ -622,9 +705,28 @@ impl Db {
             });
         }
 
+        // Pull every referenced user in one query so the frontend can
+        // resolve avatars + names without an N+1.
+        let mut users: std::collections::HashMap<i64, DiscordUser> =
+            std::collections::HashMap::new();
+        if !user_ids.is_empty() {
+            let rows = sqlx::query_as::<_, DiscordUser>(
+                "SELECT id, username, display_name, avatar_hash, \
+                   avatar_local_path, last_avatar_fetched_at, last_seen_at \
+                 FROM discord_users WHERE id = ANY($1)",
+            )
+            .bind(&user_ids)
+            .fetch_all(&self.pool)
+            .await?;
+            for u in rows {
+                users.insert(u.id, u);
+            }
+        }
+
         Ok(Some(ConversationView {
             conversation,
             turns: turn_views,
+            users,
         }))
     }
 }

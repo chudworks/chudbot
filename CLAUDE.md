@@ -11,7 +11,13 @@ and the final answer.
 - **Discord**: `twilight` (gateway + http + model + cache + mention).
   Native event-stream API; **never use serenity or any crate requiring
   `async-trait`** (see [[feedback-no-async-trait]]).
-- **Web**: `axum` 0.8 + `maud` (inline HTML, no template files)
+- **Web**: `axum` 0.8 JSON API + SSE event stream. Frontend is a
+  React 19 + Vite + TypeScript + Zustand + SCSS SPA living in
+  `frontend/`. The Rust server serves the built bundle from
+  `[web].frontend_dir` (default `./frontend-build`) with an
+  `index.html` SPA fallback for client-side routes like `/c/<uuid>`.
+  `serve.sh deploy` builds the frontend with `bun` and atomically
+  copies `dist/` into `$CHUDBOT_DIR/frontend-build/`.
 - **DB**: Postgres via `sqlx` 0.9 with runtime-checked queries
 - **LLM**: abstracted behind `LlmProvider::step` in `core::llm`. Two
   implementations: `XaiProvider` and `AnthropicProvider`. Both support
@@ -31,9 +37,16 @@ Cargo workspace with two crates under `crates/`:
 - **`grok-discord-bot-core`** — `LlmProvider` trait + xAI / Anthropic /
   mock impls, conversation domain types, Postgres data layer (`Db`),
   TOML config loader.
-- **`grok-discord-bot-bin`** — the binary. Contains `bot` (Discord
-  event loop) and `web` (Axum viewer) modules plus `clap` subcommand
-  parsing. Produces a single binary named `grok`.
+- **`grok-discord-bot-bin`** — the binary. Contains:
+  - `app` — shared `AppState`: db, providers, storage paths, the
+    broadcast event bus, `CancellationToken`, `TaskTracker`.
+  - `bot` — Discord gateway loop (twilight).
+  - `web` — Axum JSON API + SSE + static file server.
+  - `avatars` — background avatar fetcher.
+  - `titles` — background conversation titler.
+  - `commands` — slash command dispatchers.
+  Produces a single binary named `grok` with two subcommands: `serve`
+  (runs bot + web together with graceful shutdown) and `migrate`.
 
 Migrations live at the workspace root in `migrations/` and are baked
 into the binary via `sqlx::migrate!`.
@@ -43,11 +56,16 @@ into the binary via `sqlx::migrate!`.
 ```sh
 cargo build                          # debug build
 cargo build --profile distribute     # production build
-cargo run -- bot                     # run the Discord gateway loop
-cargo run -- web                     # run the web viewer
+cargo run -- serve                   # run bot + web in one process
 cargo run -- migrate                 # apply Postgres migrations
 cargo test --all-features            # run tests (mocks the LLM)
+
+# Frontend (separate Vite dev server when iterating on UI)
+cd frontend && bun install && bun run dev   # serves on :5173, proxies /api → :1860
 ```
+
+Ctrl+C on `serve` drains in-flight work (turn handlers, title gen,
+avatar fetches) for up to 30 seconds before exiting.
 
 Configuration is in `config.toml` (see `config.toml.example`). The
 `--config / -c` global flag points at a different path.

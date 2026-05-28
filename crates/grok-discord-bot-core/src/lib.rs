@@ -29,7 +29,9 @@ pub use config::{
     VideoProviderKind,
 };
 pub use db::{Db, DbError};
-pub use domain::{Conversation, ContextItem, ConversationView, Turn, TurnView, VideoJob};
+pub use domain::{
+    ContextItem, Conversation, ConversationView, DiscordUser, Turn, TurnView, VideoJob,
+};
 pub use imagegen::{AnyImageProvider, ImageProvider};
 pub use llm::{
     AnthropicOptions, AnyProvider, ChatTurn, LlmError, LlmProvider, MessageRole, ProviderOptions,

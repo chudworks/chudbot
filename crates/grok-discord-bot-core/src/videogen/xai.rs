@@ -154,7 +154,11 @@ impl VideoProvider for XaiVideoProvider {
 /// the saved file.
 pub fn guess_mime(url: &str) -> String {
     let no_query = url.split('?').next().unwrap_or(url);
-    let ext = no_query.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let ext = no_query
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "mp4" => "video/mp4".to_string(),
         "webm" => "video/webm".to_string(),

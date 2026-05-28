@@ -39,10 +39,10 @@ impl LlmProvider for MockProvider {
     }
 
     async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
-        if let Ok(mut script) = self.script.lock() {
-            if !script.is_empty() {
-                return Ok(script.remove(0));
-            }
+        if let Ok(mut script) = self.script.lock()
+            && !script.is_empty()
+        {
+            return Ok(script.remove(0));
         }
         Ok(StepResponse::Final {
             content: self.answer.clone(),

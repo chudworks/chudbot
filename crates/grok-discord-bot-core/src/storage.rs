@@ -100,7 +100,12 @@ pub fn file_uri_to_local_path(uri: &str, base_dir: &Path) -> Option<std::path::P
 /// Map a MIME type to an extension we'd write to disk. Falls back to
 /// `bin` for unknown types.
 pub fn extension_for_mime(mime: &str) -> &'static str {
-    let normalized = mime.split(';').next().unwrap_or(mime).trim().to_ascii_lowercase();
+    let normalized = mime
+        .split(';')
+        .next()
+        .unwrap_or(mime)
+        .trim()
+        .to_ascii_lowercase();
     match normalized.as_str() {
         "image/png" => "png",
         "image/jpeg" | "image/jpg" => "jpg",
@@ -161,7 +166,12 @@ pub async fn save_image_from_url(
 /// string); otherwise fall back to `bin`.
 fn pick_extension(content_type: Option<&str>, url: &str) -> &'static str {
     if let Some(ct) = content_type {
-        let normalized = ct.split(';').next().unwrap_or(ct).trim().to_ascii_lowercase();
+        let normalized = ct
+            .split(';')
+            .next()
+            .unwrap_or(ct)
+            .trim()
+            .to_ascii_lowercase();
         match normalized.as_str() {
             "image/png" => return "png",
             "image/jpeg" | "image/jpg" => return "jpg",
@@ -172,7 +182,11 @@ fn pick_extension(content_type: Option<&str>, url: &str) -> &'static str {
         }
     }
     let no_query = url.split('?').next().unwrap_or(url);
-    let ext = no_query.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let ext = no_query
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "png" => "png",
         "jpg" | "jpeg" => "jpg",
@@ -222,13 +236,19 @@ mod tests {
     #[test]
     fn extension_from_content_type() {
         assert_eq!(pick_extension(Some("image/png"), ""), "png");
-        assert_eq!(pick_extension(Some("image/jpeg; charset=binary"), ""), "jpg");
+        assert_eq!(
+            pick_extension(Some("image/jpeg; charset=binary"), ""),
+            "jpg"
+        );
         assert_eq!(pick_extension(Some("image/webp"), ""), "webp");
     }
 
     #[test]
     fn extension_from_url_fallback() {
-        assert_eq!(pick_extension(None, "https://cdn.discordapp.com/x.PNG?ex=1"), "png");
+        assert_eq!(
+            pick_extension(None, "https://cdn.discordapp.com/x.PNG?ex=1"),
+            "png"
+        );
         assert_eq!(pick_extension(None, "https://x/y.heic"), "heic");
         assert_eq!(pick_extension(None, "https://x/y"), "bin");
     }

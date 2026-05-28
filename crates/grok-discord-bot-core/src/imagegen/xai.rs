@@ -58,10 +58,7 @@ impl ImageProvider for XaiImageProvider {
         "xai"
     }
 
-    async fn generate(
-        &self,
-        request: ImageGenRequest,
-    ) -> Result<GeneratedImage, ImageGenError> {
+    async fn generate(&self, request: ImageGenRequest) -> Result<GeneratedImage, ImageGenError> {
         // Resolve any file:// references to inline data URIs before
         // building the request body.
         let mut resolved_refs: Vec<String> = Vec::with_capacity(request.references.len());
@@ -82,9 +79,7 @@ impl ImageProvider for XaiImageProvider {
             body["aspect_ratio"] = json!(ar);
         }
         if is_edit {
-            body["images"] = Value::Array(
-                resolved_refs.into_iter().map(Value::String).collect(),
-            );
+            body["images"] = Value::Array(resolved_refs.into_iter().map(Value::String).collect());
         }
 
         let endpoint = if is_edit {
@@ -181,12 +176,10 @@ async fn resolve_reference(
     if reference.starts_with("data:") {
         return Ok(reference.to_string());
     }
-    if let Some(local_path) =
-        crate::storage::file_uri_to_local_path(reference, images_dir)
-    {
-        let bytes = tokio::fs::read(&local_path).await.map_err(|e| {
-            ImageGenError::Reference(format!("read {}: {e}", local_path.display()))
-        })?;
+    if let Some(local_path) = crate::storage::file_uri_to_local_path(reference, images_dir) {
+        let bytes = tokio::fs::read(&local_path)
+            .await
+            .map_err(|e| ImageGenError::Reference(format!("read {}: {e}", local_path.display())))?;
         let mime = mime_from_ext(local_path.extension().and_then(|s| s.to_str()));
         let encoded = B64.encode(&bytes);
         return Ok(format!("data:{mime};base64,{encoded}"));
@@ -264,9 +257,8 @@ mod tests {
     #[test]
     fn unknown_scheme_errors() {
         let tmp = std::env::temp_dir();
-        let result = tokio_test_block_on(async {
-            resolve_reference("s3://bucket/key", &tmp).await
-        });
+        let result =
+            tokio_test_block_on(async { resolve_reference("s3://bucket/key", &tmp).await });
         assert!(matches!(result, Err(ImageGenError::Reference(_))));
     }
 

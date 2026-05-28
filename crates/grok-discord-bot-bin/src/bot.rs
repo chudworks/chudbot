@@ -15,28 +15,25 @@
 //!
 //! Interactions (slash commands) are dispatched to [`crate::commands`].
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use grok_discord_bot_core::{
-    AgentRun, AnyImageProvider, AnyProvider, AnyVideoProvider, ChatTurn, ContextItem, Conversation,
-    Db, ImageProvider, ImageProviderKind, LlmProvider, LlmProviderKind, MessageRole, NoopObserver,
-    Persona, PrivacyMode, ProviderOptions, StepRequest, StepResponse, StorageConfig,
-    ToolDefinition, ToolError, ToolExecutor, TurnBlock, VideoProvider, VideoProviderKind,
-    imagegen::ImageGenRequest,
-    run_agent, storage,
-    videogen::VideoGenRequest,
+    AgentRun, AnyImageProvider, AnyVideoProvider, ChatTurn, ContextItem, Conversation, Db,
+    ImageProvider, LlmProvider, MessageRole, NoopObserver, PrivacyMode, ProviderOptions,
+    StepRequest, StepResponse, ToolDefinition, ToolError, ToolExecutor, TurnBlock, VideoProvider,
+    imagegen::ImageGenRequest, run_agent, storage, videogen::VideoGenRequest,
 };
-use uuid::Uuid;
+
+use crate::app::{AppState, EventKind};
 use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
 use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
 use twilight_http::Client as HttpClient;
 use twilight_http::request::channel::reaction::RequestReactionType;
-use twilight_model::channel::{ChannelType, Message};
 use twilight_model::channel::message::MessageFlags;
+use twilight_model::channel::{ChannelType, Message};
 use twilight_model::gateway::event::Event;
 use twilight_model::gateway::payload::incoming::GuildCreate;
 use twilight_model::http::attachment::Attachment as HttpAttachment;
@@ -44,6 +41,7 @@ use twilight_model::id::Id;
 use twilight_model::id::marker::{
     ApplicationMarker, ChannelMarker, GuildMarker, MessageMarker, UserMarker,
 };
+use uuid::Uuid;
 
 use crate::commands;
 
@@ -52,6 +50,7 @@ use crate::commands;
 /// EITHER signal:
 ///   - total characters across all chunks > [`REPLY_LENGTH_THRESHOLD`]
 ///   - "rendered" line count > [`REPLY_RENDERED_LINES_THRESHOLD`]
+///
 /// "Rendered" counts each `\n`-delimited line plus extra rows for
 /// lines that auto-wrap on a typical Discord client (~80 chars wide).
 /// The line-based check catches replies like a 10-row numbered list
@@ -125,49 +124,40 @@ pub enum BotError {
 }
 
 /// State shared across all message-handler tasks.
+///
+/// Thin wrapper over the cross-process [`AppState`] plus Discord-only
+/// fields that don't make sense on the web side. Implements
+/// [`std::ops::Deref`] to `AppState` so existing call sites that read
+/// `state.db`, `state.providers`, etc. keep working.
 struct State {
+    /// Shared application state — db, providers, storage, event bus,
+    /// shutdown handles.
+    app: Arc<AppState>,
+    /// twilight HTTP client (Discord REST API).
     http: Arc<HttpClient>,
-    download_http: reqwest::Client,
-    db: Db,
-    /// One provider per kind we have credentials for. A persona's
-    /// `provider` field keys into this map at turn time so xAI and
-    /// Anthropic personas can coexist in the same deployment.
-    providers: HashMap<LlmProviderKind, AnyProvider>,
-    web_base_url: String,
+    /// This bot's own Discord user id (used to detect self-mentions
+    /// and filter out the bot's own messages from history fetches).
     bot_user_id: Id<UserMarker>,
+    /// Discord application id (used for registering slash commands and
+    /// responding to interactions).
     app_id: Id<ApplicationMarker>,
-    default_privacy: PrivacyMode,
-    /// Personas keyed by name. Each pairs a system prompt with a
-    /// (provider, model) pair and optional sampling knobs.
-    personas: HashMap<String, Persona>,
-    /// Floor fallback when no `persona_selections` row matches the
-    /// resolution chain. Always a valid key in `personas`.
-    default_persona: String,
-    images_dir: PathBuf,
-    videos_dir: PathBuf,
-    /// One image provider per configured `[image.<kind>]` block. The
-    /// per-turn persona's `image_provider` field keys into this map;
-    /// when the persona doesn't name one (or names one with no
-    /// matching block), the `generate_image` tool isn't exposed.
-    image_providers: HashMap<ImageProviderKind, AnyImageProvider>,
-    /// Same shape for video.
-    video_providers: HashMap<VideoProviderKind, AnyVideoProvider>,
 }
 
-/// Entry point for the `grok bot` subcommand.
-#[allow(clippy::too_many_arguments)]
+impl std::ops::Deref for State {
+    type Target = AppState;
+
+    fn deref(&self) -> &AppState {
+        &self.app
+    }
+}
+
+/// Entry point for the Discord half of `grok serve`. Connects to the
+/// gateway, registers slash commands, then loops until the shared
+/// `AppState::cancel` token fires or the gateway returns end-of-stream.
 pub async fn run(
+    app: Arc<AppState>,
     discord_token: String,
     dev_guild_id: Option<u64>,
-    db: Db,
-    providers: HashMap<LlmProviderKind, AnyProvider>,
-    personas: HashMap<String, Persona>,
-    default_persona: String,
-    web_base_url: String,
-    default_privacy: PrivacyMode,
-    storage_config: StorageConfig,
-    image_providers: HashMap<ImageProviderKind, AnyImageProvider>,
-    video_providers: HashMap<VideoProviderKind, AnyVideoProvider>,
 ) -> Result<(), BotError> {
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
@@ -190,20 +180,10 @@ pub async fn run(
     }
 
     let state = Arc::new(State {
+        app: Arc::clone(&app),
         http,
-        download_http: reqwest::Client::new(),
-        db,
-        providers,
-        web_base_url,
         bot_user_id: current.id,
         app_id: application.id,
-        default_privacy,
-        personas,
-        default_persona,
-        images_dir: storage_config.images_dir,
-        videos_dir: storage_config.videos_dir,
-        image_providers,
-        video_providers,
     });
 
     let mut shard = Shard::new(ShardId::ONE, discord_token, intents);
@@ -211,39 +191,54 @@ pub async fn run(
         | EventTypeFlags::INTERACTION_CREATE
         | EventTypeFlags::GUILD_CREATE;
 
-    while let Some(item) = shard.next_event(watched).await {
-        let event = match item {
-            Ok(e) => e,
-            Err(err) => {
-                tracing::warn!(error = %err, "gateway receive error");
-                continue;
-            }
-        };
+    let cancel = app.cancel.clone();
+    let tracker = app.tracker.clone();
 
-        match event {
-            Event::MessageCreate(msg) => {
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    handle_message(state, msg.0).await;
-                });
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                tracing::info!("bot loop: cancellation requested, exiting gateway read");
+                break;
             }
-            Event::InteractionCreate(boxed) => {
-                let state = Arc::clone(&state);
-                tokio::spawn(async move {
-                    commands::handle(
-                        Arc::clone(&state.http),
-                        state.db.clone(),
-                        state.default_privacy.clone(),
-                        state.personas.clone(),
-                        state.default_persona.clone(),
-                        state.app_id,
-                        boxed.0,
-                    )
-                    .await;
-                });
+            item = shard.next_event(watched) => {
+                let Some(item) = item else {
+                    tracing::info!("bot loop: gateway stream ended");
+                    break;
+                };
+                let event = match item {
+                    Ok(e) => e,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "gateway receive error");
+                        continue;
+                    }
+                };
+                match event {
+                    Event::MessageCreate(msg) => {
+                        let state = Arc::clone(&state);
+                        tracker.spawn(async move {
+                            handle_message(state, msg.0).await;
+                        });
+                    }
+                    Event::InteractionCreate(boxed) => {
+                        let state = Arc::clone(&state);
+                        tracker.spawn(async move {
+                            commands::handle(
+                                Arc::clone(&state.http),
+                                state.db.clone(),
+                                state.default_privacy.clone(),
+                                state.personas.clone(),
+                                state.default_persona.clone(),
+                                state.app_id,
+                                boxed.0,
+                            )
+                            .await;
+                        });
+                    }
+                    Event::GuildCreate(boxed) => log_guild_create(&boxed),
+                    _ => {}
+                }
             }
-            Event::GuildCreate(boxed) => log_guild_create(&boxed),
-            _ => {}
         }
     }
 
@@ -314,7 +309,9 @@ async fn moderation_allows(state: &State, content: &str) -> bool {
     };
 
     match provider.step(request).await {
-        Ok(StepResponse::Final { content: verdict, .. }) => {
+        Ok(StepResponse::Final {
+            content: verdict, ..
+        }) => {
             let normalized = verdict.trim().to_ascii_uppercase();
             // Treat anything containing REFUSE as a refusal; anything
             // else (including empty / unexpected) as ALLOW. We don't
@@ -400,7 +397,9 @@ async fn handle_message(state: Arc<State>, msg: Message) {
         return;
     }
 
-    let guild_id_opt = msg.guild_id.map(|g| i64::try_from(g.get()).unwrap_or(i64::MAX));
+    let guild_id_opt = msg
+        .guild_id
+        .map(|g| i64::try_from(g.get()).unwrap_or(i64::MAX));
     let privacy_mode = match guild_id_opt {
         Some(gid) => match state
             .db
@@ -426,8 +425,7 @@ async fn handle_message(state: Arc<State>, msg: Message) {
         let in_grok_thread = if in_allowed_channel {
             false
         } else {
-            let channel_as_msg =
-                i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
+            let channel_as_msg = i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
             state
                 .db
                 .lookup_conversation_by_message(channel_as_msg)
@@ -526,11 +524,7 @@ async fn handle_message(state: Arc<State>, msg: Message) {
 /// Full happy-path: resolve conversation, build initial context, run
 /// the agent loop with `fetch_messages` available, persist everything,
 /// post the reply.
-async fn process(
-    state: &State,
-    msg: &Message,
-    privacy_mode: &PrivacyMode,
-) -> Result<(), BotError> {
+async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Result<(), BotError> {
     let preview_chars = msg.content.chars().take(80).collect::<String>();
     tracing::info!(
         author = %msg.author.name,
@@ -558,6 +552,35 @@ async fn process(
     let persona_channel_id = parent_channel_id(&state.http, msg.channel_id).await;
     let persona_channel_id_i64 = i64::try_from(persona_channel_id.get()).unwrap_or(i64::MAX);
     let user_id_i64 = i64::try_from(msg.author.id.get()).unwrap_or(i64::MAX);
+
+    // Capture the author's identity NOW (before any DB writes that need
+    // to attribute to them). Picks guild nickname → global display name
+    // → username, in priority order. `discord_users` is upserted so
+    // later turns referring to this user resolve to current name +
+    // avatar in the viewer; the chosen display name is also stamped on
+    // the turn row below so historical attribution is durable.
+    let display_name = best_display_name(msg).to_string();
+    let avatar_hash = msg.author.avatar.map(|h| h.to_string());
+    let prior_user = state.db.get_discord_user(user_id_i64).await?;
+    let user_row = state
+        .db
+        .upsert_discord_user(
+            user_id_i64,
+            &msg.author.name,
+            msg.author.global_name.as_deref(),
+            avatar_hash.as_deref(),
+        )
+        .await?;
+    let needs_avatar_fetch = match (&prior_user, &user_row.avatar_local_path) {
+        // First time we see this user — fetch whatever they have (or
+        // resolve to a default avatar).
+        (None, _) => true,
+        // Hash changed since last fetch → re-download.
+        (Some(prev), _) if prev.avatar_hash != user_row.avatar_hash => true,
+        // We never successfully wrote a file.
+        (Some(_), None) => true,
+        _ => false,
+    };
 
     let resolved_persona_name = state
         .db
@@ -644,6 +667,7 @@ async fn process(
         &conversation,
         is_new,
         &user_content,
+        &display_name,
         privacy_mode,
         &persona.system_prompt,
     )
@@ -666,8 +690,17 @@ async fn process(
             conversation.id,
             i64::try_from(msg.id.get()).unwrap_or(i64::MAX),
             &user_content,
+            user_id_i64,
+            &display_name,
         )
         .await?;
+    state.publish(conversation.id, EventKind::TurnStarted);
+    if is_new {
+        state.publish(conversation.id, EventKind::Created);
+    }
+    if needs_avatar_fetch {
+        crate::avatars::spawn_fetch(Arc::clone(&state.app), user_id_i64);
+    }
     // Stamp the persona on the turn *before* the agent runs so the
     // model used is recoverable even if a later step fails. The web
     // viewer picks this up via the `persona_name` column on `turns`.
@@ -717,6 +750,7 @@ async fn process(
     {
         state.db.record_context_item(turn.id, item).await?;
     }
+    state.publish(conversation.id, EventKind::ContextItemAdded);
 
     // Build the LLM-facing chat history from the initial context items.
     // Image rows are skipped here and re-attached below as proper
@@ -727,34 +761,34 @@ async fn process(
         .filter(|c| !c.source.contains(":image:"))
         .map(|c| ChatTurn::text(MessageRole::from_str_lossy(&c.role), c.content.clone()))
         .collect();
-    if !saved_images.is_empty() {
-        if let Some(last) = messages.last_mut() {
-            // Inject the attachment URLs as TEXT into the user's turn
-            // so the model can pass them verbatim to tools like
-            // generate_image. Without this hint, the model sees the
-            // images via the structured input_image content block but
-            // doesn't treat the URL as a quotable string and tends to
-            // invent paths instead.
-            let url_list = saved_images
-                .iter()
-                .map(|i| format!("- {}", i.live_url))
-                .collect::<Vec<_>>()
-                .join("\n");
-            let annotation = format!(
-                "\n\n[Images attached to this message — when calling \
+    if !saved_images.is_empty()
+        && let Some(last) = messages.last_mut()
+    {
+        // Inject the attachment URLs as TEXT into the user's turn
+        // so the model can pass them verbatim to tools like
+        // generate_image. Without this hint, the model sees the
+        // images via the structured input_image content block but
+        // doesn't treat the URL as a quotable string and tends to
+        // invent paths instead.
+        let url_list = saved_images
+            .iter()
+            .map(|i| format!("- {}", i.live_url))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let annotation = format!(
+            "\n\n[Images attached to this message — when calling \
                  generate_image to edit one of them, pass the exact URL \
                  below as a reference_images entry. Do not invent paths.]\n{url_list}"
-            );
-            match last.blocks.first_mut() {
-                Some(TurnBlock::Text(text)) => text.push_str(&annotation),
-                _ => last.blocks.insert(0, TurnBlock::Text(annotation)),
-            }
-            for image in &saved_images {
-                last.blocks.push(TurnBlock::Image {
-                    url: image.live_url.clone(),
-                    mime_type: image.mime_type.clone(),
-                });
-            }
+        );
+        match last.blocks.first_mut() {
+            Some(TurnBlock::Text(text)) => text.push_str(&annotation),
+            _ => last.blocks.insert(0, TurnBlock::Text(annotation)),
+        }
+        for image in &saved_images {
+            last.blocks.push(TurnBlock::Image {
+                url: image.live_url.clone(),
+                mime_type: image.mime_type.clone(),
+            });
         }
     }
 
@@ -793,8 +827,8 @@ async fn process(
         privacy_mode: privacy_mode.clone(),
         image_provider,
         video_provider,
-        images_dir: state.images_dir.clone(),
-        videos_dir: state.videos_dir.clone(),
+        images_dir: state.storage.images_dir.clone(),
+        videos_dir: state.storage.videos_dir.clone(),
         last_status_text: Mutex::new(None),
     };
 
@@ -823,13 +857,14 @@ async fn process(
             .db
             .record_tool_call(turn.id, i32::try_from(i).unwrap_or(0), tc)
             .await?;
+        state.publish(conversation.id, EventKind::ToolCallRecorded);
     }
 
     // Collect any media the agent generated this turn for upload as
     // Discord attachments on the outgoing reply.
     let generated_attachments = collect_generated_attachments(
-        &state.images_dir,
-        &state.videos_dir,
+        &state.storage.images_dir,
+        &state.storage.videos_dir,
         &agent_run.tool_calls,
     )
     .await;
@@ -859,6 +894,7 @@ async fn process(
             .fail_turn(turn.id, "media generation refused by upstream safety")
             .await
             .ok();
+        state.publish(conversation.id, EventKind::TurnUpdated);
         return Err(BotError::Llm(synthesize_safety_refusal(
             "media generation was refused by xAI's safety policy",
         )));
@@ -979,10 +1015,23 @@ async fn process(
             i64::try_from(reply_msg.id.get()).unwrap_or(i64::MAX),
         )
         .await?;
+    state.publish(conversation.id, EventKind::TurnUpdated);
     // Note: user + assistant message_links are recorded earlier — the
     // user link right after start_turn (so thread continuation works
     // even on partial failures), and assistant chunks inside
     // post_reply_chunks as each one is posted.
+
+    // If this was the first completed turn on a fresh conversation,
+    // schedule a background title generation task. The task drops
+    // itself if the conversation already has a title (we never auto-
+    // regenerate; user-driven retitles can be added later).
+    if turn.turn_index == 0 {
+        crate::titles::spawn_generate(
+            Arc::clone(&state.app),
+            conversation.id,
+            persona_name.clone(),
+        );
+    }
 
     if media_gen_failed {
         // Bubble the failure up so handle_message reacts ❌ instead of ✅.
@@ -990,10 +1039,12 @@ async fn process(
             format!("{failure_label} was attempted but produced no output"),
         )));
     }
-    if agent_loop_error.is_some() && !have_media {
+    if let Some(err) = agent_loop_error
+        && !have_media
+    {
         // Bare error, nothing to salvage — ❌.
         return Err(BotError::Llm(grok_discord_bot_core::LlmError::Transport(
-            agent_loop_error.unwrap().to_string(),
+            err.to_string(),
         )));
     }
     Ok(())
@@ -1007,10 +1058,7 @@ async fn process(
 ///
 /// Falls back to the raw channel id on any lookup error so we never
 /// block a turn on a transient Discord API hiccup.
-async fn parent_channel_id(
-    http: &HttpClient,
-    channel_id: Id<ChannelMarker>,
-) -> Id<ChannelMarker> {
+async fn parent_channel_id(http: &HttpClient, channel_id: Id<ChannelMarker>) -> Id<ChannelMarker> {
     let Ok(resp) = http.channel(channel_id).await else {
         return channel_id;
     };
@@ -1042,18 +1090,18 @@ async fn lookup_existing_conversation(
 ) -> Result<Option<Conversation>, BotError> {
     if let Some(referenced) = &msg.referenced_message {
         let parent_id = i64::try_from(referenced.id.get()).unwrap_or(i64::MAX);
-        if let Some(conv_id) = state.db.lookup_conversation_by_message(parent_id).await? {
-            if let Some(conv) = state.db.get_conversation(conv_id).await? {
-                return Ok(Some(conv));
-            }
+        if let Some(conv_id) = state.db.lookup_conversation_by_message(parent_id).await?
+            && let Some(conv) = state.db.get_conversation(conv_id).await?
+        {
+            return Ok(Some(conv));
         }
     }
 
     let channel_id = i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
-    if let Some(conv_id) = state.db.lookup_conversation_by_message(channel_id).await? {
-        if let Some(conv) = state.db.get_conversation(conv_id).await? {
-            return Ok(Some(conv));
-        }
+    if let Some(conv_id) = state.db.lookup_conversation_by_message(channel_id).await?
+        && let Some(conv) = state.db.get_conversation(conv_id).await?
+    {
+        return Ok(Some(conv));
     }
 
     Ok(None)
@@ -1062,16 +1110,18 @@ async fn lookup_existing_conversation(
 /// Assemble the initial prompt for the agent loop. The model can
 /// always pull more channel history on demand via `fetch_messages`, so
 /// this only needs to include:
-///   - the system prompt;
-///   - prior turns of the conversation (when continuing);
-///   - the Discord-reply-quoted message, gated by the privacy mode;
-///   - the user's current `@`-mention.
+/// - the system prompt;
+/// - prior turns of the conversation (when continuing);
+/// - the Discord-reply-quoted message, gated by the privacy mode;
+/// - the user's current `@`-mention.
+#[allow(clippy::too_many_arguments)]
 async fn build_context(
     state: &State,
     msg: &Message,
     conversation: &Conversation,
     is_new: bool,
     user_content: &str,
+    user_display_name: &str,
     privacy_mode: &PrivacyMode,
     system_prompt: &str,
 ) -> Result<Vec<ContextItem>, BotError> {
@@ -1090,12 +1140,16 @@ async fn build_context(
     if !is_new {
         let history = state.db.load_conversation_history(conversation.id).await?;
         for turn in history {
+            // Prefix prior turns' user text with the historical display
+            // name pinned on the turn row. Falls back to "user" for
+            // legacy turns predating the identity-tracking feature.
+            let prior_name = turn.discord_user_name.as_deref().unwrap_or("user");
             push_item(
                 &mut items,
                 &mut pos,
                 format!("turn:{}:user", turn.id),
                 "user",
-                turn.user_content,
+                format!("[{prior_name}]: {}", turn.user_content),
                 Some(turn.user_discord_message_id),
             );
             if let Some(answer) = turn.assistant_content {
@@ -1109,22 +1163,21 @@ async fn build_context(
                 );
             }
         }
-    } else if let Some(referenced) = &msg.referenced_message {
-        if !referenced.author.bot
-            && quoted_message_allowed(state, conversation, referenced, privacy_mode).await?
-        {
-            push_item(
-                &mut items,
-                &mut pos,
-                format!("discord:msg:{}", referenced.id),
-                "user",
-                format!(
-                    "[Quoted message from {}]: {}",
-                    referenced.author.name, referenced.content
-                ),
-                Some(i64::try_from(referenced.id.get()).unwrap_or(i64::MAX)),
-            );
-        }
+    } else if let Some(referenced) = &msg.referenced_message
+        && !referenced.author.bot
+        && quoted_message_allowed(state, conversation, referenced, privacy_mode).await?
+    {
+        push_item(
+            &mut items,
+            &mut pos,
+            format!("discord:msg:{}", referenced.id),
+            "user",
+            format!(
+                "[Quoted message from {}]: {}",
+                referenced.author.name, referenced.content
+            ),
+            Some(i64::try_from(referenced.id.get()).unwrap_or(i64::MAX)),
+        );
     }
 
     push_item(
@@ -1132,7 +1185,7 @@ async fn build_context(
         &mut pos,
         format!("discord:msg:{}", msg.id),
         "user",
-        user_content.to_string(),
+        format!("[{user_display_name}]: {user_content}"),
         Some(i64::try_from(msg.id.get()).unwrap_or(i64::MAX)),
     );
 
@@ -1151,9 +1204,9 @@ struct SavedImage {
     mime_type: Option<String>,
 }
 
-/// Download every image-typed attachment on `msg` to `state.images_dir`.
-/// Failures are logged and skipped — a broken attachment shouldn't fail
-/// the whole reply.
+/// Download every image-typed attachment on `msg` to the configured
+/// images dir. Failures are logged and skipped — a broken attachment
+/// shouldn't fail the whole reply.
 async fn save_image_attachments(state: &State, msg: &Message) -> Vec<SavedImage> {
     let mut out = Vec::new();
     for att in &msg.attachments {
@@ -1164,7 +1217,7 @@ async fn save_image_attachments(state: &State, msg: &Message) -> Vec<SavedImage>
             &state.download_http,
             &att.url,
             att.content_type.as_deref(),
-            &state.images_dir,
+            &state.storage.images_dir,
         )
         .await
         {
@@ -1195,12 +1248,16 @@ async fn save_image_attachments(state: &State, msg: &Message) -> Vec<SavedImage>
 }
 
 fn looks_like_image(content_type: Option<&str>, filename: &str) -> bool {
-    if let Some(ct) = content_type {
-        if ct.starts_with("image/") {
-            return true;
-        }
+    if let Some(ct) = content_type
+        && ct.starts_with("image/")
+    {
+        return true;
     }
-    let ext = filename.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     matches!(
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif"
@@ -1239,8 +1296,7 @@ async fn quoted_message_allowed(
         PrivacyMode::OptIn => {
             // Messages inside a Grok-owned thread are always visible
             // (participation implies consent).
-            let channel_as_msg =
-                i64::try_from(referenced.channel_id.get()).unwrap_or(i64::MAX);
+            let channel_as_msg = i64::try_from(referenced.channel_id.get()).unwrap_or(i64::MAX);
             if state
                 .db
                 .lookup_conversation_by_message(channel_as_msg)
@@ -1525,12 +1581,11 @@ impl BotToolExecutor {
             channel_id: allowed,
             ..
         } = &self.privacy_mode
+            && channel_id.get() != *allowed
         {
-            if channel_id.get() != *allowed {
-                return Err(ToolError::InvalidInput(format!(
-                    "this server is in channel_only mode; fetch_messages can only target channel {allowed}"
-                )));
-            }
+            return Err(ToolError::InvalidInput(format!(
+                "this server is in channel_only mode; fetch_messages can only target channel {allowed}"
+            )));
         }
 
         let limit_i64 = input
@@ -2048,10 +2103,10 @@ fn fix_bare_mentions(s: &str) -> String {
     out
 }
 
-/// Walk the agent's tool-call trace and load any generated media (images
-/// + videos) from disk, in order. Each becomes a Discord file
-/// attachment on the outgoing reply, skipping anything that exceeds
-/// Discord's free-tier upload size limit.
+/// Walk the agent's tool-call trace and load any generated media
+/// (images and videos) from disk, in order. Each becomes a Discord
+/// file attachment on the outgoing reply, skipping anything that
+/// exceeds Discord's free-tier upload size limit.
 async fn collect_generated_attachments(
     images_dir: &std::path::Path,
     videos_dir: &std::path::Path,
@@ -2103,7 +2158,11 @@ async fn collect_generated_attachments(
 
 fn extension_from_video_url(url: &str) -> &'static str {
     let no_query = url.split('?').next().unwrap_or(url);
-    let ext = no_query.rsplit('.').next().unwrap_or("").to_ascii_lowercase();
+    let ext = no_query
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     match ext.as_str() {
         "mp4" => "mp4",
         "webm" => "webm",
@@ -2258,9 +2317,7 @@ fn rendered_line_count(text: &str) -> usize {
 fn normalize_status_for_dedup(s: &str) -> String {
     let lower = s.to_lowercase();
     let trimmed = lower.trim();
-    let cleaned = trimmed.trim_end_matches(|c: char| {
-        c == '.' || c == '…' || c.is_whitespace()
-    });
+    let cleaned = trimmed.trim_end_matches(|c: char| c == '.' || c == '…' || c.is_whitespace());
     cleaned.to_string()
 }
 
@@ -2308,6 +2365,22 @@ fn strip_bracketed_tokens(s: &str) -> String {
         }
     }
     out
+}
+
+/// Pick the best display name for a Discord message author. Priority:
+/// guild nickname (when present) → global display name → username.
+/// The returned slice borrows from `msg`, so callers wanting to store
+/// it should `.to_string()`.
+fn best_display_name(msg: &Message) -> &str {
+    if let Some(member) = &msg.member
+        && let Some(nick) = &member.nick
+    {
+        return nick;
+    }
+    if let Some(gn) = &msg.author.global_name {
+        return gn;
+    }
+    &msg.author.name
 }
 
 fn strip_mentions(content: &str, bot_user_id: Id<UserMarker>) -> String {
@@ -2361,6 +2434,7 @@ mod tests {
             created_by_user_id: 0,
             root_discord_message_id: 0,
             title: None,
+            title_generated_at: None,
             model: "test".to_string(),
         }
     }
@@ -2373,7 +2447,12 @@ mod tests {
 
     #[test]
     fn split_prefers_paragraph_breaks() {
-        let body = format!("{}\n\n{}\n\n{}", "a".repeat(40), "b".repeat(40), "c".repeat(40));
+        let body = format!(
+            "{}\n\n{}\n\n{}",
+            "a".repeat(40),
+            "b".repeat(40),
+            "c".repeat(40)
+        );
         let out = split_into_messages(&body, 60);
         // Each "a"/"b"/"c" block is 40 chars; budget 60; paragraph
         // breaks must keep each block intact in its own chunk.
@@ -2394,8 +2473,7 @@ mod tests {
         }
         // Each chunk's whitespace-separated tokens must all be real
         // input words — no half-tokens from cutting mid-word.
-        let input_words: std::collections::HashSet<&str> =
-            body.split_whitespace().collect();
+        let input_words: std::collections::HashSet<&str> = body.split_whitespace().collect();
         for chunk in &out {
             for word in chunk.split_whitespace() {
                 assert!(input_words.contains(word), "broken word: {word}");
@@ -2574,11 +2652,17 @@ mod tests {
         // sits well under REPLY_LENGTH_THRESHOLD, but the line
         // count alone should be enough to thread.
         let body = "**GDP:**\n\n".to_string()
-            + &(1..=10).map(|i| format!("{i}. Country\n")).collect::<String>()
+            + &(1..=10)
+                .map(|i| format!("{i}. Country\n"))
+                .collect::<String>()
             + "\n**Population:**\n\n"
-            + &(1..=10).map(|i| format!("{i}. Country\n")).collect::<String>()
+            + &(1..=10)
+                .map(|i| format!("{i}. Country\n"))
+                .collect::<String>()
             + "\n**Best:**\n\n"
-            + &(1..=5).map(|i| format!("{i}. Country\n")).collect::<String>();
+            + &(1..=5)
+                .map(|i| format!("{i}. Country\n"))
+                .collect::<String>();
         assert!(body.len() < REPLY_LENGTH_THRESHOLD);
         assert!(rendered_line_count(&body) > REPLY_RENDERED_LINES_THRESHOLD);
     }

@@ -120,10 +120,7 @@ impl ImageProvider for AnyImageProvider {
         }
     }
 
-    async fn generate(
-        &self,
-        request: ImageGenRequest,
-    ) -> Result<GeneratedImage, ImageGenError> {
+    async fn generate(&self, request: ImageGenRequest) -> Result<GeneratedImage, ImageGenError> {
         match self {
             Self::Xai(p) => p.generate(request).await,
         }

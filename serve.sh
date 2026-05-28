@@ -6,22 +6,30 @@
 #     grok-discord-bot/    # this repo (a checkout, kept up to date with `git pull`)
 #     grok                 # the installed binary, copied from target/distribute/grok
 #     config.toml          # the production config (gitignored in the repo)
+#     frontend-build/      # built React bundle, copied from frontend/dist on deploy
 #     images/, videos/     # media storage (per [storage] in config.toml)
+#     avatars/             # cached Discord profile pictures
 #     logs/                # tmux pane output, one file per service
 #
 # Default $CHUDBOT_DIR is $HOME/chudbot. Override with the CHUDBOT_DIR env var.
 #
-# The bot runs in a tmux session called "chudbot" with two windows:
-#   - "bot": `grok bot` (Discord gateway loop)
-#   - "web": `grok web` (Axum conversation viewer)
-# Both windows run with cwd $CHUDBOT_DIR so the binary picks up config.toml
-# and storage dirs by relative path. Output of each window is tee'd to
-# $CHUDBOT_DIR/logs/{bot,web}.log so crash output survives a window close.
+# The bot runs in a tmux session called "chudbot" with one window
+# running `grok serve`, which combines the Discord gateway loop and
+# the Axum web/API server in a single process. Output is tee'd to
+# $CHUDBOT_DIR/logs/grok.log so crash output survives a window close.
+#
+# The frontend is a React + Vite SPA. `deploy` runs `bun install` and
+# `bun run build` inside grok-discord-bot/frontend/, then atomically
+# swaps the resulting dist/ into $CHUDBOT_DIR/frontend-build/.
+# Axum serves that directory as static files (with index.html as the
+# SPA fallback for client-side routes like /c/<uuid>).
 
 set -euo pipefail
 
 CHUDBOT_DIR="${CHUDBOT_DIR:-$HOME/chudbot}"
 REPO_DIR="$CHUDBOT_DIR/grok-discord-bot"
+FRONTEND_SRC="$REPO_DIR/frontend"
+FRONTEND_BUILD="$CHUDBOT_DIR/frontend-build"
 BINARY="$CHUDBOT_DIR/grok"
 LOG_DIR="$CHUDBOT_DIR/logs"
 SESSION="chudbot"
@@ -32,12 +40,12 @@ usage() {
 usage: $0 <command>
 
 commands:
-  deploy    git pull, build, stop, migrate, install binary, start
+  deploy    git pull, build frontend, build binary, stop, migrate, install, start
   restart   restart the tmux session (no rebuild)
   start     start the session if not running
   stop      kill the tmux session
   status    show whether the session is running, with pids per window
-  logs      attach to the session (Ctrl-b d to detach, Ctrl-b n to switch)
+  logs      attach to the session (Ctrl-b d to detach)
   migrate   run \`grok migrate\` with the installed binary
 
 env vars:
@@ -63,16 +71,14 @@ start_session() {
         return
     fi
     mkdir -p "$LOG_DIR"
-    # `exec` so the bot replaces the shell -- when the bot exits, the
-    # pane exits with the bot's status (no zombie shell). `tee -a` keeps
-    # output visible in the pane AND persists it to a log file for
+    # `exec` so `grok` replaces the shell -- when it exits, the pane
+    # exits with its status (no zombie shell). `tee -a` keeps output
+    # visible in the pane AND persists it to a log file for
     # post-mortem after a crash closes the window.
-    tmux new-session -d -s "$SESSION" -n bot -c "$CHUDBOT_DIR" \
-        "exec $BINARY bot 2>&1 | tee -a $LOG_DIR/bot.log"
-    tmux new-window -t "$SESSION" -n web -c "$CHUDBOT_DIR" \
-        "exec $BINARY web 2>&1 | tee -a $LOG_DIR/web.log"
-    echo "started session $SESSION (windows: bot, web)"
-    echo "logs: $LOG_DIR/{bot,web}.log"
+    tmux new-session -d -s "$SESSION" -n grok -c "$CHUDBOT_DIR" \
+        "exec $BINARY serve 2>&1 | tee -a $LOG_DIR/grok.log"
+    echo "started session $SESSION (running: grok serve)"
+    echo "logs: $LOG_DIR/grok.log"
     echo "attach with: $0 logs"
 }
 
@@ -85,6 +91,42 @@ stop_session() {
     fi
 }
 
+build_frontend() {
+    if [[ ! -d "$FRONTEND_SRC" ]]; then
+        echo "error: $FRONTEND_SRC not found" >&2
+        exit 1
+    fi
+    if ! command -v bun >/dev/null 2>&1; then
+        echo "error: bun is not on PATH -- install from https://bun.sh" >&2
+        exit 1
+    fi
+    echo "==> bun install (frontend)"
+    (cd "$FRONTEND_SRC" && bun install --frozen-lockfile)
+    echo "==> bun run build (frontend)"
+    (cd "$FRONTEND_SRC" && bun run build)
+    if [[ ! -f "$FRONTEND_SRC/dist/index.html" ]]; then
+        echo "error: vite build did not produce $FRONTEND_SRC/dist/index.html" >&2
+        exit 1
+    fi
+
+    # Atomic swap: stage the new build under a sibling name, mv the
+    # current one out of the way, mv the new one in, then rm the
+    # previous. Tracker-and-swap pattern so the bot's ServeDir doesn't
+    # see a partially-copied tree at any instant.
+    local stage="$CHUDBOT_DIR/.frontend-build.new"
+    rm -rf "$stage"
+    cp -R "$FRONTEND_SRC/dist" "$stage"
+
+    local previous="$CHUDBOT_DIR/.frontend-build.old"
+    rm -rf "$previous"
+    if [[ -d "$FRONTEND_BUILD" ]]; then
+        mv "$FRONTEND_BUILD" "$previous"
+    fi
+    mv "$stage" "$FRONTEND_BUILD"
+    rm -rf "$previous"
+    echo "==> frontend installed to $FRONTEND_BUILD"
+}
+
 cmd_deploy() {
     if [[ ! -d "$REPO_DIR/.git" ]]; then
         echo "error: $REPO_DIR is not a git checkout" >&2
@@ -94,11 +136,13 @@ cmd_deploy() {
     echo "==> git pull --ff-only"
     git -C "$REPO_DIR" pull --ff-only
 
+    build_frontend
+
     echo "==> cargo build --profile $PROFILE"
     (cd "$REPO_DIR" && cargo build --profile "$PROFILE")
     local built="$REPO_DIR/target/$PROFILE/grok"
     if [[ ! -x "$built" ]]; then
-        echo "error: build did not produce $built" >&2
+        echo "error: cargo build did not produce $built" >&2
         exit 1
     fi
 

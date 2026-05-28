@@ -1,0 +1,285 @@
+// Color tokens. Dark theme is the default since the screenshot shows
+// the user has it on; light theme is a media-query override. Pick
+// matches the maud version's palette so the migration is visually
+// neutral (and tweakable later).
+
+:root {
+  color-scheme: light dark;
+  --fg: #eaeaea;
+  --bg: #111;
+  --muted: #999;
+  --border: #2a2a2a;
+  --card: #1a1a1a;
+  --code-bg: #202020;
+  --accent: #7e8aff;
+  --err: #f04438;
+  --ok: #2dc56e;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --fg: #1a1a1a;
+    --bg: #fafafa;
+    --muted: #666;
+    --border: #ddd;
+    --card: #ffffff;
+    --code-bg: #f1f1f1;
+    --accent: #5b6cff;
+    --err: #c0392b;
+    --ok: #27ae60;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font: 15px/1.5 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+a {
+  color: var(--accent);
+}
+
+code {
+  background: var(--code-bg);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font: 13px ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+pre {
+  background: var(--code-bg);
+  padding: 0.75rem 1rem;
+  border-radius: 6px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 0;
+  font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.app {
+  min-height: 100vh;
+}
+
+main.center,
+main.conv,
+header.conv-header {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 2rem 1.25rem;
+}
+
+main.center {
+  text-align: center;
+}
+
+header.conv-header {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 1rem;
+  margin-bottom: 1rem;
+
+  h1 {
+    margin: 0 0 0.5rem;
+    font-size: 1.6rem;
+  }
+
+  .meta {
+    color: var(--muted);
+    font-size: 0.9rem;
+    margin: 0;
+  }
+}
+
+.empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+// --- Turn card ---
+
+.turn {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.25rem;
+
+  &__header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.05rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  &__index {
+    font-weight: 600;
+  }
+
+  &__persona,
+  &__time {
+    color: var(--muted);
+    font-weight: normal;
+    font-size: 0.9rem;
+  }
+
+  &__user {
+    margin-bottom: 0.75rem;
+  }
+
+  &__user-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.4rem;
+  }
+
+  &__user-meta {
+    display: flex;
+    flex-direction: column;
+  }
+
+  &__assistant {
+    h3 {
+      font-size: 0.85rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      margin: 1rem 0 0.35rem;
+    }
+  }
+
+  &__content {
+    &--err {
+      color: var(--err);
+    }
+  }
+}
+
+// --- Status badge ---
+
+.badge {
+  font-size: 0.75rem;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--code-bg);
+  color: var(--muted);
+
+  &--ok {
+    background: rgba(45, 197, 110, 0.12);
+    color: var(--ok);
+  }
+
+  &--err {
+    background: rgba(240, 68, 56, 0.12);
+    color: var(--err);
+  }
+}
+
+// --- Avatar ---
+
+.avatar {
+  border-radius: 50%;
+  display: inline-block;
+  vertical-align: middle;
+  flex-shrink: 0;
+  object-fit: cover;
+
+  &--fallback {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-weight: 600;
+    font-size: 0.9rem;
+    text-transform: uppercase;
+    user-select: none;
+  }
+}
+
+// --- Context + tool call detail panels ---
+
+details {
+  margin: 0.5rem 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.5rem 0.75rem;
+
+  summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 0.85rem;
+  }
+
+  &[open] summary {
+    margin-bottom: 0.5rem;
+  }
+}
+
+.context-item,
+.tool-call {
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid var(--border);
+  background: var(--bg);
+
+  header {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 0.35rem;
+  }
+}
+
+.context-item__role,
+.tool-call__name {
+  font-weight: 600;
+  color: var(--accent);
+}
+
+.tools h3 {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  margin: 1rem 0 0.35rem;
+}
+
+.context-image,
+.context-video {
+  max-width: 100%;
+  max-height: 400px;
+  border-radius: 6px;
+  margin: 0.25rem 0;
+  display: block;
+}
+
+.tool-call__media {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin: 0.5rem 0;
+
+  .context-image,
+  .context-video {
+    max-height: 300px;
+    flex: 0 0 auto;
+  }
+}
+
+time[dateTime] {
+  border-bottom: 1px dotted transparent;
+  cursor: help;
+
+  &:hover {
+    border-bottom-color: var(--muted);
+  }
+}

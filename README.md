@@ -8,12 +8,28 @@ call, and the final answer.
 ## Run
 
 ```sh
-grok bot       # start the Discord gateway loop
-grok web       # start the Axum web viewer
+grok serve     # run the Discord gateway loop + Axum API/web server in one process
 grok migrate   # apply pending Postgres migrations
 ```
 
-All three subcommands take `-c / --config <path>` (default `config.toml`).
+Both subcommands take `-c / --config <path>` (default `config.toml`).
+Ctrl+C drains in-flight work (turn handlers, title generation, avatar
+fetches) with a 30-second grace period before exiting.
+
+The web layer serves a React + Vite SPA from `[web].frontend_dir`
+(default `./frontend-build`). For development:
+
+```sh
+# terminal 1 — backend
+cargo run -- serve
+
+# terminal 2 — frontend (Vite dev server on :5173, proxying /api to :1860)
+cd frontend && bun install && bun run dev
+```
+
+For production, `./serve.sh deploy` handles the full pipeline: git
+pull → bun install + bun run build (frontend) → cargo build → stop →
+migrate → install → start.
 
 ## Configuration
 
