@@ -224,6 +224,26 @@ impl Db {
         Ok(())
     }
 
+    /// Snapshot the fully-composed system prompt sent to the model for a
+    /// turn. Stored once per turn for the web viewer; `ON CONFLICT` keeps
+    /// it idempotent if a turn is ever re-stamped. Lives in its own table
+    /// so the history hot path never loads this large text.
+    pub async fn record_turn_system_prompt(
+        &self,
+        turn_id: Uuid,
+        content: &str,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO turn_system_prompts (turn_id, content) VALUES ($1, $2) \
+             ON CONFLICT (turn_id) DO UPDATE SET content = EXCLUDED.content",
+        )
+        .bind(turn_id)
+        .bind(content)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Persist a tool call performed during a turn.
     pub async fn record_tool_call(
         &self,
@@ -738,8 +758,18 @@ impl Db {
                 })
                 .collect();
 
+            // Viewer-only: the composed system prompt snapshot, if one was
+            // recorded for this turn (absent on legacy turns).
+            let system_prompt: Option<String> = sqlx::query_scalar(
+                "SELECT content FROM turn_system_prompts WHERE turn_id = $1",
+            )
+            .bind(turn.id)
+            .fetch_optional(&self.pool)
+            .await?;
+
             turn_views.push(TurnView {
                 turn,
+                system_prompt,
                 context,
                 tool_calls,
             });

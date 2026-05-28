@@ -6,6 +6,17 @@
 # TOML parser doesn't attach it to whichever section was opened last.
 default_persona = "default"
 
+# Optional global system-prompt addendum, appended to EVERY persona's
+# system prompt after the dynamically-built operational guidance (build
+# version, model, enabled capabilities, conventions). Use it for
+# deployment-wide rules that aren't part of any persona's voice — e.g.
+# the Discord developer ToS or a content policy. Keep it BEFORE any
+# `[section]` header (it's a top-level scalar). Optional; omit for none.
+# extra_system_prompt = """
+# This bot operates under the Discord Developer Terms of Service and
+# Developer Policy. Do not produce content that violates them.
+# """
+
 [discord]
 # Bot token from https://discord.com/developers/applications
 token = "MTIzNDU2..."

@@ -32,6 +32,10 @@ export interface Conversation {
 
 export interface TurnView {
   turn: Turn;
+  /** Fully-composed system prompt sent to the model for this turn
+   *  (persona voice + operational block + operator policy). Null for
+   *  legacy turns recorded before snapshotting existed. */
+  system_prompt: string | null;
   context: ContextItem[];
   tool_calls: ToolCallRecord[];
 }

@@ -283,6 +283,10 @@ pub struct ConversationView {
 pub struct TurnView {
     /// Turn row.
     pub turn: Turn,
+    /// Fully-composed system prompt sent to the model for this turn
+    /// (persona voice + operational block + operator policy). `None` for
+    /// legacy turns recorded before snapshotting existed.
+    pub system_prompt: Option<String>,
     /// Context items fed to the model, ordered by `position` ascending.
     pub context: Vec<ContextItem>,
     /// Server-side tool calls, ordered by `ordinal` ascending.
@@ -404,6 +408,7 @@ mod tests {
             },
             turns: vec![TurnView {
                 turn,
+                system_prompt: None,
                 context: vec![],
                 tool_calls: vec![],
             }],

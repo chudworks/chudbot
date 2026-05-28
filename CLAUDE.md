@@ -203,6 +203,32 @@ api key — the model is no longer there. Include only the provider
 blocks the configured personas actually use; validation rejects a
 persona that references a provider with no credentials.
 
+**System prompt composition.** The persona's `system_prompt` is only the
+*voice*. The actual system prompt sent to the model is built per turn by
+`compose_system_prompt` (in `bot`), once the persona is resolved:
+`persona.system_prompt` + a dynamically-generated **operational block** +
+the operator's global `extra_system_prompt` (optional top-level config
+scalar — the non-persona slot for deployment-wide rules like the Discord
+ToS). The operational block is non-persona and self-updating: the build
+version (`env!("GIT_VERSION")`), the model + provider actually answering,
+a one-line pointer to each capability whose tool is declared *this* turn
+(image/video gen, `fetch_messages`, always-on web search — the HOW stays
+in the tool descriptions), and cross-cutting conventions (don't echo the
+bracketed context notes we inject or any internal id/URL/`file://` path;
+narrate slow ops via `post_status_message`; write for Discord). Both the
+operational block and operator policy come AFTER the persona so their
+rules win on conflict and survive an adversarial persona prompt. Output
+is stable within a (deployment, persona, privacy-mode), so it caches
+cleanly. Capability lines mirror `build_tool_definitions`, so the prompt
+never advertises a tool the model wasn't given. The composed prompt is
+snapshotted per turn into `turn_system_prompts(turn_id → content)` and
+surfaced in the web viewer (collapsible "System prompt" on each turn) so
+a trace shows exactly what the model was instructed with — it can vary
+across a conversation as the persona/model/tools change. It's a separate
+1:1 table, not a `turns` column, specifically so the hot-path
+`load_conversation_history` query never drags the large text; only the
+viewer reads it (legacy turns predating the snapshot show `null`).
+
 At runtime, persona selection lives in `persona_selections(scope, key
 → persona_name)`. Resolution is **most-specific-wins**:
 `conversation → user-in-guild → channel → guild → default_persona`.

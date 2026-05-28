@@ -124,6 +124,13 @@ pub struct Config {
     /// reasonably for a local single-host deploy.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Operator-supplied text appended to the dynamically-built
+    /// operational guidance on EVERY persona's system prompt — a global,
+    /// non-persona slot for deployment-wide rules (e.g. the Discord
+    /// developer ToS, content policy). Distinct from `personas.*.
+    /// system_prompt`, which is the per-persona voice. Optional.
+    #[serde(default)]
+    pub extra_system_prompt: Option<String>,
 }
 
 /// Media storage settings. Local-only today; the URI scheme in the DB

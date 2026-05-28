@@ -164,6 +164,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         web_title_prefix: config.web.title_prefix,
         web_favicon_path: config.web.favicon_path,
         storage: config.storage,
+        extra_system_prompt: config.extra_system_prompt,
         download_http: reqwest::Client::new(),
         events: new_event_channel(),
         cancel: CancellationToken::new(),

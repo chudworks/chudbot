@@ -10,7 +10,7 @@ interface Props {
 }
 
 export default function Turn({ turnView, users }: Props) {
-  const { turn, context, tool_calls } = turnView;
+  const { turn, system_prompt, context, tool_calls } = turnView;
   // discord_user_id is a snowflake string and the `users` map is keyed
   // by the same string, so this lookup is exact (see types.ts on why
   // IDs are strings, not numbers).
@@ -43,6 +43,13 @@ export default function Turn({ turnView, users }: Props) {
         </div>
         <pre className="turn__content">{turn.user_content}</pre>
       </div>
+
+      {system_prompt && (
+        <details className="context">
+          <summary>System prompt</summary>
+          <pre className="turn__content">{system_prompt}</pre>
+        </details>
+      )}
 
       {context.length > 0 && (
         <details className="context">

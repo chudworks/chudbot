@@ -119,6 +119,10 @@ pub struct AppState {
     pub web_favicon_path: Option<PathBuf>,
     /// Media storage settings (images, videos, avatars dirs).
     pub storage: StorageConfig,
+    /// Operator-supplied global system-prompt addendum (e.g. Discord
+    /// ToS), appended to every persona's composed system prompt. `None`
+    /// when the operator didn't configure one.
+    pub extra_system_prompt: Option<String>,
     /// HTTP client used by background tasks (avatar fetcher, image
     /// downloads, etc). Separate from twilight's Discord client.
     pub download_http: reqwest::Client,

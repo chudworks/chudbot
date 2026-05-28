@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use grok_discord_bot_core::{
     AgentRun, AnyImageProvider, AnyVideoProvider, ChatTurn, ContextItem, Conversation, Db,
-    ImageProvider, LlmProvider, MessageRole, NoopObserver, PrivacyMode, ProviderOptions,
+    ImageProvider, LlmProvider, MessageRole, NoopObserver, Persona, PrivacyMode, ProviderOptions,
     StepRequest, StepResponse, ToolDefinition, ToolError, ToolExecutor, TurnBlock, VideoProvider,
     imagegen::ImageGenRequest, run_agent, storage, videogen::VideoGenRequest,
 };
@@ -674,6 +674,33 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
     // to pass to the LLM (it's still fresh; cheaper than base64).
     let saved_images = save_image_attachments(state, msg).await;
 
+    // Resolve the per-turn media providers from the persona. A persona
+    // that doesn't name an image/video provider (or names one with no
+    // matching `[image.<kind>]` / `[video.<kind>]` credentials block)
+    // simply doesn't get the corresponding tool — same as before, just
+    // now decided per-persona instead of per-deployment. Resolved here
+    // (before context building) so the composed system prompt can list
+    // exactly the capabilities whose tools will be declared this turn.
+    let image_provider: Option<AnyImageProvider> = persona
+        .image_provider
+        .and_then(|kind| state.image_providers.get(&kind).cloned());
+    let video_provider: Option<AnyVideoProvider> = persona
+        .video_provider
+        .and_then(|kind| state.video_providers.get(&kind).cloned());
+
+    // The system prompt = the persona's voice + a dynamically-built
+    // operational block (build version, model tuple, the capabilities
+    // actually enabled this turn) + any operator-global addendum. Built
+    // per turn because persona/privacy/capabilities are only known after
+    // resolution; see `compose_system_prompt`.
+    let system_prompt = compose_system_prompt(
+        persona,
+        privacy_mode,
+        image_provider.is_some(),
+        video_provider.is_some(),
+        state.extra_system_prompt.as_deref(),
+    );
+
     let mut initial_context = build_context(
         state,
         msg,
@@ -682,7 +709,7 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
         &user_content,
         &display_name,
         privacy_mode,
-        &persona.system_prompt,
+        &system_prompt,
     )
     .await?;
 
@@ -724,6 +751,19 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
             "failed to stamp persona on turn row; continuing"
         );
     }
+    // Snapshot the fully-composed system prompt for the viewer. Best-effort
+    // (viewer-only data) — a failure here must not sink the turn.
+    if let Err(err) = state
+        .db
+        .record_turn_system_prompt(turn.id, &system_prompt)
+        .await
+    {
+        tracing::warn!(
+            turn = %turn.id,
+            error = %err,
+            "failed to snapshot system prompt; continuing"
+        );
+    }
     tracing::info!(
         conversation = %conversation.id,
         turn = %turn.id,
@@ -752,11 +792,12 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
 
     // Persist only items that are NOVEL to this turn — the user's
     // @-mention, any Discord-quoted message, and saved image
-    // attachments. The system prompt is constant (lives in the bot
-    // config) and prior-turn user/assistant content is already stored
-    // verbatim in the `turns` table, so re-stamping them into
-    // `context_items` every turn would just duplicate data and grow
-    // the table quadratically with conversation length.
+    // attachments. The composed system prompt is snapshotted separately
+    // (in `turn_system_prompts`, above) and prior-turn user/assistant
+    // content is already stored verbatim in the `turns` table, so
+    // re-stamping them into `context_items` every turn would just
+    // duplicate data and grow the table quadratically with conversation
+    // length.
     for item in initial_context
         .iter()
         .filter(|i| i.source.starts_with("discord:msg:"))
@@ -852,18 +893,6 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
             });
         }
     }
-
-    // Resolve the per-turn media providers from the persona. A persona
-    // that doesn't name an image/video provider (or names one with no
-    // matching `[image.<kind>]` / `[video.<kind>]` credentials block)
-    // simply doesn't get the corresponding tool — same as before, just
-    // now decided per-persona instead of per-deployment.
-    let image_provider: Option<AnyImageProvider> = persona
-        .image_provider
-        .and_then(|kind| state.image_providers.get(&kind).cloned());
-    let video_provider: Option<AnyVideoProvider> = persona
-        .video_provider
-        .and_then(|kind| state.video_providers.get(&kind).cloned());
 
     // Tools available to the model for this turn:
     //   - fetch_messages: every mode except ConversationOnly
@@ -1293,6 +1322,72 @@ async fn build_context(
     );
 
     Ok(items)
+}
+
+/// Build the full system prompt for a resolved turn:
+///   1. the persona's own `system_prompt` (its voice — operator-authored);
+///   2. a dynamically-generated operational block — build version, the
+///      model actually answering, and a one-line pointer to each
+///      capability whose tool is declared *this* turn (the HOW stays in
+///      the tool descriptions; these lines just make the model aware the
+///      capability exists), plus cross-cutting conventions;
+///   3. any global operator addendum from config (`extra_system_prompt`,
+///      e.g. the Discord ToS).
+///
+/// The operational block and operator policy are placed AFTER the persona
+/// so their rules win on conflict and survive an adversarial or careless
+/// persona prompt. Output is stable within a deployment (build version),
+/// persona, and privacy mode, so it caches cleanly.
+fn compose_system_prompt(
+    persona: &Persona,
+    privacy_mode: &PrivacyMode,
+    image_enabled: bool,
+    video_enabled: bool,
+    extra: Option<&str>,
+) -> String {
+    // One pointer line per capability whose tool is declared this turn.
+    // Order/conditions mirror `build_tool_definitions` + the always-on
+    // server-side web search, so the prompt never advertises a tool the
+    // model wasn't given.
+    let mut capabilities = vec!["- Web search: look up current information when it helps."];
+    if image_enabled {
+        capabilities.push("- Image generation & editing: via the generate_image tool.");
+    }
+    if video_enabled {
+        capabilities.push("- Video generation: via the generate_video tool.");
+    }
+    if !matches!(privacy_mode, PrivacyMode::ConversationOnly) {
+        capabilities.push("- Recent channel messages: via the fetch_messages tool.");
+    }
+
+    let mut out = persona.system_prompt.trim_end().to_string();
+    out.push_str("\n\n— Operational context (always applies; not part of your persona) —\n");
+    out.push_str(&format!(
+        "Bot build: {}. You are answering as model `{}` via the {} API.\n\n",
+        crate::VERSION,
+        persona.model,
+        persona.provider.as_str(),
+    ));
+    out.push_str("Capabilities available this turn:\n");
+    out.push_str(&capabilities.join("\n"));
+    out.push_str(
+        "\n\nConventions:\n\
+         - Some messages carry bracketed notes we insert (e.g. \"[Quoted message from …]\" or \
+         \"[Images in this conversation you can edit …]\"). They are context for you, not the \
+         user's own words — act on them, but never echo the bracketed text and never surface \
+         internal ids, URLs, or file:// paths to the user.\n\
+         - For anything that takes more than a moment (image or video generation), call \
+         post_status_message in the same response so the user sees progress.\n\
+         - Write for Discord: concise, minimal markdown; don't re-link or re-describe media you \
+         have already attached.",
+    );
+
+    if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("\n\n— Operator policy —\n");
+        out.push_str(extra);
+    }
+
+    out
 }
 
 /// A single image attachment that's been persisted to local disk plus
@@ -2576,6 +2671,69 @@ mod tests {
             title_generated_at: None,
             model: "test".to_string(),
         }
+    }
+
+    fn fake_persona() -> Persona {
+        Persona {
+            provider: grok_discord_bot_core::LlmProviderKind::Xai,
+            model: "grok-4.3".to_string(),
+            system_prompt: "You are Chud. Be edgy.".to_string(),
+            temperature: None,
+            top_p: None,
+            xai: None,
+            anthropic: None,
+            image_provider: None,
+            video_provider: None,
+        }
+    }
+
+    #[test]
+    fn system_prompt_keeps_persona_first_then_operational_block() {
+        let p = fake_persona();
+        let out = compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, None);
+        // Persona voice leads; operational block follows it.
+        assert!(out.starts_with("You are Chud. Be edgy."));
+        let persona_at = out.find("You are Chud").unwrap();
+        let ops_at = out.find("Operational context").unwrap();
+        assert!(persona_at < ops_at);
+        // Dynamic bits are present.
+        assert!(out.contains("model `grok-4.3`"));
+        assert!(out.contains("via the xai API"));
+        assert!(out.contains(crate::VERSION));
+        // Web search is always advertised.
+        assert!(out.contains("- Web search:"));
+    }
+
+    #[test]
+    fn system_prompt_gates_capabilities_on_what_is_enabled() {
+        let p = fake_persona();
+        // ConversationOnly + no media providers → only web search.
+        let minimal = compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, None);
+        assert!(!minimal.contains("generate_image"));
+        assert!(!minimal.contains("generate_video"));
+        assert!(!minimal.contains("fetch_messages"));
+
+        // Open privacy + both media providers → all four capabilities.
+        let full = compose_system_prompt(
+            &p,
+            &PrivacyMode::opt_in_default(),
+            true,
+            true,
+            Some("  Discord ToS: be nice.  "),
+        );
+        assert!(full.contains("generate_image"));
+        assert!(full.contains("generate_video"));
+        assert!(full.contains("fetch_messages"));
+        // Operator addendum is appended (trimmed) under its own header.
+        assert!(full.contains("— Operator policy —"));
+        assert!(full.contains("Discord ToS: be nice."));
+    }
+
+    #[test]
+    fn system_prompt_omits_operator_policy_when_blank() {
+        let p = fake_persona();
+        let out = compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, Some("   "));
+        assert!(!out.contains("Operator policy"));
     }
 
     #[test]
