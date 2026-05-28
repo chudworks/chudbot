@@ -57,6 +57,7 @@ impl LlmProvider for XaiProvider {
         "xai"
     }
 
+    #[tracing::instrument(name = "step", skip_all, fields(provider = "xai", model = %request.model))]
     async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
         let (instructions, input_items) = to_responses_input(&request.messages);
         let tools = build_tools(&request.tools, request.enable_web_search);

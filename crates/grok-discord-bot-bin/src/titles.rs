@@ -73,6 +73,11 @@ enum TitleError {
     NoTurns,
 }
 
+#[tracing::instrument(
+    name = "title_gen",
+    skip_all,
+    fields(conversation = %conversation_id, persona = %persona_name)
+)]
 async fn generate(
     app: &AppState,
     conversation_id: Uuid,
@@ -84,10 +89,7 @@ async fn generate(
         .await?
         .ok_or(TitleError::ConversationMissing)?;
     if conv.title.is_some() && conv.title_generated_at.is_some() {
-        tracing::debug!(
-            conversation = %conversation_id,
-            "title already set; skipping"
-        );
+        tracing::debug!("title already set; skipping");
         return Ok(());
     }
     let turns = app.db.load_conversation_history(conversation_id).await?;
@@ -140,7 +142,7 @@ async fn generate(
     let response = tokio::select! {
         biased;
         _ = app.cancel.cancelled() => {
-            tracing::debug!(conversation = %conversation_id, "title gen cancelled");
+            tracing::debug!("title gen cancelled");
             return Ok(());
         }
         result = provider.step(request) => result?,
@@ -156,7 +158,6 @@ async fn generate(
     let title = clean_title(&raw);
     if title.is_empty() {
         tracing::warn!(
-            conversation = %conversation_id,
             raw = %raw,
             "title generator returned empty/garbage; skipping write"
         );
@@ -167,11 +168,7 @@ async fn generate(
         .set_conversation_title(conversation_id, &title)
         .await?;
     app.publish(conversation_id, EventKind::TitleUpdated);
-    tracing::info!(
-        conversation = %conversation_id,
-        title = %title,
-        "conversation title set"
-    );
+    tracing::info!(title = %title, "conversation title set");
     Ok(())
 }
 

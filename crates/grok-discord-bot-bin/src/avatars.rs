@@ -49,6 +49,7 @@ enum AvatarError {
     Transport(String),
 }
 
+#[tracing::instrument(name = "avatar_fetch", skip_all, fields(user_id = user_id))]
 async fn fetch(app: &AppState, user_id: i64) -> Result<(), AvatarError> {
     let user = app
         .db
@@ -79,7 +80,7 @@ async fn fetch(app: &AppState, user_id: i64) -> Result<(), AvatarError> {
     tokio::select! {
         biased;
         _ = app.cancel.cancelled() => {
-            tracing::debug!(user_id, "avatar fetch cancelled before request");
+            tracing::debug!("avatar fetch cancelled before request");
             return Ok(());
         }
         result = download_and_save(app, user_id, &url, &filename_hash) => result?,
@@ -129,7 +130,6 @@ async fn download_and_save(
     tokio::fs::write(&path, &bytes).await?;
     app.db.mark_avatar_fetched(user_id, &filename).await?;
     tracing::info!(
-        user_id,
         bytes = bytes.len(),
         path = %path.display(),
         "avatar cached"

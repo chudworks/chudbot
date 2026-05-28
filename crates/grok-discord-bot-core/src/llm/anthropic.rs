@@ -50,6 +50,7 @@ impl LlmProvider for AnthropicProvider {
         "anthropic"
     }
 
+    #[tracing::instrument(name = "step", skip_all, fields(provider = "anthropic", model = %request.model))]
     async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
         let (system, mut anthropic_messages) = to_anthropic_messages(&request.messages);
 

@@ -78,6 +78,10 @@ pub struct AgentRun {
 /// (e.g. media that already generated) even when a later LLM step
 /// failed with a 5xx.
 #[allow(clippy::too_many_arguments)]
+// `model` (the requested model) is carried by the caller's span; the
+// per-step responding model lands on each `step` child span. Here we
+// only tag the loop with which provider it's driving.
+#[tracing::instrument(name = "agent", skip_all, fields(provider = provider.name()))]
 pub async fn run<P, T, O>(
     provider: &P,
     model: String,
@@ -103,8 +107,6 @@ where
     let mut last_model_id = String::new();
 
     tracing::info!(
-        provider = provider.name(),
-        model = %model,
         messages = messages.len(),
         client_tools = tools.len(),
         web_search = enable_web_search,
@@ -156,7 +158,7 @@ where
                 all_tool_calls.extend(server_tool_calls);
                 tracing::info!(
                     iteration,
-                    model = %model_id,
+                    response_model = %model_id,
                     text_chars = content.len(),
                     server_tool_calls = server_calls,
                     total_tool_calls = all_tool_calls.len(),
@@ -189,7 +191,7 @@ where
                 let tool_names: Vec<&str> = tool_uses.iter().map(|t| t.name.as_str()).collect();
                 tracing::info!(
                     iteration,
-                    model = %last_model_id,
+                    response_model = %last_model_id,
                     client_tool_uses = tool_uses.len(),
                     server_tool_calls = server_calls,
                     tools = ?tool_names,
@@ -307,7 +309,7 @@ where
     // Out of iterations — return what we accumulated.
     tracing::warn!(
         iterations = max_iterations,
-        model = %last_model_id,
+        response_model = %last_model_id,
         tool_calls = all_tool_calls.len(),
         "agent loop hit iteration cap"
     );

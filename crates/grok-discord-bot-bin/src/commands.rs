@@ -182,6 +182,15 @@ pub async fn register(
 /// Top-level interaction dispatcher. Routes to the right command handler
 /// and replies with an ephemeral message (visible only to the invoker).
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "command",
+    skip_all,
+    fields(
+        command = tracing::field::Empty,
+        guild = ?interaction.guild_id.map(|g| g.get()),
+        user = ?interaction.author().map(|u| u.id.get()),
+    )
+)]
 pub async fn handle(
     http: Arc<HttpClient>,
     db: Db,
@@ -194,6 +203,7 @@ pub async fn handle(
     let Some(InteractionData::ApplicationCommand(data)) = interaction.data.as_ref() else {
         return;
     };
+    tracing::Span::current().record("command", data.name.as_str());
 
     let response = match data.name.as_str() {
         "grok-privacy" => handle_privacy(&db, &interaction, data).await,

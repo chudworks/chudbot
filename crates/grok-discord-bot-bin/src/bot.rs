@@ -320,6 +320,7 @@ fn log_guild_create(event: &GuildCreate) {
 /// when the upstream itself refuses for safety reasons (e.g. xAI's
 /// server-side SAFETY_CHECK_TYPE_* 403), which IS a refusal signal
 /// and we honor it directly.
+#[tracing::instrument(name = "moderation", skip_all)]
 async fn moderation_allows(state: &State, content: &str) -> bool {
     // Route the classifier through the default persona's provider +
     // model. That's the bot's baseline voice and the cheapest stable
@@ -418,6 +419,15 @@ fn body_indicates_safety_refusal(body: &str) -> bool {
 /// Top-level handler for one mention. Resolves the privacy mode, gates
 /// on ChannelOnly, sets the 👀 reaction, calls [`process`], then
 /// transitions the reaction to ✅ or ❌.
+#[tracing::instrument(
+    skip_all,
+    fields(
+        message_id = %msg.id,
+        channel = %msg.channel_id,
+        guild = ?msg.guild_id.map(|g| g.get()),
+        author = %msg.author.name,
+    )
+)]
 async fn handle_message(state: Arc<State>, msg: Message) {
     if msg.author.bot {
         return;
@@ -429,9 +439,6 @@ async fn handle_message(state: Arc<State>, msg: Message) {
         // receive this message but ignored it" diagnostics, which is
         // crucial when triaging "the bot didn't respond" reports.
         tracing::debug!(
-            channel = %msg.channel_id,
-            guild = ?msg.guild_id.map(|g| g.get()),
-            author = %msg.author.name,
             mentioned_user_ids = ?msg.mentions.iter().map(|u| u.id.get()).collect::<Vec<_>>(),
             bot_id = %state.bot_user_id,
             content_preview = %msg.content.chars().take(80).collect::<String>(),
@@ -1030,6 +1037,16 @@ fn assemble_messages(
 /// user-facing turn output, which is why a failed turn now posts one
 /// message (not the old two) and is marked `failed` (not `completed`).
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(
+    name = "turn",
+    skip_all,
+    fields(
+        conversation = %conversation.id,
+        turn = %turn.id,
+        persona = %persona_name,
+        model = %persona.model,
+    )
+)]
 async fn run_turn_and_reply(
     state: &State,
     conversation: &Conversation,
@@ -1136,11 +1153,7 @@ async fn run_turn_and_reply(
         .map(body_indicates_safety_refusal)
         .unwrap_or(false);
     if media_safety_refused || chat_safety_refused {
-        tracing::info!(
-            conversation = %conversation.id,
-            turn = %turn.id,
-            "turn refused by upstream safety; reacting ❓"
-        );
+        tracing::info!("turn refused by upstream safety; reacting ❓");
         state
             .db
             .fail_turn(turn.id, "refused by upstream safety")
@@ -1209,8 +1222,6 @@ async fn run_turn_and_reply(
         // Success, or media delivered despite a late error.
         if let Some(err) = agent_loop_error {
             tracing::warn!(
-                conversation = %conversation.id,
-                turn = %turn.id,
                 error = %err,
                 "agent loop errored after media generation succeeded; \
                  short reply + attachment"
@@ -1242,8 +1253,6 @@ async fn run_turn_and_reply(
         .expect("post_reply_chunks always returns at least one message");
     let reply_msg_id = i64::try_from(reply_msg.id.get()).unwrap_or(i64::MAX);
     tracing::info!(
-        conversation = %conversation.id,
-        turn = %turn.id,
         reply_msg = %reply_msg.id,
         threaded,
         chunks = reply_msgs.len(),
@@ -1286,12 +1295,7 @@ async fn run_turn_and_reply(
                 &RequestReactionType::Unicode { name: RETRY_EMOJI },
             )
             .await;
-        tracing::warn!(
-            conversation = %conversation.id,
-            turn = %turn.id,
-            error = %real_error,
-            "turn: marked failed"
-        );
+        tracing::warn!(error = %real_error, "turn: marked failed");
         return Ok(TurnOutcome::Failed);
     }
 
@@ -1326,6 +1330,10 @@ async fn run_turn_and_reply(
 /// Gate an incoming reaction: act only on the 🔄 retry emoji (and never on
 /// our own reactions), resolve the reacted message to its turn, and hand
 /// off to [`retry_turn`]. Everything else is a silent no-op.
+#[tracing::instrument(
+    skip_all,
+    fields(message_id = %reaction.message_id, user = %reaction.user_id)
+)]
 async fn handle_reaction(state: Arc<State>, reaction: GatewayReaction) {
     let is_retry = matches!(
         &reaction.emoji,
@@ -1342,7 +1350,7 @@ async fn handle_reaction(state: Arc<State>, reaction: GatewayReaction) {
         // hiccup) — nothing to retry.
         Ok(None) => return,
         Err(err) => {
-            tracing::warn!(error = %err, message_id, "retry: turn lookup failed");
+            tracing::warn!(error = %err, "retry: turn lookup failed");
             return;
         }
     };
@@ -1357,6 +1365,7 @@ async fn handle_reaction(state: Arc<State>, reaction: GatewayReaction) {
 /// reconstructs the LLM history from the DB (no live gateway `Message`),
 /// and drives the shared [`run_turn_and_reply`] tail. Manages the reaction
 /// on the user's original message (❌ → 👀 → ✅/❌/❓).
+#[tracing::instrument(name = "retry", skip_all, fields(turn = %turn_id, conversation = tracing::field::Empty))]
 async fn retry_turn(
     state: &State,
     turn_id: Uuid,
@@ -1368,6 +1377,7 @@ async fn retry_turn(
     let Some(conversation) = state.db.get_conversation(turn.conversation_id).await? else {
         return Ok(());
     };
+    tracing::Span::current().record("conversation", tracing::field::display(conversation.id));
 
     // Atomic gate: only the LATEST turn, and only while it's `failed`.
     // The same statement flips it to `pending`, so a double 🔄 or a stale
@@ -1378,13 +1388,12 @@ async fn retry_turn(
         .await?
     {
         tracing::info!(
-            %turn_id,
             status = %turn.status,
             "retry: turn not eligible (not failed, or not the latest turn); ignoring"
         );
         return Ok(());
     }
-    tracing::info!(%turn_id, conversation = %conversation.id, "retry: re-running failed turn");
+    tracing::info!("retry: re-running failed turn");
     state.publish(conversation.id, EventKind::TurnUpdated);
 
     let working = RequestReactionType::Unicode { name: "👀" };
@@ -1397,7 +1406,7 @@ async fn retry_turn(
         .ok()
         .and_then(Id::<MessageMarker>::new_checked)
     else {
-        tracing::warn!(%turn_id, "retry: turn has no valid user message id; aborting");
+        tracing::warn!("retry: turn has no valid user message id; aborting");
         state
             .db
             .fail_turn(turn.id, "retry: invalid user message id")
@@ -1538,7 +1547,7 @@ async fn retry_turn(
             }
         }
         Err(err) => {
-            tracing::warn!(error = %err, %turn_id, "retry: couldn't list prior reply messages");
+            tracing::warn!(error = %err, "retry: couldn't list prior reply messages");
         }
     }
     let _ = state
@@ -1596,7 +1605,7 @@ async fn retry_turn(
             // The run errored before it could finalize the turn (and post
             // its own message). Restore the `failed` status so the turn
             // stays retryable, and react ❌.
-            tracing::error!(error = %err, %turn_id, "retry: run failed before finalizing");
+            tracing::error!(error = %err, "retry: run failed before finalizing");
             state.db.fail_turn(turn.id, &err.to_string()).await.ok();
             state.publish(conversation.id, EventKind::TurnUpdated);
             let _ = state
@@ -2277,6 +2286,7 @@ struct FetchedMessage {
 }
 
 impl BotToolExecutor {
+    #[tracing::instrument(name = "tool.fetch_messages", skip_all)]
     async fn fetch_messages(&self, input: Value) -> Result<Value, ToolError> {
         let channel_id_input = input
             .get("channel_id")
@@ -2358,6 +2368,7 @@ impl BotToolExecutor {
         Ok(serde_json::to_value(&out).unwrap_or(Value::Array(vec![])))
     }
 
+    #[tracing::instrument(name = "tool.generate_image", skip_all)]
     async fn generate_image(&self, input: Value) -> Result<Value, ToolError> {
         let Some(provider) = self.image_provider.as_ref() else {
             return Err(ToolError::Execution(
@@ -2431,6 +2442,7 @@ impl BotToolExecutor {
     /// the agent loop sees one tool call go in and one result come
     /// out. Status messages reach the user via `post_status_message`
     /// fired in the same response as this call.
+    #[tracing::instrument(name = "tool.generate_video", skip_all)]
     async fn generate_video(&self, input: Value) -> Result<Value, ToolError> {
         let Some(provider) = self.video_provider.as_ref() else {
             return Err(ToolError::Execution(
@@ -2488,7 +2500,6 @@ impl BotToolExecutor {
         tracing::info!(
             request_id = %request_id,
             job_id = %job.id,
-            turn = %self.turn_id,
             "videogen: job submitted and persisted; polling inline"
         );
 
@@ -2552,6 +2563,7 @@ impl BotToolExecutor {
         }))
     }
 
+    #[tracing::instrument(name = "tool.post_status_message", skip_all)]
     async fn post_status_message(&self, input: Value) -> Result<Value, ToolError> {
         let text = input
             .get("text")
@@ -2573,7 +2585,6 @@ impl BotToolExecutor {
             let mut last = self.last_status_text.lock().unwrap();
             if last.as_deref() == Some(normalized.as_str()) {
                 tracing::info!(
-                    turn = %self.turn_id,
                     chars = trimmed.len(),
                     "status message suppressed (duplicate of previous)"
                 );
@@ -2608,7 +2619,6 @@ impl BotToolExecutor {
             .await;
         tracing::info!(
             message_id = %posted.id,
-            turn = %self.turn_id,
             chars = trimmed.len(),
             "status message posted (via tool)"
         );
