@@ -698,6 +698,7 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
         privacy_mode,
         image_provider.is_some(),
         video_provider.is_some(),
+        state.app_version,
         state.extra_system_prompt.as_deref(),
     );
 
@@ -732,6 +733,7 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
             &user_content,
             user_id_i64,
             &display_name,
+            state.app_version,
         )
         .await?;
     state.publish(conversation.id, EventKind::TurnStarted);
@@ -1343,6 +1345,7 @@ fn compose_system_prompt(
     privacy_mode: &PrivacyMode,
     image_enabled: bool,
     video_enabled: bool,
+    version_number: i32,
     extra: Option<&str>,
 ) -> String {
     // One pointer line per capability whose tool is declared this turn.
@@ -1363,7 +1366,8 @@ fn compose_system_prompt(
     let mut out = persona.system_prompt.trim_end().to_string();
     out.push_str("\n\n— Operational context (always applies; not part of your persona) —\n");
     out.push_str(&format!(
-        "Bot build: {}. You are answering as model `{}` via the {} API.\n\n",
+        "Bot build: v{} ({}). You are answering as model `{}` via the {} API.\n\n",
+        version_number,
         crate::VERSION,
         persona.model,
         persona.provider.as_str(),
@@ -2690,7 +2694,7 @@ mod tests {
     #[test]
     fn system_prompt_keeps_persona_first_then_operational_block() {
         let p = fake_persona();
-        let out = compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, None);
+        let out = compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, 7, None);
         // Persona voice leads; operational block follows it.
         assert!(out.starts_with("You are Chud. Be edgy."));
         let persona_at = out.find("You are Chud").unwrap();
@@ -2700,6 +2704,9 @@ mod tests {
         assert!(out.contains("model `grok-4.3`"));
         assert!(out.contains("via the xai API"));
         assert!(out.contains(crate::VERSION));
+        // The ordered version number leads the build line, with the git
+        // descriptor in parens.
+        assert!(out.contains(&format!("Bot build: v7 ({})", crate::VERSION)));
         // Web search is always advertised.
         assert!(out.contains("- Web search:"));
     }
@@ -2708,7 +2715,8 @@ mod tests {
     fn system_prompt_gates_capabilities_on_what_is_enabled() {
         let p = fake_persona();
         // ConversationOnly + no media providers → only web search.
-        let minimal = compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, None);
+        let minimal =
+            compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, 1, None);
         assert!(!minimal.contains("generate_image"));
         assert!(!minimal.contains("generate_video"));
         assert!(!minimal.contains("fetch_messages"));
@@ -2719,6 +2727,7 @@ mod tests {
             &PrivacyMode::opt_in_default(),
             true,
             true,
+            2,
             Some("  Discord ToS: be nice.  "),
         );
         assert!(full.contains("generate_image"));
@@ -2732,7 +2741,8 @@ mod tests {
     #[test]
     fn system_prompt_omits_operator_policy_when_blank() {
         let p = fake_persona();
-        let out = compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, Some("   "));
+        let out =
+            compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, 1, Some("   "));
         assert!(!out.contains("Operator policy"));
     }
 

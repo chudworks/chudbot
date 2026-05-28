@@ -157,6 +157,11 @@ pub struct Turn {
     /// Persona name active when this turn ran. `None` for turns
     /// written before the personas feature shipped.
     pub persona_name: Option<String>,
+    /// Build version (`app_versions.id`) that answered this turn — the
+    /// "vN" number. `None` for turns written before version tracking
+    /// shipped. The viewer resolves the commit string via
+    /// [`ConversationView::versions`].
+    pub version_id: Option<i32>,
     /// Discord user id of whoever sent the prompt. `None` for turns
     /// written before the identity-tracking feature shipped.
     #[serde(with = "snowflake::option", default)]
@@ -264,6 +269,21 @@ pub struct VideoJob {
     pub error: Option<String>,
 }
 
+/// One build the bot has run as: the "vN" number (`id`) plus the
+/// `git describe` string and when we first saw it. Registered once per
+/// distinct build at startup; see `Db::register_app_version`.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AppVersion {
+    /// Monotonic, gap-free version number. Surfaced as "v{id}".
+    pub id: i32,
+    /// Full `git describe --tags --always --dirty` string baked into
+    /// the binary at build time.
+    pub git_version: String,
+    /// First time the bot booted on this build.
+    #[serde(with = "time::serde::rfc3339")]
+    pub first_seen: OffsetDateTime,
+}
+
 /// Aggregated read-model for the web viewer: a conversation plus all of
 /// its turns, each with its context items and tool calls.
 #[derive(Debug, Clone, Serialize)]
@@ -276,6 +296,11 @@ pub struct ConversationView {
     /// keyed by user id. Lets the frontend render avatars + names
     /// without an N+1 fetch per turn.
     pub users: HashMap<i64, DiscordUser>,
+    /// Every build referenced by a turn's `version_id` in this view,
+    /// keyed by version number. Lets the frontend show "vN" with the
+    /// commit string on hover without an N+1 fetch. (serde emits the
+    /// integer keys as JSON strings, same as `users`.)
+    pub versions: HashMap<i32, AppVersion>,
 }
 
 /// One turn plus its context and tool calls. Used only for rendering.
@@ -391,6 +416,7 @@ mod tests {
             status: "completed".to_string(),
             error: None,
             persona_name: None,
+            version_id: None,
             discord_user_id: Some(uid),
             discord_user_name: Some("Robert".to_string()),
         };
@@ -413,6 +439,7 @@ mod tests {
                 tool_calls: vec![],
             }],
             users: HashMap::from([(uid, user)]),
+            versions: HashMap::new(),
         };
         let json = serde_json::to_value(&view).unwrap();
         let key = "1335037364980023356";

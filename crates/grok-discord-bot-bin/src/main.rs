@@ -120,6 +120,18 @@ async fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     let db = Db::connect(&config.postgres.url).await?;
 
+    // Resolve (or first-time register) the ordered "vN" version for this
+    // build. Requires the `app_versions` table, so the operator must
+    // have run `grok migrate` first — same precondition the rest of
+    // `serve` already assumes for a migrated DB.
+    let app_version = db.register_app_version(VERSION).await?;
+    tracing::info!(
+        version_number = app_version.id,
+        git_version = %app_version.git_version,
+        first_seen = %app_version.first_seen,
+        "resolved build version"
+    );
+
     let mut providers: HashMap<LlmProviderKind, AnyProvider> = HashMap::new();
     if let Some(cfg) = config.llm.xai.clone() {
         providers.insert(LlmProviderKind::Xai, AnyProvider::from(cfg));
@@ -158,6 +170,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         video_providers,
         personas: config.personas,
         default_persona: config.default_persona,
+        app_version: app_version.id,
         default_privacy: config.default_privacy,
         web_base_url: config.web.base_url,
         web_frontend_dir: config.web.frontend_dir,

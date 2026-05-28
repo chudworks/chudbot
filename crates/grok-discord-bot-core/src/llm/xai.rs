@@ -81,6 +81,13 @@ impl LlmProvider for XaiProvider {
             reasoning: reasoning.as_ref(),
         };
 
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            match serde_json::to_string(&body) {
+                Ok(json) => tracing::debug!(target: "xai_request", model = %request.model, body = %json, "xai: sending request"),
+                Err(e) => tracing::debug!(target: "xai_request", model = %request.model, error = %e, "xai: failed to serialize request for logging"),
+            }
+        }
+
         let resp = self
             .http
             .post(format!("{}/responses", self.base_url))

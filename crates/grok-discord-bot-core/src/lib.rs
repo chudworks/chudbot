@@ -30,8 +30,8 @@ pub use config::{
 };
 pub use db::{Db, DbError};
 pub use domain::{
-    ContextItem, Conversation, ConversationView, DiscordUser, ReplayImage, Turn, TurnView,
-    VideoJob,
+    AppVersion, ContextItem, Conversation, ConversationView, DiscordUser, ReplayImage, Turn,
+    TurnView, VideoJob,
 };
 pub use imagegen::{AnyImageProvider, ImageProvider};
 pub use llm::{

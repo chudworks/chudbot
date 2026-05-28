@@ -103,6 +103,11 @@ pub struct AppState {
     pub personas: HashMap<String, Persona>,
     /// Floor fallback persona name.
     pub default_persona: String,
+    /// Ordered "vN" version number for the running build, resolved once
+    /// at startup from `app_versions` (see `Db::register_app_version`).
+    /// Stamped onto every turn and surfaced in the operational block of
+    /// the system prompt.
+    pub app_version: i32,
     /// Per-guild bootstrap default privacy mode.
     pub default_privacy: PrivacyMode,
     /// Public base URL of the viewer; used to build the link the bot

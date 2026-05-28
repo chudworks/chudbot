@@ -1,4 +1,4 @@
-import type { ContextItem, DiscordUser, TurnView } from '../types';
+import type { AppVersion, ContextItem, DiscordUser, TurnView } from '../types';
 import Avatar from './Avatar';
 import RelativeTime from './RelativeTime';
 import ToolCall from './ToolCall';
@@ -7,9 +7,10 @@ import { displayNameFor } from '../users';
 interface Props {
   turnView: TurnView;
   users: Record<string, DiscordUser>;
+  versions: Record<string, AppVersion>;
 }
 
-export default function Turn({ turnView, users }: Props) {
+export default function Turn({ turnView, users, versions }: Props) {
   const { turn, system_prompt, context, tool_calls } = turnView;
   // discord_user_id is a snowflake string and the `users` map is keyed
   // by the same string, so this lookup is exact (see types.ts on why
@@ -18,6 +19,13 @@ export default function Turn({ turnView, users }: Props) {
     turn.discord_user_id != null ? users[turn.discord_user_id] : undefined;
   const userLabel =
     displayNameFor(user) ?? turn.discord_user_name ?? 'user';
+  // The version map is keyed by the stringified integer id (JSON object
+  // keys are strings). Present for any non-legacy turn.
+  const version =
+    turn.version_id != null ? versions[String(turn.version_id)] : undefined;
+  const versionTitle = version
+    ? `${version.git_version} · first seen ${new Date(version.first_seen).toLocaleString()}`
+    : undefined;
 
   return (
     <section className="turn">
@@ -27,6 +35,11 @@ export default function Turn({ turnView, users }: Props) {
         {turn.persona_name && (
           <span className="turn__persona">
             · persona <code>{turn.persona_name}</code>
+          </span>
+        )}
+        {turn.version_id != null && (
+          <span className="turn__version" title={versionTitle}>
+            · <code>v{turn.version_id}</code>
           </span>
         )}
         <span className="turn__time">

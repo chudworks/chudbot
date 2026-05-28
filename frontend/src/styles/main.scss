@@ -65,6 +65,26 @@ pre {
 
 .app {
   min-height: 100vh;
+  // Column layout so the version footer can sink to the bottom of the
+  // viewport via `margin-top: auto` even when the page content is short.
+  display: flex;
+  flex-direction: column;
+}
+
+.app-footer {
+  margin-top: auto;
+  max-width: 860px;
+  width: 100%;
+  margin-left: auto;
+  margin-right: auto;
+  padding: 1rem 1.25rem 1.5rem;
+  text-align: center;
+  color: var(--muted);
+  font-size: 0.8rem;
+
+  span {
+    cursor: help;
+  }
 }
 
 main.center,
@@ -125,10 +145,16 @@ header.conv-header {
   }
 
   &__persona,
+  &__version,
   &__time {
     color: var(--muted);
     font-weight: normal;
     font-size: 0.9rem;
+  }
+
+  &__version {
+    // Signals the build-string tooltip on the "vN" chip.
+    cursor: help;
   }
 
   &__user {

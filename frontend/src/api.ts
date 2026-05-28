@@ -8,10 +8,14 @@ export class ApiError extends Error {
   }
 }
 
-/** Operator-tunable front-end config served from `/api/config`. */
+/** Front-end config served from `/api/config`. */
 export interface SiteConfig {
   /** Prefix prepended to every browser-tab title. */
   title_prefix: string;
+  /** Ordered "vN" build number of the running server. */
+  version_number: number;
+  /** Full `git describe` string of the running server. */
+  git_version: string;
 }
 
 /** Fetch the static site config. Soft-fails to a sensible default so a

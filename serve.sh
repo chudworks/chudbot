@@ -6,6 +6,7 @@
 #     grok-discord-bot/    # this repo (a checkout, kept up to date with `git pull`)
 #     grok                 # the installed binary, copied from target/distribute/grok
 #     config.toml          # the production config (gitignored in the repo)
+#     .env                 # optional; KEY=value lines exported into the bot's tmux session
 #     frontend-build/      # built React bundle, copied from frontend/dist on deploy
 #     images/, videos/     # media storage (per [storage] in config.toml)
 #     avatars/             # cached Discord profile pictures
@@ -32,6 +33,7 @@ FRONTEND_SRC="$REPO_DIR/frontend"
 FRONTEND_BUILD="$CHUDBOT_DIR/frontend-build"
 BINARY="$CHUDBOT_DIR/grok"
 LOG_DIR="$CHUDBOT_DIR/logs"
+ENV_FILE="$CHUDBOT_DIR/.env"
 SESSION="chudbot"
 PROFILE="distribute"
 
@@ -50,6 +52,10 @@ commands:
 
 env vars:
   CHUDBOT_DIR    deployment root (default: \$HOME/chudbot)
+
+files:
+  \$CHUDBOT_DIR/.env   optional; if present, its KEY=value lines are
+                      exported into the bot's tmux session on start
 USAGE
 }
 
@@ -71,6 +77,20 @@ start_session() {
         return
     fi
     mkdir -p "$LOG_DIR"
+
+    # Optionally load $CHUDBOT_DIR/.env into the pane's shell so `grok`
+    # inherits its KEY=value pairs. We source it INSIDE the tmux command
+    # rather than in this script's shell because tmux's `update-environment`
+    # only refreshes a fixed allowlist of vars into new sessions -- arbitrary
+    # vars exported out here would not reliably reach the pane. `set -a`
+    # (allexport) makes every assignment in the file an exported var, then
+    # `set +a` restores normal behavior before `exec`.
+    local env_prefix=""
+    if [[ -f "$ENV_FILE" ]]; then
+        echo "loading environment from $ENV_FILE"
+        env_prefix="set -a; . $ENV_FILE; set +a; "
+    fi
+
     # `exec` so `grok` replaces the left side of the pipe -- when it
     # exits, the pipeline (and the single-pane session) ends. `tee -a`
     # keeps output visible in the pane AND persists it to a log file.
@@ -83,7 +103,7 @@ start_session() {
     # exec) keeps it alive until grok finishes draining and closes the
     # pipe, so the shutdown is fully captured in the log.
     tmux new-session -d -s "$SESSION" -n grok -c "$CHUDBOT_DIR" \
-        "exec $BINARY serve 2>&1 | { trap '' INT; exec tee -a $LOG_DIR/grok.log; }"
+        "${env_prefix}exec $BINARY serve 2>&1 | { trap '' INT; exec tee -a $LOG_DIR/grok.log; }"
     echo "started session $SESSION (running: grok serve)"
     echo "logs: $LOG_DIR/grok.log"
     echo "attach with: $0 logs"

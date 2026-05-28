@@ -305,12 +305,17 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// Static front-end configuration the React bundle reads at startup.
-/// Kept deliberately tiny — just the bits the operator can tune via
-/// `config.toml` that the browser needs to know about (today: the
-/// browser-tab title prefix).
+/// Static front-end configuration the React bundle reads at startup:
+/// the operator-tunable browser-tab title prefix, plus the running
+/// server's build version (the ordered "vN" number resolved at startup
+/// and the underlying `git describe` string) so every page can show it
+/// in the footer.
 async fn get_site_config(State(app): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "title_prefix": app.web_title_prefix }))
+    Json(serde_json::json!({
+        "title_prefix": app.web_title_prefix,
+        "version_number": app.app_version,
+        "git_version": crate::VERSION,
+    }))
 }
 
 async fn get_conversation(

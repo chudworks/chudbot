@@ -7,18 +7,30 @@ interface SiteConfigStore {
    * `index.html` ships with so there's no flash before the fetch
    * resolves, and so the title stays sane if the fetch fails. */
   titlePrefix: string;
+  /** Running server's ordered "vN" build number. `null` until the
+   * config fetch resolves (the footer renders nothing meanwhile). */
+  versionNumber: number | null;
+  /** Running server's full `git describe` string, for the footer tooltip. */
+  gitVersion: string | null;
   loaded: boolean;
   load: () => Promise<void>;
 }
 
 export const useSiteConfig = create<SiteConfigStore>((set, get) => ({
   titlePrefix: 'grok · ',
+  versionNumber: null,
+  gitVersion: null,
   loaded: false,
   load: async () => {
     if (get().loaded) return;
     try {
       const cfg = await fetchSiteConfig();
-      set({ titlePrefix: cfg.title_prefix, loaded: true });
+      set({
+        titlePrefix: cfg.title_prefix,
+        versionNumber: cfg.version_number,
+        gitVersion: cfg.git_version,
+        loaded: true,
+      });
     } catch (err) {
       console.warn('failed to load site config', err);
     }

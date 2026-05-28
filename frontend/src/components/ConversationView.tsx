@@ -82,7 +82,7 @@ export default function ConversationView() {
     );
   }
 
-  const { conversation, turns, users } = state.view;
+  const { conversation, turns, users, versions } = state.view;
   const title = conversation.title ?? 'Untitled conversation';
 
   return (
@@ -97,7 +97,7 @@ export default function ConversationView() {
       </header>
       <main className="conv">
         {turns.map((tv) => (
-          <Turn key={tv.turn.id} turnView={tv} users={users} />
+          <Turn key={tv.turn.id} turnView={tv} users={users} versions={versions} />
         ))}
         {turns.length === 0 && <p className="empty">No turns yet.</p>}
       </main>

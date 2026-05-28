@@ -16,6 +16,11 @@ export interface ConversationView {
    * (JSON object keys are always strings, and the backend emits the
    * matching ID fields as strings too, so lookups line up exactly). */
   users: Record<string, DiscordUser>;
+  /** Map of version number -> AppVersion for every build referenced by
+   * a turn. Keys are the integer version id as a string (JSON object
+   * keys are always strings; serde emits the i32 key stringified). Lets
+   * a turn render "vN" with the commit string on hover. */
+  versions: Record<string, AppVersion>;
 }
 
 export interface Conversation {
@@ -53,6 +58,10 @@ export interface Turn {
   status: 'pending' | 'completed' | 'failed' | string;
   error: string | null;
   persona_name: string | null;
+  /** Ordered build version ("vN") that answered this turn. Null for
+   *  legacy turns recorded before version tracking existed. Resolve the
+   *  commit string via ConversationView.versions[String(version_id)]. */
+  version_id: number | null;
   discord_user_id: string | null;
   discord_user_name: string | null;
 }
@@ -69,6 +78,15 @@ export interface ToolCallRecord {
   tool_name: string;
   request: unknown;
   response: unknown;
+}
+
+export interface AppVersion {
+  /** The "vN" number (an integer, not a snowflake — safe as a number). */
+  id: number;
+  /** Full `git describe --tags --always --dirty` string for the build. */
+  git_version: string;
+  /** ISO-8601 timestamp of the first boot on this build. */
+  first_seen: string;
 }
 
 export interface DiscordUser {

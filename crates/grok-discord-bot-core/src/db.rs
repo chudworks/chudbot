@@ -10,8 +10,8 @@ use uuid::Uuid;
 
 use crate::config::PrivacyMode;
 use crate::domain::{
-    ContextItem, Conversation, ConversationView, DiscordUser, ReplayImage, Turn, TurnView,
-    VideoJob,
+    AppVersion, ContextItem, Conversation, ConversationView, DiscordUser, ReplayImage, Turn,
+    TurnView, VideoJob,
 };
 use crate::llm::ToolCallRecord;
 
@@ -56,6 +56,41 @@ impl Db {
     pub async fn migrate(&self) -> Result<(), DbError> {
         MIGRATOR.run(&self.pool).await?;
         Ok(())
+    }
+
+    /// Resolve the ordered "vN" version row for the running build,
+    /// inserting it the first time this build is ever seen. Called once
+    /// at `serve` startup with `env!("GIT_VERSION")`.
+    ///
+    /// SELECT-then-INSERT, deliberately *not* an `ON CONFLICT` upsert:
+    /// the SERIAL `id` is the user-facing version number and must stay
+    /// gap-free, but `ON CONFLICT DO NOTHING` still burns a sequence
+    /// value on every conflict (Postgres allocates it before detecting
+    /// the conflict, and sequences don't roll back). Reading first and
+    /// only inserting for a never-seen build consumes a number exactly
+    /// once per real version. Startup is effectively single-writer, so
+    /// the read→insert race is vanishingly unlikely; the `UNIQUE`
+    /// constraint still guarantees correctness, and a lost race surfaces
+    /// as a unique-violation error rather than a duplicate row.
+    pub async fn register_app_version(&self, git_version: &str) -> Result<AppVersion, DbError> {
+        if let Some(existing) = sqlx::query_as::<_, AppVersion>(
+            "SELECT id, git_version, first_seen FROM app_versions WHERE git_version = $1",
+        )
+        .bind(git_version)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return Ok(existing);
+        }
+
+        let inserted = sqlx::query_as::<_, AppVersion>(
+            "INSERT INTO app_versions (git_version) VALUES ($1) \
+             RETURNING id, git_version, first_seen",
+        )
+        .bind(git_version)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(inserted)
     }
 
     /// Create a new conversation row.
@@ -129,18 +164,19 @@ impl Db {
         user_content: &str,
         discord_user_id: i64,
         discord_user_name: &str,
+        version_id: i32,
     ) -> Result<Turn, DbError> {
         let id = Uuid::new_v4();
         let turn = sqlx::query_as::<_, Turn>(
             "INSERT INTO turns \
                (id, conversation_id, turn_index, user_discord_message_id, user_content, \
-                discord_user_id, discord_user_name) \
+                discord_user_id, discord_user_name, version_id) \
              VALUES ($1, $2, \
                COALESCE((SELECT MAX(turn_index) + 1 FROM turns WHERE conversation_id = $2), 0), \
-               $3, $4, $5, $6) \
+               $3, $4, $5, $6, $7) \
              RETURNING id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error, persona_name, \
+               assistant_content, status, error, persona_name, version_id, \
                discord_user_id, discord_user_name",
         )
         .bind(id)
@@ -149,6 +185,7 @@ impl Db {
         .bind(user_content)
         .bind(discord_user_id)
         .bind(discord_user_name)
+        .bind(version_id)
         .fetch_one(&self.pool)
         .await?;
         Ok(turn)
@@ -382,7 +419,7 @@ impl Db {
         let turns = sqlx::query_as::<_, Turn>(
             "SELECT id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error, persona_name, \
+               assistant_content, status, error, persona_name, version_id, \
                discord_user_id, discord_user_name \
              FROM turns \
              WHERE conversation_id = $1 AND status = 'completed' \
@@ -717,7 +754,7 @@ impl Db {
         let turns = sqlx::query_as::<_, Turn>(
             "SELECT id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
-               assistant_content, status, error, persona_name, \
+               assistant_content, status, error, persona_name, version_id, \
                discord_user_id, discord_user_name \
              FROM turns WHERE conversation_id = $1 ORDER BY turn_index ASC",
         )
@@ -727,11 +764,17 @@ impl Db {
 
         let mut turn_views = Vec::with_capacity(turns.len());
         let mut user_ids: Vec<i64> = Vec::new();
+        let mut version_ids: Vec<i32> = Vec::new();
         for turn in turns {
             if let Some(uid) = turn.discord_user_id
                 && !user_ids.contains(&uid)
             {
                 user_ids.push(uid);
+            }
+            if let Some(vid) = turn.version_id
+                && !version_ids.contains(&vid)
+            {
+                version_ids.push(vid);
             }
             let context = sqlx::query_as::<_, ContextItem>(
                 "SELECT position, source, role, content, discord_message_id \
@@ -793,10 +836,28 @@ impl Db {
             }
         }
 
+        // Resolve every build referenced by a turn in one query, so the
+        // viewer can render "vN" with the commit string on hover without
+        // an N+1. Mirrors the `users` batch above.
+        let mut versions: std::collections::HashMap<i32, AppVersion> =
+            std::collections::HashMap::new();
+        if !version_ids.is_empty() {
+            let rows = sqlx::query_as::<_, AppVersion>(
+                "SELECT id, git_version, first_seen FROM app_versions WHERE id = ANY($1)",
+            )
+            .bind(&version_ids)
+            .fetch_all(&self.pool)
+            .await?;
+            for v in rows {
+                versions.insert(v.id, v);
+            }
+        }
+
         Ok(Some(ConversationView {
             conversation,
             turns: turn_views,
             users,
+            versions,
         }))
     }
 }

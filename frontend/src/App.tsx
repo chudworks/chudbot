@@ -5,11 +5,15 @@ import { useSiteConfig } from './title';
 // Top-level layout shell. Children come from the router (`Landing` at
 // `/`, `ConversationView` at `/c/:id`). We deliberately keep this
 // minimal — header chrome lives inside each child so the conversation
-// view can size its title bar freely.
+// view can size its title bar freely. The version footer lives here so
+// it shows on every page.
 export default function App() {
-  // Pull the server-configured tab-title prefix once, up front. Every
-  // page's `usePageTitle` reads it from the same store.
+  // Pull the server config once, up front. Every page's `usePageTitle`
+  // reads the title prefix from the same store; the footer reads the
+  // build version from it.
   const loadConfig = useSiteConfig((s) => s.load);
+  const versionNumber = useSiteConfig((s) => s.versionNumber);
+  const gitVersion = useSiteConfig((s) => s.gitVersion);
   useEffect(() => {
     void loadConfig();
   }, [loadConfig]);
@@ -17,6 +21,14 @@ export default function App() {
   return (
     <div className="app">
       <Outlet />
+      {versionNumber != null && (
+        <footer className="app-footer">
+          <span title={gitVersion ?? undefined}>
+            v{versionNumber}
+            {gitVersion && <> · {gitVersion}</>}
+          </span>
+        </footer>
+      )}
     </div>
   );
 }
