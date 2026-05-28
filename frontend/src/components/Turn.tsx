@@ -84,11 +84,18 @@ export default function Turn({ turnView, users, versions }: Props) {
 
       <div className="turn__assistant">
         <h3>Assistant</h3>
+        {/* A failed turn shows its error in red AND any partial content
+            the model managed to produce (e.g. an image-gen failure where
+            the model still wrote text). "(no response yet)" only when
+            there's genuinely nothing — no content, no error, not failed. */}
+        {turn.error && (
+          <pre className="turn__content turn__content--err">{turn.error}</pre>
+        )}
         {turn.assistant_content ? (
           <pre className="turn__content">{turn.assistant_content}</pre>
-        ) : turn.status === 'failed' ? (
+        ) : turn.error ? null : turn.status === 'failed' ? (
           <pre className="turn__content turn__content--err">
-            {turn.error ?? '(no error message)'}
+            (no error message)
           </pre>
         ) : (
           <em>(no response yet)</em>

@@ -170,6 +170,19 @@ pub struct Turn {
     /// user *at the time the turn was recorded* — names can change but
     /// the historical attribution stays pinned to the turn.
     pub discord_user_name: Option<String>,
+    /// Opaque, provider-tagged continuation state for this turn's final
+    /// assistant response — today xAI's encrypted `reasoning` items,
+    /// shaped `{"provider": "<kind>", "data": [...]}`. Replayed verbatim
+    /// before the assistant message on later turns to keep the prompt
+    /// cache warm (see migration 0009). `None` for non-reasoning turns
+    /// and providers with no such state.
+    ///
+    /// `#[serde(skip)]`: this is encrypted, replay-only model plumbing —
+    /// it must NEVER cross the web API (the viewer embeds the whole `Turn`
+    /// via [`TurnView`]). sqlx `FromRow` populates it from the column
+    /// independently of serde, so DB loads are unaffected.
+    #[serde(skip)]
+    pub provider_state: Option<serde_json::Value>,
 }
 
 /// One row in `context_items`: a single message snapshot that was sent
@@ -419,6 +432,9 @@ mod tests {
             version_id: None,
             discord_user_id: Some(uid),
             discord_user_name: Some("Robert".to_string()),
+            // Populated, so the assertion below proves it's withheld even
+            // when present.
+            provider_state: Some(serde_json::json!({ "provider": "xai", "data": [1] })),
         };
         let view = ConversationView {
             conversation: Conversation {
@@ -444,11 +460,20 @@ mod tests {
         let json = serde_json::to_value(&view).unwrap();
         let key = "1335037364980023356";
         // Map key is the exact snowflake string...
-        assert!(json["users"].get(key).is_some(), "users map key must be the exact id");
+        assert!(
+            json["users"].get(key).is_some(),
+            "users map key must be the exact id"
+        );
         // ...and equals both the embedded id and the turn's user id.
         assert_eq!(json["users"][key]["id"], key);
         assert_eq!(json["turns"][0]["turn"]["discord_user_id"], key);
         // A `None` snowflake option stays JSON null (not "null", not 0).
         assert!(json["turns"][0]["turn"]["assistant_discord_message_id"].is_null());
+        // The encrypted reasoning continuation MUST NOT cross the web API,
+        // even though it's set on the turn. `#[serde(skip)]` enforces this.
+        assert!(
+            json["turns"][0]["turn"].get("provider_state").is_none(),
+            "provider_state leaked into the conversation view JSON"
+        );
     }
 }

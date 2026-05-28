@@ -48,6 +48,21 @@ pub enum VideoGenError {
     Timeout(std::time::Duration),
 }
 
+impl crate::retry::ClassifyError for VideoGenError {
+    fn error_class(&self) -> crate::retry::ErrorClass {
+        use crate::retry::ErrorClass;
+        match self {
+            VideoGenError::Api { status, .. } if *status == 429 || (500..=599).contains(status) => {
+                ErrorClass::ServerTransient
+            }
+            VideoGenError::Transport(_) => ErrorClass::Network,
+            // Decode, upstream failed/expired, and polling timeouts are
+            // terminal — retrying the same HTTP call won't help.
+            _ => ErrorClass::Permanent,
+        }
+    }
+}
+
 /// Input to [`VideoProvider::submit`] (and the convenience `generate`).
 #[derive(Debug, Clone)]
 pub struct VideoGenRequest {

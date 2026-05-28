@@ -82,7 +82,25 @@ Replies are inline by default; the bot auto-opens a thread when the
 answer would exceed 1500 chars (Discord's hard limit is 2000). The
 first reply in a new conversation includes the viewer URL
 (`$WEB_BASE_URL/c/<uuid>`). Web viewer auth: **none** — security relies
-on the unguessable UUID. Status emojis: 👀 working, ✅ success, ❌ error.
+on the unguessable UUID. Status emojis: 👀 working, ✅ success, ❌ error,
+❓ refused (upstream safety / moderation), 🔄 retry affordance on a failed
+turn's reply.
+
+**Resilience & failure handling.** Transient upstream blips (HTTP 5xx /
+429 / transport) are retried with exponential backoff via `core::retry`,
+which wraps every LLM / image / video HTTP call (video `submit` opts out
+of network-error retries so a dropped connection can't double-charge a
+render). If a turn still fails, `run_turn_and_reply` (in `bot` — the
+single seam that owns all user-facing turn output) posts exactly ONE
+`⚠️ …` reply, marks the turn `failed` (persisting the error + any salvaged
+partial content, both shown in the viewer), and adds a 🔄 reaction to its
+own error message. Clicking that 🔄 — or reacting 🔄 on the original
+`@`-mention — re-runs the turn: `handle_reaction` maps the message back to
+its turn and `Db::reset_turn_for_retry` atomically re-runs ONLY the latest
+still-`failed` turn (double-clicks / stale reactions are no-ops; the bot's
+own 🔄 is self-ignored via a `user_id == bot` check). Retry reconstructs
+the LLM history from the DB — no live gateway message — and reuses the
+same `run_turn_and_reply` tail.
 
 Each turn persists the inputs that are NOVEL to that turn in
 `context_items`: the user's `@`-mention, any Discord-reply-quoted

@@ -20,10 +20,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use grok_discord_bot_core::{
-    AgentRun, AnyImageProvider, AnyVideoProvider, ChatTurn, ContextItem, Conversation, Db,
-    ImageProvider, LlmProvider, MessageRole, NoopObserver, Persona, PrivacyMode, ProviderOptions,
-    StepRequest, StepResponse, ToolDefinition, ToolError, ToolExecutor, TurnBlock, VideoProvider,
-    imagegen::ImageGenRequest, run_agent, storage, videogen::VideoGenRequest,
+    AgentRun, AnyImageProvider, AnyProvider, AnyVideoProvider, ChatTurn, ContextItem, Conversation,
+    Db, ImageProvider, LlmProvider, MessageRole, NoopObserver, Persona, PrivacyMode,
+    ProviderOptions, StepRequest, StepResponse, ToolDefinition, ToolError, ToolExecutor, Turn,
+    TurnBlock, VideoProvider, imagegen::ImageGenRequest, run_agent, storage,
+    videogen::VideoGenRequest,
 };
 
 use crate::app::{AppState, EventKind};
@@ -33,8 +34,9 @@ use thiserror::Error;
 use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, StreamExt};
 use twilight_http::Client as HttpClient;
 use twilight_http::request::channel::reaction::RequestReactionType;
-use twilight_model::channel::message::{Mention, MessageFlags};
+use twilight_model::channel::message::{EmojiReactionType, Mention, MessageFlags};
 use twilight_model::channel::{ChannelType, Message};
+use twilight_model::gateway::GatewayReaction;
 use twilight_model::gateway::event::Event;
 use twilight_model::gateway::payload::incoming::GuildCreate;
 use twilight_model::http::attachment::Attachment as HttpAttachment;
@@ -82,14 +84,22 @@ const MAX_REPLAYED_IMAGES: usize = 8;
 /// linked rather than attached (avoids a Discord-side reject).
 const DISCORD_FREE_UPLOAD_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
 
+/// Unicode emoji a user reacts with to retry a failed turn. Reacting it on
+/// either the user's @mention (which carries the ❌) or the bot's error
+/// reply re-runs the turn — see [`handle_reaction`].
+const RETRY_EMOJI: &str = "🔄";
+
 /// System prompt for the pre-flight moderation classifier. The bot
 /// runs in **private friends-only servers**, so the default is ALLOW
 /// and the refusal list is narrowly scoped to genuinely illegal or
 /// near-illegal content. Banter, slurs, dark humor, political shit-
 /// talking, and edgy art requests are explicitly *not* refusals.
 const MODERATION_PROMPT: &str = "You are a TOS compliance classifier for a \
-private friends-only Discord server. The DEFAULT IS ALLOW. Only REFUSE the \
-narrowly listed categories below.
+private friends-only Discord server. Each message you classify is prefixed \
+with the sender's Discord display name as `[name]: ` — use it to apply any \
+sender-specific rules below, but classify the message text itself for the \
+categories. The DEFAULT IS ALLOW. Only REFUSE the narrowly listed categories \
+below.
 
 REFUSE these:
 - CSAM or any sexualization of minors
@@ -110,7 +120,8 @@ discussion, dark or NSFW jokes that don't involve minors, requests to \
 generate edgy art, asking about news/current events, and asking me to \
 explain why someone is wrong about something.
 
-When in any doubt, ALLOW.
+When in any doubt, ALLOW. Unless it's panther. That guy is always trying to get us banned. \
+Be extra careful with panther.
 
 Respond with EXACTLY one token: ALLOW or REFUSE. No punctuation. No \
 explanation.";
@@ -130,6 +141,23 @@ pub enum BotError {
     /// LLM provider error.
     #[error(transparent)]
     Llm(#[from] grok_discord_bot_core::LlmError),
+}
+
+/// Disposition of a finished turn. Returned by [`run_turn_and_reply`] (and
+/// thus `process` / `handle_reaction`) so the caller sets the right
+/// reaction WITHOUT posting another message — the turn machinery already
+/// posted exactly one user-facing reply and finalized the turn row. `Err`
+/// is reserved for infrastructure failures that happened *before* we could
+/// post anything, which the caller surfaces with a generic fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnOutcome {
+    /// Clean success (or media delivered despite a late transient error).
+    Completed,
+    /// The turn posted a user-facing failure message and was marked
+    /// `failed` in the DB.
+    Failed,
+    /// Refused by upstream safety; no user-facing message was posted.
+    Refused,
 }
 
 /// State shared across all message-handler tasks.
@@ -171,7 +199,11 @@ pub async fn run(
     let intents = Intents::GUILDS
         | Intents::GUILD_MESSAGES
         | Intents::MESSAGE_CONTENT
-        | Intents::DIRECT_MESSAGES;
+        | Intents::DIRECT_MESSAGES
+        // Reaction intents power the 🔄-to-retry affordance. Neither is
+        // privileged, so no Developer-Portal toggle is required.
+        | Intents::GUILD_MESSAGE_REACTIONS
+        | Intents::DIRECT_MESSAGE_REACTIONS;
 
     let http = Arc::new(HttpClient::new(discord_token.clone()));
 
@@ -198,7 +230,8 @@ pub async fn run(
     let mut shard = Shard::new(ShardId::ONE, discord_token, intents);
     let watched = EventTypeFlags::MESSAGE_CREATE
         | EventTypeFlags::INTERACTION_CREATE
-        | EventTypeFlags::GUILD_CREATE;
+        | EventTypeFlags::GUILD_CREATE
+        | EventTypeFlags::REACTION_ADD;
 
     let cancel = app.cancel.clone();
     let tracker = app.tracker.clone();
@@ -242,6 +275,12 @@ pub async fn run(
                                 boxed.0,
                             )
                             .await;
+                        });
+                    }
+                    Event::ReactionAdd(boxed) => {
+                        let state = Arc::clone(&state);
+                        tracker.spawn(async move {
+                            handle_reaction(state, boxed.0).await;
                         });
                     }
                     Event::GuildCreate(boxed) => log_guild_create(&boxed),
@@ -315,6 +354,12 @@ async fn moderation_allows(state: &State, content: &str) -> bool {
         // the model to burn tokens reasoning here, even if the
         // persona normally requests high effort.
         provider_options: ProviderOptions::default(),
+        // No cache key: this is a one-shot classification with a short,
+        // static prefix (xAI caches that automatically). A constant key
+        // would only funnel every guild's moderation traffic onto one
+        // server for negligible gain — affinity is worth it only for the
+        // long, growing per-conversation prefix in the main agent loop.
+        cache_key: None,
     };
 
     match provider.step(request).await {
@@ -368,17 +413,6 @@ fn is_upstream_safety_refusal(err: &grok_discord_bot_core::LlmError) -> bool {
 fn body_indicates_safety_refusal(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     lower.contains("safety_check") || lower.contains("violates usage guidelines")
-}
-
-/// Synthesize an [`LlmError`] representing a safety refusal that
-/// happened inside a client-side tool call, so the existing
-/// [`is_upstream_safety_refusal`] dispatch in `handle_message` lights up
-/// and reacts ❓.
-fn synthesize_safety_refusal(reason: &str) -> grok_discord_bot_core::LlmError {
-    grok_discord_bot_core::LlmError::Api {
-        status: 403,
-        body: format!("SAFETY_CHECK refusal: {reason}"),
-    }
 }
 
 /// Top-level handler for one mention. Resolves the privacy mode, gates
@@ -464,9 +498,18 @@ async fn handle_message(state: Arc<State>, msg: Message) {
         .await;
 
     // Pre-flight moderation check — refuse without replying if the
-    // message clearly violates Discord TOS.
+    // message clearly violates Discord TOS. Hand the classifier the
+    // same `[display name]: text` form the main model sees (see
+    // build_context), so author-targeted rules in MODERATION_PROMPT can
+    // act on who is speaking, not just what was said.
     let stripped = strip_mentions(&msg.content, state.bot_user_id);
-    if !stripped.is_empty() && !moderation_allows(&state, &stripped).await {
+    if !stripped.is_empty()
+        && !moderation_allows(
+            &state,
+            &format!("[{}]: {stripped}", best_display_name(&msg)),
+        )
+        .await
+    {
         tracing::info!(
             author = %msg.author.name,
             channel = %msg.channel_id,
@@ -492,24 +535,33 @@ async fn handle_message(state: Arc<State>, msg: Message) {
         .await;
 
     match result {
-        Ok(()) => {
+        Ok(TurnOutcome::Completed) => {
             let _ = state
                 .http
                 .create_reaction(msg.channel_id, msg.id, &done)
                 .await;
         }
-        Err(BotError::Llm(ref llm_err)) if is_upstream_safety_refusal(llm_err) => {
-            tracing::info!(
-                error = %llm_err,
-                "message refused by upstream safety check; reacting ❓"
-            );
+        Ok(TurnOutcome::Refused) => {
+            tracing::info!("message refused by upstream safety check; reacting ❓");
             let _ = state
                 .http
                 .create_reaction(msg.channel_id, msg.id, &refused)
                 .await;
         }
+        Ok(TurnOutcome::Failed) => {
+            // `process` already posted the single user-facing error
+            // message and marked the turn failed in the DB; we only set
+            // the reaction here (no second message).
+            let _ = state
+                .http
+                .create_reaction(msg.channel_id, msg.id, &failed)
+                .await;
+        }
         Err(err) => {
-            tracing::error!(error = %err, "message handler failed");
+            // An infrastructure failure *before* the turn machinery posted
+            // a reply (e.g. a DB write mid-setup). Surface a generic
+            // fallback so the user isn't left with a bare 👀→nothing.
+            tracing::error!(error = %err, "message handler failed before a reply was posted");
             let _ = state
                 .http
                 .create_reaction(msg.channel_id, msg.id, &failed)
@@ -533,7 +585,11 @@ async fn handle_message(state: Arc<State>, msg: Message) {
 /// Full happy-path: resolve conversation, build initial context, run
 /// the agent loop with `fetch_messages` available, persist everything,
 /// post the reply.
-async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Result<(), BotError> {
+async fn process(
+    state: &State,
+    msg: &Message,
+    privacy_mode: &PrivacyMode,
+) -> Result<TurnOutcome, BotError> {
     let preview_chars = msg.content.chars().take(80).collect::<String>();
     tracing::info!(
         author = %msg.author.name,
@@ -808,21 +864,85 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
     }
     state.publish(conversation.id, EventKind::ContextItemAdded);
 
-    // Build the LLM-facing chat history from the initial context items.
-    // Text items map 1:1 to chat turns. Image items attach as
-    // `TurnBlock::Image` to the user turn they belong to — which is
-    // always the message we just pushed, because `build_context` orders
-    // each turn's image rows immediately after its user-text row:
-    //   - `turn:<id>:image:*` are prior-turn images, served from our own
-    //     storage so the URL outlives Discord's expiring CDN links;
-    //   - `discord:msg:*:image:*` are this turn's freshly-uploaded
-    //     attachments, attached below with the live Discord URL.
+    // Assemble the LLM-facing chat history from the context items, with
+    // this turn's freshly-uploaded images attached via their live Discord
+    // URLs. Extracted so the 🔄-retry path reuses identical assembly.
+    let messages = assemble_messages(&initial_context, &saved_images, &state.web_base_url);
+
+    // Resolve tools + executor, drive the agent loop, post exactly one
+    // reply, and finalize the turn row. Shared with the retry path.
+    run_turn_and_reply(
+        state,
+        &conversation,
+        &turn,
+        is_new,
+        msg.channel_id,
+        msg.id,
+        &msg.content,
+        privacy_mode,
+        &persona_name,
+        persona,
+        provider,
+        image_provider,
+        video_provider,
+        messages,
+    )
+    .await
+}
+
+/// Build the LLM-facing chat history from a turn's ordered context items.
+///
+/// - Text items map 1:1 to chat turns.
+/// - Image items attach as [`TurnBlock::Image`] to the user turn they
+///   belong to (`build_context` / the retry builder order each turn's
+///   image rows immediately after its user-text row):
+///   - `turn:<id>:image:*` are served from our own storage via
+///     [`storage::to_public_url`] (the URL outlives Discord's expiring CDN
+///     links). The retry path relabels *this* turn's uploads to this form
+///     too, since the original Discord URL is long gone.
+///   - `discord:msg:*:image:*` are skipped here — on the live gateway path
+///     they're attached below from `saved_images` with the fresh Discord
+///     URL (reachable even in local dev).
+///
+/// A reference annotation lists every in-context image by its stable
+/// `file://` id so the model can pass one to `generate_image`'s
+/// `reference_images` to edit or restyle it.
+fn assemble_messages(
+    initial_context: &[ContextItem],
+    saved_images: &[SavedImage],
+    web_base_url: &str,
+) -> Vec<ChatTurn> {
     let mut messages: Vec<ChatTurn> = Vec::new();
-    for c in &initial_context {
+    // A `turn:<id>:reasoning` item carries the opaque {provider, data}
+    // continuation blob for the assistant message that immediately
+    // follows it; hold it until we build that assistant turn.
+    let mut pending_reasoning: Option<TurnBlock> = None;
+    for c in initial_context {
+        if c.source.starts_with("turn:") && c.source.ends_with(":reasoning") {
+            match serde_json::from_str::<serde_json::Value>(&c.content) {
+                Ok(mut blob) => {
+                    let provider_name = blob
+                        .get("provider")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let data = blob
+                        .get_mut("data")
+                        .map(serde_json::Value::take)
+                        .unwrap_or(serde_json::Value::Null);
+                    pending_reasoning = Some(TurnBlock::Reasoning {
+                        provider_name,
+                        data,
+                    });
+                }
+                Err(e) => tracing::warn!(error = %e, "skipping unparseable reasoning replay blob"),
+            }
+            continue;
+        }
         if c.source.starts_with("turn:") && c.source.contains(":image:") {
             match (
                 messages.last_mut(),
-                storage::to_public_url(&c.content, &state.web_base_url),
+                storage::to_public_url(&c.content, web_base_url),
             ) {
                 (Some(last), Some(url)) => last.blocks.push(TurnBlock::Image {
                     url,
@@ -840,23 +960,24 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
             // This turn's upload — handled by the `saved_images` block below.
             continue;
         }
-        messages.push(ChatTurn::text(
-            MessageRole::from_str_lossy(&c.role),
-            c.content.clone(),
-        ));
+        let role = MessageRole::from_str_lossy(&c.role);
+        let mut blocks: Vec<TurnBlock> = Vec::new();
+        // Reasoning leads the assistant turn it was captured before.
+        if role == MessageRole::Assistant
+            && let Some(reasoning) = pending_reasoning.take()
+        {
+            blocks.push(reasoning);
+        }
+        blocks.push(TurnBlock::Text(c.content.clone()));
+        messages.push(ChatTurn { role, blocks });
     }
-    // Reference annotation: list every image currently in context — prior
-    // turns AND this message — by its stable `file://` id, so the model
-    // can pass one to `generate_image`'s `reference_images` to edit or
-    // restyle it. The pixels are already *visible* (prior turns as
-    // served-URL image blocks attached above; this turn's uploads as
-    // live-URL blocks below), but vision blocks aren't quotable strings —
-    // the model needs the ids in text. `file://` is the most robust
-    // reference: `generate_image` base64-encodes it from disk, so editing
-    // works without our server being publicly reachable and never trips
-    // over Discord's CDN expiry. Both prior (`turn:*:image:*`) and current
-    // (`discord:msg:*:image:*`) image rows carry the `file://` URI in
-    // `content`, so one filter covers them.
+    // Reference annotation: list every image currently in context by its
+    // stable `file://` id. The pixels are already *visible* (as image
+    // blocks), but vision blocks aren't quotable strings — the model needs
+    // the ids in text to pass one to `generate_image`. `file://` is the
+    // most robust reference: `generate_image` base64-encodes it from disk,
+    // so editing works without our server being publicly reachable and
+    // never trips over Discord's CDN expiry.
     let reference_lines: Vec<String> = initial_context
         .iter()
         .filter(|c| c.source.contains(":image:"))
@@ -887,19 +1008,48 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
         // Vision for this turn's uploads: the live Discord URL is fresh and
         // reachable without our own server, so the model can *see* them
         // even in local dev. (Prior-turn images were already attached as
-        // served-URL blocks during message assembly.)
-        for image in &saved_images {
+        // served-URL blocks during message assembly. On retry this slice
+        // is empty — those uploads were relabeled `turn:*:image:*` above.)
+        for image in saved_images {
             last.blocks.push(TurnBlock::Image {
                 url: image.live_url.clone(),
                 mime_type: image.mime_type.clone(),
             });
         }
     }
+    messages
+}
 
-    // Tools available to the model for this turn:
+/// Shared tail for running a turn: build tools + executor, drive the agent
+/// loop, persist tool calls, post **exactly one** user-facing reply, and
+/// finalize the turn row. Used by both the gateway create path
+/// (`process`) and the 🔄-reaction retry path (`handle_reaction`).
+///
+/// Returns the [`TurnOutcome`] so the caller sets the reaction emoji
+/// WITHOUT posting another message — this is the single seam that owns all
+/// user-facing turn output, which is why a failed turn now posts one
+/// message (not the old two) and is marked `failed` (not `completed`).
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_and_reply(
+    state: &State,
+    conversation: &Conversation,
+    turn: &Turn,
+    is_new: bool,
+    channel_id: Id<ChannelMarker>,
+    reply_to: Id<MessageMarker>,
+    user_content: &str,
+    privacy_mode: &PrivacyMode,
+    persona_name: &str,
+    persona: &Persona,
+    provider: &AnyProvider,
+    image_provider: Option<AnyImageProvider>,
+    video_provider: Option<AnyVideoProvider>,
+    messages: Vec<ChatTurn>,
+) -> Result<TurnOutcome, BotError> {
+    // Tools available this turn:
     //   - fetch_messages: every mode except ConversationOnly
-    //   - generate_image / generate_video: only when the resolved
-    //     persona names a backend that's actually configured
+    //   - generate_image / generate_video: only when the resolved persona
+    //     names a backend that's actually configured
     //   - post_status_message: always available
     let tools = build_tool_definitions(
         privacy_mode,
@@ -911,8 +1061,8 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
         http: Arc::clone(&state.http),
         db: state.db.clone(),
         bot_user_id: state.bot_user_id,
-        default_channel_id: msg.channel_id,
-        user_msg_id: msg.id,
+        default_channel_id: channel_id,
+        user_msg_id: reply_to,
         guild_id: conversation.discord_guild_id,
         conversation_id: conversation.id,
         turn_id: turn.id,
@@ -939,11 +1089,17 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
             xai: persona.xai.clone(),
             anthropic: persona.anthropic.clone(),
         },
+        // Stable cache-routing key: the conversation UUID. Every
+        // agent-loop iteration and every later turn re-sends the
+        // growing prefix, so pinning all of them to one
+        // `prompt_cache_key` keeps xAI's prefix cache hitting.
+        Some(conversation.id.to_string()),
         MAX_AGENT_ITERATIONS,
     )
     .await;
 
-    // Persist all tool calls (server + client) in execution order.
+    // Persist all tool calls (server + client) in execution order — even
+    // on a failed run, so the trace shows the failed generate_image etc.
     for (i, tc) in agent_run.tool_calls.iter().enumerate() {
         state
             .db
@@ -961,11 +1117,10 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
     )
     .await;
 
-    // If any generate_image or check_video_status call was refused by
-    // xAI's safety layer, treat the whole turn as a TOS refusal and
-    // bail out with ❓ — same shape as if the chat call itself had
-    // been refused. We do this BEFORE the generic media-failed path so
-    // a safety 403 doesn't get a ❌ + warning-text reply.
+    // --- Safety refusal: a media tool refused, OR the chat call itself
+    // refused (a 403 whose body trips the safety matcher). No user-facing
+    // message — mark the turn failed and react ❓. Checked first so a
+    // safety 403 never gets a ❌ + raw-error reply.
     let media_safety_refused = agent_run.tool_calls.iter().any(|tc| {
         matches!(tc.tool_name.as_str(), "generate_image" | "generate_video")
             && tc
@@ -975,27 +1130,29 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
                 .map(body_indicates_safety_refusal)
                 .unwrap_or(false)
     });
-    if media_safety_refused {
+    let chat_safety_refused = agent_run
+        .error
+        .as_deref()
+        .map(body_indicates_safety_refusal)
+        .unwrap_or(false);
+    if media_safety_refused || chat_safety_refused {
         tracing::info!(
             conversation = %conversation.id,
             turn = %turn.id,
-            "media generation refused by upstream safety; surfacing as TOS refusal"
+            "turn refused by upstream safety; reacting ❓"
         );
         state
             .db
-            .fail_turn(turn.id, "media generation refused by upstream safety")
+            .fail_turn(turn.id, "refused by upstream safety")
             .await
             .ok();
         state.publish(conversation.id, EventKind::TurnUpdated);
-        return Err(BotError::Llm(synthesize_safety_refusal(
-            "media generation was refused by xAI's safety policy",
-        )));
+        return Ok(TurnOutcome::Refused);
     }
 
-    // Detect "model claimed success but media generation failed" — any
-    // generate_image call with no image_uri in its response, or any
-    // start_video_generation that never reached a check_video_status
-    // result with a video_uri.
+    // --- Detect "media generation attempted but produced no output" — a
+    // generate_image call with no image_uri, or a generate_video with no
+    // video_uri, in any response.
     let attempted_image_gen = agent_run
         .tool_calls
         .iter()
@@ -1021,57 +1178,61 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
         (false, true) => "Video generation",
         (false, false) => "Media generation",
     };
-    // Partial-success handling: if the agent loop errored mid-flight
-    // (e.g. xAI returned a transient 5xx on the final-answer step) but
-    // we already have generated media or some prior assistant text,
-    // surface what we have rather than dumping the raw error on the
-    // user.
+
     let agent_loop_error = agent_run.error.as_deref();
     let have_media = !generated_attachments.is_empty();
+    // What the model actually said (may be empty). If media generated but
+    // the loop died before the closing line, fall back to a minimal ack.
     let final_content: String = if !agent_run.content.is_empty() {
         agent_run.content.clone()
     } else if have_media && agent_loop_error.is_some() {
-        // Media generated, but the model never got to write the
-        // closing line. Post the media with a minimal acknowledgement.
         "Here you go.".to_string()
     } else {
         agent_run.content.clone()
     };
 
+    // A failure is: media attempted-but-empty, OR a bare loop error with
+    // no media to salvage. (Media delivered despite a late transient error
+    // is still a success — the user got their picture/video.)
+    let is_failure = media_gen_failed || (agent_loop_error.is_some() && !have_media);
+
     let answer_text = if media_gen_failed {
         format!("⚠️ {failure_label} failed.\n\n{final_content}")
-    } else if let Some(err) = agent_loop_error {
-        if have_media {
-            // The interesting work succeeded; the failed step was the
-            // final-answer LLM call. Keep the reply concise.
+    } else if agent_loop_error.is_some() && !have_media {
+        let snippet = agent_loop_error
+            .unwrap_or_default()
+            .chars()
+            .take(200)
+            .collect::<String>();
+        format!("⚠️ {snippet}")
+    } else {
+        // Success, or media delivered despite a late error.
+        if let Some(err) = agent_loop_error {
             tracing::warn!(
                 conversation = %conversation.id,
                 turn = %turn.id,
                 error = %err,
                 "agent loop errored after media generation succeeded; \
-                 falling back to short reply + attachment"
+                 short reply + attachment"
             );
-            final_content
-        } else {
-            // Nothing useful happened. Surface the error briefly so the
-            // user knows the turn died.
-            let snippet = err.chars().take(200).collect::<String>();
-            format!("⚠️ {snippet}")
         }
-    } else {
-        final_content
+        final_content.clone()
     };
-    let formatted = format_reply(&answer_text, is_new, &conversation, &state.web_base_url);
+
+    // Post exactly one reply.
+    let formatted = format_reply(&answer_text, is_new, conversation, &state.web_base_url);
     let chunks = assemble_chunks(&formatted);
     let total_rendered_lines: usize = chunks.iter().map(|c| rendered_line_count(c)).sum();
     let threaded = should_open_thread(is_new, &chunks);
     let reply_msgs = post_reply_chunks(
         state,
-        msg,
+        channel_id,
+        reply_to,
+        user_content,
         &chunks,
         is_new,
         &generated_attachments,
-        &conversation,
+        conversation,
         turn.id,
     )
     .await?;
@@ -1079,14 +1240,7 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
         .last()
         .cloned()
         .expect("post_reply_chunks always returns at least one message");
-    if media_gen_failed {
-        tracing::warn!(
-            conversation = %conversation.id,
-            turn = %turn.id,
-            label = failure_label,
-            "media generation was attempted but produced no output; reply marked as failed"
-        );
-    }
+    let reply_msg_id = i64::try_from(reply_msg.id.get()).unwrap_or(i64::MAX);
     tracing::info!(
         conversation = %conversation.id,
         turn = %turn.id,
@@ -1096,48 +1250,360 @@ async fn process(state: &State, msg: &Message, privacy_mode: &PrivacyMode) -> Re
         reply_chars = agent_run.content.len(),
         rendered_lines = total_rendered_lines,
         tool_calls = agent_run.tool_calls.len(),
+        is_failure,
         "turn: reply posted"
     );
+
+    // Finalize the turn row. Failure path stores the REAL underlying error
+    // (not the cosmetic ⚠️ text) plus any salvaged content, so the viewer
+    // shows the error in red AND whatever the model managed to say.
+    if is_failure {
+        let real_error = if media_gen_failed {
+            match agent_loop_error {
+                Some(err) => format!("{failure_label} produced no output; {err}"),
+                None => format!("{failure_label} produced no output"),
+            }
+        } else {
+            agent_loop_error.unwrap_or("unknown error").to_string()
+        };
+        let salvaged = (!final_content.is_empty()).then_some(final_content.as_str());
+        state
+            .db
+            .fail_turn_with_reply(turn.id, &real_error, salvaged, Some(reply_msg_id))
+            .await?;
+        state.publish(conversation.id, EventKind::TurnUpdated);
+        // Add a 🔄 affordance to our own failure message so the user can
+        // one-click retry. `handle_reaction` resolves the reacted message
+        // back to this turn (the reply is message-linked), and the bot's
+        // own reaction here is self-ignored — it just sits there clickable
+        // until a human adds theirs. Reacts on the reply's actual channel
+        // so it's correct even in the rare threaded case.
+        let _ = state
+            .http
+            .create_reaction(
+                reply_msg.channel_id,
+                reply_msg.id,
+                &RequestReactionType::Unicode { name: RETRY_EMOJI },
+            )
+            .await;
+        tracing::warn!(
+            conversation = %conversation.id,
+            turn = %turn.id,
+            error = %real_error,
+            "turn: marked failed"
+        );
+        return Ok(TurnOutcome::Failed);
+    }
 
     state
         .db
         .complete_turn(
             turn.id,
             &agent_run.content,
-            i64::try_from(reply_msg.id.get()).unwrap_or(i64::MAX),
+            reply_msg_id,
+            // Opaque, provider-tagged reasoning continuation — replayed
+            // before this turn's answer on later turns to keep the prompt
+            // cache warm. NULL for non-reasoning providers/models.
+            agent_run.provider_state.as_ref(),
         )
         .await?;
     state.publish(conversation.id, EventKind::TurnUpdated);
-    // Note: user + assistant message_links are recorded earlier — the
-    // user link right after start_turn (so thread continuation works
-    // even on partial failures), and assistant chunks inside
-    // post_reply_chunks as each one is posted.
 
-    // If this was the first completed turn on a fresh conversation,
-    // schedule a background title generation task. The task drops
-    // itself if the conversation already has a title (we never auto-
-    // regenerate; user-driven retitles can be added later).
+    // First completed turn on a conversation → schedule background title
+    // generation. The task drops itself if a title already exists, so this
+    // is safe to fire from a retry of turn 0 too.
     if turn.turn_index == 0 {
         crate::titles::spawn_generate(
             Arc::clone(&state.app),
             conversation.id,
-            persona_name.clone(),
+            persona_name.to_string(),
         );
     }
 
-    if media_gen_failed {
-        // Bubble the failure up so handle_message reacts ❌ instead of ✅.
-        return Err(BotError::Llm(grok_discord_bot_core::LlmError::Transport(
-            format!("{failure_label} was attempted but produced no output"),
-        )));
+    Ok(TurnOutcome::Completed)
+}
+
+/// Gate an incoming reaction: act only on the 🔄 retry emoji (and never on
+/// our own reactions), resolve the reacted message to its turn, and hand
+/// off to [`retry_turn`]. Everything else is a silent no-op.
+async fn handle_reaction(state: Arc<State>, reaction: GatewayReaction) {
+    let is_retry = matches!(
+        &reaction.emoji,
+        EmojiReactionType::Unicode { name } if name == RETRY_EMOJI
+    );
+    if !is_retry || reaction.user_id == state.bot_user_id {
+        return;
     }
-    if let Some(err) = agent_loop_error
-        && !have_media
+
+    let message_id = i64::try_from(reaction.message_id.get()).unwrap_or(i64::MAX);
+    let turn_id = match state.db.lookup_turn_by_message(message_id).await {
+        Ok(Some(id)) => id,
+        // Reaction on a message that isn't part of any turn (or a DB
+        // hiccup) — nothing to retry.
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(error = %err, message_id, "retry: turn lookup failed");
+            return;
+        }
+    };
+
+    if let Err(err) = retry_turn(&state, turn_id, reaction.channel_id).await {
+        tracing::error!(error = %err, %turn_id, "retry: failed to re-run turn");
+    }
+}
+
+/// Re-run a previously-failed turn (triggered by a 🔄 reaction). Confirms
+/// it's the latest failed turn (atomic), cleans up the prior failed reply,
+/// reconstructs the LLM history from the DB (no live gateway `Message`),
+/// and drives the shared [`run_turn_and_reply`] tail. Manages the reaction
+/// on the user's original message (❌ → 👀 → ✅/❌/❓).
+async fn retry_turn(
+    state: &State,
+    turn_id: Uuid,
+    channel_id: Id<ChannelMarker>,
+) -> Result<(), BotError> {
+    let Some(turn) = state.db.get_turn(turn_id).await? else {
+        return Ok(());
+    };
+    let Some(conversation) = state.db.get_conversation(turn.conversation_id).await? else {
+        return Ok(());
+    };
+
+    // Atomic gate: only the LATEST turn, and only while it's `failed`.
+    // The same statement flips it to `pending`, so a double 🔄 or a stale
+    // reaction on an older turn is a silent no-op.
+    if !state
+        .db
+        .reset_turn_for_retry(turn.id, conversation.id)
+        .await?
     {
-        // Bare error, nothing to salvage — ❌.
-        return Err(BotError::Llm(grok_discord_bot_core::LlmError::Transport(
-            err.to_string(),
-        )));
+        tracing::info!(
+            %turn_id,
+            status = %turn.status,
+            "retry: turn not eligible (not failed, or not the latest turn); ignoring"
+        );
+        return Ok(());
+    }
+    tracing::info!(%turn_id, conversation = %conversation.id, "retry: re-running failed turn");
+    state.publish(conversation.id, EventKind::TurnUpdated);
+
+    let working = RequestReactionType::Unicode { name: "👀" };
+    let done = RequestReactionType::Unicode { name: "✅" };
+    let failed = RequestReactionType::Unicode { name: "❌" };
+    let refused = RequestReactionType::Unicode { name: "❓" };
+
+    // The user's original message — what we reply to and react on.
+    let Some(user_msg_id) = u64::try_from(turn.user_discord_message_id)
+        .ok()
+        .and_then(Id::<MessageMarker>::new_checked)
+    else {
+        tracing::warn!(%turn_id, "retry: turn has no valid user message id; aborting");
+        state
+            .db
+            .fail_turn(turn.id, "retry: invalid user message id")
+            .await
+            .ok();
+        state.publish(conversation.id, EventKind::TurnUpdated);
+        return Ok(());
+    };
+
+    // Re-resolve everything the turn needs — same as `process` does for a
+    // live mention, but sourced from the DB. All fallible DB reads happen
+    // BEFORE we touch Discord, so a propagated error never leaves a
+    // dangling 👀.
+    let guild_id = conversation.discord_guild_id;
+    let guild_opt = (guild_id != 0).then_some(guild_id);
+    let privacy_mode = state
+        .db
+        .guild_privacy_mode_or(guild_id, &state.default_privacy)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "retry: privacy mode load failed; using default");
+            state.default_privacy.clone()
+        });
+
+    let user_id = turn.discord_user_id.unwrap_or(0);
+    let persona_channel = parent_channel_id(&state.http, channel_id).await;
+    let persona_channel_i64 = i64::try_from(persona_channel.get()).unwrap_or(i64::MAX);
+    let resolved_persona_name = state
+        .db
+        .resolve_persona(
+            Some(conversation.id),
+            guild_opt,
+            persona_channel_i64,
+            user_id,
+        )
+        .await?
+        .unwrap_or_else(|| state.default_persona.clone());
+    let (persona_name, persona) = match state.personas.get(&resolved_persona_name) {
+        Some(p) => (resolved_persona_name, p),
+        None => (
+            state.default_persona.clone(),
+            state
+                .personas
+                .get(&state.default_persona)
+                .expect("default_persona validated at startup"),
+        ),
+    };
+    let Some(provider) = state.providers.get(&persona.provider) else {
+        tracing::error!(
+            persona = %persona_name,
+            provider = persona.provider.as_str(),
+            "retry: no provider initialized for resolved persona"
+        );
+        state
+            .db
+            .fail_turn(turn.id, "retry: persona's provider not configured")
+            .await
+            .ok();
+        state.publish(conversation.id, EventKind::TurnUpdated);
+        let _ = state
+            .http
+            .create_reaction(channel_id, user_msg_id, &failed)
+            .await;
+        return Ok(());
+    };
+
+    let image_provider = persona
+        .image_provider
+        .and_then(|kind| state.image_providers.get(&kind).cloned());
+    let video_provider = persona
+        .video_provider
+        .and_then(|kind| state.video_providers.get(&kind).cloned());
+
+    let system_prompt = compose_system_prompt(
+        persona,
+        &privacy_mode,
+        image_provider.is_some(),
+        video_provider.is_some(),
+        state.app_version,
+        state.extra_system_prompt.as_deref(),
+    );
+    // Re-stamp persona + system-prompt snapshot for the viewer (overwrites
+    // the failed attempt's). Best-effort.
+    let _ = state.db.set_turn_persona(turn.id, &persona_name).await;
+    let _ = state
+        .db
+        .record_turn_system_prompt(turn.id, &system_prompt)
+        .await;
+
+    // Rebuild the LLM history from the DB: system prompt + prior completed
+    // turns + this turn's own persisted novel items.
+    let mut context: Vec<ContextItem> = Vec::new();
+    let mut pos: i32 = 0;
+    push_item(
+        &mut context,
+        &mut pos,
+        "system".to_string(),
+        "system",
+        system_prompt,
+        None,
+    );
+    history_context_items(state, &conversation, &mut context, &mut pos).await?;
+    for item in state.db.load_turn_context(turn.id).await? {
+        // Relabel this turn's image uploads `discord:msg:<id>:image:<i>` →
+        // `turn:<turnid>:image:<i>` so `assemble_messages` serves them from
+        // our own storage — the original Discord CDN URL has long expired.
+        let source = match item.source.split_once(":image:") {
+            Some((_, idx)) => format!("turn:{}:image:{idx}", turn.id),
+            None => item.source,
+        };
+        push_item(
+            &mut context,
+            &mut pos,
+            source,
+            &item.role,
+            item.content,
+            item.discord_message_id,
+        );
+    }
+    let messages = assemble_messages(&context, &[], &state.web_base_url);
+
+    // Wipe the failed attempt's tool-call rows so the re-run's fresh rows
+    // don't collide on (turn_id, ordinal). Last fallible op before we touch
+    // Discord.
+    state.db.delete_turn_tool_calls(turn.id).await?;
+
+    // Discord side effects: drop the prior (failed) reply message(s) so the
+    // retry doesn't stack a second reply, clear the ❌, and show 👀.
+    match state.db.assistant_message_ids_for_turn(turn.id).await {
+        Ok(ids) => {
+            for mid in ids {
+                if let Some(id) = u64::try_from(mid)
+                    .ok()
+                    .and_then(Id::<MessageMarker>::new_checked)
+                {
+                    let _ = state.http.delete_message(channel_id, id).await;
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, %turn_id, "retry: couldn't list prior reply messages");
+        }
+    }
+    let _ = state
+        .http
+        .delete_current_user_reaction(channel_id, user_msg_id, &failed)
+        .await;
+    let _ = state
+        .http
+        .create_reaction(channel_id, user_msg_id, &working)
+        .await;
+
+    let user_content = turn.user_content.clone();
+    let result = run_turn_and_reply(
+        state,
+        &conversation,
+        &turn,
+        false, // is_new: a retry replies inline (no viewer-URL footer / auto-thread)
+        channel_id,
+        user_msg_id,
+        &user_content,
+        &privacy_mode,
+        &persona_name,
+        persona,
+        provider,
+        image_provider,
+        video_provider,
+        messages,
+    )
+    .await;
+
+    let _ = state
+        .http
+        .delete_current_user_reaction(channel_id, user_msg_id, &working)
+        .await;
+    match &result {
+        Ok(TurnOutcome::Completed) => {
+            let _ = state
+                .http
+                .create_reaction(channel_id, user_msg_id, &done)
+                .await;
+        }
+        Ok(TurnOutcome::Refused) => {
+            let _ = state
+                .http
+                .create_reaction(channel_id, user_msg_id, &refused)
+                .await;
+        }
+        Ok(TurnOutcome::Failed) => {
+            let _ = state
+                .http
+                .create_reaction(channel_id, user_msg_id, &failed)
+                .await;
+        }
+        Err(err) => {
+            // The run errored before it could finalize the turn (and post
+            // its own message). Restore the `failed` status so the turn
+            // stays retryable, and react ❌.
+            tracing::error!(error = %err, %turn_id, "retry: run failed before finalizing");
+            state.db.fail_turn(turn.id, &err.to_string()).await.ok();
+            state.publish(conversation.id, EventKind::TurnUpdated);
+            let _ = state
+                .http
+                .create_reaction(channel_id, user_msg_id, &failed)
+                .await;
+        }
     }
     Ok(())
 }
@@ -1199,6 +1665,103 @@ async fn lookup_existing_conversation(
     Ok(None)
 }
 
+/// Append a conversation's prior **completed** turns (user text, replayed
+/// images, assistant text) to `items`, advancing `pos`. Factored out of
+/// [`build_context`] so the 🔄-retry path can reconstruct an identical
+/// history without a live Discord [`Message`]. Replay images are capped to
+/// the most recent [`MAX_REPLAYED_IMAGES`] (oldest dropped, logged).
+async fn history_context_items(
+    state: &State,
+    conversation: &Conversation,
+    items: &mut Vec<ContextItem>,
+    pos: &mut i32,
+) -> Result<(), BotError> {
+    let history = state.db.load_conversation_history(conversation.id).await?;
+
+    // Replayable images from earlier turns (user-uploaded + model-
+    // generated), capped to the most recent N. Capping from the
+    // chronological front drops the OLDEST first. Grouped by turn so
+    // each image re-attaches to the user message it belongs to; the
+    // message-assembly step turns these rows into `Image` blocks.
+    let mut replay = state
+        .db
+        .load_conversation_image_uris(conversation.id)
+        .await?;
+    if replay.len() > MAX_REPLAYED_IMAGES {
+        let dropped = replay.len() - MAX_REPLAYED_IMAGES;
+        tracing::info!(
+            conversation = %conversation.id,
+            dropped,
+            cap = MAX_REPLAYED_IMAGES,
+            "replaying only the most recent images; older ones dropped from context"
+        );
+        replay.drain(0..dropped);
+    }
+    let mut images_by_turn: HashMap<Uuid, Vec<String>> = HashMap::new();
+    for img in replay {
+        images_by_turn.entry(img.turn_id).or_default().push(img.uri);
+    }
+
+    for turn in history {
+        // Prefix prior turns' user text with the historical display
+        // name pinned on the turn row. Falls back to "user" for
+        // legacy turns predating the identity-tracking feature.
+        let prior_name = turn.discord_user_name.as_deref().unwrap_or("user");
+        push_item(
+            items,
+            pos,
+            format!("turn:{}:user", turn.id),
+            "user",
+            format!("[{prior_name}]: {}", turn.user_content),
+            Some(turn.user_discord_message_id),
+        );
+        // Re-attach this turn's surviving images immediately after
+        // its user text. `content` carries the stored `file://` URI;
+        // message assembly resolves it to a served URL. These rows
+        // are NOT persisted (only `discord:msg:` items are), so they
+        // never feed back into `load_conversation_image_uris`.
+        if let Some(uris) = images_by_turn.get(&turn.id) {
+            for (i, uri) in uris.iter().enumerate() {
+                push_item(
+                    items,
+                    pos,
+                    format!("turn:{}:image:{i}", turn.id),
+                    "user",
+                    uri.clone(),
+                    None,
+                );
+            }
+        }
+        if let Some(answer) = turn.assistant_content {
+            // Replay this turn's opaque reasoning continuation (if any)
+            // immediately before its answer — the position the provider
+            // emitted it, and where the cache prefix expects it. Carried
+            // as a transient item (source not `discord:msg:`, so never
+            // persisted); `assemble_messages` decodes the {provider,data}
+            // blob and attaches it to the reconstructed assistant turn.
+            if let Some(state) = &turn.provider_state {
+                push_item(
+                    items,
+                    pos,
+                    format!("turn:{}:reasoning", turn.id),
+                    "assistant",
+                    state.to_string(),
+                    None,
+                );
+            }
+            push_item(
+                items,
+                pos,
+                format!("turn:{}:assistant", turn.id),
+                "assistant",
+                answer,
+                turn.assistant_discord_message_id,
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Assemble the initial prompt for the agent loop. The model can
 /// always pull more channel history on demand via `fetch_messages`, so
 /// this only needs to include:
@@ -1230,73 +1793,9 @@ async fn build_context(
     );
 
     if !is_new {
-        let history = state.db.load_conversation_history(conversation.id).await?;
-
-        // Replayable images from earlier turns (user-uploaded + model-
-        // generated), capped to the most recent N. Capping from the
-        // chronological front drops the OLDEST first. Grouped by turn so
-        // each image re-attaches to the user message it belongs to; the
-        // message-assembly step turns these rows into `Image` blocks.
-        let mut replay = state
-            .db
-            .load_conversation_image_uris(conversation.id)
-            .await?;
-        if replay.len() > MAX_REPLAYED_IMAGES {
-            let dropped = replay.len() - MAX_REPLAYED_IMAGES;
-            tracing::info!(
-                conversation = %conversation.id,
-                dropped,
-                cap = MAX_REPLAYED_IMAGES,
-                "replaying only the most recent images; older ones dropped from context"
-            );
-            replay.drain(0..dropped);
-        }
-        let mut images_by_turn: HashMap<Uuid, Vec<String>> = HashMap::new();
-        for img in replay {
-            images_by_turn.entry(img.turn_id).or_default().push(img.uri);
-        }
-
-        for turn in history {
-            // Prefix prior turns' user text with the historical display
-            // name pinned on the turn row. Falls back to "user" for
-            // legacy turns predating the identity-tracking feature.
-            let prior_name = turn.discord_user_name.as_deref().unwrap_or("user");
-            push_item(
-                &mut items,
-                &mut pos,
-                format!("turn:{}:user", turn.id),
-                "user",
-                format!("[{prior_name}]: {}", turn.user_content),
-                Some(turn.user_discord_message_id),
-            );
-            // Re-attach this turn's surviving images immediately after
-            // its user text. `content` carries the stored `file://` URI;
-            // message assembly resolves it to a served URL. These rows
-            // are NOT persisted (only `discord:msg:` items are), so they
-            // never feed back into `load_conversation_image_uris`.
-            if let Some(uris) = images_by_turn.get(&turn.id) {
-                for (i, uri) in uris.iter().enumerate() {
-                    push_item(
-                        &mut items,
-                        &mut pos,
-                        format!("turn:{}:image:{i}", turn.id),
-                        "user",
-                        uri.clone(),
-                        None,
-                    );
-                }
-            }
-            if let Some(answer) = turn.assistant_content {
-                push_item(
-                    &mut items,
-                    &mut pos,
-                    format!("turn:{}:assistant", turn.id),
-                    "assistant",
-                    answer,
-                    turn.assistant_discord_message_id,
-                );
-            }
-        }
+        // Prior completed turns + their replayable images. Shared with
+        // the retry path so the two reconstruct identical history.
+        history_context_items(state, conversation, &mut items, &mut pos).await?;
     } else if let Some(referenced) = &msg.referenced_message
         && !referenced.author.bot
         && quoted_message_allowed(state, conversation, referenced, privacy_mode).await?
@@ -1380,6 +1879,13 @@ fn compose_system_prompt(
          \"[Images in this conversation you can edit …]\"). They are context for you, not the \
          user's own words — act on them, but never echo the bracketed text and never surface \
          internal ids, URLs, or file:// paths to the user.\n\
+         - Mentioning people: to ping or notify someone, emit the literal token `<@USER_ID>` — \
+         Discord renders it as a clickable mention. You learn a user's ID from context (a person \
+         shows up as `Name (<@123…>)`) and from fetch_messages results (each `author_id`). Prefer \
+         pinging a person with their `<@ID>` over typing their bare name whenever you know the ID \
+         and are addressing them or calling them out. This wrapped mention token is the ONE \
+         identifier you should output verbatim — it is the deliberate exception to the no-raw-ids \
+         rule above; never expose the digits any other way (no plain `@123…`, no `(<@123…>)`).\n\
          - For anything that takes more than a moment (image or video generation), call \
          post_status_message in the same response so the user sees progress.\n\
          - Write for Discord: concise, minimal markdown; don't re-link or re-describe media you \
@@ -2395,7 +2901,9 @@ fn extension_from_video_url(url: &str) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 async fn post_reply_chunks(
     state: &State,
-    user_msg: &Message,
+    channel_id: Id<ChannelMarker>,
+    user_msg_id: Id<MessageMarker>,
+    user_content: &str,
     chunks: &[String],
     is_new: bool,
     generated: &[HttpAttachment],
@@ -2407,10 +2915,10 @@ async fn post_reply_chunks(
 
     let (target_channel, first_chunk_replies_to_user): (Id<ChannelMarker>, bool) =
         if should_open_thread(is_new, chunks) {
-            let title = make_thread_title(&user_msg.content);
+            let title = make_thread_title(user_content);
             let thread = state
                 .http
-                .create_thread_from_message(user_msg.channel_id, user_msg.id, &title)
+                .create_thread_from_message(channel_id, user_msg_id, &title)
                 .await?
                 .model()
                 .await?;
@@ -2432,7 +2940,7 @@ async fn post_reply_chunks(
             }
             (thread.id, false)
         } else {
-            (user_msg.channel_id, true)
+            (channel_id, true)
         };
 
     let total = chunks.len();
@@ -2445,7 +2953,7 @@ async fn post_reply_chunks(
             .content(chunk)
             .flags(suppress);
         if i == 0 && first_chunk_replies_to_user {
-            builder = builder.reply(user_msg.id);
+            builder = builder.reply(user_msg_id);
         }
         if is_last && !generated.is_empty() {
             builder = builder.attachments(generated);
@@ -2714,14 +3222,19 @@ mod tests {
     #[test]
     fn system_prompt_gates_capabilities_on_what_is_enabled() {
         let p = fake_persona();
-        // ConversationOnly + no media providers → only web search.
+        // Assert on the capability *lines* (the gated content), not bare
+        // tool names: the always-on conventions block legitimately mentions
+        // a tool like `fetch_messages` (for the `<@ID>` mention guidance)
+        // regardless of whether its capability is enabled this turn.
+        // ConversationOnly + no media providers → only the web-search line.
         let minimal =
             compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, 1, None);
-        assert!(!minimal.contains("generate_image"));
-        assert!(!minimal.contains("generate_video"));
-        assert!(!minimal.contains("fetch_messages"));
+        assert!(minimal.contains("- Web search:"));
+        assert!(!minimal.contains("- Image generation & editing:"));
+        assert!(!minimal.contains("- Video generation:"));
+        assert!(!minimal.contains("- Recent channel messages:"));
 
-        // Open privacy + both media providers → all four capabilities.
+        // Open privacy + both media providers → all four capability lines.
         let full = compose_system_prompt(
             &p,
             &PrivacyMode::opt_in_default(),
@@ -2730,19 +3243,128 @@ mod tests {
             2,
             Some("  Discord ToS: be nice.  "),
         );
-        assert!(full.contains("generate_image"));
-        assert!(full.contains("generate_video"));
-        assert!(full.contains("fetch_messages"));
+        assert!(full.contains("- Image generation & editing:"));
+        assert!(full.contains("- Video generation:"));
+        assert!(full.contains("- Recent channel messages:"));
         // Operator addendum is appended (trimmed) under its own header.
         assert!(full.contains("— Operator policy —"));
         assert!(full.contains("Discord ToS: be nice."));
     }
 
+    fn ctx(source: &str, role: &str, content: &str) -> ContextItem {
+        ContextItem {
+            position: 0,
+            source: source.to_string(),
+            role: role.to_string(),
+            content: content.to_string(),
+            discord_message_id: None,
+        }
+    }
+
+    #[test]
+    fn assemble_messages_serves_prior_images_and_skips_live_uploads() {
+        // Live gateway path: a `turn:*:image:*` row is served from storage;
+        // a `discord:msg:*:image:*` row is skipped here (it rides the live
+        // Discord URL via `saved_images`).
+        let context = vec![
+            ctx("system", "system", "sys"),
+            ctx("turn:abc:user", "user", "[bob]: hi"),
+            ctx("turn:abc:image:0", "user", "file://images/old.png"),
+            ctx("discord:msg:9", "user", "[amy]: draw"),
+            ctx("discord:msg:9:image:0", "user", "file://images/up.png"),
+        ];
+        let msgs = assemble_messages(&context, &[], "https://ex.com");
+        // system, user(bob)+served-image, user(amy)+annotation
+        let images: usize = msgs
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter(|b| matches!(b, TurnBlock::Image { .. }))
+            .count();
+        // Only the prior `turn:*` image is attached (no live saved_images);
+        // the `discord:msg:*` upload is skipped.
+        assert_eq!(images, 1);
+        // The reference annotation lists BOTH images by their file:// id.
+        let all_text: String = msgs
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter_map(|b| match b {
+                TurnBlock::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(all_text.contains("file://images/old.png"));
+        assert!(all_text.contains("file://images/up.png"));
+    }
+
+    #[test]
+    fn assemble_messages_attaches_reasoning_to_following_assistant_turn() {
+        // A `turn:*:reasoning` item decodes its {provider, data} blob and
+        // rides as the LEADING block of the assistant turn that follows it
+        // (never as its own message).
+        let context = vec![
+            ctx("turn:abc:user", "user", "[bob]: hi"),
+            ctx(
+                "turn:abc:reasoning",
+                "assistant",
+                r#"{"provider":"xai","data":[{"type":"reasoning","id":"rs_1"}]}"#,
+            ),
+            ctx("turn:abc:assistant", "assistant", "the answer"),
+        ];
+        let msgs = assemble_messages(&context, &[], "https://ex.com");
+        assert_eq!(msgs.len(), 2, "reasoning must not become its own message");
+        let assistant = &msgs[1];
+        assert_eq!(assistant.role, MessageRole::Assistant);
+        match &assistant.blocks[0] {
+            TurnBlock::Reasoning {
+                provider_name,
+                data,
+            } => {
+                assert_eq!(provider_name, "xai");
+                assert_eq!(data[0]["id"], "rs_1");
+            }
+            other => panic!("expected leading reasoning block, got {other:?}"),
+        }
+        assert!(matches!(&assistant.blocks[1], TurnBlock::Text(t) if t == "the answer"));
+    }
+
+    #[test]
+    fn assemble_messages_attaches_live_uploads_from_saved_images() {
+        // Live gateway path with a fresh upload: the `discord:msg:*:image:*`
+        // row is skipped in the loop but its bytes are attached from
+        // `saved_images` via the live Discord URL.
+        let context = vec![
+            ctx("discord:msg:9", "user", "[amy]: draw"),
+            ctx("discord:msg:9:image:0", "user", "file://images/up.png"),
+        ];
+        let saved = vec![SavedImage {
+            stored_uri: "file://images/up.png".to_string(),
+            live_url: "https://cdn.discord/up.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+        }];
+        let msgs = assemble_messages(&context, &saved, "https://ex.com");
+        let urls: Vec<&str> = msgs
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter_map(|b| match b {
+                TurnBlock::Image { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Exactly the live URL — served-from-storage path is for `turn:*`.
+        assert_eq!(urls, vec!["https://cdn.discord/up.png"]);
+    }
+
     #[test]
     fn system_prompt_omits_operator_policy_when_blank() {
         let p = fake_persona();
-        let out =
-            compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, 1, Some("   "));
+        let out = compose_system_prompt(
+            &p,
+            &PrivacyMode::ConversationOnly,
+            false,
+            false,
+            1,
+            Some("   "),
+        );
         assert!(!out.contains("Operator policy"));
     }
 
@@ -2864,9 +3486,24 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_safety_error_round_trips_through_detector() {
-        let err = synthesize_safety_refusal("generate_image was refused");
+    fn upstream_safety_refusal_matches_403_with_safety_body() {
+        let err = grok_discord_bot_core::LlmError::Api {
+            status: 403,
+            body: "Content violates usage guidelines".to_string(),
+        };
         assert!(is_upstream_safety_refusal(&err));
+        // A 403 without the safety language is NOT a safety refusal.
+        let other = grok_discord_bot_core::LlmError::Api {
+            status: 403,
+            body: "forbidden".to_string(),
+        };
+        assert!(!is_upstream_safety_refusal(&other));
+        // Safety-ish text on a non-403 status is also not (wrong status).
+        let five = grok_discord_bot_core::LlmError::Api {
+            status: 500,
+            body: "safety_check".to_string(),
+        };
+        assert!(!is_upstream_safety_refusal(&five));
     }
 
     #[test]

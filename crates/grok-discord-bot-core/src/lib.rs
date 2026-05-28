@@ -20,6 +20,7 @@ pub mod db;
 pub mod domain;
 pub mod imagegen;
 pub mod llm;
+pub mod retry;
 pub mod storage;
 pub mod videogen;
 
@@ -39,4 +40,5 @@ pub use llm::{
     StepRequest, StepResponse, ToolCallRecord, ToolDefinition, ToolError, ToolExecutor,
     ToolUseRequest, TurnBlock, XaiOptions,
 };
+pub use retry::{ClassifyError, ErrorClass, RetryPolicy, with_retry};
 pub use videogen::{AnyVideoProvider, VideoProvider};

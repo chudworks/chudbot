@@ -139,12 +139,16 @@ impl LlmProvider for AnthropicProvider {
                 tool_uses: client_uses,
                 server_tool_calls,
                 model_id,
+                // Anthropic continuation (extended-thinking blocks) is not
+                // captured yet; its caching uses cache_control breakpoints.
+                provider_state: None,
             })
         } else {
             Ok(StepResponse::Final {
                 content: text,
                 server_tool_calls,
                 model_id,
+                provider_state: None,
             })
         }
     }
@@ -294,6 +298,10 @@ fn to_anthropic_messages(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
                     }
                     content_blocks.push(Value::Object(obj));
                 }
+                // Another provider's opaque reasoning (xAI's encrypted
+                // items, replayed across a persona switch). Not Anthropic's
+                // format, so drop it — it isn't ours to send.
+                TurnBlock::Reasoning { .. } => {}
             }
         }
 

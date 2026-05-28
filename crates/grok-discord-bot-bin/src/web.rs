@@ -205,11 +205,7 @@ const UA_MAX_LEN: usize = 48;
 /// known for length-delimited bodies (most responses, and requests with
 /// a `Content-Length`); streaming responses (the SSE endpoint) report
 /// `0` since their bytes are produced after this middleware returns.
-async fn access_log(
-    State(trust_forwarded_for): State<bool>,
-    req: Request,
-    next: Next,
-) -> Response {
+async fn access_log(State(trust_forwarded_for): State<bool>, req: Request, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
     let remote = client_ip(&req, trust_forwarded_for);
@@ -248,17 +244,16 @@ async fn access_log(
 /// original client; later entries are intermediary proxies). Otherwise
 /// fall back to the TCP peer address from `ConnectInfo`.
 fn client_ip(req: &Request, trust_forwarded_for: bool) -> String {
-    if trust_forwarded_for {
-        if let Some(ip) = req
+    if trust_forwarded_for
+        && let Some(ip) = req
             .headers()
             .get("x-forwarded-for")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.split(',').next())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            return ip.to_owned();
-        }
+    {
+        return ip.to_owned();
     }
     req.extensions()
         .get::<ConnectInfo<SocketAddr>>()

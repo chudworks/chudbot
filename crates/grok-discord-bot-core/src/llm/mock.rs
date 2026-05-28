@@ -48,6 +48,7 @@ impl LlmProvider for MockProvider {
             content: self.answer.clone(),
             server_tool_calls: self.server_tool_calls.clone(),
             model_id: request.model,
+            provider_state: None,
         })
     }
 }
@@ -70,6 +71,7 @@ mod tests {
                 temperature: None,
                 top_p: None,
                 provider_options: Default::default(),
+                cache_key: None,
             })
             .await
             .unwrap();

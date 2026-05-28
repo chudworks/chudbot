@@ -21,8 +21,8 @@ fn watch(path: &str) {
 }
 
 fn main() {
-    let version =
-        git(&["describe", "--tags", "--always", "--dirty"]).unwrap_or_else(|| "unknown".to_string());
+    let version = git(&["describe", "--tags", "--always", "--dirty"])
+        .unwrap_or_else(|| "unknown".to_string());
 
     println!("cargo:rustc-env=GIT_VERSION={version}");
 

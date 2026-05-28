@@ -97,26 +97,39 @@ impl ImageProvider for XaiImageProvider {
             "imagegen[xai]: requesting image"
         );
 
-        let resp = self
-            .http
-            .post(&endpoint)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| ImageGenError::Transport(e.to_string()))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let mut text = resp.text().await.unwrap_or_default();
-            if text.len() > 400 {
-                text.truncate(400);
-            }
-            return Err(ImageGenError::Api {
-                status: status.as_u16(),
-                body: text,
-            });
-        }
+        // Retry transient 5xx/429/transport blips with backoff. A 5xx
+        // means no image was produced (and xAI doesn't bill it), so
+        // re-running is safe.
+        let resp = crate::retry::with_retry(
+            crate::retry::RetryPolicy::default(),
+            "imagegen[xai]",
+            || {
+                let req = self
+                    .http
+                    .post(&endpoint)
+                    .bearer_auth(&self.api_key)
+                    .json(&body);
+                async move {
+                    let resp = req
+                        .send()
+                        .await
+                        .map_err(|e| ImageGenError::Transport(e.to_string()))?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let mut text = resp.text().await.unwrap_or_default();
+                        if text.len() > 400 {
+                            text.truncate(400);
+                        }
+                        return Err(ImageGenError::Api {
+                            status: status.as_u16(),
+                            body: text,
+                        });
+                    }
+                    Ok(resp)
+                }
+            },
+        )
+        .await?;
 
         let parsed: ImagesResponse = resp
             .json()
@@ -304,10 +317,7 @@ mod tests {
             "grok-imagine-image-quality",
             "combine <IMAGE_0> and <IMAGE_1>",
             None,
-            vec![
-                "https://x/a.png".to_string(),
-                "https://x/b.png".to_string(),
-            ],
+            vec!["https://x/a.png".to_string(), "https://x/b.png".to_string()],
         );
         assert!(body.get("image").is_none());
         assert_eq!(

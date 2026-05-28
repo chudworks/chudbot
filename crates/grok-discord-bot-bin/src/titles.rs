@@ -129,6 +129,12 @@ async fn generate(
             xai: persona.xai.clone(),
             anthropic: persona.anthropic.clone(),
         },
+        // No cache key: a once-per-conversation one-shot whose only
+        // shared text is the short, static TITLE_SYSTEM_PROMPT (xAI
+        // caches that automatically). Its prefix doesn't match the main
+        // conversation's, so a per-conversation key wouldn't hit either;
+        // routing affinity buys nothing here.
+        cache_key: None,
     };
 
     let response = tokio::select! {

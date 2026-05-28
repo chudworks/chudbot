@@ -120,6 +120,21 @@ pub enum TurnBlock {
         /// Whether the call failed; signals the model to retry or back off.
         is_error: bool,
     },
+    /// Opaque, provider-specific reasoning continuation carried on an
+    /// assistant turn (xAI's encrypted `reasoning` items today). Replayed
+    /// verbatim — placed before the assistant's text/tool_use blocks — so
+    /// reasoning models keep hitting the prompt cache across iterations
+    /// and turns. `provider_name` tags which provider produced it (from
+    /// [`LlmProvider::name`]); a provider's input encoder emits only its
+    /// own and ignores the rest, so a conversation that switches providers
+    /// never feeds one's reasoning to another. Never rendered to users.
+    Reasoning {
+        /// Producing provider's [`LlmProvider::name`] (e.g. `xai`).
+        provider_name: String,
+        /// Verbatim provider payload — for xAI, the JSON array of
+        /// `reasoning` output items to splice back into the request input.
+        data: serde_json::Value,
+    },
 }
 
 /// One client-side tool the model is allowed to invoke. Declared on
@@ -191,6 +206,19 @@ pub struct StepRequest {
     /// Per-provider knobs that don't fit the shared sampling fields.
     /// Each provider implementation reads only its own slot.
     pub provider_options: ProviderOptions,
+    /// Opaque, stable cache-routing key for requests that share a
+    /// prefix. The xAI provider sends it as the Responses-API
+    /// `prompt_cache_key` body field (the Responses-API equivalent of
+    /// the Chat-Completions `x-grok-conv-id` header), which xAI uses to
+    /// route prefix-sharing requests to the same server so its
+    /// per-server prompt cache stays warm. It must be STABLE across
+    /// every step that shares a prefix — all agent-loop iterations and
+    /// all later turns of one conversation — so the growing-prefix
+    /// cache keeps hitting; the conversation UUID is the natural value.
+    /// Anthropic ignores it (its caching is driven by explicit
+    /// `cache_control` breakpoints instead). `None` lets the provider
+    /// fall back to its automatic, content-addressed caching.
+    pub cache_key: Option<String>,
 }
 
 /// One round-trip result from a provider.
@@ -205,6 +233,12 @@ pub enum StepResponse {
         server_tool_calls: Vec<ToolCallRecord>,
         /// Model id reported by the provider for this call.
         model_id: String,
+        /// Opaque provider continuation state for this response (xAI's
+        /// encrypted `reasoning` items today), or `None` when the
+        /// provider produced none. The agent replays it on later
+        /// iterations and the caller persists the final one for
+        /// cross-turn replay. See [`TurnBlock::Reasoning`].
+        provider_state: Option<serde_json::Value>,
     },
     /// The model is asking us to invoke one or more client-side tools.
     /// The caller must execute them and feed the results back via the
@@ -219,6 +253,11 @@ pub enum StepResponse {
         server_tool_calls: Vec<ToolCallRecord>,
         /// Model id reported by the provider for this call.
         model_id: String,
+        /// Opaque provider continuation state for this response (xAI's
+        /// encrypted `reasoning` items today). The agent re-attaches it
+        /// to the reconstructed assistant turn so the next iteration
+        /// replays it. See [`TurnBlock::Reasoning`].
+        provider_state: Option<serde_json::Value>,
     },
 }
 
@@ -303,6 +342,23 @@ pub enum LlmError {
     /// Model emitted a tool name we don't know how to translate.
     #[error("malformed tool call: {0}")]
     MalformedToolCall(String),
+}
+
+impl crate::retry::ClassifyError for LlmError {
+    fn error_class(&self) -> crate::retry::ErrorClass {
+        use crate::retry::ErrorClass;
+        match self {
+            // Overloaded / rate-limited backend: the request didn't
+            // commit, so retrying is safe.
+            LlmError::Api { status, .. } if *status == 429 || (500..=599).contains(status) => {
+                ErrorClass::ServerTransient
+            }
+            LlmError::Transport(_) => ErrorClass::Network,
+            // 4xx (other than 429), decode failures, config/loop errors:
+            // re-running won't change the outcome.
+            _ => ErrorClass::Permanent,
+        }
+    }
 }
 
 /// Shared interface for one round-trip to the model. Drive the

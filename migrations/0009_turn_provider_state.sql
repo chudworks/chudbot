@@ -1,0 +1,22 @@
+-- Opaque, provider-specific continuation state for a turn's FINAL
+-- assistant response. Today this carries xAI's encrypted `reasoning`
+-- output items (requested via `include: ["reasoning.encrypted_content"]`
+-- on the Responses API): for reasoning models, replaying those items
+-- verbatim before the assistant message on later requests is what keeps
+-- the prompt cache warm across turns — omitting them is xAI's top cause
+-- of multi-turn cache misses.
+--
+-- The column is a self-describing, provider-tagged blob:
+--   {"provider": "xai", "data": [<reasoning items, verbatim>]}
+-- so a conversation that switches personas/providers mid-stream never
+-- replays one provider's state into another's request (the replay path
+-- and each provider's input encoder both key off the `provider` tag).
+--
+-- It lives on `turns` (not a separate 1:1 table like turn_system_prompts)
+-- precisely because it's read on the HOT replay path — every
+-- `load_conversation_history` already fetches the turn row, so a column
+-- avoids a per-turn join. NULL for non-reasoning turns and for providers
+-- with no continuation state (Anthropic today), so the common case pays
+-- nothing. The contents are encrypted/opaque and never surfaced in the
+-- web viewer.
+ALTER TABLE turns ADD COLUMN provider_state JSONB;

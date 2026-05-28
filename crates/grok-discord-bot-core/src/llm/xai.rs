@@ -79,32 +79,54 @@ impl LlmProvider for XaiProvider {
             temperature: request.temperature,
             top_p: request.top_p,
             reasoning: reasoning.as_ref(),
+            // Responses-API cache-routing hint. xAI routes requests
+            // carrying the same `prompt_cache_key` to the same server so
+            // the per-server prompt cache stays warm — the Responses-API
+            // equivalent of the Chat-Completions `x-grok-conv-id` header.
+            prompt_cache_key: request.cache_key.as_deref(),
+            // Ask for the model's reasoning as an encrypted, opaque blob so
+            // we can replay it verbatim on later requests. For reasoning
+            // models, dropping prior-turn reasoning is xAI's top cause of
+            // multi-turn cache misses; non-reasoning models simply emit no
+            // reasoning items, so requesting it is harmless.
+            include: REASONING_INCLUDE,
         };
 
         if tracing::enabled!(tracing::Level::DEBUG) {
             match serde_json::to_string(&body) {
-                Ok(json) => tracing::debug!(target: "xai_request", model = %request.model, body = %json, "xai: sending request"),
-                Err(e) => tracing::debug!(target: "xai_request", model = %request.model, error = %e, "xai: failed to serialize request for logging"),
+                Ok(json) => {
+                    tracing::debug!(target: "xai_request", model = %request.model, body = %json, "xai: sending request")
+                }
+                Err(e) => {
+                    tracing::debug!(target: "xai_request", model = %request.model, error = %e, "xai: failed to serialize request for logging")
+                }
             }
         }
 
-        let resp = self
-            .http
-            .post(format!("{}/responses", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?;
-
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(LlmError::Api {
-                status: status.as_u16(),
-                body,
-            });
-        }
+        // Retry transient 5xx/429/transport blips with backoff. The
+        // request is rebuilt each attempt (`.json` serializes eagerly, so
+        // the future owns its body and borrows nothing across awaits).
+        let url = format!("{}/responses", self.base_url);
+        let resp =
+            crate::retry::with_retry(crate::retry::RetryPolicy::default(), "llm[xai]", || {
+                let req = self.http.post(&url).bearer_auth(&self.api_key).json(&body);
+                async move {
+                    let resp = req
+                        .send()
+                        .await
+                        .map_err(|e| LlmError::Transport(e.to_string()))?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body = resp.text().await.unwrap_or_default();
+                        return Err(LlmError::Api {
+                            status: status.as_u16(),
+                            body,
+                        });
+                    }
+                    Ok(resp)
+                }
+            })
+            .await?;
 
         let parsed: ResponsesResponse = resp
             .json()
@@ -112,8 +134,11 @@ impl LlmProvider for XaiProvider {
             .map_err(|e| LlmError::Decode(e.to_string()))?;
 
         let model_id = parsed.model.unwrap_or_else(|| request.model.clone());
-        let (text, tool_uses, server_tool_calls) =
+        let (text, tool_uses, server_tool_calls, reasoning_items) =
             walk_output(&parsed.output, parsed.citations.as_ref());
+        // The opaque reasoning items, as a JSON array, to carry forward and
+        // replay verbatim. `None` when the model emitted none.
+        let provider_state = (!reasoning_items.is_empty()).then_some(Value::Array(reasoning_items));
 
         if !tool_uses.is_empty() {
             Ok(StepResponse::UseTools {
@@ -121,12 +146,14 @@ impl LlmProvider for XaiProvider {
                 tool_uses,
                 server_tool_calls,
                 model_id,
+                provider_state,
             })
         } else {
             Ok(StepResponse::Final {
                 content: text,
                 server_tool_calls,
                 model_id,
+                provider_state,
             })
         }
     }
@@ -157,11 +184,24 @@ fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
         let mut text_buf = String::new();
         let mut image_urls: Vec<String> = Vec::new();
         let mut deferred: Vec<Value> = Vec::new();
+        // Reasoning items to splice back in BEFORE this turn's message, in
+        // the order the Responses API emitted them. Only our own (`xai`)
+        // reasoning round-trips; a block tagged for another provider (a
+        // mid-conversation persona switch) is not ours to replay.
+        let mut reasoning: Vec<Value> = Vec::new();
 
         for block in &turn.blocks {
             match block {
                 TurnBlock::Text(t) => text_buf.push_str(t),
                 TurnBlock::Image { url, .. } => image_urls.push(url.clone()),
+                TurnBlock::Reasoning {
+                    provider_name,
+                    data,
+                } if provider_name == "xai" => match data {
+                    Value::Array(items) => reasoning.extend(items.iter().cloned()),
+                    other => reasoning.push(other.clone()),
+                },
+                TurnBlock::Reasoning { .. } => {}
                 TurnBlock::ToolUse {
                     id,
                     name,
@@ -191,6 +231,11 @@ fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
                 }
             }
         }
+
+        // Reasoning leads the turn — it precedes the assistant's message
+        // and tool calls in the response, and must be replayed in that
+        // position for the cache prefix to match.
+        input.append(&mut reasoning);
 
         // Pick the content shape: plain string when text-only, content
         // array when any image is attached. Both forms are valid input
@@ -251,18 +296,25 @@ fn build_tools(defs: &[ToolDefinition], enable_web_search: bool) -> Vec<Value> {
 ///   - server-side tool uses (`web_search_call`, `x_search_call`, etc.)
 ///     as [`ToolCallRecord`]s, attaching the top-level `citations`
 ///     field to whichever server tool emitted them when we can't tell
-///     them apart (citations are response-wide, not per-block).
+///     them apart (citations are response-wide, not per-block);
+///   - `reasoning` items captured VERBATIM (opaque, with their
+///     `encrypted_content`) so the caller can replay them on later
+///     requests to keep the prompt cache warm.
 fn walk_output(
     output: &[Value],
     citations: Option<&Value>,
-) -> (String, Vec<ToolUseRequest>, Vec<ToolCallRecord>) {
+) -> (String, Vec<ToolUseRequest>, Vec<ToolCallRecord>, Vec<Value>) {
     let mut text = String::new();
     let mut tool_uses: Vec<ToolUseRequest> = Vec::new();
     let mut server_calls: Vec<ToolCallRecord> = Vec::new();
+    let mut reasoning_items: Vec<Value> = Vec::new();
 
     for item in output {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
+            // Opaque reasoning — keep the whole item so it round-trips
+            // byte-for-byte back into the next request's input.
+            "reasoning" => reasoning_items.push(item.clone()),
             "message" => {
                 if let Some(content) = item.get("content").and_then(Value::as_array) {
                     for block in content {
@@ -337,8 +389,13 @@ fn walk_output(
         }
     }
 
-    (text, tool_uses, server_calls)
+    (text, tool_uses, server_calls, reasoning_items)
 }
+
+/// Responses-API `include` value requesting the model's reasoning be
+/// returned as an encrypted, opaque blob (so it can be replayed verbatim
+/// without us storing plaintext chain-of-thought).
+const REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
 
 #[derive(Serialize)]
 struct ResponsesRequest<'a> {
@@ -356,6 +413,13 @@ struct ResponsesRequest<'a> {
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
+    /// Extra fields to include in the response (e.g.
+    /// `reasoning.encrypted_content`). Always sent; harmless for models
+    /// that produce no reasoning.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    include: &'a [&'a str],
 }
 
 #[derive(Deserialize)]
@@ -435,7 +499,7 @@ mod tests {
                 "arguments": "{\"limit\":30}",
             }),
         ];
-        let (text, uses, server) = walk_output(&output, None);
+        let (text, uses, server, _reasoning) = walk_output(&output, None);
         assert_eq!(text, "Let me check. ");
         assert_eq!(uses.len(), 1);
         assert_eq!(uses[0].id, "call_42");
@@ -456,6 +520,8 @@ mod tests {
             temperature: None,
             top_p: None,
             reasoning: Some(&reasoning),
+            prompt_cache_key: None,
+            include: &[],
         };
         let v = serde_json::to_value(&body).unwrap();
         assert_eq!(v["reasoning"]["effort"], "high");
@@ -472,6 +538,8 @@ mod tests {
             temperature: None,
             top_p: None,
             reasoning: None,
+            prompt_cache_key: None,
+            include: &[],
         };
         let v = serde_json::to_value(&body).unwrap();
         assert!(v.get("reasoning").is_none(), "got {v}");
@@ -488,11 +556,131 @@ mod tests {
             }),
         ];
         let citations = json!([{"url": "https://example.com", "title": "x"}]);
-        let (text, uses, server) = walk_output(&output, Some(&citations));
+        let (text, uses, server, _reasoning) = walk_output(&output, Some(&citations));
         assert_eq!(text, "Found it.");
         assert!(uses.is_empty());
         assert_eq!(server.len(), 1);
         assert_eq!(server[0].tool_name, "web_search");
         assert_eq!(server[0].response, citations);
+    }
+
+    #[test]
+    fn prompt_cache_key_serializes_when_set() {
+        let body = ResponsesRequest {
+            model: "grok-4.3",
+            input: &[],
+            instructions: None,
+            tools: None,
+            max_output_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            reasoning: None,
+            prompt_cache_key: Some("conv-123"),
+            include: &[],
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["prompt_cache_key"], "conv-123");
+    }
+
+    #[test]
+    fn prompt_cache_key_omitted_when_unset() {
+        let body = ResponsesRequest {
+            model: "grok-4.3",
+            input: &[],
+            instructions: None,
+            tools: None,
+            max_output_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            reasoning: None,
+            prompt_cache_key: None,
+            include: &[],
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("prompt_cache_key").is_none(), "got {v}");
+    }
+
+    #[test]
+    fn include_requests_encrypted_reasoning() {
+        let body = ResponsesRequest {
+            model: "grok-4.3",
+            input: &[],
+            instructions: None,
+            tools: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            reasoning: None,
+            prompt_cache_key: None,
+            include: REASONING_INCLUDE,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn walk_output_captures_reasoning_items_verbatim() {
+        let output = vec![
+            json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "BLOB" }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}],
+            }),
+        ];
+        let (text, uses, server, reasoning) = walk_output(&output, None);
+        assert_eq!(text, "hi");
+        assert!(uses.is_empty());
+        assert!(server.is_empty());
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0]["id"], "rs_1");
+        assert_eq!(reasoning[0]["encrypted_content"], "BLOB");
+    }
+
+    #[test]
+    fn replays_xai_reasoning_before_assistant_message() {
+        let turns = vec![
+            ChatTurn::text(MessageRole::User, "hi"),
+            ChatTurn {
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    TurnBlock::Reasoning {
+                        provider_name: "xai".into(),
+                        data: json!([{ "type": "reasoning", "id": "rs_1", "encrypted_content": "BLOB" }]),
+                    },
+                    TurnBlock::Text("the answer".into()),
+                ],
+            },
+        ];
+        let (_instructions, input) = to_responses_input(&turns);
+        // user message, then the reasoning item, then the assistant message
+        // — reasoning must precede the message for the cache prefix to match.
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["id"], "rs_1");
+        assert_eq!(input[1]["encrypted_content"], "BLOB");
+        assert_eq!(input[2]["role"], "assistant");
+        assert_eq!(input[2]["content"], "the answer");
+    }
+
+    #[test]
+    fn drops_reasoning_tagged_for_another_provider() {
+        let turns = vec![ChatTurn {
+            role: MessageRole::Assistant,
+            blocks: vec![
+                TurnBlock::Reasoning {
+                    provider_name: "anthropic".into(),
+                    data: json!([{ "thinking": "secret" }]),
+                },
+                TurnBlock::Text("hi".into()),
+            ],
+        }];
+        let (_instructions, input) = to_responses_input(&turns);
+        // Only the assistant message survives — foreign reasoning is not ours
+        // to replay, so it never reaches an xAI request.
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["content"], "hi");
     }
 }

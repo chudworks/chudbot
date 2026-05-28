@@ -62,22 +62,34 @@ impl VideoProvider for XaiVideoProvider {
             body["image"] = json!({ "url": url });
         }
 
-        let resp = self
-            .http
-            .post(format!("{}/videos/generations", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| VideoGenError::Transport(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = truncate_body(resp.text().await.unwrap_or_default(), 400);
-            return Err(VideoGenError::Api {
-                status: status.as_u16(),
-                body,
-            });
-        }
+        // Submitting a video job is NOT idempotent — a transport error
+        // after the server created the job would double-submit a paid
+        // render on retry. So retry only server-transient 5xx/429 (no job
+        // created), never ambiguous network failures.
+        let url = format!("{}/videos/generations", self.base_url);
+        let policy = crate::retry::RetryPolicy {
+            retry_network: false,
+            ..crate::retry::RetryPolicy::default()
+        };
+        let resp = crate::retry::with_retry(policy, "videogen[xai].submit", || {
+            let req = self.http.post(&url).bearer_auth(&self.api_key).json(&body);
+            async move {
+                let resp = req
+                    .send()
+                    .await
+                    .map_err(|e| VideoGenError::Transport(e.to_string()))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = truncate_body(resp.text().await.unwrap_or_default(), 400);
+                    return Err(VideoGenError::Api {
+                        status: status.as_u16(),
+                        body,
+                    });
+                }
+                Ok(resp)
+            }
+        })
+        .await?;
         let parsed: SubmitResponse = resp
             .json()
             .await
@@ -86,22 +98,33 @@ impl VideoProvider for XaiVideoProvider {
     }
 
     async fn check_once(&self, request_id: &str) -> Result<JobStatus, VideoGenError> {
+        // Polling is a safe idempotent GET — retry transient blips
+        // (5xx/429/transport) so one flaky poll doesn't abort the whole
+        // wait.
         let endpoint = format!("{}/videos/{}", self.base_url, request_id);
-        let resp = self
-            .http
-            .get(&endpoint)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await
-            .map_err(|e| VideoGenError::Transport(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = truncate_body(resp.text().await.unwrap_or_default(), 400);
-            return Err(VideoGenError::Api {
-                status: status.as_u16(),
-                body,
-            });
-        }
+        let resp = crate::retry::with_retry(
+            crate::retry::RetryPolicy::default(),
+            "videogen[xai].check",
+            || {
+                let req = self.http.get(&endpoint).bearer_auth(&self.api_key);
+                async move {
+                    let resp = req
+                        .send()
+                        .await
+                        .map_err(|e| VideoGenError::Transport(e.to_string()))?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body = truncate_body(resp.text().await.unwrap_or_default(), 400);
+                        return Err(VideoGenError::Api {
+                            status: status.as_u16(),
+                            body,
+                        });
+                    }
+                    Ok(resp)
+                }
+            },
+        )
+        .await?;
         let parsed: PollResponse = resp
             .json()
             .await
@@ -128,20 +151,33 @@ impl VideoProvider for XaiVideoProvider {
     }
 
     async fn download_bytes(&self, url: &str) -> Result<Vec<u8>, VideoGenError> {
-        let resp = self
-            .http
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| VideoGenError::Transport(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = truncate_body(resp.text().await.unwrap_or_default(), 400);
-            return Err(VideoGenError::Api {
-                status: status.as_u16(),
-                body,
-            });
-        }
+        // Downloading the finished render is an idempotent GET — retry
+        // transient blips on the request/status. (A mid-body drop during
+        // `.bytes()` below isn't retried; that's rare and the caller can
+        // re-poll.)
+        let resp = crate::retry::with_retry(
+            crate::retry::RetryPolicy::default(),
+            "videogen[xai].download",
+            || {
+                let req = self.http.get(url);
+                async move {
+                    let resp = req
+                        .send()
+                        .await
+                        .map_err(|e| VideoGenError::Transport(e.to_string()))?;
+                    let status = resp.status();
+                    if !status.is_success() {
+                        let body = truncate_body(resp.text().await.unwrap_or_default(), 400);
+                        return Err(VideoGenError::Api {
+                            status: status.as_u16(),
+                            body,
+                        });
+                    }
+                    Ok(resp)
+                }
+            },
+        )
+        .await?;
         resp.bytes()
             .await
             .map(|b| b.to_vec())

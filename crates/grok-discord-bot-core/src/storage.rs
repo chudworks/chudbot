@@ -331,6 +331,9 @@ mod tests {
             to_public_url("https://cdn/x.png", "https://grok.example.com").as_deref(),
             Some("https://cdn/x.png")
         );
-        assert_eq!(to_public_url("s3://bucket/key", "https://grok.example.com"), None);
+        assert_eq!(
+            to_public_url("s3://bucket/key", "https://grok.example.com"),
+            None
+        );
     }
 }

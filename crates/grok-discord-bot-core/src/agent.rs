@@ -60,6 +60,12 @@ pub struct AgentRun {
     /// iteration cap hit). Callers should check this and decide
     /// whether the partial trace is enough to act on.
     pub error: Option<String>,
+    /// Opaque, provider-tagged continuation state for the FINAL assistant
+    /// response — `{"provider": <name>, "data": <items>}` — for the
+    /// caller to persist so later turns can replay it and keep the prompt
+    /// cache warm. `None` when the provider produced no such state or the
+    /// run errored before a final answer. See [`crate::llm::TurnBlock::Reasoning`].
+    pub provider_state: Option<serde_json::Value>,
 }
 
 /// Drive the model through a tool-use loop until it produces a final
@@ -82,6 +88,7 @@ pub async fn run<P, T, O>(
     temperature: Option<f32>,
     top_p: Option<f32>,
     provider_options: ProviderOptions,
+    cache_key: Option<String>,
     max_iterations: u32,
 ) -> AgentRun
 where
@@ -113,6 +120,7 @@ where
                 temperature,
                 top_p,
                 provider_options: provider_options.clone(),
+                cache_key: cache_key.clone(),
             })
             .await
         {
@@ -129,6 +137,7 @@ where
                     tool_calls: all_tool_calls,
                     model_id: last_model_id,
                     error: Some(err.to_string()),
+                    provider_state: None,
                 };
             }
         };
@@ -138,6 +147,7 @@ where
                 content,
                 server_tool_calls,
                 model_id,
+                provider_state,
             } => {
                 log_server_tool_calls(iteration, &server_tool_calls);
                 let server_calls = server_tool_calls.len();
@@ -148,6 +158,7 @@ where
                     text_chars = content.len(),
                     server_tool_calls = server_calls,
                     total_tool_calls = all_tool_calls.len(),
+                    has_reasoning = provider_state.is_some(),
                     "agent: final answer received"
                 );
                 return AgentRun {
@@ -155,6 +166,11 @@ where
                     tool_calls: all_tool_calls,
                     model_id,
                     error: None,
+                    // Tag with the producing provider so cross-turn replay
+                    // never feeds this back into a different provider.
+                    provider_state: provider_state.map(
+                        |data| serde_json::json!({ "provider": provider.name(), "data": data }),
+                    ),
                 };
             }
             StepResponse::UseTools {
@@ -162,6 +178,7 @@ where
                 tool_uses,
                 server_tool_calls,
                 model_id,
+                provider_state,
             } => {
                 log_server_tool_calls(iteration, &server_tool_calls);
                 let server_calls = server_tool_calls.len();
@@ -188,7 +205,17 @@ where
                 }
 
                 // Reconstruct the assistant turn so the next step can see it.
+                // Reasoning leads the turn (it precedes the model's
+                // text/tool_use in the response): replaying it verbatim is
+                // what keeps reasoning models hitting the prompt cache and,
+                // for some models, is required to continue a tool loop.
                 let mut assistant_blocks: Vec<TurnBlock> = Vec::new();
+                if let Some(data) = provider_state {
+                    assistant_blocks.push(TurnBlock::Reasoning {
+                        provider_name: provider.name().to_string(),
+                        data,
+                    });
+                }
                 if let Some(text) = partial_text
                     && !text.is_empty()
                 {
@@ -254,6 +281,7 @@ where
         tool_calls: all_tool_calls,
         model_id: last_model_id,
         error: Some(format!("hit iteration cap ({max_iterations})")),
+        provider_state: None,
     }
 }
 

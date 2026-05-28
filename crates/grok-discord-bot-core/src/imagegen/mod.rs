@@ -45,6 +45,19 @@ pub enum ImageGenError {
     Reference(String),
 }
 
+impl crate::retry::ClassifyError for ImageGenError {
+    fn error_class(&self) -> crate::retry::ErrorClass {
+        use crate::retry::ErrorClass;
+        match self {
+            ImageGenError::Api { status, .. } if *status == 429 || (500..=599).contains(status) => {
+                ErrorClass::ServerTransient
+            }
+            ImageGenError::Transport(_) => ErrorClass::Network,
+            _ => ErrorClass::Permanent,
+        }
+    }
+}
+
 /// Input to [`ImageProvider::generate`].
 #[derive(Debug, Clone)]
 pub struct ImageGenRequest {

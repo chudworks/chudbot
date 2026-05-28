@@ -154,6 +154,37 @@ impl Db {
         Ok(row.map(|(id,)| id))
     }
 
+    /// Look up which turn a Discord message belongs to, if any. Every
+    /// message_link (the user's @mention and the bot's replies/status
+    /// posts) points at its turn, so this resolves a 🔄 reaction on
+    /// *either* side of a turn back to the turn id.
+    pub async fn lookup_turn_by_message(
+        &self,
+        discord_message_id: i64,
+    ) -> Result<Option<Uuid>, DbError> {
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT turn_id FROM message_links WHERE discord_message_id = $1")
+                .bind(discord_message_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(id,)| id))
+    }
+
+    /// Fetch a single turn by id.
+    pub async fn get_turn(&self, turn_id: Uuid) -> Result<Option<Turn>, DbError> {
+        let turn = sqlx::query_as::<_, Turn>(
+            "SELECT id, conversation_id, turn_index, created_at, completed_at, \
+               user_discord_message_id, user_content, assistant_discord_message_id, \
+               assistant_content, status, error, persona_name, version_id, \
+               discord_user_id, discord_user_name, provider_state \
+             FROM turns WHERE id = $1",
+        )
+        .bind(turn_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(turn)
+    }
+
     /// Start a new turn in `conversation_id`. Assigns the next
     /// `turn_index` atomically and pins the Discord user's identity to
     /// the row so historical attribution survives username changes.
@@ -177,7 +208,7 @@ impl Db {
              RETURNING id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
                assistant_content, status, error, persona_name, version_id, \
-               discord_user_id, discord_user_name",
+               discord_user_id, discord_user_name, provider_state",
         )
         .bind(id)
         .bind(conversation_id)
@@ -197,18 +228,21 @@ impl Db {
         turn_id: Uuid,
         assistant_content: &str,
         assistant_discord_message_id: i64,
+        provider_state: Option<&serde_json::Value>,
     ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE turns \
              SET status = 'completed', \
                  completed_at = now(), \
                  assistant_content = $2, \
-                 assistant_discord_message_id = $3 \
+                 assistant_discord_message_id = $3, \
+                 provider_state = $4 \
              WHERE id = $1",
         )
         .bind(turn_id)
         .bind(assistant_content)
         .bind(assistant_discord_message_id)
+        .bind(provider_state)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -238,6 +272,100 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Mark a turn as failed but also persist whatever reply we managed
+    /// to post. Used when a turn produced a user-facing message (e.g. a
+    /// "⚠️ image generation failed" notice, possibly with partial model
+    /// text) yet still counts as a failure — the viewer then shows the
+    /// error AND any salvaged content, and the Discord message is linked.
+    pub async fn fail_turn_with_reply(
+        &self,
+        turn_id: Uuid,
+        error: &str,
+        assistant_content: Option<&str>,
+        assistant_discord_message_id: Option<i64>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE turns \
+             SET status = 'failed', completed_at = now(), error = $2, \
+                 assistant_content = $3, assistant_discord_message_id = $4 \
+             WHERE id = $1",
+        )
+        .bind(turn_id)
+        .bind(error)
+        .bind(assistant_content)
+        .bind(assistant_discord_message_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Reset a failed turn back to `pending` so it can be re-run, but
+    /// ONLY if it is both currently `failed` AND the latest turn in its
+    /// conversation. Returns `true` when a row was reset. The combined
+    /// guard is atomic, so a double 🔄 (or a stale reaction on an older
+    /// turn) is a no-op — retrying a mid-conversation turn would
+    /// invalidate the turns built on top of it.
+    pub async fn reset_turn_for_retry(
+        &self,
+        turn_id: Uuid,
+        conversation_id: Uuid,
+    ) -> Result<bool, DbError> {
+        let res = sqlx::query(
+            "UPDATE turns \
+             SET status = 'pending', error = NULL, assistant_content = NULL, \
+                 assistant_discord_message_id = NULL, completed_at = NULL, \
+                 provider_state = NULL \
+             WHERE id = $1 AND status = 'failed' \
+               AND turn_index = (SELECT MAX(turn_index) FROM turns \
+                                  WHERE conversation_id = $2)",
+        )
+        .bind(turn_id)
+        .bind(conversation_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() == 1)
+    }
+
+    /// Delete all tool-call rows for a turn. Called before a retry re-runs
+    /// the turn so the fresh calls don't collide on the `(turn_id,
+    /// ordinal)` unique constraint with the failed attempt's rows.
+    pub async fn delete_turn_tool_calls(&self, turn_id: Uuid) -> Result<(), DbError> {
+        sqlx::query("DELETE FROM tool_calls WHERE turn_id = $1")
+            .bind(turn_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Discord message ids the bot posted for a turn (its replies and
+    /// status messages — every `message_links` role except `user`). Used
+    /// on retry to clean up the prior (failed) reply before posting fresh.
+    pub async fn assistant_message_ids_for_turn(&self, turn_id: Uuid) -> Result<Vec<i64>, DbError> {
+        let rows: Vec<(i64,)> = sqlx::query_as(
+            "SELECT discord_message_id FROM message_links \
+             WHERE turn_id = $1 AND role LIKE 'assistant%'",
+        )
+        .bind(turn_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
+    /// Load a single turn's persisted context items in position order.
+    /// On retry these are the turn's NOVEL inputs (the user's @mention,
+    /// any quoted message, and image-attachment rows) — prior-turn text
+    /// and replay images are reconstructed separately.
+    pub async fn load_turn_context(&self, turn_id: Uuid) -> Result<Vec<ContextItem>, DbError> {
+        let items = sqlx::query_as::<_, ContextItem>(
+            "SELECT position, source, role, content, discord_message_id \
+             FROM context_items WHERE turn_id = $1 ORDER BY position ASC",
+        )
+        .bind(turn_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(items)
     }
 
     /// Append a context item used in a turn's prompt.
@@ -420,7 +548,7 @@ impl Db {
             "SELECT id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
                assistant_content, status, error, persona_name, version_id, \
-               discord_user_id, discord_user_name \
+               discord_user_id, discord_user_name, provider_state \
              FROM turns \
              WHERE conversation_id = $1 AND status = 'completed' \
              ORDER BY turn_index ASC",
@@ -755,7 +883,7 @@ impl Db {
             "SELECT id, conversation_id, turn_index, created_at, completed_at, \
                user_discord_message_id, user_content, assistant_discord_message_id, \
                assistant_content, status, error, persona_name, version_id, \
-               discord_user_id, discord_user_name \
+               discord_user_id, discord_user_name, provider_state \
              FROM turns WHERE conversation_id = $1 ORDER BY turn_index ASC",
         )
         .bind(id)
@@ -803,12 +931,11 @@ impl Db {
 
             // Viewer-only: the composed system prompt snapshot, if one was
             // recorded for this turn (absent on legacy turns).
-            let system_prompt: Option<String> = sqlx::query_scalar(
-                "SELECT content FROM turn_system_prompts WHERE turn_id = $1",
-            )
-            .bind(turn.id)
-            .fetch_optional(&self.pool)
-            .await?;
+            let system_prompt: Option<String> =
+                sqlx::query_scalar("SELECT content FROM turn_system_prompts WHERE turn_id = $1")
+                    .bind(turn.id)
+                    .fetch_optional(&self.pool)
+                    .await?;
 
             turn_views.push(TurnView {
                 turn,
