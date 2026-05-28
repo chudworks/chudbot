@@ -59,6 +59,17 @@ impl LlmProvider for XaiProvider {
         let (instructions, input_items) = to_responses_input(&request.messages);
         let tools = build_tools(&request.tools, request.enable_web_search);
 
+        // Per-persona xAI knobs. Today: `reasoning_effort` mapped to
+        // the Responses API's `reasoning: { effort: ... }` block. The
+        // field is silently ignored by non-reasoning models, so we
+        // pass it through without sniffing the model id.
+        let reasoning = request
+            .provider_options
+            .xai
+            .as_ref()
+            .and_then(|x| x.reasoning_effort.as_ref())
+            .map(|effort| json!({ "effort": effort }));
+
         let body = ResponsesRequest {
             model: &request.model,
             input: &input_items,
@@ -67,6 +78,7 @@ impl LlmProvider for XaiProvider {
             max_output_tokens: Some(request.max_tokens),
             temperature: request.temperature,
             top_p: request.top_p,
+            reasoning: reasoning.as_ref(),
         };
 
         let resp = self
@@ -324,6 +336,8 @@ struct ResponsesRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<&'a Value>,
 }
 
 #[derive(Deserialize)]
@@ -410,6 +424,39 @@ mod tests {
         assert_eq!(uses[0].name, "fetch_messages");
         assert_eq!(uses[0].input["limit"], 30);
         assert!(server.is_empty());
+    }
+
+    #[test]
+    fn reasoning_block_serializes_when_effort_set() {
+        let reasoning = json!({ "effort": "high" });
+        let body = ResponsesRequest {
+            model: "grok-4.3",
+            input: &[],
+            instructions: None,
+            tools: None,
+            max_output_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            reasoning: Some(&reasoning),
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert_eq!(v["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn reasoning_omitted_when_unset() {
+        let body = ResponsesRequest {
+            model: "grok-4.3",
+            input: &[],
+            instructions: None,
+            tools: None,
+            max_output_tokens: Some(4096),
+            temperature: None,
+            top_p: None,
+            reasoning: None,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("reasoning").is_none(), "got {v}");
     }
 
     #[test]

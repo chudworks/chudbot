@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex};
 
 use grok_discord_bot_core::{
     AgentRun, AnyProvider, ChatTurn, ContextItem, Conversation, Db, LlmProvider, LlmProviderKind,
-    MessageRole, NoopObserver, Persona, PrivacyMode, StepRequest, StepResponse, StorageConfig,
-    ToolDefinition, ToolError, ToolExecutor, TurnBlock,
+    MessageRole, NoopObserver, Persona, PrivacyMode, ProviderOptions, StepRequest, StepResponse,
+    StorageConfig, ToolDefinition, ToolError, ToolExecutor, TurnBlock,
     imagegen::{ImageGenRequest, ImageGenerator, ImageQuality},
     run_agent, storage,
     videogen::{VideoGenRequest, VideoGenerator, VideoResolution},
@@ -304,6 +304,10 @@ async fn moderation_allows(state: &State, content: &str) -> bool {
         max_tokens: 8,
         temperature: Some(0.0),
         top_p: None,
+        // Moderation is one tight ALLOW/REFUSE token — we never want
+        // the model to burn tokens reasoning here, even if the
+        // persona normally requests high effort.
+        provider_options: ProviderOptions::default(),
     };
 
     match provider.step(request).await {
@@ -790,6 +794,10 @@ async fn process(
         MAX_OUTPUT_TOKENS,
         persona.temperature,
         persona.top_p,
+        ProviderOptions {
+            xai: persona.xai.clone(),
+            anthropic: persona.anthropic.clone(),
+        },
         MAX_AGENT_ITERATIONS,
     )
     .await;

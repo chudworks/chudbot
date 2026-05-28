@@ -140,6 +140,16 @@ persona ties together a system prompt, a provider (`xai` or
 default fallback is `default_persona = "<name>"` at the top of the
 config; that name must be a key in the personas table.
 
+Per-provider knobs live under sub-tables on the persona:
+`[personas.<name>.xai]` and `[personas.<name>.anthropic]`. Today the
+only field is `xai.reasoning_effort` (`"low"` | `"medium"` |
+`"high"`), forwarded as `reasoning: { effort: ... }` on the Responses
+API. Reasoning-capable models (grok-4 family) consume it; others
+silently ignore it. The slot is typed end-to-end via `ProviderOptions`
+in `core::llm`, so adding e.g. Anthropic extended-thinking budget is a
+one-field-add on `AnthropicOptions` plus a read in the provider's
+`step`.
+
 The provider blocks (`[llm.xai]`, `[llm.anthropic]`) supply only the
 api key — the model is no longer there. Include only the provider
 blocks the configured personas actually use; validation rejects a

@@ -135,6 +135,36 @@ pub struct ToolDefinition {
     pub input_schema: serde_json::Value,
 }
 
+/// Provider-specific request knobs that don't fit the shared sampling
+/// vocabulary (temperature, top_p, max_tokens). Each provider reads its
+/// own field and ignores the others. Fields are optional so personas
+/// only have to declare the knobs they actually want to override.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderOptions {
+    /// xAI-specific knobs (e.g. `reasoning_effort` on the Responses API).
+    pub xai: Option<XaiOptions>,
+    /// Anthropic-specific knobs. Placeholder today; reserved for
+    /// fields like extended-thinking budgets when we add them.
+    pub anthropic: Option<AnthropicOptions>,
+}
+
+/// xAI-specific per-request knobs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct XaiOptions {
+    /// Reasoning effort hint forwarded as `reasoning: { effort: ... }`
+    /// on the Responses API. Valid values per xAI: `low` | `medium` |
+    /// `high`. Only meaningful for reasoning-capable models (grok-4
+    /// family); non-reasoning models silently ignore it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
+
+/// Anthropic-specific per-request knobs. Empty for now; kept as a
+/// named slot so future fields (e.g. extended-thinking budget) drop
+/// in without churning Persona / StepRequest signatures.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AnthropicOptions {}
+
 /// Input to [`LlmProvider::step`].
 #[derive(Debug, Clone)]
 pub struct StepRequest {
@@ -158,6 +188,9 @@ pub struct StepRequest {
     /// Nucleus sampling probability mass (0.0-1.0). `None` defers to
     /// the provider's default.
     pub top_p: Option<f32>,
+    /// Per-provider knobs that don't fit the shared sampling fields.
+    /// Each provider implementation reads only its own slot.
+    pub provider_options: ProviderOptions,
 }
 
 /// One round-trip result from a provider.

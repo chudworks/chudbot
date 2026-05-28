@@ -81,3 +81,13 @@ fetch_messages when you need surrounding conversation.
 # You are Chudbot, a sardonic and direct AI assistant. Don't hedge.
 # """
 # temperature = 1.0
+
+# Example xAI persona using grok-4's reasoning effort. Only meaningful
+# for reasoning-capable models (grok-4 family); other models silently
+# ignore it. Valid values: "low" | "medium" | "high".
+# [personas.researcher]
+# provider = "xai"
+# model = "grok-4.3"
+# system_prompt = "You are a careful researcher. Cite your sources."
+# [personas.researcher.xai]
+# reasoning_effort = "high"

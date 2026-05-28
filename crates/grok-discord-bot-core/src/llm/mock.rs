@@ -69,6 +69,7 @@ mod tests {
                 max_tokens: 1024,
                 temperature: None,
                 top_p: None,
+                provider_options: Default::default(),
             })
             .await
             .unwrap();

@@ -15,8 +15,8 @@
 //! into the `tool_calls` table for the web viewer.
 
 use crate::llm::{
-    ChatTurn, LlmProvider, MessageRole, StepRequest, StepResponse, ToolCallRecord, ToolDefinition,
-    ToolExecutor, ToolUseRequest, TurnBlock,
+    ChatTurn, LlmProvider, MessageRole, ProviderOptions, StepRequest, StepResponse, ToolCallRecord,
+    ToolDefinition, ToolExecutor, ToolUseRequest, TurnBlock,
 };
 
 /// Observes events during an agent run. Currently just intermediate
@@ -84,6 +84,7 @@ pub async fn run<P, T, O>(
     max_tokens: u32,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    provider_options: ProviderOptions,
     max_iterations: u32,
 ) -> AgentRun
 where
@@ -114,6 +115,7 @@ where
                 max_tokens,
                 temperature,
                 top_p,
+                provider_options: provider_options.clone(),
             })
             .await
         {

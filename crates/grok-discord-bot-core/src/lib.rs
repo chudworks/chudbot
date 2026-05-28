@@ -28,6 +28,7 @@ pub use config::{Config, ConfigError, LlmProviderKind, Persona, PrivacyMode, Sto
 pub use db::{Db, DbError};
 pub use domain::{Conversation, ContextItem, ConversationView, Turn, TurnView, VideoJob};
 pub use llm::{
-    AnyProvider, ChatTurn, LlmError, LlmProvider, MessageRole, StepRequest, StepResponse,
-    ToolCallRecord, ToolDefinition, ToolError, ToolExecutor, ToolUseRequest, TurnBlock,
+    AnthropicOptions, AnyProvider, ChatTurn, LlmError, LlmProvider, MessageRole, ProviderOptions,
+    StepRequest, StepResponse, ToolCallRecord, ToolDefinition, ToolError, ToolExecutor,
+    ToolUseRequest, TurnBlock, XaiOptions,
 };

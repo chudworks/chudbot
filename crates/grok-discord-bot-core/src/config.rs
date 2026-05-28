@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+use crate::llm::{AnthropicOptions, XaiOptions};
+
 /// Errors returned by [`Config::load`].
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -136,6 +138,17 @@ pub struct Persona {
     /// provider pick its default.
     #[serde(default)]
     pub top_p: Option<f32>,
+    /// Provider-specific knobs for when this persona's `provider = "xai"`.
+    /// Today: `reasoning_effort` (`"low"` | `"medium"` | `"high"`).
+    /// Ignored when the persona doesn't route to xAI.
+    #[serde(default)]
+    pub xai: Option<XaiOptions>,
+    /// Provider-specific knobs for when this persona's `provider =
+    /// "anthropic"`. Placeholder today; reserved for future Anthropic-
+    /// specific options. Ignored when the persona doesn't route to
+    /// Anthropic.
+    #[serde(default)]
+    pub anthropic: Option<AnthropicOptions>,
 }
 
 /// Privacy / context-gathering policy. The four variants correspond to
