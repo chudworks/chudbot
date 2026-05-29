@@ -1887,8 +1887,7 @@ fn compose_system_prompt(
         out.push_str(extra);
         out.push_str("\n\n");
     }
-    out.push_str(persona.system_prompt.trim_end());
-    out.push_str("\n\n— Operational context (always applies; not part of your persona) —\n");
+    out.push_str("— Operational context (always applies; not part of your persona) —\n");
     out.push_str(&format!(
         "Bot build: v{} ({}). You are answering as model `{}` via the {} API.\n\n",
         version_number,
@@ -1916,6 +1915,9 @@ fn compose_system_prompt(
          - Write for Discord: concise, minimal markdown; don't re-link or re-describe media you \
          have already attached.",
     );
+
+    out.push_str("\n\n");
+    out.push_str(persona.system_prompt.trim_end());
 
     out
 }
