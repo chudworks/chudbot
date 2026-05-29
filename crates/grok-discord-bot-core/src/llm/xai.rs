@@ -59,7 +59,7 @@ impl LlmProvider for XaiProvider {
 
     #[tracing::instrument(name = "step", skip_all, fields(provider = "xai", model = %request.model))]
     async fn step(&self, request: StepRequest) -> Result<StepResponse, LlmError> {
-        let (instructions, input_items) = to_responses_input(&request.messages);
+        let input_items = to_responses_input(&request.messages);
         let tools = build_tools(&request.tools, request.enable_web_search);
 
         // Per-persona xAI knobs. Today: `reasoning_effort` mapped to
@@ -76,7 +76,6 @@ impl LlmProvider for XaiProvider {
         let body = ResponsesRequest {
             model: &request.model,
             input: &input_items,
-            instructions: instructions.as_deref(),
             tools: if tools.is_empty() { None } else { Some(&tools) },
             max_output_tokens: Some(request.max_tokens),
             temperature: request.temperature,
@@ -174,19 +173,25 @@ impl LlmProvider for XaiProvider {
     }
 }
 
-/// Convert our [`ChatTurn`] history into the Responses API's
-/// `(instructions, input)` pair. System turns are lifted out of the
-/// input list and concatenated into the top-level `instructions` field.
-fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
-    let mut instructions: Vec<String> = Vec::new();
+/// Convert our [`ChatTurn`] history into the Responses API's `input`
+/// array. System turns become inline `role: "system"` messages at the
+/// position they appear (callers put the system prompt first) — xAI's
+/// documented form, anchoring the cached prefix.
+fn to_responses_input(turns: &[ChatTurn]) -> Vec<Value> {
     let mut input: Vec<Value> = Vec::new();
 
     for turn in turns {
         if turn.role == MessageRole::System {
+            // System turns are text-only by construction; concatenate any
+            // blocks into a single `role: "system"` message.
+            let mut text = String::new();
             for block in &turn.blocks {
                 if let TurnBlock::Text(t) = block {
-                    instructions.push(t.clone());
+                    text.push_str(t);
                 }
+            }
+            if !text.is_empty() {
+                input.push(json!({ "role": "system", "content": text }));
             }
             continue;
         }
@@ -278,12 +283,7 @@ fn to_responses_input(turns: &[ChatTurn]) -> (Option<String>, Vec<Value>) {
         input.extend(deferred);
     }
 
-    let instructions = if instructions.is_empty() {
-        None
-    } else {
-        Some(instructions.join("\n\n"))
-    };
-    (instructions, input)
+    input
 }
 
 /// Build the `tools` array — client-side function definitions plus
@@ -458,8 +458,6 @@ struct ResponsesRequest<'a> {
     model: &'a str,
     input: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
-    instructions: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a [Value]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u32>,
@@ -532,16 +530,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lifts_system_into_instructions() {
+    fn system_becomes_inline_role_message() {
         let turns = vec![
             ChatTurn::text(MessageRole::System, "be helpful"),
             ChatTurn::text(MessageRole::User, "hi"),
         ];
-        let (instructions, input) = to_responses_input(&turns);
-        assert_eq!(instructions.as_deref(), Some("be helpful"));
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], "user");
-        assert_eq!(input[0]["content"], "hi");
+        let input = to_responses_input(&turns);
+        // System rides as the FIRST input item with role "system" — xAI's
+        // documented form, not the top-level `instructions` field.
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[0]["content"], "be helpful");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"], "hi");
     }
 
     #[test]
@@ -568,7 +569,7 @@ mod tests {
                 }],
             },
         ];
-        let (_, input) = to_responses_input(&turns);
+        let input = to_responses_input(&turns);
         // user text, assistant text, function_call, function_call_output
         assert_eq!(input.len(), 4);
         assert_eq!(input[2]["type"], "function_call");
@@ -609,7 +610,6 @@ mod tests {
         let body = ResponsesRequest {
             model: "grok-4.3",
             input: &[],
-            instructions: None,
             tools: None,
             max_output_tokens: Some(4096),
             temperature: None,
@@ -628,7 +628,6 @@ mod tests {
         let body = ResponsesRequest {
             model: "grok-4.3",
             input: &[],
-            instructions: None,
             tools: None,
             max_output_tokens: Some(4096),
             temperature: None,
@@ -666,7 +665,6 @@ mod tests {
         let body = ResponsesRequest {
             model: "grok-4.3",
             input: &[],
-            instructions: None,
             tools: None,
             max_output_tokens: Some(4096),
             temperature: None,
@@ -685,7 +683,6 @@ mod tests {
         let body = ResponsesRequest {
             model: "grok-4.3",
             input: &[],
-            instructions: None,
             tools: None,
             max_output_tokens: Some(4096),
             temperature: None,
@@ -704,7 +701,6 @@ mod tests {
         let body = ResponsesRequest {
             model: "grok-4.3",
             input: &[],
-            instructions: None,
             tools: None,
             max_output_tokens: None,
             temperature: None,
@@ -752,7 +748,7 @@ mod tests {
                 ],
             },
         ];
-        let (_instructions, input) = to_responses_input(&turns);
+        let input = to_responses_input(&turns);
         // user message, then the reasoning item, then the assistant message
         // — reasoning must precede the message for the cache prefix to match.
         assert_eq!(input.len(), 3);
@@ -769,7 +765,6 @@ mod tests {
         let body = ResponsesRequest {
             model: "grok-4.3",
             input: &[],
-            instructions: None,
             tools: None,
             max_output_tokens: None,
             temperature: None,
@@ -845,7 +840,7 @@ mod tests {
                 TurnBlock::Text("hi".into()),
             ],
         }];
-        let (_instructions, input) = to_responses_input(&turns);
+        let input = to_responses_input(&turns);
         // Only the assistant message survives — foreign reasoning is not ours
         // to replay, so it never reaches an xAI request.
         assert_eq!(input.len(), 1);

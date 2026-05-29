@@ -78,7 +78,7 @@ const MAX_AGENT_ITERATIONS: u32 = 8;
 /// per-turn image bill. Prompt caching makes re-sending the survivors
 /// cheap, but the count still needs a ceiling. Dropped images are
 /// logged so a silent truncation never looks like full coverage.
-const MAX_REPLAYED_IMAGES: usize = 8;
+const MAX_REPLAYED_IMAGES: usize = 32;
 
 /// Discord free-tier upload size cap. Files larger than this are
 /// linked rather than attached (avoids a Discord-side reject).
@@ -908,8 +908,11 @@ async fn process(
 ///     links). The retry path relabels *this* turn's uploads to this form
 ///     too, since the original Discord URL is long gone.
 ///   - `discord:msg:*:image:*` are skipped here — on the live gateway path
-///     they're attached below from `saved_images` with the fresh Discord
-///     URL (reachable even in local dev).
+///     they're attached below from `saved_images`, also minted through
+///     [`storage::to_public_url`] so the URL is byte-identical to the
+///     `turn:*` form this same image takes on later turns (keeping xAI's
+///     prompt cache matching). Falls back to the live Discord URL only when
+///     no served URL can be minted.
 ///
 /// A reference annotation lists every in-context image by its stable
 /// `file://` id so the model can pass one to `generate_image`'s
@@ -1012,14 +1015,21 @@ fn assemble_messages(
                 _ => last.blocks.insert(0, TurnBlock::Text(annotation)),
             }
         }
-        // Vision for this turn's uploads: the live Discord URL is fresh and
-        // reachable without our own server, so the model can *see* them
-        // even in local dev. (Prior-turn images were already attached as
-        // served-URL blocks during message assembly. On retry this slice
-        // is empty — those uploads were relabeled `turn:*:image:*` above.)
+        // Vision for this turn's uploads: mint the same served URL the
+        // cross-turn replay path produces from `stored_uri`, not the live
+        // Discord link. The Discord URL carries expiring query params and
+        // differs from the served form this image takes on later turns, so
+        // reusing it here would bust xAI's cache prefix from the image
+        // onward; a stable URL keeps the prefix matching. Costs us needing
+        // `web.base_url` publicly reachable (as prior-turn images already
+        // do). Fall back to the live URL only when none can be minted.
+        // (On retry this slice is empty — those uploads were relabeled
+        // `turn:*:image:*` and replayed above.)
         for image in saved_images {
+            let url = storage::to_public_url(&image.stored_uri, web_base_url)
+                .unwrap_or_else(|| image.live_url.clone());
             last.blocks.push(TurnBlock::Image {
-                url: image.live_url.clone(),
+                url,
                 mime_type: image.mime_type.clone(),
             });
         }
@@ -1909,13 +1919,16 @@ fn compose_system_prompt(
     out
 }
 
-/// A single image attachment that's been persisted to local disk plus
-/// the live Discord URL we'll hand to the LLM on this turn.
+/// A single image attachment that's been persisted to local disk, ready
+/// to hand to the LLM this turn as a served (cache-stable) URL.
 struct SavedImage {
-    /// `file://images/<uuid>.<ext>` — recorded in `context_items`.
+    /// `file://images/<uuid>.<ext>` — recorded in `context_items`. The
+    /// LLM sees this minted into a served URL (stable across turns, so the
+    /// prompt cache keeps matching).
     stored_uri: String,
-    /// Original Discord CDN URL — used for the in-memory LLM call only.
-    /// Don't store; signed URLs expire after ~24h.
+    /// Original Discord CDN URL. Only a fallback now, for the rare upload
+    /// whose `stored_uri` can't be minted into a served URL. Don't store;
+    /// these signed URLs expire after ~24h.
     live_url: String,
     /// `content_type` from the Discord attachment metadata, if any.
     mime_type: Option<String>,
@@ -3338,10 +3351,10 @@ mod tests {
     }
 
     #[test]
-    fn assemble_messages_attaches_live_uploads_from_saved_images() {
+    fn assemble_messages_attaches_uploads_from_saved_images_as_served_url() {
         // Live gateway path with a fresh upload: the `discord:msg:*:image:*`
-        // row is skipped in the loop but its bytes are attached from
-        // `saved_images` via the live Discord URL.
+        // row is skipped in the loop, but its bytes are attached from
+        // `saved_images`.
         let context = vec![
             ctx("discord:msg:9", "user", "[amy]: draw"),
             ctx("discord:msg:9:image:0", "user", "file://images/up.png"),
@@ -3360,7 +3373,34 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // Exactly the live URL — served-from-storage path is for `turn:*`.
+        // The served storage URL minted from `stored_uri` — same form the
+        // `turn:*` replay path produces, not the live Discord link.
+        assert_eq!(urls, vec!["https://ex.com/images/up.png"]);
+    }
+
+    #[test]
+    fn assemble_messages_upload_falls_back_to_live_url_when_unservable() {
+        // A `stored_uri` that mints no served URL (e.g. `s3://`, which
+        // `to_public_url` doesn't handle yet) degrades to the live Discord
+        // URL so the model still sees the image this turn.
+        let context = vec![
+            ctx("discord:msg:9", "user", "[amy]: draw"),
+            ctx("discord:msg:9:image:0", "user", "s3://bucket/up.png"),
+        ];
+        let saved = vec![SavedImage {
+            stored_uri: "s3://bucket/up.png".to_string(),
+            live_url: "https://cdn.discord/up.png".to_string(),
+            mime_type: Some("image/png".to_string()),
+        }];
+        let msgs = assemble_messages(&context, &saved, "https://ex.com");
+        let urls: Vec<&str> = msgs
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter_map(|b| match b {
+                TurnBlock::Image { url, .. } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(urls, vec!["https://cdn.discord/up.png"]);
     }
 
