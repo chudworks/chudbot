@@ -9,6 +9,8 @@
 //! Today's implementations:
 //!   - [`xai::XaiImageProvider`] — xAI Grok Imagine (`grok-imagine-image`
 //!     family).
+//!   - [`openai::OpenAiImageProvider`] — OpenAI images (`gpt-image-1`
+//!     family).
 //!
 //! Per-request model selection is free-form ([`ImageGenRequest::model`]):
 //! providers map the string to whatever model id their API expects.
@@ -19,8 +21,10 @@ use thiserror::Error;
 
 use crate::config::ImageProviderKind;
 
+pub mod openai;
 pub mod xai;
 
+pub use openai::OpenAiImageProvider;
 pub use xai::XaiImageProvider;
 
 /// Errors returned by any [`ImageProvider`].
@@ -114,6 +118,8 @@ pub trait ImageProvider: Send + Sync {
 pub enum AnyImageProvider {
     /// xAI Grok Imagine.
     Xai(XaiImageProvider),
+    /// OpenAI images (`gpt-image-1` family).
+    OpenAi(OpenAiImageProvider),
 }
 
 impl AnyImageProvider {
@@ -122,6 +128,7 @@ impl AnyImageProvider {
     pub fn kind(&self) -> ImageProviderKind {
         match self {
             Self::Xai(_) => ImageProviderKind::Xai,
+            Self::OpenAi(_) => ImageProviderKind::OpenAi,
         }
     }
 }
@@ -130,12 +137,14 @@ impl ImageProvider for AnyImageProvider {
     fn name(&self) -> &str {
         match self {
             Self::Xai(p) => p.name(),
+            Self::OpenAi(p) => p.name(),
         }
     }
 
     async fn generate(&self, request: ImageGenRequest) -> Result<GeneratedImage, ImageGenError> {
         match self {
             Self::Xai(p) => p.generate(request).await,
+            Self::OpenAi(p) => p.generate(request).await,
         }
     }
 }
@@ -143,5 +152,15 @@ impl ImageProvider for AnyImageProvider {
 impl From<crate::config::XaiImageConfig> for AnyImageProvider {
     fn from(c: crate::config::XaiImageConfig) -> Self {
         Self::Xai(XaiImageProvider::new(c.api_key))
+    }
+}
+
+impl From<crate::config::OpenAiImageConfig> for AnyImageProvider {
+    fn from(c: crate::config::OpenAiImageConfig) -> Self {
+        let mut provider = OpenAiImageProvider::new(c.api_key);
+        if let Some(base_url) = c.base_url {
+            provider = provider.with_base_url(base_url);
+        }
+        Self::OpenAi(provider)
     }
 }

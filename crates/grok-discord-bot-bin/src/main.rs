@@ -139,10 +139,19 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(cfg) = config.llm.anthropic.clone() {
         providers.insert(LlmProviderKind::Anthropic, AnyProvider::from(cfg));
     }
+    if let Some(cfg) = config.llm.openai.clone() {
+        providers.insert(LlmProviderKind::OpenAi, AnyProvider::from(cfg));
+    }
+    if let Some(cfg) = config.llm.openai_compat.clone() {
+        providers.insert(LlmProviderKind::OpenAiCompat, AnyProvider::from(cfg));
+    }
 
     let mut image_providers: HashMap<ImageProviderKind, AnyImageProvider> = HashMap::new();
     if let Some(cfg) = config.image.xai.clone() {
         image_providers.insert(ImageProviderKind::Xai, AnyImageProvider::from(cfg));
+    }
+    if let Some(cfg) = config.image.openai.clone() {
+        image_providers.insert(ImageProviderKind::OpenAi, AnyImageProvider::from(cfg));
     }
 
     let mut video_providers: HashMap<VideoProviderKind, AnyVideoProvider> = HashMap::new();

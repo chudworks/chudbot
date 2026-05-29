@@ -19,13 +19,19 @@ and the final answer.
   `serve.sh deploy` builds the frontend with `bun` and atomically
   copies `dist/` into `$CHUDBOT_DIR/frontend-build/`.
 - **DB**: Postgres via `sqlx` 0.9 with runtime-checked queries
-- **LLM**: abstracted behind `LlmProvider::step` in `core::llm`. Two
-  implementations: `XaiProvider` and `AnthropicProvider`. Both support
-  server-side web search (xAI: `search_parameters`; Anthropic:
-  `web_search_20250305`) AND client-side tool calls via the agentic
-  harness in `core::agent`. Providers are **model-agnostic** — the
-  specific model id is supplied per call via `StepRequest::model`, so a
-  single provider instance serves any persona that uses that provider.
+- **LLM**: abstracted behind `LlmProvider::step` in `core::llm`. Four
+  implementations: `XaiProvider`, `AnthropicProvider`, `OpenAiProvider`
+  (real OpenAI, Responses API), and `OpenAiCompatProvider` (self-hosted
+  OpenAI-compatible hosts — vLLM / Ollama / LM Studio — Chat Completions
+  API). xAI, Anthropic, and OpenAI support server-side web search (xAI:
+  `web_search`/`x_search`; Anthropic: `web_search_20250305`; OpenAI: the
+  Responses `web_search` tool); `openai_compat` does NOT (regular Chat
+  Completions models can't search). All support client-side tool calls
+  via the agentic harness in `core::agent`. Providers are
+  **model-agnostic** — the specific model id is supplied per call via
+  `StepRequest::model`, so a single provider instance serves any persona
+  that uses that provider. (OpenAI's Sora video API is intentionally not
+  integrated — it's deprecated, shutdown scheduled 2026-09-24.)
 - **Config**: TOML file (`config.toml` by default). No env vars.
 - **Async runtime**: `tokio`
 - **Target platform**: macOS (Chud's Mac Studio), native — no Docker
@@ -240,10 +246,32 @@ in `core::llm`, so adding e.g. Anthropic extended-thinking budget is a
 one-field-add on `AnthropicOptions` plus a read in the provider's
 `step`.
 
-The provider blocks (`[llm.xai]`, `[llm.anthropic]`) supply only the
-api key — the model is no longer there. Include only the provider
-blocks the configured personas actually use; validation rejects a
-persona that references a provider with no credentials.
+The provider blocks (`[llm.xai]`, `[llm.anthropic]`, `[llm.openai]`,
+`[llm.openai_compat]`) supply credentials — the model is no longer
+there. `[llm.openai]` takes an `api_key` (+ optional `base_url`);
+`[llm.openai_compat]` takes a REQUIRED `base_url` (the local host) and an
+OPTIONAL `api_key`. Include only the provider blocks the configured
+personas actually use; validation rejects a persona that references a
+provider with no credentials.
+
+Per-provider persona knobs: `[personas.<name>.openai]` exposes
+`reasoning_effort` (`"minimal"` | `"low"` | `"medium"` | `"high"`),
+forwarded as `reasoning: { effort: ... }` on the Responses API (gpt-5
+family consume it; others ignore it). `openai_compat` has no options
+block.
+
+**Prompt caching & `provider_state`.** `OpenAiProvider` mirrors the xAI
+provider: it sends `store: false` + `include:
+["reasoning.encrypted_content"]`, sets `prompt_cache_key` to the
+conversation UUID (OpenAI auto-caches ≥1024-token prefixes; the key only
+steers routing), and captures the model's entire `output` array verbatim
+into `provider_state` tagged `"openai"` so later turns/iterations replay
+it byte-for-byte (the `full_echo` path in `to_responses_input`).
+`OpenAiCompatProvider` has no replayable reasoning blob, so
+`provider_state` is always `None` (like Anthropic) and it rebuilds the
+`messages` array from history each call; caching is the host's
+server-side automatic prefix caching (vLLM APC), warmed by keeping a
+stable prefix.
 
 **System prompt composition.** The persona's `system_prompt` is only the
 *voice*. The actual system prompt sent to the model is built per turn by
@@ -299,9 +327,13 @@ Image and video generation use the same trait-+-enum pattern as the LLM
 layer:
 
 - `core::imagegen::ImageProvider` (native async fn, no `async-trait`).
-  Today's only impl is `XaiImageProvider`; static dispatch via
-  `AnyImageProvider` so adding e.g. DALL-E 3, Flux via Fal.ai, or
-  Stable Diffusion via Replicate is a one-impl drop-in.
+  Impls: `XaiImageProvider` and `OpenAiImageProvider` (`gpt-image-1`
+  family — `/v1/images/generations` for text-to-image, multipart
+  `/v1/images/edits` for reference-guided edits; maps `aspect_ratio` →
+  OpenAI `size` and interprets the free-form `model` field as either a
+  model id or a quality tier). Static dispatch via `AnyImageProvider` so
+  adding e.g. Flux via Fal.ai or Stable Diffusion via Replicate is a
+  one-impl drop-in.
 - `core::videogen::VideoProvider` — same shape with `submit` /
   `check_once` / `download_bytes` primitives so the bot can interleave
   status messages between polls. `XaiVideoProvider` today; Runway /

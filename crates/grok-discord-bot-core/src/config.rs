@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-use crate::llm::{AnthropicOptions, XaiOptions};
+use crate::llm::{AnthropicOptions, OpenAiOptions, XaiOptions};
 
 /// Errors returned by [`Config::load`].
 #[derive(Debug, Error)]
@@ -226,6 +226,13 @@ pub struct Persona {
     /// Anthropic.
     #[serde(default)]
     pub anthropic: Option<AnthropicOptions>,
+    /// Provider-specific knobs for when this persona's `provider =
+    /// "openai"`. Today: `reasoning_effort` (`"minimal"` | `"low"` |
+    /// `"medium"` | `"high"`) on the Responses API. Ignored when the
+    /// persona doesn't route to OpenAI. The `openai_compat` provider has
+    /// no options block of its own; it reads nothing here.
+    #[serde(default)]
+    pub openai: Option<OpenAiOptions>,
     /// Optional image generation backend for this persona. When set,
     /// the `generate_image` tool is exposed and routed through the
     /// matching `[image.<kind>]` credentials block. When unset, the
@@ -382,6 +389,13 @@ pub struct LlmConfig {
     pub xai: Option<XaiConfig>,
     /// Anthropic provider credentials.
     pub anthropic: Option<AnthropicConfig>,
+    /// OpenAI provider credentials (the real OpenAI platform, on the
+    /// Responses API).
+    pub openai: Option<OpenAiConfig>,
+    /// OpenAI-compatible host credentials (a self-hosted vLLM / Ollama /
+    /// LM Studio server speaking the Chat Completions API). Requires a
+    /// `base_url`; the api key is optional (many local servers need none).
+    pub openai_compat: Option<OpenAiCompatConfig>,
 }
 
 /// Discriminator for which LLM provider a persona uses.
@@ -392,6 +406,12 @@ pub enum LlmProviderKind {
     Xai,
     /// Anthropic / Claude.
     Anthropic,
+    /// OpenAI (the real platform, Responses API).
+    OpenAi,
+    /// An OpenAI-compatible host (vLLM / Ollama / LM Studio), Chat
+    /// Completions API.
+    #[serde(rename = "openai_compat")]
+    OpenAiCompat,
 }
 
 impl LlmProviderKind {
@@ -400,6 +420,8 @@ impl LlmProviderKind {
         match self {
             Self::Xai => "xai",
             Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::OpenAiCompat => "openai_compat",
         }
     }
 }
@@ -418,6 +440,34 @@ pub struct AnthropicConfig {
     pub api_key: String,
 }
 
+/// OpenAI credentials (the real OpenAI platform). The provider talks to
+/// the Responses API.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpenAiConfig {
+    /// API key issued at platform.openai.com.
+    pub api_key: String,
+    /// Optional base URL override (e.g. an Azure OpenAI gateway). When
+    /// unset, the provider defaults to `https://api.openai.com/v1`.
+    #[serde(default)]
+    pub base_url: Option<String>,
+}
+
+/// Credentials for a self-hosted OpenAI-compatible host (vLLM, Ollama,
+/// LM Studio) speaking the Chat Completions API. Unlike [`OpenAiConfig`],
+/// `base_url` is required (there's no sensible default for a local host)
+/// and the api key is optional, since many local servers accept any
+/// token or none at all.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpenAiCompatConfig {
+    /// Base URL of the host's OpenAI-compatible API, including the
+    /// version segment (e.g. `http://dgx.local:8000/v1`).
+    pub base_url: String,
+    /// Optional bearer token. Sent as `Authorization: Bearer …` when
+    /// present; omitted entirely when absent.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
 /// Image generation backend credentials. Each field is a separate
 /// `[image.<kind>]` block; presence gates whether a persona referencing
 /// that kind can actually serve image requests.
@@ -425,6 +475,8 @@ pub struct AnthropicConfig {
 pub struct ImageConfig {
     /// xAI Grok Imagine credentials.
     pub xai: Option<XaiImageConfig>,
+    /// OpenAI image (`gpt-image-1` family) credentials.
+    pub openai: Option<OpenAiImageConfig>,
 }
 
 /// xAI Grok Imagine credentials. Typically the same key as
@@ -434,6 +486,18 @@ pub struct ImageConfig {
 pub struct XaiImageConfig {
     /// API key issued at console.x.ai.
     pub api_key: String,
+}
+
+/// OpenAI image-generation credentials (`gpt-image-1` family, via
+/// `/v1/images/generations` + `/v1/images/edits`). Stored separately
+/// from `[llm.openai]` so a deployment can mix LLM and image backends.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OpenAiImageConfig {
+    /// API key issued at platform.openai.com.
+    pub api_key: String,
+    /// Optional base URL override. Defaults to `https://api.openai.com/v1`.
+    #[serde(default)]
+    pub base_url: Option<String>,
 }
 
 /// Video generation backend credentials. Symmetric with [`ImageConfig`].
@@ -456,6 +520,8 @@ pub struct XaiVideoConfig {
 pub enum ImageProviderKind {
     /// xAI Grok Imagine (`grok-imagine-image` family).
     Xai,
+    /// OpenAI images (`gpt-image-1` family).
+    OpenAi,
 }
 
 impl ImageProviderKind {
@@ -463,6 +529,7 @@ impl ImageProviderKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Xai => "xai",
+            Self::OpenAi => "openai",
         }
     }
 }
@@ -512,6 +579,8 @@ impl Config {
             let present = match persona.provider {
                 LlmProviderKind::Xai => self.llm.xai.is_some(),
                 LlmProviderKind::Anthropic => self.llm.anthropic.is_some(),
+                LlmProviderKind::OpenAi => self.llm.openai.is_some(),
+                LlmProviderKind::OpenAiCompat => self.llm.openai_compat.is_some(),
             };
             if !present {
                 return Err(ConfigError::MissingProviderForPersona {
@@ -522,6 +591,7 @@ impl Config {
             if let Some(kind) = persona.image_provider {
                 let configured = match kind {
                     ImageProviderKind::Xai => self.image.xai.is_some(),
+                    ImageProviderKind::OpenAi => self.image.openai.is_some(),
                 };
                 if !configured {
                     return Err(ConfigError::MissingImageProviderForPersona {
@@ -845,5 +915,93 @@ mod tests {
             config.personas["default"].video_provider,
             Some(VideoProviderKind::Xai)
         );
+    }
+
+    #[test]
+    fn parse_openai_and_compat_personas() {
+        let toml = r#"
+            default_persona = "cloud"
+
+            [discord]
+            token = "abc"
+
+            [postgres]
+            url = "postgres://localhost/grok"
+
+            [web]
+            base_url = "http://localhost:8080"
+
+            [llm.openai]
+            api_key = "sk-openai"
+
+            [llm.openai_compat]
+            base_url = "http://dgx.local:8000/v1"
+
+            [image.openai]
+            api_key = "sk-openai"
+
+            [personas.cloud]
+            provider = "openai"
+            model = "gpt-5.5"
+            system_prompt = "Be helpful."
+            image_provider = "openai"
+            [personas.cloud.openai]
+            reasoning_effort = "high"
+
+            [personas.local]
+            provider = "openai_compat"
+            model = "qwen3"
+            system_prompt = "Be local."
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.personas["cloud"].provider, LlmProviderKind::OpenAi);
+        assert_eq!(
+            config.personas["cloud"].openai.as_ref().unwrap().reasoning_effort,
+            Some("high".to_string())
+        );
+        assert_eq!(
+            config.personas["cloud"].image_provider,
+            Some(ImageProviderKind::OpenAi)
+        );
+        assert_eq!(
+            config.personas["local"].provider,
+            LlmProviderKind::OpenAiCompat
+        );
+        // openai_compat requires a base_url; the api key is optional.
+        let compat = config.llm.openai_compat.as_ref().unwrap();
+        assert_eq!(compat.base_url, "http://dgx.local:8000/v1");
+        assert!(compat.api_key.is_none());
+    }
+
+    #[test]
+    fn openai_compat_persona_without_block_is_an_error() {
+        let toml = r#"
+            default_persona = "local"
+
+            [discord]
+            token = "abc"
+
+            [postgres]
+            url = "postgres://localhost/grok"
+
+            [web]
+            base_url = "http://localhost:8080"
+
+            [llm.xai]
+            api_key = "xai-key"
+
+            [personas.local]
+            provider = "openai_compat"
+            model = "qwen3"
+            system_prompt = "x"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let err = config.validate().unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::MissingProviderForPersona { ref provider, .. }
+                if provider == "openai_compat"
+        ));
     }
 }

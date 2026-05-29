@@ -74,22 +74,46 @@ base_url = "http://localhost:1860"
 # trust_forwarded_for = true
 
 # LLM provider credentials. Include only the blocks for providers any of
-# your personas actually use. Both can be present — personas pick freely.
+# your personas actually use. Several can be present — personas pick freely.
 [llm.xai]
 api_key = "xai-..."
 
 # [llm.anthropic]
 # api_key = "sk-ant-..."
 
+# OpenAI (the real platform). Uses the Responses API — first-class tool
+# calls, built-in web search, and encrypted-reasoning replay for prompt
+# caching, on par with the xAI provider.
+# [llm.openai]
+# api_key = "sk-..."
+# base_url = "https://api.openai.com/v1"   # optional; override for Azure etc.
+
+# A self-hosted OpenAI-compatible host (vLLM / Ollama / LM Studio),
+# spoken to over the Chat Completions API. `base_url` is REQUIRED (no
+# default for a local host); `api_key` is optional (many local servers
+# accept any/none). No server-side web search on this path; the model
+# still drives the client-side tools. For tool calling, start vLLM with
+# `--enable-auto-tool-choice --tool-call-parser <parser>`.
+# [llm.openai_compat]
+# base_url = "http://dgx.local:8000/v1"
+# api_key = "anything"   # optional
+
 # Image generation backend credentials. Symmetric with [llm.*]: include
 # only the blocks for backends a persona's `image_provider` field names.
 # A persona with no `image_provider` simply has no `generate_image` tool.
-# Today xAI Grok Imagine is the only backend wired in; the `ImageProvider`
-# trait in `core::imagegen` is the seam for adding more.
+# xAI Grok Imagine and OpenAI (`gpt-image-1` family) are wired in; the
+# `ImageProvider` trait in `core::imagegen` is the seam for adding more.
 [image.xai]
 api_key = "xai-..."  # typically the same key as [llm.xai]
 
-# Video generation backend credentials. Same shape as `image`.
+# OpenAI images (`gpt-image-1` family) via /v1/images/{generations,edits}.
+# [image.openai]
+# api_key = "sk-..."
+# base_url = "https://api.openai.com/v1"   # optional
+
+# Video generation backend credentials. Same shape as `image`. (OpenAI's
+# Sora video API is intentionally NOT wired in — it's deprecated, with a
+# shutdown scheduled for 2026-09-24.)
 [video.xai]
 api_key = "xai-..."
 
@@ -158,4 +182,23 @@ video_provider = "xai"
 # image_provider = "xai"
 # [personas.researcher.xai]
 # reasoning_effort = "high"
+
+# Example OpenAI persona (requires the [llm.openai] block above). Uses the
+# Responses API. `reasoning_effort` is "minimal" | "low" | "medium" |
+# "high" and only affects reasoning-capable models (gpt-5 family).
+# [personas.gpt]
+# provider = "openai"
+# model = "gpt-5.5"
+# system_prompt = "You are a helpful AI assistant."
+# image_provider = "openai"
+# [personas.gpt.openai]
+# reasoning_effort = "medium"
+
+# Example self-hosted persona (requires the [llm.openai_compat] block
+# above). No web search; client-side tools (fetch_messages, image gen)
+# still work if a host-served model supports tool calling.
+# [personas.local]
+# provider = "openai_compat"
+# model = "qwen3"   # whatever model id your host serves
+# system_prompt = "You are a helpful AI assistant."
 

@@ -21,8 +21,9 @@ use std::sync::{Arc, Mutex};
 
 use grok_discord_bot_core::{
     AgentRun, AnyImageProvider, AnyProvider, AnyVideoProvider, ChatTurn, ContextItem, Conversation,
-    Db, ImageProvider, LlmProvider, MessageRole, NoopObserver, Persona, PrivacyMode,
-    ProviderOptions, StepRequest, StepResponse, ToolDefinition, ToolError, ToolExecutor, Turn,
+    Db, ImageProvider, LlmProvider, LlmProviderKind, MessageRole, NoopObserver, Persona,
+    PrivacyMode, ProviderOptions, StepRequest, StepResponse, ToolDefinition, ToolError,
+    ToolExecutor, Turn,
     TurnBlock, VideoProvider, imagegen::ImageGenRequest, run_agent, storage,
     videogen::VideoGenRequest,
 };
@@ -1183,6 +1184,7 @@ async fn run_turn_and_reply(
         ProviderOptions {
             xai: persona.xai.clone(),
             anthropic: persona.anthropic.clone(),
+            openai: persona.openai.clone(),
         },
         // Stable cache-routing key: the conversation UUID. Every
         // agent-loop iteration and every later turn re-sends the
@@ -2019,8 +2021,13 @@ fn compose_system_prompt(
     // One pointer line per capability whose tool is declared this turn.
     // Order/conditions mirror `build_tool_definitions` + the always-on
     // server-side web search, so the prompt never advertises a tool the
-    // model wasn't given.
-    let mut capabilities = vec!["- Web search: look up current information when it helps."];
+    // model wasn't given. Web search is server-side and available on every
+    // provider EXCEPT openai_compat (self-hosted Chat Completions hosts
+    // can't search), so don't advertise it there.
+    let mut capabilities: Vec<&str> = Vec::new();
+    if !matches!(persona.provider, LlmProviderKind::OpenAiCompat) {
+        capabilities.push("- Web search: look up current information when it helps.");
+    }
     if image_enabled {
         capabilities.push("- Image generation & editing: via the generate_image tool.");
     }
@@ -3372,6 +3379,7 @@ mod tests {
             top_p: None,
             xai: None,
             anthropic: None,
+            openai: None,
             image_provider: None,
             video_provider: None,
         }

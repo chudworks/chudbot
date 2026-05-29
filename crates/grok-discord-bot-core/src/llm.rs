@@ -24,9 +24,13 @@ use thiserror::Error;
 
 pub mod anthropic;
 pub mod mock;
+pub mod openai;
+pub mod openai_compat;
 pub mod xai;
 
-use crate::config::{AnthropicConfig, LlmProviderKind, XaiConfig};
+use crate::config::{
+    AnthropicConfig, LlmProviderKind, OpenAiCompatConfig, OpenAiConfig, XaiConfig,
+};
 
 /// Role of a message in a chat conversation.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -165,6 +169,10 @@ pub struct ProviderOptions {
     /// Anthropic-specific knobs. Placeholder today; reserved for
     /// fields like extended-thinking budgets when we add them.
     pub anthropic: Option<AnthropicOptions>,
+    /// OpenAI-specific knobs (e.g. `reasoning_effort` on the Responses
+    /// API). Read only by the `openai` provider; the `openai_compat`
+    /// (Chat Completions) provider ignores it.
+    pub openai: Option<OpenAiOptions>,
 }
 
 /// xAI-specific per-request knobs.
@@ -183,6 +191,17 @@ pub struct XaiOptions {
 /// in without churning Persona / StepRequest signatures.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnthropicOptions {}
+
+/// OpenAI-specific per-request knobs (Responses API).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OpenAiOptions {
+    /// Reasoning effort hint forwarded as `reasoning: { effort: ... }`
+    /// on the Responses API. Valid values per OpenAI: `minimal` | `low`
+    /// | `medium` | `high`. Only meaningful for reasoning-capable models
+    /// (the gpt-5 family); others ignore it.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+}
 
 /// Input to [`LlmProvider::step`].
 #[derive(Debug, Clone)]
@@ -391,6 +410,10 @@ pub enum AnyProvider {
     Xai(xai::XaiProvider),
     /// Anthropic Claude.
     Anthropic(anthropic::AnthropicProvider),
+    /// OpenAI (Responses API).
+    OpenAi(openai::OpenAiProvider),
+    /// OpenAI-compatible host (Chat Completions API).
+    OpenAiCompat(openai_compat::OpenAiCompatProvider),
 }
 
 impl AnyProvider {
@@ -400,6 +423,8 @@ impl AnyProvider {
         match self {
             Self::Xai(_) => LlmProviderKind::Xai,
             Self::Anthropic(_) => LlmProviderKind::Anthropic,
+            Self::OpenAi(_) => LlmProviderKind::OpenAi,
+            Self::OpenAiCompat(_) => LlmProviderKind::OpenAiCompat,
         }
     }
 }
@@ -409,6 +434,8 @@ impl LlmProvider for AnyProvider {
         match self {
             Self::Xai(p) => p.name(),
             Self::Anthropic(p) => p.name(),
+            Self::OpenAi(p) => p.name(),
+            Self::OpenAiCompat(p) => p.name(),
         }
     }
 
@@ -416,6 +443,8 @@ impl LlmProvider for AnyProvider {
         match self {
             Self::Xai(p) => p.step(request).await,
             Self::Anthropic(p) => p.step(request).await,
+            Self::OpenAi(p) => p.step(request).await,
+            Self::OpenAiCompat(p) => p.step(request).await,
         }
     }
 }
@@ -429,5 +458,17 @@ impl From<XaiConfig> for AnyProvider {
 impl From<AnthropicConfig> for AnyProvider {
     fn from(c: AnthropicConfig) -> Self {
         Self::Anthropic(anthropic::AnthropicProvider::new(c))
+    }
+}
+
+impl From<OpenAiConfig> for AnyProvider {
+    fn from(c: OpenAiConfig) -> Self {
+        Self::OpenAi(openai::OpenAiProvider::new(c))
+    }
+}
+
+impl From<OpenAiCompatConfig> for AnyProvider {
+    fn from(c: OpenAiCompatConfig) -> Self {
+        Self::OpenAiCompat(openai_compat::OpenAiCompatProvider::new(c))
     }
 }

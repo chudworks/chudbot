@@ -130,6 +130,7 @@ async fn generate(
         provider_options: ProviderOptions {
             xai: persona.xai.clone(),
             anthropic: persona.anthropic.clone(),
+            openai: persona.openai.clone(),
         },
         // No cache key: a once-per-conversation one-shot whose only
         // shared text is the short, static TITLE_SYSTEM_PROMPT (xAI

@@ -31,7 +31,7 @@ features = ["sync"]
 [workspace.dependencies.reqwest]
 version = "0.13"
 default-features = false
-features = ["json", "rustls", "http2"]
+features = ["json", "rustls", "http2", "multipart"]
 
 [workspace.dependencies.serde]
 version = "1"
