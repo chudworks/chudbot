@@ -576,6 +576,7 @@ fn event_payload(ev: &ConversationEvent) -> Event {
         EventKind::ToolCallRecorded => ("tool_call_recorded", serde_json::json!({})),
         EventKind::ContextItemAdded => ("context_item_added", serde_json::json!({})),
         EventKind::TitleUpdated => ("title_updated", serde_json::json!({})),
+        EventKind::ConversationUpdated => ("conversation_updated", serde_json::json!({})),
         EventKind::UserAvatarUpdated { user_id } => (
             "user_avatar_updated",
             // Stringify the snowflake for the same reason the JSON API

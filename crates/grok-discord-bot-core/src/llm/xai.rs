@@ -151,16 +151,19 @@ impl LlmProvider for XaiProvider {
         let (text, tool_uses, server_tool_calls) =
             walk_output(&parsed.output, parsed.citations.as_ref());
         // Carry the model's ENTIRE output array forward verbatim — the
-        // encrypted `reasoning` item(s), the assistant `message` item, and
-        // any `function_call` / server `*_call` items, in the exact order
-        // and shape xAI emitted them. The Responses API chains a
-        // conversation by echoing this array back as the assistant turn's
-        // input (see `to_responses_input`); replaying it byte-for-byte is
-        // what keeps the per-server prompt cache warm across iterations and
-        // turns. Re-synthesizing a `{"role":"assistant","content":"…"}`
-        // message instead diverges from what the model emitted, misses the
-        // cache, and orphans the reasoning item from the message it must
-        // precede. `None` only when the model produced no output at all.
+        // encrypted `reasoning` item(s), the assistant `message`, any
+        // client `function_call`, and any server tool-call items
+        // (`web_search_call`, `x_search_call`, …) — in the exact order and
+        // shape xAI emitted them. This mirrors xAI's documented manual-state
+        // chaining loop for `store: false` + `include:
+        // ["reasoning.encrypted_content"]`, which appends the whole
+        // `response.output` (server tool-call items included) back into the
+        // next request's `input` — see `to_responses_input`. Replaying it
+        // byte-for-byte rather than re-synthesizing a
+        // `{"role":"assistant","content":"…"}` message is what keeps the
+        // per-server prompt cache warm across iterations and turns and keeps
+        // each encrypted reasoning item attached to the message it precedes.
+        // `None` only when the model produced no output at all.
         let provider_state = (!parsed.output.is_empty()).then_some(Value::Array(parsed.output));
 
         if !tool_uses.is_empty() {
@@ -850,6 +853,45 @@ mod tests {
         assert_eq!(input[1]["call_id"], "call_1");
         assert_eq!(input[2]["type"], "function_call_output");
         assert_eq!(input[2]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn replays_server_tool_call_items_verbatim() {
+        // xAI's documented manual-state chaining loop appends the WHOLE
+        // `response.output` back into the next request's input — server
+        // tool-call items (`web_search_call`, `x_search_call`, …) included,
+        // not just reasoning + message. They must round-trip verbatim and
+        // in position so the cached prefix matches. (Verified against xAI's
+        // Advanced Usage docs: `input_list.extend(response.output)`.)
+        let full_output = json!([
+            { "type": "reasoning", "id": "rs_1", "encrypted_content": "BLOB" },
+            { "type": "web_search_call", "id": "ws_1", "status": "completed" },
+            {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_1",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": "found it", "annotations": [] }],
+            },
+        ]);
+        let turns = vec![ChatTurn {
+            role: MessageRole::Assistant,
+            blocks: vec![
+                TurnBlock::Reasoning {
+                    provider_name: "xai".into(),
+                    data: full_output,
+                },
+                TurnBlock::Text("found it".into()),
+            ],
+        }];
+        let input = to_responses_input(&turns);
+        // All three items replay verbatim, in order — the web_search_call is
+        // NOT stripped.
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[1]["type"], "web_search_call");
+        assert_eq!(input[1]["id"], "ws_1");
+        assert_eq!(input[2]["type"], "message");
     }
 
     #[test]

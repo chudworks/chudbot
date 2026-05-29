@@ -89,6 +89,13 @@ const DISCORD_FREE_UPLOAD_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
 /// reply re-runs the turn — see [`handle_reaction`].
 const RETRY_EMOJI: &str = "🔄";
 
+/// Unicode emoji a configured admin reacts with to pause the bot in a
+/// conversation (`:octagonal_sign:`). Adding it on any tracked message
+/// stops the bot from replying to further mentions in that conversation;
+/// removing it resumes. Non-admins reacting it are ignored. See
+/// [`handle_reaction`].
+const STOP_EMOJI: &str = "🛑";
+
 /// System prompt for the pre-flight moderation classifier. The bot
 /// runs in **private friends-only servers**, so the default is ALLOW
 /// and the refusal list is narrowly scoped to genuinely illegal or
@@ -231,7 +238,10 @@ pub async fn run(
     let watched = EventTypeFlags::MESSAGE_CREATE
         | EventTypeFlags::INTERACTION_CREATE
         | EventTypeFlags::GUILD_CREATE
-        | EventTypeFlags::REACTION_ADD;
+        | EventTypeFlags::REACTION_ADD
+        // Reaction removal powers the admin 🛑 "resume" affordance —
+        // taking the stop sign off a message un-pauses the conversation.
+        | EventTypeFlags::REACTION_REMOVE;
 
     let cancel = app.cancel.clone();
     let tracker = app.tracker.clone();
@@ -280,7 +290,13 @@ pub async fn run(
                     Event::ReactionAdd(boxed) => {
                         let state = Arc::clone(&state);
                         tracker.spawn(async move {
-                            handle_reaction(state, boxed.0).await;
+                            handle_reaction(state, boxed.0, false).await;
+                        });
+                    }
+                    Event::ReactionRemove(boxed) => {
+                        let state = Arc::clone(&state);
+                        tracker.spawn(async move {
+                            handle_reaction(state, boxed.0, true).await;
                         });
                     }
                     Event::GuildCreate(boxed) => log_guild_create(&boxed),
@@ -491,6 +507,26 @@ async fn handle_message(state: Arc<State>, msg: Message) {
                 "ignoring mention outside allowed channel (channel_only mode)"
             );
             return;
+        }
+    }
+
+    // Admin kill-switch: if this mention extends a conversation an admin
+    // paused with 🛑, stay silent — no reaction, no reply, no LLM spend.
+    // Runs before the 👀 reaction so a paused thread shows no sign of
+    // life. A lookup error here fails OPEN (we answer) rather than
+    // silently swallowing mentions on a DB hiccup. New conversations
+    // (no prior row) can't be stopped, so this only fires on continues.
+    match lookup_existing_conversation(&state, &msg).await {
+        Ok(Some(conv)) if conv.stopped_at.is_some() => {
+            tracing::info!(
+                conversation = %conv.id,
+                "turn: conversation paused by admin (🛑); ignoring mention"
+            );
+            return;
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(error = %err, "stop-gate: conversation lookup failed; answering anyway");
         }
     }
 
@@ -1289,6 +1325,11 @@ async fn run_turn_and_reply(
         turn.id,
     )
     .await?;
+    // The answer has landed — stop typing now, before the DB-finalize /
+    // 🔄-reaction tail. Dropping at end-of-scope would let a stray ping
+    // re-show "typing…" for up to 8s after the reply is already visible.
+    // (Kept alive through post_reply_chunks so it covers media upload.)
+    drop(_typing);
     let reply_msg = reply_msgs
         .last()
         .cloned()
@@ -1369,37 +1410,106 @@ async fn run_turn_and_reply(
     Ok(TurnOutcome::Completed)
 }
 
-/// Gate an incoming reaction: act only on the 🔄 retry emoji (and never on
-/// our own reactions), resolve the reacted message to its turn, and hand
-/// off to [`retry_turn`]. Everything else is a silent no-op.
+/// Gate an incoming reaction (add or remove) and route it to the right
+/// handler by emoji:
+///   - 🔄 (added): re-run the latest failed turn — see [`retry_turn`].
+///   - 🛑 (added/removed, admins only): pause / resume the bot in the
+///     conversation — see [`set_conversation_stop`].
+/// Everything else (including our own reactions, and 🔄 removals) is a
+/// silent no-op. `removed` is `true` for a `ReactionRemove` event.
 #[tracing::instrument(
     skip_all,
-    fields(message_id = %reaction.message_id, user = %reaction.user_id)
+    fields(message_id = %reaction.message_id, user = %reaction.user_id, removed)
 )]
-async fn handle_reaction(state: Arc<State>, reaction: GatewayReaction) {
-    let is_retry = matches!(
-        &reaction.emoji,
-        EmojiReactionType::Unicode { name } if name == RETRY_EMOJI
-    );
-    if !is_retry || reaction.user_id == state.bot_user_id {
+async fn handle_reaction(state: Arc<State>, reaction: GatewayReaction, removed: bool) {
+    // The bot never acts on its own reactions (it adds 🔄 to its own
+    // error replies as a clickable affordance).
+    if reaction.user_id == state.bot_user_id {
         return;
     }
-
-    let message_id = i64::try_from(reaction.message_id.get()).unwrap_or(i64::MAX);
-    let turn_id = match state.db.lookup_turn_by_message(message_id).await {
-        Ok(Some(id)) => id,
-        // Reaction on a message that isn't part of any turn (or a DB
-        // hiccup) — nothing to retry.
-        Ok(None) => return,
-        Err(err) => {
-            tracing::warn!(error = %err, "retry: turn lookup failed");
-            return;
-        }
+    let EmojiReactionType::Unicode { name } = &reaction.emoji else {
+        return;
     };
 
-    if let Err(err) = retry_turn(&state, turn_id, reaction.channel_id).await {
-        tracing::error!(error = %err, %turn_id, "retry: failed to re-run turn");
+    match name.as_str() {
+        // Retry is an add-only affordance; removing the 🔄 does nothing.
+        RETRY_EMOJI if !removed => {
+            let message_id = i64::try_from(reaction.message_id.get()).unwrap_or(i64::MAX);
+            let turn_id = match state.db.lookup_turn_by_message(message_id).await {
+                Ok(Some(id)) => id,
+                // Reaction on a message that isn't part of any turn (or a
+                // DB hiccup) — nothing to retry.
+                Ok(None) => return,
+                Err(err) => {
+                    tracing::warn!(error = %err, "retry: turn lookup failed");
+                    return;
+                }
+            };
+            if let Err(err) = retry_turn(&state, turn_id, reaction.channel_id).await {
+                tracing::error!(error = %err, %turn_id, "retry: failed to re-run turn");
+            }
+        }
+        // 🛑 add pauses, 🛑 remove resumes — admins only.
+        STOP_EMOJI => {
+            if !state.is_admin(reaction.user_id.get()) {
+                tracing::debug!("stop-sign reaction from non-admin; ignoring");
+                return;
+            }
+            if let Err(err) = set_conversation_stop(&state, &reaction, !removed).await {
+                tracing::error!(error = %err, "stop-sign: failed to update conversation");
+            }
+        }
+        _ => {}
     }
+}
+
+/// Apply an admin 🛑 reaction to the conversation the reacted message
+/// belongs to: `stop = true` pauses the bot there, `stop = false`
+/// resumes it. Resolves the conversation from the message id first
+/// (covers reacting on the @mention or any bot reply) and then the
+/// channel id (covers reacting inside a Grok-owned thread). A reaction
+/// on an untracked message resolves to nothing and is a silent no-op.
+///
+/// The flag is a single per-conversation bit: any admin's 🛑 pauses, any
+/// admin's removal resumes. With multiple admins' stop signs on
+/// different messages, one removal resumes even if another's sign
+/// remains — acceptable for an operator kill-switch.
+async fn set_conversation_stop(
+    state: &State,
+    reaction: &GatewayReaction,
+    stop: bool,
+) -> Result<(), BotError> {
+    let message_id = i64::try_from(reaction.message_id.get()).unwrap_or(i64::MAX);
+    let channel_id = i64::try_from(reaction.channel_id.get()).unwrap_or(i64::MAX);
+
+    let conversation_id = match state.db.lookup_conversation_by_message(message_id).await? {
+        Some(id) => Some(id),
+        None => state.db.lookup_conversation_by_message(channel_id).await?,
+    };
+    let Some(conversation_id) = conversation_id else {
+        tracing::debug!("stop-sign: reacted message maps to no conversation; ignoring");
+        return Ok(());
+    };
+
+    let rows = if stop {
+        let admin_id = i64::try_from(reaction.user_id.get()).unwrap_or(i64::MAX);
+        state.db.stop_conversation(conversation_id, admin_id).await?
+    } else {
+        state.db.resume_conversation(conversation_id).await?
+    };
+    if rows == 0 {
+        return Ok(());
+    }
+
+    tracing::info!(
+        conversation = %conversation_id,
+        admin = %reaction.user_id,
+        stopped = stop,
+        "stop-sign: admin {} the bot in this conversation",
+        if stop { "paused" } else { "resumed" }
+    );
+    state.publish(conversation_id, EventKind::ConversationUpdated);
+    Ok(())
 }
 
 /// Re-run a previously-failed turn (triggered by a 🔄 reaction). Confirms
@@ -1420,6 +1530,14 @@ async fn retry_turn(
         return Ok(());
     };
     tracing::Span::current().record("conversation", tracing::field::display(conversation.id));
+
+    // Respect the admin 🛑 kill-switch on the retry path too — a paused
+    // conversation must not produce replies, however the re-run was
+    // triggered.
+    if conversation.stopped_at.is_some() {
+        tracing::info!("retry: conversation paused by admin (🛑); ignoring");
+        return Ok(());
+    }
 
     // Atomic gate: only the LATEST turn, and only while it's `failed`.
     // The same statement flips it to `pending`, so a double 🔄 or a stale
@@ -3240,6 +3358,8 @@ mod tests {
             title: None,
             title_generated_at: None,
             model: "test".to_string(),
+            stopped_at: None,
+            stopped_by_user_id: None,
         }
     }
 

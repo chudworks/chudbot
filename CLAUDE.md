@@ -86,6 +86,20 @@ on the unguessable UUID. Status emojis: 👀 working, ✅ success, ❌ error,
 ❓ refused (upstream safety / moderation), 🔄 retry affordance on a failed
 turn's reply.
 
+**Admin stop-sign (🛑).** Operator admins (top-level `admins` config — a
+list of Discord user ids as strings) can pause the bot in a single
+conversation by reacting 🛑 (`:octagonal_sign:`) on any tracked message
+(the @mention, a bot reply, or any message inside a Grok-owned thread);
+removing the reaction resumes it. State lives on `conversations.
+stopped_at` / `stopped_by_user_id` (nullable; `stopped_at` doubles as the
+flag). `handle_reaction` routes both `ReactionAdd` and `ReactionRemove`:
+🛑 from an admin resolves the message→conversation and calls
+`Db::stop_conversation` / `resume_conversation`. While stopped, both the
+live-mention path (`handle_message`, gated before the 👀 reaction so a
+paused thread shows no sign of life and spends no tokens) and the 🔄-retry
+path stay silent. The viewer renders a banner from `stopped_at` and
+refetches on the `conversation_updated` SSE event.
+
 **Resilience & failure handling.** Transient upstream blips (HTTP 5xx /
 429 / transport) are retried with exponential backoff via `core::retry`,
 which wraps every LLM / image / video HTTP call (video `submit` opts out

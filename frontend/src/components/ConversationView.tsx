@@ -40,6 +40,7 @@ export default function ConversationView() {
       'tool_call_recorded',
       'context_item_added',
       'title_updated',
+      'conversation_updated',
       'user_avatar_updated',
       'lag',
     ].forEach((name) => source.addEventListener(name, onAny));
@@ -94,6 +95,14 @@ export default function ConversationView() {
           {' · model '}
           <code>{conversation.model}</code>
         </p>
+        {conversation.stopped_at && (
+          <p className="stopped-banner" role="status">
+            🛑 An admin paused the bot in this conversation
+            {' '}
+            <RelativeTime iso={conversation.stopped_at} prefix="" />.
+            {' '}It won’t reply until the 🛑 reaction is removed.
+          </p>
+        )}
       </header>
       <main className="conv">
         {turns.map((tv) => (

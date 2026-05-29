@@ -111,7 +111,7 @@ impl Db {
              VALUES ($1, $2, $3, $4, $5, $6, $7) \
              RETURNING id, created_at, discord_guild_id, discord_channel_id, \
                created_by_user_id, root_discord_message_id, title, title_generated_at, \
-               model",
+               model, stopped_at, stopped_by_user_id",
         )
         .bind(id)
         .bind(discord_guild_id)
@@ -129,13 +129,48 @@ impl Db {
     pub async fn get_conversation(&self, id: Uuid) -> Result<Option<Conversation>, DbError> {
         let conv = sqlx::query_as::<_, Conversation>(
             "SELECT id, created_at, discord_guild_id, discord_channel_id, \
-              created_by_user_id, root_discord_message_id, title, title_generated_at, model \
+              created_by_user_id, root_discord_message_id, title, title_generated_at, model, \
+              stopped_at, stopped_by_user_id \
              FROM conversations WHERE id = $1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
         Ok(conv)
+    }
+
+    /// Pause the bot in a conversation: stamp `stopped_at = now()` and
+    /// record the admin who did it. Idempotent — re-stopping an already
+    /// stopped conversation just refreshes the timestamp/attribution.
+    /// Triggered by an admin's 🛑 reaction; see the bot's reaction
+    /// handler. Returns the number of rows touched (0 if the id is
+    /// unknown).
+    pub async fn stop_conversation(
+        &self,
+        id: Uuid,
+        stopped_by_user_id: i64,
+    ) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE conversations SET stopped_at = now(), stopped_by_user_id = $2 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(stopped_by_user_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Resume a paused conversation: clear `stopped_at` /
+    /// `stopped_by_user_id` back to NULL. Idempotent. Triggered when an
+    /// admin removes their 🛑 reaction.
+    pub async fn resume_conversation(&self, id: Uuid) -> Result<u64, DbError> {
+        let result = sqlx::query(
+            "UPDATE conversations SET stopped_at = NULL, stopped_by_user_id = NULL WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Look up which conversation a Discord message belongs to, if any.

@@ -33,6 +33,12 @@ export interface Conversation {
   title: string | null;
   title_generated_at: string | null;
   model: string;
+  /** When an admin paused the bot in this conversation by reacting 🛑
+   *  on a tracked message. `null` means active; a timestamp means the
+   *  bot is ignoring further mentions until the reaction is removed. */
+  stopped_at: string | null;
+  /** Discord user id of the admin who paused it; `null` when active. */
+  stopped_by_user_id: string | null;
 }
 
 export interface TurnView {
@@ -108,5 +114,6 @@ export type ServerEventName =
   | 'tool_call_recorded'
   | 'context_item_added'
   | 'title_updated'
+  | 'conversation_updated'
   | 'user_avatar_updated'
   | 'lag';

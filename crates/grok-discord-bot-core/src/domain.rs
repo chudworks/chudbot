@@ -121,6 +121,17 @@ pub struct Conversation {
     pub title_generated_at: Option<OffsetDateTime>,
     /// LLM provider identifier (e.g. `xai/grok-4.1-fast`).
     pub model: String,
+    /// When an admin paused the bot in this conversation by reacting 🛑
+    /// (`:octagonal_sign:`) on a tracked message. `None` (the common
+    /// case) means the bot replies normally; `Some` means it silently
+    /// ignores further mentions until the reaction is removed. Doubles
+    /// as the flag and the audit timestamp.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub stopped_at: Option<OffsetDateTime>,
+    /// Discord user id of the admin who paused the conversation. `None`
+    /// when the conversation is active (see [`Self::stopped_at`]).
+    #[serde(with = "snowflake::option", default)]
+    pub stopped_by_user_id: Option<i64>,
 }
 
 /// One user→assistant exchange within a conversation. A conversation is
@@ -357,6 +368,8 @@ mod tests {
             title: None,
             title_generated_at: Some(datetime!(2026-05-28 17:12:00 UTC)),
             model: "test".to_string(),
+            stopped_at: None,
+            stopped_by_user_id: None,
         };
         let json = serde_json::to_value(&conv).unwrap();
         assert_eq!(json["created_at"], "2026-05-28T17:11:51Z");
@@ -391,6 +404,8 @@ mod tests {
             title: None,
             title_generated_at: None,
             model: "test".to_string(),
+            stopped_at: None,
+            stopped_by_user_id: None,
         };
         let json = serde_json::to_value(&conv).unwrap();
         assert_eq!(json["created_by_user_id"], "1335037364980023356");
@@ -450,6 +465,8 @@ mod tests {
                 title: None,
                 title_generated_at: None,
                 model: "test".to_string(),
+                stopped_at: None,
+                stopped_by_user_id: None,
             },
             turns: vec![TurnView {
                 turn,

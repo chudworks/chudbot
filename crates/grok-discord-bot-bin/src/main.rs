@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -150,6 +150,19 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         video_providers.insert(VideoProviderKind::Xai, AnyVideoProvider::from(cfg));
     }
 
+    // Parse the operator admin snowflakes (config stores them as strings
+    // so the gigantic 64-bit ids survive losslessly). Reject + log any
+    // that aren't valid u64s rather than failing startup over a typo.
+    let (admin_ids, invalid_admins) = config.admin_ids();
+    if !invalid_admins.is_empty() {
+        tracing::warn!(
+            invalid = ?invalid_admins,
+            "ignoring unparseable entries in config `admins` (expected Discord user id strings)"
+        );
+    }
+    let admins: HashSet<u64> = admin_ids.into_iter().collect();
+    tracing::info!(admin_count = admins.len(), "resolved operator admins");
+
     let listen: SocketAddr = SocketAddr::from_str(&config.web.listen)?;
 
     tracing::info!(
@@ -170,6 +183,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         video_providers,
         personas: config.personas,
         default_persona: config.default_persona,
+        admins,
         app_version: app_version.id,
         default_privacy: config.default_privacy,
         web_base_url: config.web.base_url,

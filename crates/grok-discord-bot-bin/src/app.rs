@@ -19,7 +19,7 @@
 //! shutdown without each spawner needing to plumb the handles
 //! separately.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use tokio::sync::broadcast;
@@ -71,6 +71,10 @@ pub enum EventKind {
     ContextItemAdded,
     /// `conversations.title` was set by the background titler.
     TitleUpdated,
+    /// A conversation-level field other than the title changed — today
+    /// the admin 🛑 stop/resume flag (`stopped_at`). The viewer refetches
+    /// and re-renders the stopped banner.
+    ConversationUpdated,
     /// An avatar was downloaded and pinned for `user_id`. Any rendered
     /// reference to that user should refresh its image. Carries the
     /// user id so consumers can scope without a full conversation
@@ -103,6 +107,10 @@ pub struct AppState {
     pub personas: HashMap<String, Persona>,
     /// Floor fallback persona name.
     pub default_persona: String,
+    /// Hard-coded operator admin Discord user ids (from config's
+    /// top-level `admins`). These users can pause/resume the bot in a
+    /// conversation via the 🛑 reaction. See [`Self::is_admin`].
+    pub admins: HashSet<u64>,
     /// Ordered "vN" version number for the running build, resolved once
     /// at startup from `app_versions` (see `Db::register_app_version`).
     /// Stamped onto every turn and surfaced in the operational block of
@@ -147,6 +155,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Whether `user_id` is a configured operator admin (the 🛑
+    /// stop-sign kill-switch). Returns `false` when no admins are
+    /// configured, so the feature is inert until the operator opts in.
+    pub fn is_admin(&self, user_id: u64) -> bool {
+        self.admins.contains(&user_id)
+    }
+
     /// Publish a [`ConversationEvent`] to all active SSE subscribers.
     /// Returns silently when there are no subscribers (which is the
     /// common case — most events fire while nobody's looking).

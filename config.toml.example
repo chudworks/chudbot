@@ -6,6 +6,19 @@
 # TOML parser doesn't attach it to whichever section was opened last.
 default_persona = "default"
 
+# Hard-coded operator admins, as Discord user ids. These users can pause
+# the bot in a single conversation by reacting 🛑 (`:octagonal_sign:`) on
+# any message the bot tracks for that conversation (the @mention, a bot
+# reply, or any message inside a Grok-owned thread), and resume it by
+# removing the reaction. The paused state shows in the web viewer. This
+# is the operator's own kill-switch — distinct from Discord guild admins,
+# who gate the `/grok-mode` and channel-scoped `/grok-persona` commands.
+# Top-level scalar; keep it BEFORE any `[section]` header. Optional;
+# omit (or leave empty) to disable the feature entirely. Ids are quoted
+# STRINGS, not bare numbers — Discord snowflakes are gigantic 64-bit ids
+# and quoting keeps them lossless.
+# admins = ["123456789012345678", "234567890123456789"]
+
 # Optional global system-prompt addendum, appended to EVERY persona's
 # system prompt after the dynamically-built operational guidance (build
 # version, model, enabled capabilities, conventions). Use it for

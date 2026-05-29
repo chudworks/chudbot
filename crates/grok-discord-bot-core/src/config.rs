@@ -116,6 +116,23 @@ pub struct Config {
     /// selection is recorded in `persona_selections`. Must be a key in
     /// [`Self::personas`].
     pub default_persona: String,
+    /// Hard-coded operator admins, as Discord user ids. These users can
+    /// pause the bot in a conversation by reacting 🛑
+    /// (`:octagonal_sign:`) on any tracked message, and resume it by
+    /// removing the reaction. Distinct from Discord guild admins (who
+    /// gate the `/grok-mode` / channel-scoped `/grok-persona` commands):
+    /// this list is the operator's own kill-switch, not a per-guild
+    /// permission. Optional — defaults to empty (nobody can stop the
+    /// bot this way). Top-level scalar; keep it BEFORE any `[section]`.
+    ///
+    /// Ids are **strings**, not TOML integers: Discord snowflakes are
+    /// 64-bit and live near the top of the range, so quoting them keeps
+    /// the encoding lossless and consistent with how snowflakes cross
+    /// every other boundary (see the `snowflake` serde module). Parsed
+    /// to `u64` once at startup; unparseable entries are logged and
+    /// skipped (see `Config::admin_ids`).
+    #[serde(default)]
+    pub admins: Vec<String>,
     /// Named personas. Each ties together a model, a system prompt, and
     /// optional sampling knobs. Runtime selection picks one of these by
     /// name; see `persona_selections` in the DB for scope.
@@ -528,6 +545,23 @@ impl Config {
         Ok(())
     }
 
+    /// Parse the configured `admins` snowflake strings into `u64` ids.
+    /// Returns `(valid, invalid)`: the parsed ids and any entries that
+    /// weren't a base-10 `u64` (surrounding whitespace tolerated), so
+    /// the caller can log the rejects. Pure + testable; the binary logs
+    /// the invalid entries once at startup.
+    pub fn admin_ids(&self) -> (Vec<u64>, Vec<&str>) {
+        let mut valid = Vec::new();
+        let mut invalid = Vec::new();
+        for entry in &self.admins {
+            match entry.trim().parse::<u64>() {
+                Ok(id) => valid.push(id),
+                Err(_) => invalid.push(entry.as_str()),
+            }
+        }
+        (valid, invalid)
+    }
+
     /// Look up a persona by name, falling back to `default_persona`
     /// when missing. Panics only if the config has no default persona
     /// at all — which `validate` already guarantees can't happen.
@@ -582,6 +616,25 @@ mod tests {
         assert_eq!(config.web.listen, "127.0.0.1:1860");
         assert_eq!(config.web.frontend_dir, PathBuf::from("frontend-build"));
         assert!(matches!(config.default_privacy, PrivacyMode::OptIn));
+    }
+
+    #[test]
+    fn admin_ids_parse_strings_and_reject_garbage() {
+        let toml = format!(
+            "admins = [\"1335037364980023356\", \" 42 \", \"not-an-id\", \"\"]\n{MINIMAL_CONFIG}"
+        );
+        let config: Config = toml::from_str(&toml).unwrap();
+        let (valid, invalid) = config.admin_ids();
+        // The huge snowflake survives losslessly as a string → u64.
+        assert_eq!(valid, vec![1_335_037_364_980_023_356, 42]);
+        assert_eq!(invalid, vec!["not-an-id", ""]);
+    }
+
+    #[test]
+    fn admins_default_to_empty() {
+        let config: Config = toml::from_str(MINIMAL_CONFIG).unwrap();
+        assert!(config.admins.is_empty());
+        assert_eq!(config.admin_ids(), (Vec::new(), Vec::new()));
     }
 
     #[test]
