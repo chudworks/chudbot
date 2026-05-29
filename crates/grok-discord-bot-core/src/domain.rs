@@ -171,15 +171,18 @@ pub struct Turn {
     /// the historical attribution stays pinned to the turn.
     pub discord_user_name: Option<String>,
     /// Opaque, provider-tagged continuation state for this turn's final
-    /// assistant response — today xAI's encrypted `reasoning` items,
-    /// shaped `{"provider": "<kind>", "data": [...]}`. Replayed verbatim
-    /// before the assistant message on later turns to keep the prompt
-    /// cache warm (see migration 0009). `None` for non-reasoning turns
-    /// and providers with no such state.
+    /// assistant response — for xAI, the model's full `output` array
+    /// (encrypted `reasoning` + the assistant `message` + any tool-call
+    /// items), shaped `{"provider": "<kind>", "data": [...]}`. Replayed
+    /// verbatim as the assistant turn on later turns to keep the prompt
+    /// cache warm (see migration 0009 — the column predates the move from
+    /// reasoning-only to full-output capture, which the input encoder reads
+    /// back compatibly). `None` for turns with no such state and providers
+    /// that produce none.
     ///
-    /// `#[serde(skip)]`: this is encrypted, replay-only model plumbing —
-    /// it must NEVER cross the web API (the viewer embeds the whole `Turn`
-    /// via [`TurnView`]). sqlx `FromRow` populates it from the column
+    /// `#[serde(skip)]`: this is replay-only model plumbing — it must NEVER
+    /// cross the web API (the viewer embeds the whole `Turn` via
+    /// [`TurnView`]). sqlx `FromRow` populates it from the column
     /// independently of serde, so DB loads are unaffected.
     #[serde(skip)]
     pub provider_state: Option<serde_json::Value>,

@@ -233,19 +233,19 @@ persona that references a provider with no credentials.
 
 **System prompt composition.** The persona's `system_prompt` is only the
 *voice*. The actual system prompt sent to the model is built per turn by
-`compose_system_prompt` (in `bot`), once the persona is resolved:
-`persona.system_prompt` + a dynamically-generated **operational block** +
-the operator's global `extra_system_prompt` (optional top-level config
-scalar — the non-persona slot for deployment-wide rules like the Discord
-ToS). The operational block is non-persona and self-updating: the build
+`compose_system_prompt` (in `bot`), once the persona is resolved, in this
+order: the operator's global `extra_system_prompt` (optional top-level
+config scalar — the non-persona slot for deployment-wide rules like the
+Discord ToS) + a dynamically-generated **operational block** +
+`persona.system_prompt`. The operational block is non-persona and self-updating: the build
 version (`env!("GIT_VERSION")`), the model + provider actually answering,
 a one-line pointer to each capability whose tool is declared *this* turn
 (image/video gen, `fetch_messages`, always-on web search — the HOW stays
 in the tool descriptions), and cross-cutting conventions (don't echo the
 bracketed context notes we inject or any internal id/URL/`file://` path;
-narrate slow ops via `post_status_message`; write for Discord). Both the
-operational block and operator policy come AFTER the persona so their
-rules win on conflict and survive an adversarial persona prompt. Output
+narrate slow ops via `post_status_message`; write for Discord). The
+operator policy and operational block come BEFORE the persona, framing it
+as a stable non-persona preamble with the persona voice last. Output
 is stable within a (deployment, persona, privacy-mode), so it caches
 cleanly. Capability lines mirror `build_tool_definitions`, so the prompt
 never advertises a tool the model wasn't given. The composed prompt is

@@ -1037,6 +1037,34 @@ fn assemble_messages(
     messages
 }
 
+/// Keeps the Discord "chudbot is typing…" indicator alive in a channel for
+/// the duration of a turn. Discord's indicator lasts ~10s per trigger, so a
+/// background task re-pings every 8s until the guard is dropped (turn done or
+/// early `?` return). Pings are best-effort: a failed trigger is a cosmetic
+/// blip and must never disturb the turn's single user-facing failure path.
+struct TypingGuard(tokio::task::JoinHandle<()>);
+
+impl TypingGuard {
+    fn start(http: Arc<HttpClient>, channel_id: Id<ChannelMarker>) -> Self {
+        Self(tokio::spawn(async move {
+            // `interval` fires its first tick immediately, so the indicator
+            // shows right away with no startup delay.
+            let mut tick =
+                tokio::time::interval(std::time::Duration::from_secs(8));
+            loop {
+                tick.tick().await;
+                let _ = http.create_typing_trigger(channel_id).await;
+            }
+        }))
+    }
+}
+
+impl Drop for TypingGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Shared tail for running a turn: build tools + executor, drive the agent
 /// loop, persist tool calls, post **exactly one** user-facing reply, and
 /// finalize the turn row. Used by both the gateway create path
@@ -1100,6 +1128,10 @@ async fn run_turn_and_reply(
         videos_dir: state.storage.videos_dir.clone(),
         last_status_text: Mutex::new(None),
     };
+
+    // Show "chudbot is typing…" while the agent loop runs. Dropped at the end
+    // of this fn (or on any early return) which aborts the re-trigger task.
+    let _typing = TypingGuard::start(Arc::clone(&state.http), channel_id);
 
     let agent_run: AgentRun = run_agent(
         provider,
@@ -3226,14 +3258,15 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_keeps_persona_first_then_operational_block() {
+    fn system_prompt_keeps_operational_block_first_then_persona() {
         let p = fake_persona();
         let out = compose_system_prompt(&p, &PrivacyMode::ConversationOnly, false, false, 7, None);
-        // Persona voice leads; operational block follows it.
-        assert!(out.starts_with("You are Chud. Be edgy."));
-        let persona_at = out.find("You are Chud").unwrap();
+        // Operational block leads; persona voice follows it so the
+        // non-persona rules can't be displaced by an adversarial persona.
+        assert!(out.trim_start().starts_with("— Operational context"));
         let ops_at = out.find("Operational context").unwrap();
-        assert!(persona_at < ops_at);
+        let persona_at = out.find("You are Chud").unwrap();
+        assert!(ops_at < persona_at);
         // Dynamic bits are present.
         assert!(out.contains("model `grok-4.3`"));
         assert!(out.contains("via the xai API"));

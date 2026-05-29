@@ -120,19 +120,23 @@ pub enum TurnBlock {
         /// Whether the call failed; signals the model to retry or back off.
         is_error: bool,
     },
-    /// Opaque, provider-specific reasoning continuation carried on an
-    /// assistant turn (xAI's encrypted `reasoning` items today). Replayed
-    /// verbatim — placed before the assistant's text/tool_use blocks — so
-    /// reasoning models keep hitting the prompt cache across iterations
-    /// and turns. `provider_name` tags which provider produced it (from
+    /// Opaque, provider-specific continuation state carried on an assistant
+    /// turn. For xAI this is the model's entire `output` array captured
+    /// verbatim — the encrypted `reasoning` item(s), the assistant
+    /// `message` item, and any `function_call` / server `*_call` items — to
+    /// be echoed back byte-for-byte as the assistant turn's request input.
+    /// Replaying it verbatim (rather than re-synthesizing the message) is
+    /// what keeps the prompt cache warm across iterations and turns and
+    /// keeps each encrypted reasoning item attached to the message it must
+    /// precede. `provider_name` tags which provider produced it (from
     /// [`LlmProvider::name`]); a provider's input encoder emits only its
     /// own and ignores the rest, so a conversation that switches providers
-    /// never feeds one's reasoning to another. Never rendered to users.
+    /// never feeds one's state to another. Never rendered to users.
     Reasoning {
         /// Producing provider's [`LlmProvider::name`] (e.g. `xai`).
         provider_name: String,
-        /// Verbatim provider payload — for xAI, the JSON array of
-        /// `reasoning` output items to splice back into the request input.
+        /// Verbatim provider payload — for xAI, the JSON array of the
+        /// model's `output` items to splice back into the request input.
         data: serde_json::Value,
     },
 }
@@ -233,11 +237,11 @@ pub enum StepResponse {
         server_tool_calls: Vec<ToolCallRecord>,
         /// Model id reported by the provider for this call.
         model_id: String,
-        /// Opaque provider continuation state for this response (xAI's
-        /// encrypted `reasoning` items today), or `None` when the
-        /// provider produced none. The agent replays it on later
-        /// iterations and the caller persists the final one for
-        /// cross-turn replay. See [`TurnBlock::Reasoning`].
+        /// Opaque provider continuation state for this response (for xAI,
+        /// the model's full `output` array captured verbatim), or `None`
+        /// when the provider produced none. The agent replays it on later
+        /// iterations and the caller persists the final one for cross-turn
+        /// replay. See [`TurnBlock::Reasoning`].
         provider_state: Option<serde_json::Value>,
     },
     /// The model is asking us to invoke one or more client-side tools.
@@ -253,10 +257,10 @@ pub enum StepResponse {
         server_tool_calls: Vec<ToolCallRecord>,
         /// Model id reported by the provider for this call.
         model_id: String,
-        /// Opaque provider continuation state for this response (xAI's
-        /// encrypted `reasoning` items today). The agent re-attaches it
-        /// to the reconstructed assistant turn so the next iteration
-        /// replays it. See [`TurnBlock::Reasoning`].
+        /// Opaque provider continuation state for this response (for xAI,
+        /// the model's full `output` array captured verbatim). The agent
+        /// re-attaches it to the reconstructed assistant turn so the next
+        /// iteration replays it. See [`TurnBlock::Reasoning`].
         provider_state: Option<serde_json::Value>,
     },
 }

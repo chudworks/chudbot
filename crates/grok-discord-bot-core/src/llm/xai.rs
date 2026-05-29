@@ -148,11 +148,20 @@ impl LlmProvider for XaiProvider {
         // wall-clock latency (retries included). See `log_usage`.
         log_usage(&model_id, parsed.usage.as_ref(), elapsed);
 
-        let (text, tool_uses, server_tool_calls, reasoning_items) =
+        let (text, tool_uses, server_tool_calls) =
             walk_output(&parsed.output, parsed.citations.as_ref());
-        // The opaque reasoning items, as a JSON array, to carry forward and
-        // replay verbatim. `None` when the model emitted none.
-        let provider_state = (!reasoning_items.is_empty()).then_some(Value::Array(reasoning_items));
+        // Carry the model's ENTIRE output array forward verbatim — the
+        // encrypted `reasoning` item(s), the assistant `message` item, and
+        // any `function_call` / server `*_call` items, in the exact order
+        // and shape xAI emitted them. The Responses API chains a
+        // conversation by echoing this array back as the assistant turn's
+        // input (see `to_responses_input`); replaying it byte-for-byte is
+        // what keeps the per-server prompt cache warm across iterations and
+        // turns. Re-synthesizing a `{"role":"assistant","content":"…"}`
+        // message instead diverges from what the model emitted, misses the
+        // cache, and orphans the reasoning item from the message it must
+        // precede. `None` only when the model produced no output at all.
+        let provider_state = (!parsed.output.is_empty()).then_some(Value::Array(parsed.output));
 
         if !tool_uses.is_empty() {
             Ok(StepResponse::UseTools {
@@ -201,26 +210,50 @@ fn to_responses_input(turns: &[ChatTurn]) -> Vec<Value> {
             _ => "user",
         };
 
+        // Gather this turn's verbatim xAI continuation items (the model's
+        // full `output` array, captured at response time): reasoning +
+        // message + tool-call items, in emission order. Only our own
+        // (`xai`) state round-trips; a block tagged for another provider (a
+        // mid-conversation persona switch) is not ours to replay.
+        let mut echo: Vec<Value> = Vec::new();
+        for block in &turn.blocks {
+            if let TurnBlock::Reasoning {
+                provider_name,
+                data,
+            } = block
+                && provider_name == "xai"
+            {
+                match data {
+                    Value::Array(items) => echo.extend(items.iter().cloned()),
+                    other => echo.push(other.clone()),
+                }
+            }
+        }
+        // A turn carrying any non-`reasoning` item was captured under the
+        // full-output format: replay it byte-for-byte and skip
+        // re-synthesis. Re-synthesizing the assistant message instead would
+        // diverge from what the model emitted and miss xAI's prompt cache
+        // (and orphan the encrypted reasoning item from its message). A turn
+        // whose only items are `reasoning` is a legacy reasoning-only blob
+        // (or there are none): fall through to the synthesis path below,
+        // which replays the reasoning (if any) ahead of the rebuilt message.
+        let full_echo = echo
+            .iter()
+            .any(|it| it.get("type").and_then(Value::as_str) != Some("reasoning"));
+        if full_echo {
+            input.append(&mut echo);
+            continue;
+        }
+
         let mut text_buf = String::new();
         let mut image_urls: Vec<String> = Vec::new();
         let mut deferred: Vec<Value> = Vec::new();
-        // Reasoning items to splice back in BEFORE this turn's message, in
-        // the order the Responses API emitted them. Only our own (`xai`)
-        // reasoning round-trips; a block tagged for another provider (a
-        // mid-conversation persona switch) is not ours to replay.
-        let mut reasoning: Vec<Value> = Vec::new();
 
         for block in &turn.blocks {
             match block {
                 TurnBlock::Text(t) => text_buf.push_str(t),
                 TurnBlock::Image { url, .. } => image_urls.push(url.clone()),
-                TurnBlock::Reasoning {
-                    provider_name,
-                    data,
-                } if provider_name == "xai" => match data {
-                    Value::Array(items) => reasoning.extend(items.iter().cloned()),
-                    other => reasoning.push(other.clone()),
-                },
+                // Already gathered into `echo` above.
                 TurnBlock::Reasoning { .. } => {}
                 TurnBlock::ToolUse {
                     id,
@@ -252,10 +285,10 @@ fn to_responses_input(turns: &[ChatTurn]) -> Vec<Value> {
             }
         }
 
-        // Reasoning leads the turn — it precedes the assistant's message
-        // and tool calls in the response, and must be replayed in that
-        // position for the cache prefix to match.
-        input.append(&mut reasoning);
+        // Legacy reasoning-only items lead the turn — they precede the
+        // rebuilt assistant message and must be replayed in that position
+        // for the cache prefix to match.
+        input.append(&mut echo);
 
         // Pick the content shape: plain string when text-only, content
         // array when any image is attached. Both forms are valid input
@@ -311,25 +344,22 @@ fn build_tools(defs: &[ToolDefinition], enable_web_search: bool) -> Vec<Value> {
 ///   - server-side tool uses (`web_search_call`, `x_search_call`, etc.)
 ///     as [`ToolCallRecord`]s, attaching the top-level `citations`
 ///     field to whichever server tool emitted them when we can't tell
-///     them apart (citations are response-wide, not per-block);
-///   - `reasoning` items captured VERBATIM (opaque, with their
-///     `encrypted_content`) so the caller can replay them on later
-///     requests to keep the prompt cache warm.
+///     them apart (citations are response-wide, not per-block).
+///
+/// `reasoning` items are ignored here — the caller captures the WHOLE
+/// `output` array verbatim into `provider_state` for replay, so there's
+/// nothing to extract for them at this layer.
 fn walk_output(
     output: &[Value],
     citations: Option<&Value>,
-) -> (String, Vec<ToolUseRequest>, Vec<ToolCallRecord>, Vec<Value>) {
+) -> (String, Vec<ToolUseRequest>, Vec<ToolCallRecord>) {
     let mut text = String::new();
     let mut tool_uses: Vec<ToolUseRequest> = Vec::new();
     let mut server_calls: Vec<ToolCallRecord> = Vec::new();
-    let mut reasoning_items: Vec<Value> = Vec::new();
 
     for item in output {
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
-            // Opaque reasoning — keep the whole item so it round-trips
-            // byte-for-byte back into the next request's input.
-            "reasoning" => reasoning_items.push(item.clone()),
             "message" => {
                 if let Some(content) = item.get("content").and_then(Value::as_array) {
                     for block in content {
@@ -404,7 +434,7 @@ fn walk_output(
         }
     }
 
-    (text, tool_uses, server_calls, reasoning_items)
+    (text, tool_uses, server_calls)
 }
 
 /// Emit a single INFO-level usage + timing event for one Responses API
@@ -595,7 +625,7 @@ mod tests {
                 "arguments": "{\"limit\":30}",
             }),
         ];
-        let (text, uses, server, _reasoning) = walk_output(&output, None);
+        let (text, uses, server) = walk_output(&output, None);
         assert_eq!(text, "Let me check. ");
         assert_eq!(uses.len(), 1);
         assert_eq!(uses[0].id, "call_42");
@@ -652,7 +682,7 @@ mod tests {
             }),
         ];
         let citations = json!([{"url": "https://example.com", "title": "x"}]);
-        let (text, uses, server, _reasoning) = walk_output(&output, Some(&citations));
+        let (text, uses, server) = walk_output(&output, Some(&citations));
         assert_eq!(text, "Found it.");
         assert!(uses.is_empty());
         assert_eq!(server.len(), 1);
@@ -715,7 +745,10 @@ mod tests {
     }
 
     #[test]
-    fn walk_output_captures_reasoning_items_verbatim() {
+    fn walk_output_ignores_reasoning_items() {
+        // Reasoning is captured wholesale into provider_state at the step
+        // layer, not extracted here — walk_output just pulls the message
+        // text and tool calls and skips the reasoning item.
         let output = vec![
             json!({ "type": "reasoning", "id": "rs_1", "encrypted_content": "BLOB" }),
             json!({
@@ -724,17 +757,107 @@ mod tests {
                 "content": [{"type": "output_text", "text": "hi"}],
             }),
         ];
-        let (text, uses, server, reasoning) = walk_output(&output, None);
+        let (text, uses, server) = walk_output(&output, None);
         assert_eq!(text, "hi");
         assert!(uses.is_empty());
         assert!(server.is_empty());
-        assert_eq!(reasoning.len(), 1);
-        assert_eq!(reasoning[0]["id"], "rs_1");
-        assert_eq!(reasoning[0]["encrypted_content"], "BLOB");
     }
 
     #[test]
-    fn replays_xai_reasoning_before_assistant_message() {
+    fn replays_full_output_verbatim_when_present() {
+        // New-format capture: the Reasoning block carries the model's full
+        // output array (reasoning + message). It must be replayed
+        // byte-for-byte — including the message item's `id`, `status`, and
+        // `output_text` shape — and the synthesized Text block ignored. A
+        // re-synthesized `{"role":"assistant","content":"…"}` message would
+        // diverge from what the model emitted and miss xAI's prompt cache.
+        let full_output = json!([
+            { "type": "reasoning", "id": "rs_1", "summary": [], "status": "completed", "encrypted_content": "BLOB" },
+            {
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_1",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": "the answer", "annotations": [], "logprobs": null }],
+            },
+        ]);
+        let turns = vec![
+            ChatTurn::text(MessageRole::User, "hi"),
+            ChatTurn {
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    TurnBlock::Reasoning {
+                        provider_name: "xai".into(),
+                        data: full_output,
+                    },
+                    TurnBlock::Text("the answer".into()),
+                ],
+            },
+        ];
+        let input = to_responses_input(&turns);
+        // user, then the reasoning item, then the message item — both
+        // verbatim, with NO synthesized assistant message tacked on.
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["encrypted_content"], "BLOB");
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[2]["id"], "msg_1");
+        assert_eq!(input[2]["content"][0]["text"], "the answer");
+    }
+
+    #[test]
+    fn replays_full_output_with_function_call_verbatim() {
+        // A tool-use turn's full output (reasoning + function_call) replays
+        // verbatim — the function_call keeps its item `id`/`status` — and
+        // the synthesized ToolUse block is NOT re-emitted (no duplicate
+        // function_call). The following tool result still matches by call_id.
+        let full_output = json!([
+            { "type": "reasoning", "id": "rs_1", "encrypted_content": "BLOB" },
+            { "type": "function_call", "call_id": "call_1", "id": "fc_1", "name": "fetch_messages", "arguments": "{\"limit\":10}", "status": "completed" },
+        ]);
+        let turns = vec![
+            ChatTurn {
+                role: MessageRole::Assistant,
+                blocks: vec![
+                    TurnBlock::Reasoning {
+                        provider_name: "xai".into(),
+                        data: full_output,
+                    },
+                    TurnBlock::ToolUse {
+                        id: "call_1".into(),
+                        name: "fetch_messages".into(),
+                        input: json!({ "limit": 10 }),
+                    },
+                ],
+            },
+            ChatTurn {
+                role: MessageRole::User,
+                blocks: vec![TurnBlock::ToolResult {
+                    tool_use_id: "call_1".into(),
+                    content: "[]".into(),
+                    is_error: false,
+                }],
+            },
+        ];
+        let input = to_responses_input(&turns);
+        // reasoning, function_call (verbatim), function_call_output — three
+        // items, not four (the synthesized ToolUse is dropped).
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["id"], "fc_1");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn replays_legacy_reasoning_only_before_synthesized_message() {
+        // Backward compat: a provider_state row written before the
+        // full-output change holds ONLY reasoning items. We still replay the
+        // reasoning verbatim, then rebuild the assistant message from the
+        // turn's Text block (the only place its content survives).
         let turns = vec![
             ChatTurn::text(MessageRole::User, "hi"),
             ChatTurn {
@@ -749,13 +872,11 @@ mod tests {
             },
         ];
         let input = to_responses_input(&turns);
-        // user message, then the reasoning item, then the assistant message
-        // — reasoning must precede the message for the cache prefix to match.
+        // user message, then the reasoning item, then the rebuilt message.
         assert_eq!(input.len(), 3);
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[1]["id"], "rs_1");
-        assert_eq!(input[1]["encrypted_content"], "BLOB");
         assert_eq!(input[2]["role"], "assistant");
         assert_eq!(input[2]["content"], "the answer");
     }
