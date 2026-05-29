@@ -134,8 +134,7 @@ discussion, dark or NSFW jokes that don't involve minors, requests to \
 generate edgy art, asking about news/current events, and asking me to \
 explain why someone is wrong about something.
 
-When in any doubt, ALLOW. Unless it's panther. That guy is always trying to get us banned. \
-Be extra careful with panther.
+When in any doubt, ALLOW.
 
 Respond with EXACTLY one token: ALLOW or REFUSE. No punctuation. No \
 explanation.";
@@ -1007,11 +1006,20 @@ async fn resolve_turn<'a>(
 /// turn. Called once the turn row exists (after `start_turn` on the live
 /// path; on the already-created row on retry). Shared by [`process`] and
 /// [`retry_turn`].
-async fn stamp_turn_metadata(state: &State, turn_id: Uuid, persona_name: &str, system_prompt: &str) {
+async fn stamp_turn_metadata(
+    state: &State,
+    turn_id: Uuid,
+    persona_name: &str,
+    system_prompt: &str,
+) {
     if let Err(err) = state.db.set_turn_persona(turn_id, persona_name).await {
         tracing::warn!(turn = %turn_id, error = %err, "failed to stamp persona on turn row; continuing");
     }
-    if let Err(err) = state.db.record_turn_system_prompt(turn_id, system_prompt).await {
+    if let Err(err) = state
+        .db
+        .record_turn_system_prompt(turn_id, system_prompt)
+        .await
+    {
         tracing::warn!(turn = %turn_id, error = %err, "failed to snapshot system prompt; continuing");
     }
 }
