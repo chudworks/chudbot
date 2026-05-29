@@ -41,9 +41,7 @@ use twilight_model::gateway::event::Event;
 use twilight_model::gateway::payload::incoming::GuildCreate;
 use twilight_model::http::attachment::Attachment as HttpAttachment;
 use twilight_model::id::Id;
-use twilight_model::id::marker::{
-    ApplicationMarker, ChannelMarker, GuildMarker, MessageMarker, UserMarker,
-};
+use twilight_model::id::marker::{ApplicationMarker, ChannelMarker, MessageMarker, UserMarker};
 use uuid::Uuid;
 
 use crate::commands;
@@ -95,6 +93,15 @@ const RETRY_EMOJI: &str = "🔄";
 /// removing it resumes. Non-admins reacting it are ignored. See
 /// [`handle_reaction`].
 const STOP_EMOJI: &str = "🛑";
+
+/// Reaction emojis the bot stamps to signal turn status: 👀 working,
+/// ✅ success, ❌ error, ❓ refused. Hoisted to consts (alongside
+/// [`RETRY_EMOJI`] / [`STOP_EMOJI`]) so the live and retry paths can't
+/// drift, and minted into reactions via [`add_reaction`] / [`react_for_outcome`].
+const WORKING_EMOJI: &str = "👀";
+const SUCCESS_EMOJI: &str = "✅";
+const ERROR_EMOJI: &str = "❌";
+const REFUSED_EMOJI: &str = "❓";
 
 /// System prompt for the pre-flight moderation classifier. The bot
 /// runs in **private friends-only servers**, so the default is ALLOW
@@ -436,6 +443,62 @@ fn body_indicates_safety_refusal(body: &str) -> bool {
     lower.contains("safety_check") || lower.contains("violates usage guidelines")
 }
 
+/// Add a Unicode reaction to a message, swallowing the (cosmetic) error.
+/// Reactions are status feedback; a transient Discord hiccup adding one must
+/// never sink a turn — every call site already discarded the result.
+async fn add_reaction(
+    http: &HttpClient,
+    channel: Id<ChannelMarker>,
+    message: Id<MessageMarker>,
+    emoji: &str,
+) {
+    let reaction = RequestReactionType::Unicode { name: emoji };
+    let _ = http.create_reaction(channel, message, &reaction).await;
+}
+
+/// Remove the bot's own Unicode reaction from a message, swallowing the
+/// (cosmetic) error. Counterpart to [`add_reaction`].
+async fn remove_reaction(
+    http: &HttpClient,
+    channel: Id<ChannelMarker>,
+    message: Id<MessageMarker>,
+    emoji: &str,
+) {
+    let reaction = RequestReactionType::Unicode { name: emoji };
+    let _ = http
+        .delete_current_user_reaction(channel, message, &reaction)
+        .await;
+}
+
+/// Stamp the status reaction for a finished [`TurnOutcome`] onto the
+/// user-facing message. The caller has already removed the 👀 working
+/// reaction and owns the `Err` arm (whose disposition differs per path: the
+/// live path posts a generic ⚠️, the retry path restores `failed`). Shared
+/// by the live-mention tail ([`handle_message`]) and the 🔄-retry tail
+/// ([`retry_turn`]) so they react identically on success / refusal / etc.
+async fn react_for_outcome(
+    http: &HttpClient,
+    channel: Id<ChannelMarker>,
+    message: Id<MessageMarker>,
+    outcome: TurnOutcome,
+) {
+    match outcome {
+        TurnOutcome::Completed => add_reaction(http, channel, message, SUCCESS_EMOJI).await,
+        TurnOutcome::Refused => {
+            tracing::info!("turn refused by upstream safety check; reacting ❓");
+            add_reaction(http, channel, message, REFUSED_EMOJI).await;
+        }
+        TurnOutcome::Failed => add_reaction(http, channel, message, ERROR_EMOJI).await,
+        TurnOutcome::Stopped => {
+            // An admin hit 🛑 mid-flight. The 👀 was already removed by the
+            // caller; we deliberately add no ✅/❌/❓ and post no message —
+            // the admin's own 🛑 and the viewer's stopped banner are the
+            // signals. Staying silent matches "the bot stops".
+            tracing::info!("turn: stopped by admin mid-flight; staying silent");
+        }
+    }
+}
+
 /// Top-level handler for one mention. Resolves the privacy mode, gates
 /// on ChannelOnly, sets the 👀 reaction, calls [`process`], then
 /// transitions the reaction to ✅ or ❌.
@@ -534,15 +597,7 @@ async fn handle_message(state: Arc<State>, msg: Message) {
         }
     }
 
-    let working = RequestReactionType::Unicode { name: "👀" };
-    let done = RequestReactionType::Unicode { name: "✅" };
-    let failed = RequestReactionType::Unicode { name: "❌" };
-    let refused = RequestReactionType::Unicode { name: "❓" };
-
-    let _ = state
-        .http
-        .create_reaction(msg.channel_id, msg.id, &working)
-        .await;
+    add_reaction(&state.http, msg.channel_id, msg.id, WORKING_EMOJI).await;
 
     // Pre-flight moderation check — refuse without replying if the
     // message clearly violates Discord TOS. Hand the classifier the
@@ -563,63 +618,27 @@ async fn handle_message(state: Arc<State>, msg: Message) {
             preview = %stripped.chars().take(80).collect::<String>(),
             "turn: refused by moderation"
         );
-        let _ = state
-            .http
-            .delete_current_user_reaction(msg.channel_id, msg.id, &working)
-            .await;
-        let _ = state
-            .http
-            .create_reaction(msg.channel_id, msg.id, &refused)
-            .await;
+        remove_reaction(&state.http, msg.channel_id, msg.id, WORKING_EMOJI).await;
+        add_reaction(&state.http, msg.channel_id, msg.id, REFUSED_EMOJI).await;
         return;
     }
 
     let result = process(&state, &msg, &privacy_mode).await;
 
-    let _ = state
-        .http
-        .delete_current_user_reaction(msg.channel_id, msg.id, &working)
-        .await;
-
+    // The turn machinery owns all user-facing output and finalized the turn
+    // row; here we only transition the 👀 to the right status reaction. The
+    // `Ok` arms are shared with the retry tail via `react_for_outcome`; only
+    // the infra-error `Err` arm (a generic ⚠️ fallback) is unique to the
+    // live path.
+    remove_reaction(&state.http, msg.channel_id, msg.id, WORKING_EMOJI).await;
     match result {
-        Ok(TurnOutcome::Completed) => {
-            let _ = state
-                .http
-                .create_reaction(msg.channel_id, msg.id, &done)
-                .await;
-        }
-        Ok(TurnOutcome::Refused) => {
-            tracing::info!("message refused by upstream safety check; reacting ❓");
-            let _ = state
-                .http
-                .create_reaction(msg.channel_id, msg.id, &refused)
-                .await;
-        }
-        Ok(TurnOutcome::Failed) => {
-            // `process` already posted the single user-facing error
-            // message and marked the turn failed in the DB; we only set
-            // the reaction here (no second message).
-            let _ = state
-                .http
-                .create_reaction(msg.channel_id, msg.id, &failed)
-                .await;
-        }
-        Ok(TurnOutcome::Stopped) => {
-            // An admin hit 🛑 mid-flight. The 👀 was already removed above;
-            // we deliberately add no success/failure reaction and post no
-            // message — the admin's own 🛑 and the viewer's stopped banner
-            // are the signals. Staying silent matches "the bot stops".
-            tracing::info!("turn: stopped by admin mid-flight; staying silent");
-        }
+        Ok(outcome) => react_for_outcome(&state.http, msg.channel_id, msg.id, outcome).await,
         Err(err) => {
             // An infrastructure failure *before* the turn machinery posted
             // a reply (e.g. a DB write mid-setup). Surface a generic
             // fallback so the user isn't left with a bare 👀→nothing.
             tracing::error!(error = %err, "message handler failed before a reply was posted");
-            let _ = state
-                .http
-                .create_reaction(msg.channel_id, msg.id, &failed)
-                .await;
+            add_reaction(&state.http, msg.channel_id, msg.id, ERROR_EMOJI).await;
             let snippet = err.to_string();
             let snippet = if snippet.len() > 500 {
                 format!("{}…", &snippet[..500])
@@ -665,11 +684,6 @@ async fn process(
         .guild_id
         .map(|g| i64::try_from(g.get()).unwrap_or(i64::MAX));
     let channel_id_i64 = i64::try_from(msg.channel_id.get()).unwrap_or(i64::MAX);
-    // For channel-scoped persona lookups, threads roll up to their
-    // parent channel — operators set the override on the channel they
-    // can see, not on individual auto-opened threads.
-    let persona_channel_id = parent_channel_id(&state.http, msg.channel_id).await;
-    let persona_channel_id_i64 = i64::try_from(persona_channel_id.get()).unwrap_or(i64::MAX);
     let user_id_i64 = i64::try_from(msg.author.id.get()).unwrap_or(i64::MAX);
 
     // Capture the author's identity NOW (before any DB writes that need
@@ -701,35 +715,24 @@ async fn process(
         _ => false,
     };
 
-    let resolved_persona_name = state
-        .db
-        .resolve_persona(
-            conversation_id_for_persona,
-            guild_id_for_persona,
-            persona_channel_id_i64,
-            user_id_i64,
-        )
-        .await?
-        .unwrap_or_else(|| state.default_persona.clone());
-    // If the stored persona name no longer exists in config (e.g. the
-    // operator renamed/removed it), fall back to default rather than
-    // panic. The user can fix the override later with /grok-persona.
-    let (persona_name, persona) = match state.personas.get(&resolved_persona_name) {
-        Some(p) => (resolved_persona_name, p),
-        None => {
-            tracing::warn!(
-                stored = %resolved_persona_name,
-                "persona resolved to a name not in current config; using default"
-            );
-            (
-                state.default_persona.clone(),
-                state
-                    .personas
-                    .get(&state.default_persona)
-                    .expect("default_persona validated at startup"),
-            )
-        }
-    };
+    // Resolve the persona (conversation/guild/channel/user-scoped, falling
+    // back to default), its media backends, and the composed system prompt —
+    // identically to the 🔄-retry path. See [`resolve_turn`].
+    let ResolvedTurn {
+        persona_name,
+        persona,
+        image_provider,
+        video_provider,
+        system_prompt,
+    } = resolve_turn(
+        state,
+        conversation_id_for_persona,
+        guild_id_for_persona,
+        msg.channel_id,
+        user_id_i64,
+        privacy_mode,
+    )
+    .await?;
     let Some(provider) = state.providers.get(&persona.provider) else {
         tracing::error!(
             persona = %persona_name,
@@ -784,34 +787,6 @@ async fn process(
     // to pass to the LLM (it's still fresh; cheaper than base64).
     let saved_images = save_image_attachments(state, msg).await;
 
-    // Resolve the per-turn media providers from the persona. A persona
-    // that doesn't name an image/video provider (or names one with no
-    // matching `[image.<kind>]` / `[video.<kind>]` credentials block)
-    // simply doesn't get the corresponding tool — same as before, just
-    // now decided per-persona instead of per-deployment. Resolved here
-    // (before context building) so the composed system prompt can list
-    // exactly the capabilities whose tools will be declared this turn.
-    let image_provider: Option<AnyImageProvider> = persona
-        .image_provider
-        .and_then(|kind| state.image_providers.get(&kind).cloned());
-    let video_provider: Option<AnyVideoProvider> = persona
-        .video_provider
-        .and_then(|kind| state.video_providers.get(&kind).cloned());
-
-    // The system prompt = the persona's voice + a dynamically-built
-    // operational block (build version, model tuple, the capabilities
-    // actually enabled this turn) + any operator-global addendum. Built
-    // per turn because persona/privacy/capabilities are only known after
-    // resolution; see `compose_system_prompt`.
-    let system_prompt = compose_system_prompt(
-        persona,
-        privacy_mode,
-        image_provider.is_some(),
-        video_provider.is_some(),
-        state.app_version,
-        state.extra_system_prompt.as_deref(),
-    );
-
     let mut initial_context = build_context(
         state,
         msg,
@@ -853,29 +828,11 @@ async fn process(
     if needs_avatar_fetch {
         crate::avatars::spawn_fetch(Arc::clone(&state.app), user_id_i64);
     }
-    // Stamp the persona on the turn *before* the agent runs so the
-    // model used is recoverable even if a later step fails. The web
-    // viewer picks this up via the `persona_name` column on `turns`.
-    if let Err(err) = state.db.set_turn_persona(turn.id, &persona_name).await {
-        tracing::warn!(
-            turn = %turn.id,
-            error = %err,
-            "failed to stamp persona on turn row; continuing"
-        );
-    }
-    // Snapshot the fully-composed system prompt for the viewer. Best-effort
-    // (viewer-only data) — a failure here must not sink the turn.
-    if let Err(err) = state
-        .db
-        .record_turn_system_prompt(turn.id, &system_prompt)
-        .await
-    {
-        tracing::warn!(
-            turn = %turn.id,
-            error = %err,
-            "failed to snapshot system prompt; continuing"
-        );
-    }
+    // Stamp the persona + snapshot the composed system prompt on the turn
+    // row *before* the agent runs, so both are recoverable in the viewer even
+    // if a later step fails. Best-effort (viewer-only); shared with the retry
+    // path. See [`stamp_turn_metadata`].
+    stamp_turn_metadata(state, turn.id, &persona_name, &system_prompt).await;
     tracing::info!(
         conversation = %conversation.id,
         turn = %turn.id,
@@ -942,6 +899,121 @@ async fn process(
         messages,
     )
     .await
+}
+
+/// Everything a turn needs once the persona selection is resolved: the
+/// persona name + handle, its optional media backends, and the
+/// fully-composed system prompt. Built identically by the live-mention path
+/// ([`process`]) and the 🔄-retry path ([`retry_turn`]) — see [`resolve_turn`].
+///
+/// The LLM provider handle is deliberately NOT bundled here: the two paths
+/// dispose of a missing provider differently (the live path returns an error
+/// that surfaces a generic ⚠️; the retry path marks the turn `failed`), so
+/// each call site does its own `state.providers.get(&persona.provider)`.
+#[derive(Debug)]
+struct ResolvedTurn<'a> {
+    persona_name: String,
+    persona: &'a Persona,
+    image_provider: Option<AnyImageProvider>,
+    video_provider: Option<AnyVideoProvider>,
+    system_prompt: String,
+}
+
+/// Resolve the persona for a turn (conversation → user-in-guild → channel →
+/// guild → default, with a graceful fallback if the stored name no longer
+/// exists in config), its optional image/video backends, and the composed
+/// system prompt. Shared by [`process`] and [`retry_turn`] so the live and
+/// retry paths reconstruct the same model-facing setup.
+///
+/// The only failure is a propagated `Db::resolve_persona` error; the persona
+/// itself always resolves (falling back to `default_persona`), and a persona
+/// that names an unconfigured media backend simply yields `None` for it.
+async fn resolve_turn<'a>(
+    state: &'a State,
+    conversation_id: Option<Uuid>,
+    guild_id: Option<i64>,
+    channel_id: Id<ChannelMarker>,
+    user_id: i64,
+    privacy_mode: &PrivacyMode,
+) -> Result<ResolvedTurn<'a>, BotError> {
+    // For channel-scoped persona lookups, threads roll up to their parent
+    // channel — operators set the override on the channel they can see, not
+    // on individual auto-opened threads.
+    let persona_channel = parent_channel_id(&state.http, channel_id).await;
+    let persona_channel_i64 = i64::try_from(persona_channel.get()).unwrap_or(i64::MAX);
+
+    let resolved_name = state
+        .db
+        .resolve_persona(conversation_id, guild_id, persona_channel_i64, user_id)
+        .await?
+        .unwrap_or_else(|| state.default_persona.clone());
+    // If the stored persona name no longer exists in config (e.g. the
+    // operator renamed/removed it), fall back to default rather than panic.
+    // The user can fix the override later with /grok-persona.
+    let (persona_name, persona) = match state.personas.get(&resolved_name) {
+        Some(p) => (resolved_name, p),
+        None => {
+            tracing::warn!(
+                stored = %resolved_name,
+                "persona resolved to a name not in current config; using default"
+            );
+            (
+                state.default_persona.clone(),
+                state
+                    .personas
+                    .get(&state.default_persona)
+                    .expect("default_persona validated at startup"),
+            )
+        }
+    };
+
+    // A persona that doesn't name an image/video backend (or names one with
+    // no matching `[image.<kind>]` / `[video.<kind>]` credentials block)
+    // simply doesn't get the corresponding tool this turn.
+    let image_provider = persona
+        .image_provider
+        .and_then(|kind| state.image_providers.get(&kind).cloned());
+    let video_provider = persona
+        .video_provider
+        .and_then(|kind| state.video_providers.get(&kind).cloned());
+
+    // The system prompt = the persona's voice + a dynamically-built
+    // operational block (build version, model tuple, the capabilities
+    // actually enabled this turn) + any operator-global addendum. Composed
+    // here, after media resolution, so the capability lines match the tools
+    // declared this turn — and identically across the live and retry paths,
+    // keeping the prompt-cache prefix stable within a conversation.
+    let system_prompt = compose_system_prompt(
+        persona,
+        privacy_mode,
+        image_provider.is_some(),
+        video_provider.is_some(),
+        state.app_version,
+        state.extra_system_prompt.as_deref(),
+    );
+
+    Ok(ResolvedTurn {
+        persona_name,
+        persona,
+        image_provider,
+        video_provider,
+        system_prompt,
+    })
+}
+
+/// Best-effort: stamp the resolved persona name and snapshot the composed
+/// system prompt onto the turn row for the web viewer. Both are viewer-only
+/// metadata — a write failure is logged and swallowed so it never sinks the
+/// turn. Called once the turn row exists (after `start_turn` on the live
+/// path; on the already-created row on retry). Shared by [`process`] and
+/// [`retry_turn`].
+async fn stamp_turn_metadata(state: &State, turn_id: Uuid, persona_name: &str, system_prompt: &str) {
+    if let Err(err) = state.db.set_turn_persona(turn_id, persona_name).await {
+        tracing::warn!(turn = %turn_id, error = %err, "failed to stamp persona on turn row; continuing");
+    }
+    if let Err(err) = state.db.record_turn_system_prompt(turn_id, system_prompt).await {
+        tracing::warn!(turn = %turn_id, error = %err, "failed to snapshot system prompt; continuing");
+    }
 }
 
 /// Build the LLM-facing chat history from a turn's ordered context items.
@@ -1406,14 +1478,7 @@ async fn run_turn_and_reply(
         // own reaction here is self-ignored — it just sits there clickable
         // until a human adds theirs. Reacts on the reply's actual channel
         // so it's correct even in the rare threaded case.
-        let _ = state
-            .http
-            .create_reaction(
-                reply_msg.channel_id,
-                reply_msg.id,
-                &RequestReactionType::Unicode { name: RETRY_EMOJI },
-            )
-            .await;
+        add_reaction(&state.http, reply_msg.channel_id, reply_msg.id, RETRY_EMOJI).await;
         tracing::warn!(error = %real_error, "turn: marked failed");
         return Ok(TurnOutcome::Failed);
     }
@@ -1612,11 +1677,6 @@ async fn retry_turn(
     tracing::info!("retry: re-running failed turn");
     state.publish(conversation.id, EventKind::TurnUpdated);
 
-    let working = RequestReactionType::Unicode { name: "👀" };
-    let done = RequestReactionType::Unicode { name: "✅" };
-    let failed = RequestReactionType::Unicode { name: "❌" };
-    let refused = RequestReactionType::Unicode { name: "❓" };
-
     // The user's original message — what we reply to and react on.
     let Some(user_msg_id) = u64::try_from(turn.user_discord_message_id)
         .ok()
@@ -1648,28 +1708,24 @@ async fn retry_turn(
         });
 
     let user_id = turn.discord_user_id.unwrap_or(0);
-    let persona_channel = parent_channel_id(&state.http, channel_id).await;
-    let persona_channel_i64 = i64::try_from(persona_channel.get()).unwrap_or(i64::MAX);
-    let resolved_persona_name = state
-        .db
-        .resolve_persona(
-            Some(conversation.id),
-            guild_opt,
-            persona_channel_i64,
-            user_id,
-        )
-        .await?
-        .unwrap_or_else(|| state.default_persona.clone());
-    let (persona_name, persona) = match state.personas.get(&resolved_persona_name) {
-        Some(p) => (resolved_persona_name, p),
-        None => (
-            state.default_persona.clone(),
-            state
-                .personas
-                .get(&state.default_persona)
-                .expect("default_persona validated at startup"),
-        ),
-    };
+    // Resolve persona + media backends + system prompt exactly as the live
+    // path does, but sourced from the DB rather than a live Message. See
+    // [`resolve_turn`].
+    let ResolvedTurn {
+        persona_name,
+        persona,
+        image_provider,
+        video_provider,
+        system_prompt,
+    } = resolve_turn(
+        state,
+        Some(conversation.id),
+        guild_opt,
+        channel_id,
+        user_id,
+        &privacy_mode,
+    )
+    .await?;
     let Some(provider) = state.providers.get(&persona.provider) else {
         tracing::error!(
             persona = %persona_name,
@@ -1682,35 +1738,13 @@ async fn retry_turn(
             .await
             .ok();
         state.publish(conversation.id, EventKind::TurnUpdated);
-        let _ = state
-            .http
-            .create_reaction(channel_id, user_msg_id, &failed)
-            .await;
+        add_reaction(&state.http, channel_id, user_msg_id, ERROR_EMOJI).await;
         return Ok(());
     };
 
-    let image_provider = persona
-        .image_provider
-        .and_then(|kind| state.image_providers.get(&kind).cloned());
-    let video_provider = persona
-        .video_provider
-        .and_then(|kind| state.video_providers.get(&kind).cloned());
-
-    let system_prompt = compose_system_prompt(
-        persona,
-        &privacy_mode,
-        image_provider.is_some(),
-        video_provider.is_some(),
-        state.app_version,
-        state.extra_system_prompt.as_deref(),
-    );
     // Re-stamp persona + system-prompt snapshot for the viewer (overwrites
-    // the failed attempt's). Best-effort.
-    let _ = state.db.set_turn_persona(turn.id, &persona_name).await;
-    let _ = state
-        .db
-        .record_turn_system_prompt(turn.id, &system_prompt)
-        .await;
+    // the failed attempt's). Best-effort; shared with the live path.
+    stamp_turn_metadata(state, turn.id, &persona_name, &system_prompt).await;
 
     // Rebuild the LLM history from the DB: system prompt + prior completed
     // turns + this turn's own persisted novel items.
@@ -1766,14 +1800,8 @@ async fn retry_turn(
             tracing::warn!(error = %err, "retry: couldn't list prior reply messages");
         }
     }
-    let _ = state
-        .http
-        .delete_current_user_reaction(channel_id, user_msg_id, &failed)
-        .await;
-    let _ = state
-        .http
-        .create_reaction(channel_id, user_msg_id, &working)
-        .await;
+    remove_reaction(&state.http, channel_id, user_msg_id, ERROR_EMOJI).await;
+    add_reaction(&state.http, channel_id, user_msg_id, WORKING_EMOJI).await;
 
     let user_content = turn.user_content.clone();
     let result = run_turn_and_reply(
@@ -1794,35 +1822,12 @@ async fn retry_turn(
     )
     .await;
 
-    let _ = state
-        .http
-        .delete_current_user_reaction(channel_id, user_msg_id, &working)
-        .await;
-    match &result {
-        Ok(TurnOutcome::Completed) => {
-            let _ = state
-                .http
-                .create_reaction(channel_id, user_msg_id, &done)
-                .await;
-        }
-        Ok(TurnOutcome::Refused) => {
-            let _ = state
-                .http
-                .create_reaction(channel_id, user_msg_id, &refused)
-                .await;
-        }
-        Ok(TurnOutcome::Failed) => {
-            let _ = state
-                .http
-                .create_reaction(channel_id, user_msg_id, &failed)
-                .await;
-        }
-        Ok(TurnOutcome::Stopped) => {
-            // Admin stopped the conversation while the retry was running.
-            // Leave the message with just the 👀 removed — no ✅/❌, no
-            // reply. (The conversation is now flagged stopped in the DB.)
-            tracing::info!("retry: stopped by admin mid-flight; staying silent");
-        }
+    // Transition the 👀 to the right status reaction. The `Ok` arms are
+    // shared with the live tail via `react_for_outcome`; only the `Err` arm
+    // is unique to retry (restore `failed` so the turn stays retryable).
+    remove_reaction(&state.http, channel_id, user_msg_id, WORKING_EMOJI).await;
+    match result {
+        Ok(outcome) => react_for_outcome(&state.http, channel_id, user_msg_id, outcome).await,
         Err(err) => {
             // The run errored before it could finalize the turn (and post
             // its own message). Restore the `failed` status so the turn
@@ -1830,10 +1835,7 @@ async fn retry_turn(
             tracing::error!(error = %err, "retry: run failed before finalizing");
             state.db.fail_turn(turn.id, &err.to_string()).await.ok();
             state.publish(conversation.id, EventKind::TurnUpdated);
-            let _ = state
-                .http
-                .create_reaction(channel_id, user_msg_id, &failed)
-                .await;
+            add_reaction(&state.http, channel_id, user_msg_id, ERROR_EMOJI).await;
         }
     }
     Ok(())
@@ -3230,10 +3232,6 @@ async fn post_reply_chunks(
     Ok(posted)
 }
 
-/// Hard-cap a string to `max` BYTES, appending a `…` (3 UTF-8 bytes)
-/// when truncation occurs. The returned string's `len()` is always
-/// `<= max`. The cutoff is walked back to a char boundary so we never
-/// slice mid-codepoint.
 /// Decide whether a new-conversation reply should open a thread.
 /// Threading triggers if EITHER the raw character count or the
 /// approximate visual-row count exceeds its threshold (see the
@@ -3280,6 +3278,10 @@ fn normalize_status_for_dedup(s: &str) -> String {
     cleaned.to_string()
 }
 
+/// Hard-cap a string to `max` BYTES, appending a `…` (3 UTF-8 bytes)
+/// when truncation occurs. The returned string's `len()` is always
+/// `<= max`. The cutoff is walked back to a char boundary so we never
+/// slice mid-codepoint.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -3380,19 +3382,6 @@ fn resolve_user_mentions(content: &str, msg: &Message, bot_user_id: Id<UserMarke
             .replace(&format!("<@!{id}>"), &replacement);
     }
     out
-}
-
-// Reference the unused marker types so rustc's dead-code linter doesn't
-// complain when only one of them is needed in the future.
-#[allow(dead_code)]
-fn _force_marker_imports(
-    _g: Id<GuildMarker>,
-    _c: Id<ChannelMarker>,
-    _m: Id<MessageMarker>,
-    _u: Id<UserMarker>,
-    _a: Id<ApplicationMarker>,
-    _t: TurnBlock,
-) {
 }
 
 #[cfg(test)]
