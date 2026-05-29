@@ -1881,7 +1881,13 @@ fn compose_system_prompt(
         capabilities.push("- Recent channel messages: via the fetch_messages tool.");
     }
 
-    let mut out = persona.system_prompt.trim_end().to_string();
+    let mut out = String::new();
+    if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str("— Operator policy —\n");
+        out.push_str(extra);
+        out.push_str("\n\n");
+    }
+    out.push_str(persona.system_prompt.trim_end());
     out.push_str("\n\n— Operational context (always applies; not part of your persona) —\n");
     out.push_str(&format!(
         "Bot build: v{} ({}). You are answering as model `{}` via the {} API.\n\n",
@@ -1910,11 +1916,6 @@ fn compose_system_prompt(
          - Write for Discord: concise, minimal markdown; don't re-link or re-describe media you \
          have already attached.",
     );
-
-    if let Some(extra) = extra.map(str::trim).filter(|s| !s.is_empty()) {
-        out.push_str("\n\n— Operator policy —\n");
-        out.push_str(extra);
-    }
 
     out
 }
