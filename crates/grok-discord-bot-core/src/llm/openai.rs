@@ -87,13 +87,19 @@ impl LlmProvider for OpenAiProvider {
             .and_then(|o| o.reasoning_effort.as_ref())
             .map(|effort| json!({ "effort": effort }));
 
+        // OpenAI's reasoning models (gpt-5 family, o-series) reject
+        // `temperature` / `top_p` outright (400 "Unsupported parameter").
+        // Drop them for those models so a persona that sets a temperature
+        // still works; non-reasoning models keep honoring it.
+        let sampling = model_supports_sampling(&request.model);
+
         let body = ResponsesRequest {
             model: &request.model,
             input: &input_items,
             tools: if tools.is_empty() { None } else { Some(&tools) },
             max_output_tokens: Some(request.max_tokens),
-            temperature: request.temperature,
-            top_p: request.top_p,
+            temperature: if sampling { request.temperature } else { None },
+            top_p: if sampling { request.top_p } else { None },
             reasoning: reasoning.as_ref(),
             // OpenAI auto-caches prompt prefixes ≥1024 tokens for free;
             // `prompt_cache_key` steers prefix-sharing requests to the
@@ -312,6 +318,24 @@ fn to_responses_input(turns: &[ChatTurn]) -> Vec<Value> {
     }
 
     input
+}
+
+/// Whether a model accepts the `temperature` / `top_p` sampling knobs.
+///
+/// OpenAI's reasoning models reject them with a 400 — only their fixed
+/// default sampling is allowed. That's the `o`-series (`o1`, `o3`,
+/// `o4`, …) and the gpt-5 reasoning family. The exception is the
+/// `gpt-5*-chat*` variants (e.g. `gpt-5-chat-latest`), which are
+/// non-reasoning and DO accept sampling. We match on the model-id prefix
+/// rather than a hard-coded list so new point releases (gpt-5.5, o4, …)
+/// are covered without a code change.
+fn model_supports_sampling(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    let reasoning = m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.starts_with("o4")
+        || (m.starts_with("gpt-5") && !m.contains("chat"));
+    !reasoning
 }
 
 /// Build the `tools` array — client-side function definitions plus
@@ -604,6 +628,40 @@ mod tests {
         assert_eq!(uses[0].id, "call_42");
         assert_eq!(uses[0].input["limit"], 30);
         assert!(server.is_empty());
+    }
+
+    #[test]
+    fn reasoning_models_reject_sampling_knobs() {
+        // gpt-5 family + o-series are reasoning models → no temperature/top_p.
+        assert!(!model_supports_sampling("gpt-5.5"));
+        assert!(!model_supports_sampling("gpt-5"));
+        assert!(!model_supports_sampling("gpt-5-mini"));
+        assert!(!model_supports_sampling("o3"));
+        assert!(!model_supports_sampling("o4-mini"));
+        // Non-reasoning models keep sampling: gpt-4o, gpt-4.1, the gpt-5 chat variant.
+        assert!(model_supports_sampling("gpt-4o"));
+        assert!(model_supports_sampling("gpt-4.1"));
+        assert!(model_supports_sampling("gpt-5-chat-latest"));
+    }
+
+    #[test]
+    fn sampling_omitted_for_reasoning_model_in_body() {
+        // The body skips temperature/top_p when serialized as None.
+        let body = ResponsesRequest {
+            model: "gpt-5.5",
+            input: &[],
+            tools: None,
+            max_output_tokens: None,
+            temperature: None,
+            top_p: None,
+            reasoning: None,
+            prompt_cache_key: None,
+            include: &[],
+            store: false,
+        };
+        let v = serde_json::to_value(&body).unwrap();
+        assert!(v.get("temperature").is_none());
+        assert!(v.get("top_p").is_none());
     }
 
     #[test]
