@@ -309,6 +309,25 @@ impl Db {
         Ok(())
     }
 
+    /// Mark a turn as `cancelled` — an admin hit 🛑 mid-flight and the
+    /// agent loop was aborted before a reply was posted. Distinct from
+    /// `failed` on purpose: a cancelled turn is intentional, so it gets
+    /// no 🔄 retry affordance (`reset_turn_for_retry` only acts on
+    /// `failed`) and the viewer can style it differently. The reason is
+    /// stored in `error` for the trace.
+    pub async fn cancel_turn(&self, turn_id: Uuid, reason: &str) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE turns \
+             SET status = 'cancelled', completed_at = now(), error = $2 \
+             WHERE id = $1",
+        )
+        .bind(turn_id)
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Mark a turn as failed but also persist whatever reply we managed
     /// to post. Used when a turn produced a user-facing message (e.g. a
     /// "⚠️ image generation failed" notice, possibly with partial model

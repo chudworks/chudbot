@@ -23,8 +23,7 @@ use grok_discord_bot_core::{
     AgentRun, AnyImageProvider, AnyProvider, AnyVideoProvider, ChatTurn, ContextItem, Conversation,
     Db, ImageProvider, LlmProvider, LlmProviderKind, MessageRole, NoopObserver, Persona,
     PrivacyMode, ProviderOptions, StepRequest, StepResponse, ToolDefinition, ToolError,
-    ToolExecutor, Turn,
-    TurnBlock, VideoProvider, imagegen::ImageGenRequest, run_agent, storage,
+    ToolExecutor, Turn, TurnBlock, VideoProvider, imagegen::ImageGenRequest, run_agent, storage,
     videogen::VideoGenRequest,
 };
 
@@ -166,6 +165,10 @@ enum TurnOutcome {
     Failed,
     /// Refused by upstream safety; no user-facing message was posted.
     Refused,
+    /// An admin hit 🛑 mid-flight: the agent loop was cancelled before a
+    /// reply was posted, and the turn was marked `cancelled` in the DB.
+    /// No user-facing message.
+    Stopped,
 }
 
 /// State shared across all message-handler tasks.
@@ -600,6 +603,13 @@ async fn handle_message(state: Arc<State>, msg: Message) {
                 .http
                 .create_reaction(msg.channel_id, msg.id, &failed)
                 .await;
+        }
+        Ok(TurnOutcome::Stopped) => {
+            // An admin hit 🛑 mid-flight. The 👀 was already removed above;
+            // we deliberately add no success/failure reaction and post no
+            // message — the admin's own 🛑 and the viewer's stopped banner
+            // are the signals. Staying silent matches "the bot stops".
+            tracing::info!("turn: stopped by admin mid-flight; staying silent");
         }
         Err(err) => {
             // An infrastructure failure *before* the turn machinery posted
@@ -1086,8 +1096,7 @@ impl TypingGuard {
         Self(tokio::spawn(async move {
             // `interval` fires its first tick immediately, so the indicator
             // shows right away with no startup delay.
-            let mut tick =
-                tokio::time::interval(std::time::Duration::from_secs(8));
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(8));
             loop {
                 tick.tick().await;
                 let _ = http.create_typing_trigger(channel_id).await;
@@ -1170,7 +1179,15 @@ async fn run_turn_and_reply(
     // of this fn (or on any early return) which aborts the re-trigger task.
     let _typing = TypingGuard::start(Arc::clone(&state.http), channel_id);
 
-    let agent_run: AgentRun = run_agent(
+    // Register this turn for admin-🛑 cancellation. The guard deregisters
+    // on drop (any exit path). The agent loop is raced against the token:
+    // if an admin stops the conversation mid-flight, the loop future is
+    // dropped, which aborts the pending LLM HTTP request and any running
+    // tool futures, and we bail without posting a reply.
+    let cancel_guard = state.turn_cancellations.register(conversation.id, turn.id);
+    let cancel_token = cancel_guard.token();
+
+    let agent_fut = run_agent(
         provider,
         persona.model.clone(),
         messages,
@@ -1192,8 +1209,25 @@ async fn run_turn_and_reply(
         // `prompt_cache_key` keeps xAI's prefix cache hitting.
         Some(conversation.id.to_string()),
         MAX_AGENT_ITERATIONS,
-    )
-    .await;
+    );
+    let agent_run: AgentRun = tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => {
+            tracing::info!("turn: cancelled by admin 🛑 mid-flight; aborting agent loop");
+            // The agent future drops here, cancelling the in-flight LLM
+            // request and any running tools. Mark the turn cancelled (not
+            // `failed`, so it gets no 🔄 retry affordance) and bail with no
+            // user-facing reply. `_typing` and `cancel_guard` drop on return.
+            state
+                .db
+                .cancel_turn(turn.id, "cancelled by admin 🛑")
+                .await
+                .ok();
+            state.publish(conversation.id, EventKind::TurnUpdated);
+            return Ok(TurnOutcome::Stopped);
+        }
+        run = agent_fut => run,
+    };
 
     // Persist all tool calls (server + client) in execution order — even
     // on a failed run, so the trace shows the failed generate_image etc.
@@ -1495,12 +1529,32 @@ async fn set_conversation_stop(
 
     let rows = if stop {
         let admin_id = i64::try_from(reaction.user_id.get()).unwrap_or(i64::MAX);
-        state.db.stop_conversation(conversation_id, admin_id).await?
+        state
+            .db
+            .stop_conversation(conversation_id, admin_id)
+            .await?
     } else {
         state.db.resume_conversation(conversation_id).await?
     };
     if rows == 0 {
         return Ok(());
+    }
+
+    // Abort any turn already running in this conversation — not just block
+    // the next mention. Cancelling drops the agent-loop future, aborting
+    // the in-flight LLM request and any running tools. No-op (0) when
+    // nothing is mid-flight, which is the common case.
+    if stop {
+        let cancelled = state
+            .turn_cancellations
+            .cancel_conversation(conversation_id);
+        if cancelled > 0 {
+            tracing::info!(
+                conversation = %conversation_id,
+                cancelled,
+                "stop-sign: aborted in-flight turn(s)"
+            );
+        }
     }
 
     tracing::info!(
@@ -1762,6 +1816,12 @@ async fn retry_turn(
                 .http
                 .create_reaction(channel_id, user_msg_id, &failed)
                 .await;
+        }
+        Ok(TurnOutcome::Stopped) => {
+            // Admin stopped the conversation while the retry was running.
+            // Leave the message with just the 👀 removed — no ✅/❌, no
+            // reply. (The conversation is now flagged stopped in the DB.)
+            tracing::info!("retry: stopped by admin mid-flight; staying silent");
         }
         Err(err) => {
             // The run errored before it could finalize the turn (and post

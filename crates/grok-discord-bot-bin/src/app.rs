@@ -21,6 +21,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -83,6 +84,92 @@ pub enum EventKind {
         /// Discord user id whose avatar changed on disk.
         user_id: i64,
     },
+}
+
+/// Registry of cancellation tokens for in-flight turns, so an admin 🛑
+/// reaction can abort a turn that's mid-LLM-call or mid-tool-execution —
+/// not just block the *next* mention. Keyed by turn id; each entry also
+/// records its conversation so a single stop cancels every turn running
+/// in that conversation at once (rare, but possible if a user fires two
+/// mentions back-to-back).
+///
+/// Cancelling a token drops the awaited agent-loop future, which in turn
+/// drops the in-flight `reqwest` request (aborting the HTTP call) and any
+/// running tool futures — Rust async cancellation is just future-drop.
+/// Tokens are deliberately NOT children of [`AppState::cancel`]: Ctrl+C
+/// should let in-flight turns *drain* (the existing behavior), whereas a
+/// 🛑 should *abort* — different intents, separate tokens.
+#[derive(Debug, Default)]
+pub struct TurnCancellations {
+    inner: Mutex<HashMap<Uuid, (Uuid, CancellationToken)>>,
+}
+
+impl TurnCancellations {
+    /// Register a fresh token for a running turn and return a guard. Hold
+    /// the guard for the cancellable region (the agent loop); dropping it
+    /// deregisters, so a completed or panicking turn never leaves a stale
+    /// entry. Call [`TurnCancelGuard::token`] to get the handle to select
+    /// on.
+    pub fn register(self: &Arc<Self>, conversation_id: Uuid, turn_id: Uuid) -> TurnCancelGuard {
+        let token = CancellationToken::new();
+        self.inner
+            .lock()
+            .expect("turn-cancellation registry mutex poisoned")
+            .insert(turn_id, (conversation_id, token.clone()));
+        TurnCancelGuard {
+            registry: Arc::clone(self),
+            turn_id,
+            token,
+        }
+    }
+
+    /// Cancel every in-flight turn belonging to `conversation_id`.
+    /// Returns how many tokens were fired (0 when nothing is running).
+    pub fn cancel_conversation(&self, conversation_id: Uuid) -> usize {
+        let guard = self
+            .inner
+            .lock()
+            .expect("turn-cancellation registry mutex poisoned");
+        let mut n = 0;
+        for (conv, token) in guard.values() {
+            if *conv == conversation_id {
+                token.cancel();
+                n += 1;
+            }
+        }
+        n
+    }
+
+    fn deregister(&self, turn_id: Uuid) {
+        self.inner
+            .lock()
+            .expect("turn-cancellation registry mutex poisoned")
+            .remove(&turn_id);
+    }
+}
+
+/// RAII handle returned by [`TurnCancellations::register`]. Deregisters
+/// its turn on drop. Exposes the [`CancellationToken`] to select on while
+/// the turn runs.
+#[derive(Debug)]
+pub struct TurnCancelGuard {
+    registry: Arc<TurnCancellations>,
+    turn_id: Uuid,
+    token: CancellationToken,
+}
+
+impl TurnCancelGuard {
+    /// The token to `select!` on; fires when an admin stops the
+    /// conversation this turn belongs to.
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+}
+
+impl Drop for TurnCancelGuard {
+    fn drop(&mut self) {
+        self.registry.deregister(self.turn_id);
+    }
 }
 
 /// Application-wide state shared between bot and web halves.
@@ -152,6 +239,10 @@ pub struct AppState {
     /// Tracks spawned background tasks so the shutdown handler can
     /// wait for them to drain.
     pub tracker: TaskTracker,
+    /// In-flight turn cancellation tokens, so an admin 🛑 reaction aborts
+    /// a turn that's mid-flight (LLM call / tool execution) instead of
+    /// only blocking the next mention. See [`TurnCancellations`].
+    pub turn_cancellations: Arc<TurnCancellations>,
 }
 
 impl AppState {
@@ -191,4 +282,49 @@ impl ConversationEvent {
 pub fn new_event_channel() -> broadcast::Sender<ConversationEvent> {
     let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
     tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Cancelling a conversation fires only the tokens for turns in THAT
+    // conversation, leaving turns in other conversations untouched.
+    #[test]
+    fn cancel_conversation_is_scoped() {
+        let reg: Arc<TurnCancellations> = Arc::default();
+        let conv_a = Uuid::new_v4();
+        let conv_b = Uuid::new_v4();
+
+        let a1 = reg.register(conv_a, Uuid::new_v4());
+        let a2 = reg.register(conv_a, Uuid::new_v4());
+        let b1 = reg.register(conv_b, Uuid::new_v4());
+
+        let fired = reg.cancel_conversation(conv_a);
+        assert_eq!(fired, 2, "both turns in conv_a should be cancelled");
+        assert!(a1.token().is_cancelled());
+        assert!(a2.token().is_cancelled());
+        assert!(!b1.token().is_cancelled(), "conv_b must be untouched");
+    }
+
+    // The guard deregisters on drop, so a completed turn leaves no stale
+    // entry that a later stop would try to cancel.
+    #[test]
+    fn guard_deregisters_on_drop() {
+        let reg: Arc<TurnCancellations> = Arc::default();
+        let conv = Uuid::new_v4();
+        {
+            let _guard = reg.register(conv, Uuid::new_v4());
+            assert_eq!(reg.inner.lock().unwrap().len(), 1);
+        }
+        assert_eq!(reg.inner.lock().unwrap().len(), 0, "drop must deregister");
+        assert_eq!(reg.cancel_conversation(conv), 0);
+    }
+
+    // Cancelling a conversation with nothing in flight is a no-op.
+    #[test]
+    fn cancel_with_nothing_in_flight() {
+        let reg: Arc<TurnCancellations> = Arc::default();
+        assert_eq!(reg.cancel_conversation(Uuid::new_v4()), 0);
+    }
 }

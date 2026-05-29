@@ -106,6 +106,22 @@ paused thread shows no sign of life and spends no tokens) and the 🔄-retry
 path stay silent. The viewer renders a banner from `stopped_at` and
 refetches on the `conversation_updated` SSE event.
 
+A 🛑 also **aborts a turn already in flight**, not just the next mention.
+Each running turn registers a `CancellationToken` in `AppState::
+turn_cancellations` (a `HashMap<turn_id → (conversation_id, token)>` behind
+a `Mutex`, keyed by turn so concurrent turns in one conversation are all
+covered); `run_turn_and_reply` races the agent loop against that token
+with `tokio::select!`. On stop, `set_conversation_stop` calls
+`cancel_conversation`, the loop future is dropped — which cancels the
+in-flight LLM `reqwest` call and any running tool futures (async
+cancellation = future-drop) — and the turn is marked `cancelled` (a
+distinct status from `failed`, so it gets no 🔄 affordance and
+`reset_turn_for_retry` ignores it) with no reply posted. These tokens are
+deliberately NOT children of `AppState::cancel`: Ctrl+C drains in-flight
+turns, a 🛑 aborts them. Caveat: a video `submit` already accepted upstream
+still bills even if the poll is cancelled (the `video_jobs` row records
+it).
+
 **Resilience & failure handling.** Transient upstream blips (HTTP 5xx /
 429 / transport) are retried with exponential backoff via `core::retry`,
 which wraps every LLM / image / video HTTP call (video `submit` opts out

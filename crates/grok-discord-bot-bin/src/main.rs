@@ -206,6 +206,7 @@ async fn serve(config: Config) -> Result<(), Box<dyn std::error::Error>> {
         events: new_event_channel(),
         cancel: CancellationToken::new(),
         tracker: TaskTracker::new(),
+        turn_cancellations: Default::default(),
     });
 
     // Both halves of the binary live on the same tracker so a Ctrl+C
