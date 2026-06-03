@@ -48,7 +48,8 @@ public_base_url = "http://localhost:1860"
 
 [memory]
 # Global memory switch. Per-agent `memory = true` below opts an agent into
-# memory context and memory tools when this is enabled.
+# memory tools when this is enabled. Memory profiles are returned by the lookup
+# tool, not injected into ordinary turn context.
 enabled = true
 # LLM provider registry key used by background diary/compaction jobs.
 provider = "grok"

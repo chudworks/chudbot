@@ -671,7 +671,7 @@ pub struct AgentConfig {
     /// Optional video generation binding exposed through `generate_video`.
     #[serde(default)]
     pub video_generation: Option<GenerationBinding>,
-    /// Whether top-level runs for this agent receive user-memory context/tools.
+    /// Whether top-level runs for this agent receive user-memory tools.
     #[serde(default)]
     pub memory: bool,
     /// Subagents exposed as named client-side tools.
@@ -1230,11 +1230,6 @@ where
         let turn_context = self
             .prepare_turn_context(&message, &settings, &snapshot.conversation)
             .await?;
-        let mut model_context = turn_context.items.clone();
-        if self.agent_memory_enabled(&agent_config) {
-            self.push_memory_context(&mut model_context, &message.author.id)
-                .await?;
-        }
         let prompt_snapshot = self
             .storage
             .load_conversation(ConversationLookup::Id {
@@ -1246,7 +1241,7 @@ where
                 conversation_id: snapshot.conversation.id,
             })?;
         let transcript = self
-            .transcript_for_turn(&prompt_snapshot, &turn, &model_context)
+            .transcript_for_turn(&prompt_snapshot, &turn, &turn_context.items)
             .await?;
         tracing::debug!(
             transcript_turns = transcript.turns.len(),
@@ -1425,15 +1420,11 @@ where
             .unwrap_or_else(|| self.compose_system_prompt(&agent_config, &settings.privacy));
         let stored_context = replayable_context_items(&turn_snapshot.context);
         let has_stored_context = !stored_context.is_empty();
-        let mut model_context = stored_context.clone();
-        if self.agent_memory_enabled(&agent_config) {
-            self.push_memory_context(&mut model_context, &turn.user).await?;
-        }
         let transcript = self
             .transcript_for_retry(
                 &retry.conversation,
                 turn_snapshot,
-                &model_context,
+                &stored_context,
                 has_stored_context,
             )
             .await?;
@@ -3340,46 +3331,6 @@ where
         .await?;
 
         Ok(PreparedTurnContext { items })
-    }
-
-    async fn push_memory_context(
-        &self,
-        items: &mut Vec<chudbot_api::ContextItem>,
-        user: &UserRef,
-    ) -> Result<(), BotError> {
-        let key = memory::key_from_user_ref(user);
-        let document = self
-            .storage
-            .load_user_memory_document(key.clone())
-            .await
-            .map_err(storage_error)?;
-        let source_event_cutoff = document
-            .as_ref()
-            .and_then(|document| document.source_event_cutoff);
-        let pending_events = self
-            .storage
-            .list_pending_memory_events(key.clone(), source_event_cutoff)
-            .await
-            .map_err(storage_error)?;
-        let position = items
-            .iter()
-            .map(|item| item.position)
-            .max()
-            .map(|position| position.saturating_add(1))
-            .unwrap_or(0);
-        items.push(memory::context_item(
-            &key,
-            document.as_ref(),
-            &pending_events,
-            position,
-        ));
-        tracing::debug!(
-            source = %items.last().map(|item| item.source.as_str()).unwrap_or("memory"),
-            has_document = document.is_some(),
-            pending_events = pending_events.len(),
-            "injected user memory context"
-        );
-        Ok(())
     }
 
     async fn push_message_context(
