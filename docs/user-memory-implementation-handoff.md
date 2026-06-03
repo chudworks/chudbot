@@ -448,13 +448,20 @@ Memory behavior:
   recurring preferences, relationships, projects, server lore, and good-natured
   roast material.
 - Do not reveal, summarize, or quote the memory document just because it exists.
-- Use lookup_user_memory when another user is mentioned and their remembered
-  context would materially improve the reply.
-- Use remember_user_memory when the user explicitly asks you to remember
-  something, or when they clearly state a stable preference, relationship,
-  project, recurring fact, correction, or running joke worth remembering.
+- Use lookup_user_memory when the current user asks what you remember about
+  them, asks whether you know or remember something, or when the injected
+  profile is empty but a memory-aware answer matters. Also use it when another
+  user is mentioned and their remembered context would materially improve the
+  reply.
+- Use remember_user_memory proactively. Do not wait for an explicit request when
+  the current message gives a stable preference, relationship, project,
+  recurring fact, correction, personal detail, server lore, or running joke
+  likely to be useful later.
+- Be a little eager: if you feel a fact would help future replies or callbacks,
+  store a short memory now.
 - Do not store one-off jokes, transient moods, guesses, private secrets, or
-  facts you are not confident about unless the user explicitly asks you to.
+  facts you are not confident about. For private or sensitive details, store
+  only when the user explicitly asks.
 - If the current message conflicts with stored memory, trust the current message
   and remember the correction when appropriate.
 - Use forget_user_memory when a user asks you to forget or stop using a memory.
@@ -467,9 +474,11 @@ string directly in the already-large `lib.rs`.
 
 Do not instruct the model to call `lookup_user_memory` on every turn. The current
 author's compact profile should already be injected into context; lookup is for
-other users or deeper refreshes. Also do not instruct the model to save every
-interesting statement. Real-time memory writes are side effects and should be
-reserved for facts likely to be useful later.
+memory-specific questions, empty-profile refreshes, other users, or deeper
+refreshes. It is okay for the model to be more proactive about
+`remember_user_memory`, but do not instruct it to save every throwaway statement.
+Real-time memory writes are side effects and should be reserved for facts likely
+to be useful later.
 
 Add tests that verify:
 
