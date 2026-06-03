@@ -1620,34 +1620,47 @@ impl BotStorage for SqlxStorage {
         schedule: MemoryJobSchedule,
     ) -> Result<u64, Self::Error> {
         let mut inserted = 0u64;
+        let diary_window_seconds =
+            i64::try_from(schedule.diary_window_seconds.max(1)).unwrap_or(i64::MAX);
         let diary_rows = sqlx::query(
-            "WITH completed AS ( \
-                 SELECT t.user_message_provider AS message_provider, \
-                        CASE \
-                          WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
-                          THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
-                          ELSE 'global' \
-                        END AS scope_key, \
-                        t.user_key AS subject_user_key, \
-                        t.completed_at \
-                   FROM turns t \
-                  WHERE t.status = 'completed' AND t.completed_at IS NOT NULL \
-             ), eligible AS ( \
-                 SELECT c.* \
-                   FROM completed c \
-                  WHERE c.completed_at > COALESCE(( \
-                        SELECT MAX(d.window_end) \
-                          FROM user_memory_diary_entries d \
-                         WHERE d.message_provider = c.message_provider \
-                           AND d.scope_key = c.scope_key \
-                           AND d.subject_user_key = c.subject_user_key \
-                    ), '-infinity'::timestamptz) \
-             ) \
-             SELECT message_provider, scope_key, subject_user_key, \
-                    MIN(completed_at) AS window_start, MAX(completed_at) AS window_end \
-               FROM eligible \
-              GROUP BY message_provider, scope_key, subject_user_key",
+            "SELECT t.user_message_provider AS message_provider, \
+                    CASE \
+                      WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
+                      THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
+                      ELSE 'global' \
+                    END AS scope_key, \
+                    t.user_key AS subject_user_key, \
+                    MIN(t.completed_at) AS window_start, \
+                    MIN(t.completed_at) + ($2::double precision * INTERVAL '1 second') AS window_end \
+               FROM turns t \
+               LEFT JOIN ( \
+                    SELECT message_provider, scope_key, subject_user_key, MAX(window_end) AS window_end \
+                      FROM user_memory_diary_entries \
+                     GROUP BY message_provider, scope_key, subject_user_key \
+               ) d \
+                 ON d.message_provider = t.user_message_provider \
+                AND d.scope_key = CASE \
+                      WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
+                      THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
+                      ELSE 'global' \
+                    END \
+                AND d.subject_user_key = t.user_key \
+              WHERE t.status = 'completed' \
+                AND t.completed_at IS NOT NULL \
+                AND t.completed_at >= $1 \
+                AND t.completed_at > COALESCE(d.window_end, '-infinity'::timestamptz) \
+              GROUP BY t.user_message_provider, \
+                    CASE \
+                      WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
+                      THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
+                      ELSE 'global' \
+                    END, \
+                    t.user_key \
+             HAVING MIN(t.completed_at) <= $3",
         )
+        .bind(schedule.diary_cutoff)
+        .bind(diary_window_seconds)
+        .bind(schedule.diary_due_before)
         .fetch_all(&self.pool)
         .await?;
         for row in diary_rows {
@@ -1679,30 +1692,31 @@ impl BotStorage for SqlxStorage {
         }
 
         let compact_rows = sqlx::query(
-            "WITH due_keys AS ( \
-                 SELECT e.message_provider, e.scope_key, e.subject_user_key \
-                   FROM user_memory_events e \
-                   LEFT JOIN user_memory_documents d \
-                     ON d.message_provider = e.message_provider \
-                    AND d.scope_key = e.scope_key \
-                    AND d.subject_user_key = e.subject_user_key \
-                  WHERE d.message_provider IS NULL \
-                     OR e.created_at > COALESCE(d.source_event_cutoff, '-infinity'::timestamptz) \
-                 UNION \
-                 SELECT de.message_provider, de.scope_key, de.subject_user_key \
-                   FROM user_memory_diary_entries de \
-                   LEFT JOIN user_memory_documents d \
-                     ON d.message_provider = de.message_provider \
-                    AND d.scope_key = de.scope_key \
-                    AND d.subject_user_key = de.subject_user_key \
-                  WHERE d.message_provider IS NULL \
-                     OR de.created_at > COALESCE(d.source_diary_cutoff, '-infinity'::timestamptz) \
-                 UNION \
-                 SELECT d.message_provider, d.scope_key, d.subject_user_key \
-                   FROM user_memory_documents d \
-                  WHERE d.last_compacted_at <= $1 \
-             ) \
-             SELECT DISTINCT message_provider, scope_key, subject_user_key FROM due_keys",
+            "SELECT p.message_provider, p.scope_key, p.subject_user_key \
+               FROM ( \
+                    SELECT e.message_provider, e.scope_key, e.subject_user_key, e.created_at \
+                      FROM user_memory_events e \
+                      LEFT JOIN user_memory_documents d \
+                        ON d.message_provider = e.message_provider \
+                       AND d.scope_key = e.scope_key \
+                       AND d.subject_user_key = e.subject_user_key \
+                     WHERE e.created_at > COALESCE(d.source_event_cutoff, '-infinity'::timestamptz) \
+                    UNION ALL \
+                    SELECT de.message_provider, de.scope_key, de.subject_user_key, de.created_at \
+                      FROM user_memory_diary_entries de \
+                      LEFT JOIN user_memory_documents d \
+                        ON d.message_provider = de.message_provider \
+                       AND d.scope_key = de.scope_key \
+                       AND d.subject_user_key = de.subject_user_key \
+                     WHERE de.created_at > COALESCE(d.source_diary_cutoff, '-infinity'::timestamptz) \
+               ) p \
+               LEFT JOIN user_memory_documents d \
+                 ON d.message_provider = p.message_provider \
+                AND d.scope_key = p.scope_key \
+                AND d.subject_user_key = p.subject_user_key \
+              GROUP BY p.message_provider, p.scope_key, p.subject_user_key, d.last_compacted_at \
+             HAVING (d.last_compacted_at IS NOT NULL AND d.last_compacted_at <= $1) \
+                 OR (d.last_compacted_at IS NULL AND MIN(p.created_at) <= $1)",
         )
         .bind(schedule.compact_due_before)
         .fetch_all(&self.pool)

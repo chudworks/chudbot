@@ -801,6 +801,21 @@ fn discord_message_context_json(
             "guild_display_name": message.author.display_name.as_deref(),
             "is_bot": message.author.is_bot,
         },
+        "mentioned_users": message.mentions.iter().map(|mention| {
+            let profile = message.mention_profiles.iter().find(|profile| {
+                profile.id.platform == mention.platform
+                    && profile.id.guild_id == mention.guild_id
+                    && profile.id.user_id == mention.user_id
+            });
+            serde_json::json!({
+                "id": mention.user_id.as_str(),
+                "mention": format!("<@{}>", mention.user_id.as_str()),
+                "username": profile.map(|profile| profile.username.as_str()),
+                "global_name": profile.and_then(|profile| profile.name.as_deref()),
+                "guild_display_name": profile.and_then(|profile| profile.display_name.as_deref()),
+                "is_bot": profile.map(|profile| profile.is_bot),
+            })
+        }).collect::<Vec<_>>(),
         "content": message.content.as_str(),
         "attachments": message.attachments.iter().map(|attachment| {
             serde_json::json!({
@@ -1684,13 +1699,13 @@ mod tests {
             id: MessageRef {
                 platform: platform.clone(),
                 guild_id: Some(guild.clone()),
-                channel_id: channel,
+                channel_id: channel.clone(),
                 message_id: ExternalId::new("333"),
             },
             author: UserProfile {
                 id: UserRef {
-                    platform,
-                    guild_id: Some(guild),
+                    platform: platform.clone(),
+                    guild_id: Some(guild.clone()),
                     user_id: ExternalId::new("444"),
                 },
                 username: "robert".to_string(),
@@ -1699,9 +1714,24 @@ mod tests {
                 avatar_url: None,
                 is_bot: false,
             },
-            content: "hello".to_string(),
-            mentions: Vec::new(),
-            mention_profiles: Vec::new(),
+            content: "hello <@777>".to_string(),
+            mentions: vec![UserRef {
+                platform: platform.clone(),
+                guild_id: Some(guild.clone()),
+                user_id: ExternalId::new("777"),
+            }],
+            mention_profiles: vec![UserProfile {
+                id: UserRef {
+                    platform,
+                    guild_id: Some(guild),
+                    user_id: ExternalId::new("777"),
+                },
+                username: "trollzorftw808".to_string(),
+                name: Some("Trollzor".to_string()),
+                display_name: Some("Troll".to_string()),
+                avatar_url: None,
+                is_bot: false,
+            }],
             reference: PlatformMessageReference::None,
             attachments: vec![AttachmentRef {
                 id: Some(ExternalId::new("555")),
@@ -1729,6 +1759,15 @@ mod tests {
             Some("img.png")
         );
         assert!(value["attachments"][0].get("url").is_none());
+        assert_eq!(value["mentioned_users"][0]["id"].as_str(), Some("777"));
+        assert_eq!(
+            value["mentioned_users"][0]["username"].as_str(),
+            Some("trollzorftw808")
+        );
+        assert_eq!(
+            value["mentioned_users"][0]["guild_display_name"].as_str(),
+            Some("Troll")
+        );
     }
 
     #[test]

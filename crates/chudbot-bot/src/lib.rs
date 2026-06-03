@@ -3329,16 +3329,30 @@ where
             .load_user_memory_document(key.clone())
             .await
             .map_err(storage_error)?;
+        let source_event_cutoff = document
+            .as_ref()
+            .and_then(|document| document.source_event_cutoff);
+        let pending_events = self
+            .storage
+            .list_pending_memory_events(key.clone(), source_event_cutoff)
+            .await
+            .map_err(storage_error)?;
         let position = items
             .iter()
             .map(|item| item.position)
             .max()
             .map(|position| position.saturating_add(1))
             .unwrap_or(0);
-        items.push(memory::context_item(&key, document.as_ref(), position));
+        items.push(memory::context_item(
+            &key,
+            document.as_ref(),
+            &pending_events,
+            position,
+        ));
         tracing::debug!(
             source = %items.last().map(|item| item.source.as_str()).unwrap_or("memory"),
             has_document = document.is_some(),
+            pending_events = pending_events.len(),
             "injected user memory context"
         );
         Ok(())
@@ -4388,6 +4402,7 @@ where
         if !opted_in {
             message.content = "[redacted: user has not opted in]".to_string();
             message.mentions.clear();
+            message.mention_profiles.clear();
             message.attachments.clear();
             message.reference = PlatformMessageReference::None;
         }

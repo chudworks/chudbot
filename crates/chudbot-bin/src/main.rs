@@ -472,6 +472,8 @@ impl RuntimeConfig {
         self.logging.filter()?;
         self.bot.validate()?;
         self.memory.compaction_interval_seconds()?;
+        self.memory.diary_backfill_window_seconds()?;
+        self.memory.diary_interval_seconds()?;
 
         let provider_names = self.llm.keys().collect::<BTreeSet<_>>();
         let image_provider_names = self.image.keys().collect::<BTreeSet<_>>();

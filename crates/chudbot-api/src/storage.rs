@@ -754,6 +754,14 @@ pub struct MemoryJobSchedule {
     /// Scheduler timestamp.
     #[serde(with = "time::serde::rfc3339")]
     pub now: OffsetDateTime,
+    /// Completed turns before this timestamp are ignored for diary backfill.
+    #[serde(with = "time::serde::rfc3339")]
+    pub diary_cutoff: OffsetDateTime,
+    /// The next pending diary window must start at or before this timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub diary_due_before: OffsetDateTime,
+    /// Source window length for one diary entry, in seconds.
+    pub diary_window_seconds: u64,
     /// Documents compacted before this timestamp are due for refresh.
     #[serde(with = "time::serde::rfc3339")]
     pub compact_due_before: OffsetDateTime,
