@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
@@ -21,6 +22,7 @@ use chudbot_bot::{
 use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::{EventBus, WebConfig, WebState};
 use clap::{Parser, Subcommand};
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::task::{JoinError, JoinHandle};
@@ -240,7 +242,23 @@ fn join_service_result(
     task: &'static str,
     result: Result<Result<(), BinError>, JoinError>,
 ) -> Result<(), BinError> {
-    result.map_err(|source| BinError::TaskJoin { task, source })?
+    match result {
+        Ok(result) => result,
+        Err(source) => {
+            log_service_join_error(task, &source);
+            Err(BinError::TaskJoin { task, source })
+        }
+    }
+}
+
+fn log_service_join_error(service: &'static str, error: &JoinError) {
+    if error.is_cancelled() {
+        tracing::warn!(service, error = %error, "service task was cancelled");
+    } else if error.is_panic() {
+        tracing::error!(service, error = %error, "service task panicked");
+    } else {
+        tracing::warn!(service, error = %error, "service task join failed");
+    }
 }
 
 /// Wait for SIGINT or SIGTERM.
@@ -1125,12 +1143,17 @@ struct ConfiguredMessagePlatformsInner {
     events: tokio::sync::Mutex<
         tokio::sync::mpsc::Receiver<Result<PlatformEvent, ConfiguredPlatformError>>,
     >,
-    event_pumps: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
+    event_pumps: tokio::sync::Mutex<Vec<PlatformEventPump>>,
 }
 
 struct ConfiguredDiscordPlatform {
     platform: chudbot_discord::DiscordPlatform,
     dev_guild_id: Option<ExternalId>,
+}
+
+struct PlatformEventPump {
+    platform: chudbot_api::PlatformName,
+    task: JoinHandle<()>,
 }
 
 impl Default for ConfiguredMessagePlatforms {
@@ -1150,51 +1173,119 @@ fn spawn_discord_event_pump(
     platform_name: chudbot_api::PlatformName,
     platform: chudbot_discord::DiscordPlatform,
     events: tokio::sync::mpsc::Sender<Result<PlatformEvent, ConfiguredPlatformError>>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        loop {
-            let event = MessagePlatform::next_event(&platform)
-                .await
-                .map_err(ConfiguredPlatformError::Discord);
-            if let Err(error) = &event {
-                tracing::warn!(
-                    platform = %platform_name,
-                    error = %error,
-                    "message platform event pump received an error"
-                );
-            }
-            let should_stop = matches!(&event, Ok(PlatformEvent::Shutdown));
-            if should_stop {
-                match events.try_send(event) {
-                    Ok(()) => {}
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        tracing::debug!(
-                            platform = %platform_name,
-                            "message platform event pump stopped because receiver closed"
-                        );
-                    }
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                        tracing::debug!(
-                            platform = %platform_name,
-                            "message platform shutdown event dropped because receiver was full"
-                        );
-                    }
-                }
+) -> PlatformEventPump {
+    let handle_platform_name = platform_name.clone();
+    let task = tokio::spawn(async move {
+        let pump = run_discord_event_pump(platform_name.clone(), platform, events.clone());
+        if let Err(payload) = AssertUnwindSafe(pump).catch_unwind().await {
+            let message = panic_payload_message(payload.as_ref());
+            tracing::error!(
+                platform = %platform_name,
+                panic = %message,
+                "message platform event pump panicked"
+            );
+            let error = ConfiguredPlatformError::EventPumpPanic {
+                platform: platform_name.clone(),
+                message,
+            };
+            if events.send(Err(error)).await.is_err() {
                 tracing::debug!(
                     platform = %platform_name,
-                    "message platform event pump stopped after platform shutdown"
+                    "message platform event pump panic dropped because receiver closed"
                 );
-                break;
-            }
-            if events.send(event).await.is_err() {
-                tracing::debug!(
-                    platform = %platform_name,
-                    "message platform event pump stopped because receiver closed"
-                );
-                break;
             }
         }
-    })
+    });
+    PlatformEventPump {
+        platform: handle_platform_name,
+        task,
+    }
+}
+
+async fn run_discord_event_pump(
+    platform_name: chudbot_api::PlatformName,
+    platform: chudbot_discord::DiscordPlatform,
+    events: tokio::sync::mpsc::Sender<Result<PlatformEvent, ConfiguredPlatformError>>,
+) {
+    loop {
+        let event = MessagePlatform::next_event(&platform)
+            .await
+            .map_err(ConfiguredPlatformError::Discord);
+        if let Err(error) = &event {
+            tracing::warn!(
+                platform = %platform_name,
+                error = %error,
+                "message platform event pump received an error"
+            );
+        }
+        let should_stop = matches!(&event, Ok(PlatformEvent::Shutdown));
+        if should_stop {
+            match events.try_send(event) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::debug!(
+                        platform = %platform_name,
+                        "message platform event pump stopped because receiver closed"
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    tracing::debug!(
+                        platform = %platform_name,
+                        "message platform shutdown event dropped because receiver was full"
+                    );
+                }
+            }
+            tracing::debug!(
+                platform = %platform_name,
+                "message platform event pump stopped after platform shutdown"
+            );
+            break;
+        }
+        if events.send(event).await.is_err() {
+            tracing::debug!(
+                platform = %platform_name,
+                "message platform event pump stopped because receiver closed"
+            );
+            break;
+        }
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+fn log_event_pump_join_result(platform: &chudbot_api::PlatformName, result: Result<(), JoinError>) {
+    match result {
+        Ok(()) => tracing::debug!(platform = %platform, "message platform event pump joined"),
+        Err(error) if error.is_cancelled() => {
+            tracing::debug!(
+                platform = %platform,
+                error = %error,
+                "message platform event pump was cancelled"
+            );
+        }
+        Err(error) if error.is_panic() => {
+            tracing::error!(
+                platform = %platform,
+                error = %error,
+                "message platform event pump panicked"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                platform = %platform,
+                error = %error,
+                "message platform event pump join failed"
+            );
+        }
+    }
 }
 
 impl ConfiguredMessagePlatforms {
@@ -1289,15 +1380,11 @@ impl ConfiguredMessagePlatforms {
         let deadline = tokio::time::sleep(PLATFORM_SHUTDOWN_TIMEOUT);
         tokio::pin!(deadline);
         let mut timed_out = false;
-        for handle in &mut handles {
+        for pump in &mut handles {
+            let platform = pump.platform.clone();
             tokio::select! {
-                result = handle => {
-                    if let Err(error) = result {
-                        tracing::warn!(
-                            error = %error,
-                            "message platform event pump join failed during shutdown"
-                        );
-                    }
+                result = &mut pump.task => {
+                    log_event_pump_join_result(&platform, result);
                 }
                 () = &mut deadline => {
                     timed_out = true;
@@ -1309,16 +1396,20 @@ impl ConfiguredMessagePlatforms {
         if timed_out {
             let remaining = handles
                 .iter()
-                .filter(|handle| !handle.is_finished())
+                .filter(|pump| !pump.task.is_finished())
                 .count();
             tracing::warn!(
                 remaining,
                 timeout_ms = PLATFORM_SHUTDOWN_TIMEOUT.as_millis(),
                 "timed out waiting for message platform shutdown"
             );
-            for handle in handles {
-                if !handle.is_finished() {
-                    handle.abort();
+            for pump in handles {
+                if !pump.task.is_finished() {
+                    tracing::debug!(
+                        platform = %pump.platform,
+                        "aborting message platform event pump after shutdown timeout"
+                    );
+                    pump.task.abort();
                 }
             }
         }
@@ -1508,6 +1599,14 @@ pub enum ConfiguredPlatformError {
     /// All event pump tasks stopped.
     #[error("all message platform event streams are closed")]
     EventsClosed,
+    /// A platform event pump panicked.
+    #[error("message platform `{platform}` event pump panicked: {message}")]
+    EventPumpPanic {
+        /// Platform name.
+        platform: chudbot_api::PlatformName,
+        /// Panic payload.
+        message: String,
+    },
     /// Discord platform failed.
     #[error(transparent)]
     Discord(#[from] chudbot_discord::DiscordError),

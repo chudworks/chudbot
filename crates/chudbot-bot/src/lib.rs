@@ -32,7 +32,7 @@ use chudbot_api::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task::{JoinHandle, JoinSet};
+use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -825,7 +825,7 @@ impl TypingIndicator {
     async fn stop(self) {
         self.stop.cancel();
         if let Err(error) = self.task.await {
-            tracing::warn!(error = %error, "typing indicator task failed to join");
+            log_task_join_error("typing indicator", &error);
         }
     }
 }
@@ -2657,7 +2657,7 @@ where
 
     fn spawn_title_generation(&self, conversation_id: ConversationId, agent_name: String) {
         let runtime = (*self).clone();
-        self.background.spawn(async move {
+        spawn_background_task(&self.background, "title generation", async move {
             if let Err(error) = runtime.generate_title(conversation_id, &agent_name).await {
                 tracing::warn!(
                     conversation = %conversation_id,
@@ -2754,7 +2754,7 @@ where
             return;
         };
         let runtime = (*self).clone();
-        self.background.spawn(async move {
+        spawn_background_task(&self.background, "avatar download", async move {
             if let Err(error) = runtime.download_avatar(user, url).await {
                 tracing::warn!(error = %error, "avatar download failed");
             }
@@ -4672,9 +4672,28 @@ fn storage_error(error: impl std::fmt::Display) -> BotError {
     }
 }
 
-fn log_event_task_result(
-    result: Result<(&'static str, Result<BotAction, BotError>), tokio::task::JoinError>,
-) {
+fn log_task_join_error(task: &'static str, error: &JoinError) {
+    if error.is_cancelled() {
+        tracing::debug!(task, error = %error, "task was cancelled");
+    } else if error.is_panic() {
+        tracing::error!(task, error = %error, "task panicked");
+    } else {
+        tracing::warn!(task, error = %error, "task join failed");
+    }
+}
+
+fn spawn_background_task<F>(tracker: &TaskTracker, task: &'static str, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tracker.spawn(async move {
+        if let Err(error) = tokio::spawn(future).await {
+            log_task_join_error(task, &error);
+        }
+    });
+}
+
+fn log_event_task_result(result: Result<(&'static str, Result<BotAction, BotError>), JoinError>) {
     match result {
         Ok((event, Ok(action))) => {
             tracing::debug!(
@@ -4689,7 +4708,8 @@ fn log_event_task_result(
         Err(error) if error.is_cancelled() => {
             tracing::debug!("event task was cancelled during shutdown")
         }
-        Err(error) => tracing::warn!(error = %error, "event task panicked"),
+        Err(error) if error.is_panic() => tracing::error!(error = %error, "event task panicked"),
+        Err(error) => tracing::warn!(error = %error, "event task join failed"),
     }
 }
 
