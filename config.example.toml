@@ -46,6 +46,23 @@ avatars_dir = "avatars"
 # is omitted, the runtime falls back to [bot].web_base_url.
 public_base_url = "http://localhost:1860"
 
+[memory]
+# Global memory switch. Per-agent `memory = true` below opts an agent into
+# memory context and memory tools when this is enabled.
+enabled = true
+# LLM provider registry key used by background diary/compaction jobs.
+provider = "grok"
+poll_interval_seconds = 60
+compaction_interval = "24h"
+lease_seconds = 300
+max_jobs_per_tick = 4
+max_concurrent_jobs = 4
+max_transcript_turns_per_diary_job = 40
+max_diary_output_tokens = 1024
+max_profile_output_tokens = 2048
+retry_backoff_seconds = 300
+max_job_attempts = 5
+
 [bot]
 # Public trace-viewer URL posted in the first Discord reply for a conversation.
 web_base_url = "http://localhost:1860"
@@ -150,7 +167,8 @@ would materially improve the answer.
 """
 # Optional agent-level allowlists. Omit for the full runtime-provided surface.
 # server_tools = ["web_search", "x_search"]
-# client_tools = ["fetch_messages", "generate_image", "generate_video", "post_status_message"]
+# client_tools = ["fetch_messages", "generate_image", "generate_video", "post_status_message", "lookup_user_memory", "remember_user_memory", "forget_user_memory"]
+memory = true
 limits = { max_iterations = 8 }
 
 [bot.agents.default.model]

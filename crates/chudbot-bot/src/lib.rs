@@ -7,6 +7,10 @@
 
 #![allow(async_fn_in_trait)]
 
+pub mod memory;
+
+pub use memory::MemoryConfig;
+
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
@@ -28,7 +32,7 @@ use chudbot_api::{
     ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput,
     SendMessage, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, Transcript,
     TranscriptTurn, Turn, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UserProfile,
-    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    UserRef, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -667,6 +671,9 @@ pub struct AgentConfig {
     /// Optional video generation binding exposed through `generate_video`.
     #[serde(default)]
     pub video_generation: Option<GenerationBinding>,
+    /// Whether top-level runs for this agent receive user-memory context/tools.
+    #[serde(default)]
+    pub memory: bool,
     /// Subagents exposed as named client-side tools.
     #[serde(default)]
     pub subagents: BTreeMap<ToolName, SubagentBinding>,
@@ -726,6 +733,7 @@ pub struct BotRuntime<P, S, M, L, I, V, E> {
     turn_cancellations: TurnCancellations,
     download_http: reqwest::Client,
     config: BotConfig,
+    memory_config: memory::MemoryConfig,
 }
 
 /// Runtime service implementations supplied by the binary crate.
@@ -745,6 +753,8 @@ pub struct BotRuntimeParts<P, S, M, L, I, V, E> {
     pub videos: V,
     /// Live event sink.
     pub events: E,
+    /// User-memory runtime configuration.
+    pub memory: memory::MemoryConfig,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -851,6 +861,7 @@ impl<P, S, M, L, I, V, E> BotRuntime<P, S, M, L, I, V, E> {
             turn_cancellations: TurnCancellations::default(),
             download_http: reqwest::Client::new(),
             config,
+            memory_config: parts.memory,
         }
     }
 
@@ -911,6 +922,8 @@ where
             .register_commands(command_definitions())
             .await
             .map_err(platform_error)?;
+        let memory_shutdown = shutdown.child_token();
+        self.spawn_memory_runtime(memory_shutdown.clone());
         tracing::info!("bot event loop starting");
         let mut tasks = JoinSet::new();
         loop {
@@ -924,7 +937,13 @@ where
                     log_event_task_result(result);
                 }
                 event = self.platforms.next_event() => {
-                    let event = event.map_err(platform_error)?;
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(error) => {
+                            memory_shutdown.cancel();
+                            return Err(platform_error(error));
+                        }
+                    };
                     tracing::trace!(
                         event = platform_event_kind(&event),
                         "received platform event"
@@ -943,6 +962,7 @@ where
             }
         }
 
+        memory_shutdown.cancel();
         drain_event_tasks(&mut tasks, options.drain_timeout).await;
         drain_background_tasks(&self.background, options.drain_timeout).await;
         self.platforms.shutdown().await.map_err(platform_error)?;
@@ -1207,9 +1227,13 @@ where
             .map_err(storage_error)?;
         tracing::debug!("linked user message to turn");
 
-        let turn_context = self
+        let mut turn_context = self
             .prepare_turn_context(&message, &settings, &snapshot.conversation)
             .await?;
+        if self.agent_memory_enabled(&agent_config) {
+            self.push_memory_context(&mut turn_context.items, &message.author.id)
+                .await?;
+        }
         let prompt_snapshot = self
             .storage
             .load_conversation(ConversationLookup::Id {
@@ -1583,12 +1607,15 @@ where
             execution.system_prompt.clone(),
             &execution.settings,
             &execution.reply_to,
+            &execution.turn.user,
+            &execution.turn.user_display_name,
             execution.conversation.id,
             execution.turn.id,
             true,
             &mut Vec::new(),
         )?;
         let transcript = std::mem::take(&mut execution.transcript);
+        let replayed_media_refs = media_reply_refs_from_transcript(&transcript).await;
         tracing::info!("running agent");
         let cancel_guard = self
             .turn_cancellations
@@ -1671,7 +1698,12 @@ where
                 .await;
         }
 
-        let generated_media_refs = generated_media_reply_refs(&run.trace);
+        let mut generated_media_refs = generated_media_reply_refs(&run.trace);
+        for reference in replayed_media_refs {
+            if !generated_media_refs.iter().any(|seen| seen == &reference) {
+                generated_media_refs.push(reference);
+            }
+        }
         let generated_attachments = self.generated_attachments(&run.trace).await;
 
         match &run.outcome {
@@ -1841,6 +1873,8 @@ where
         system_prompt: String,
         settings: &RuntimeSettings,
         reply_to: &MessageRef,
+        turn_user: &UserRef,
+        turn_user_display_name: &str,
         conversation_id: ConversationId,
         turn_id: TurnId,
         top_level: bool,
@@ -1859,6 +1893,11 @@ where
             .with_limits(agent_config.limits.unwrap_or(self.config.limits));
         spec.server_tools = agent_config.server_tools.clone();
         spec.client_tools = agent_config.client_tools.clone();
+        if top_level && self.agent_memory_enabled(agent_config) {
+            ensure_client_tool_enabled(&mut spec.client_tools, memory::LOOKUP_USER_MEMORY_TOOL);
+            ensure_client_tool_enabled(&mut spec.client_tools, memory::REMEMBER_USER_MEMORY_TOOL);
+            ensure_client_tool_enabled(&mut spec.client_tools, memory::FORGET_USER_MEMORY_TOOL);
+        }
 
         let mut tools: Vec<RuntimeTool<P, S, M, L, I, V>> = Vec::new();
         if top_level {
@@ -1872,6 +1911,43 @@ where
                         default_channel: channel_from_message(reply_to),
                         privacy: settings.privacy.clone(),
                     },
+                });
+            }
+            if self.agent_memory_enabled(agent_config) {
+                let base_key = memory::key_from_user_ref(turn_user);
+                tracing::debug!("attaching user memory tools");
+                tools.push(RuntimeTool::Memory {
+                    name: ToolName::new(memory::LOOKUP_USER_MEMORY_TOOL),
+                    tool: memory::MemoryClientTool::new(
+                        self.storage.clone(),
+                        memory::MemoryToolKind::Lookup,
+                        base_key.clone(),
+                        turn_user_display_name.to_string(),
+                        conversation_id,
+                        turn_id,
+                    ),
+                });
+                tools.push(RuntimeTool::Memory {
+                    name: ToolName::new(memory::REMEMBER_USER_MEMORY_TOOL),
+                    tool: memory::MemoryClientTool::new(
+                        self.storage.clone(),
+                        memory::MemoryToolKind::Remember,
+                        base_key.clone(),
+                        turn_user_display_name.to_string(),
+                        conversation_id,
+                        turn_id,
+                    ),
+                });
+                tools.push(RuntimeTool::Memory {
+                    name: ToolName::new(memory::FORGET_USER_MEMORY_TOOL),
+                    tool: memory::MemoryClientTool::new(
+                        self.storage.clone(),
+                        memory::MemoryToolKind::Forget,
+                        base_key,
+                        turn_user_display_name.to_string(),
+                        conversation_id,
+                        turn_id,
+                    ),
                 });
             }
             tracing::debug!(tool = POST_STATUS_TOOL, "attaching runtime tool");
@@ -1950,14 +2026,16 @@ where
                 model = %subagent_config.model.id,
                 "attaching subagent tool"
             );
-            let prompt =
-                self.compose_system_prompt(subagent_config, &PrivacyMode::ConversationOnly);
+            let prompt = self
+                .compose_subagent_system_prompt(subagent_config, &PrivacyMode::ConversationOnly);
             let nested = self.build_agent(
                 &subagent_name,
                 subagent_config,
                 prompt,
                 settings,
                 reply_to,
+                turn_user,
+                turn_user_display_name,
                 conversation_id,
                 turn_id,
                 false,
@@ -2669,6 +2747,22 @@ where
         });
     }
 
+    fn spawn_memory_runtime(&self, shutdown: CancellationToken) {
+        if !self.memory_config.enabled {
+            return;
+        }
+        let runtime = memory::MemoryRuntime::new(
+            self.storage.clone(),
+            self.llms.clone(),
+            self.memory_config.clone(),
+        );
+        spawn_background_task(&self.background, "memory runtime", async move {
+            if let Err(error) = runtime.run_until_shutdown(shutdown).await {
+                tracing::warn!(error = %error, "memory runtime stopped with error");
+            }
+        });
+    }
+
     async fn generate_title(
         &self,
         conversation_id: ConversationId,
@@ -3224,6 +3318,32 @@ where
         Ok(PreparedTurnContext { items })
     }
 
+    async fn push_memory_context(
+        &self,
+        items: &mut Vec<chudbot_api::ContextItem>,
+        user: &UserRef,
+    ) -> Result<(), BotError> {
+        let key = memory::key_from_user_ref(user);
+        let document = self
+            .storage
+            .load_user_memory_document(key.clone())
+            .await
+            .map_err(storage_error)?;
+        let position = items
+            .iter()
+            .map(|item| item.position)
+            .max()
+            .map(|position| position.saturating_add(1))
+            .unwrap_or(0);
+        items.push(memory::context_item(&key, document.as_ref(), position));
+        tracing::debug!(
+            source = %items.last().map(|item| item.source.as_str()).unwrap_or("memory"),
+            has_document = document.is_some(),
+            "injected user memory context"
+        );
+        Ok(())
+    }
+
     async fn push_message_context(
         &self,
         items: &mut Vec<chudbot_api::ContextItem>,
@@ -3508,6 +3628,7 @@ where
                 "added prior user turn to transcript"
             );
             transcript.push(user_turn);
+            append_client_tool_replay(&mut transcript, &turn.tool_trace);
 
             if let Some(answer) = &turn.turn.assistant_content {
                 let mut blocks = Vec::new();
@@ -3541,6 +3662,19 @@ where
     }
 
     fn compose_system_prompt(&self, agent: &AgentConfig, privacy: &PrivacyMode) -> String {
+        self.compose_system_prompt_inner(agent, privacy, self.agent_memory_enabled(agent))
+    }
+
+    fn compose_subagent_system_prompt(&self, agent: &AgentConfig, privacy: &PrivacyMode) -> String {
+        self.compose_system_prompt_inner(agent, privacy, false)
+    }
+
+    fn compose_system_prompt_inner(
+        &self,
+        agent: &AgentConfig,
+        privacy: &PrivacyMode,
+        include_memory: bool,
+    ) -> String {
         let mut out = String::new();
         if let Some(extra) = self
             .config
@@ -3580,11 +3714,21 @@ where
         if !agent.subagents.is_empty() {
             out.push_str("- Specialist subagents are available as tools.\n");
         }
+        if include_memory {
+            out.push_str("- User memory is available through lookup_user_memory, remember_user_memory, and forget_user_memory.\n");
+        }
         out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, file:// URIs, filenames, or markdown media links in user-facing text.\n");
         out.push_str("- Slow work (video generation, subagent calls, research) SHOULD be narrated with calls to the post_status_message tool.\n");
+        if include_memory {
+            out.push_str(memory::prompt_guidance());
+        }
         out.push_str("Agent Persona Prompt:\n");
         out.push_str(agent.system_prompt.trim());
         out
+    }
+
+    fn agent_memory_enabled(&self, agent: &AgentConfig) -> bool {
+        self.memory_config.enabled && agent.memory
     }
 
     fn publish_conversation(&self, conversation_id: ConversationId, kind: ConversationEventKind) {
@@ -3857,6 +4001,10 @@ where
         name: ToolName,
         tool: PersistentVideoGeneratorTool<RoutedVideoGenerator<V>, M, S>,
     },
+    Memory {
+        name: ToolName,
+        tool: memory::MemoryClientTool<S>,
+    },
     Subagent {
         name: ToolName,
         tool: Subagent<RoutedLlmBackend<L>>,
@@ -3878,6 +4026,7 @@ where
             Self::Status { name, tool } => spec.with_tool(name, tool),
             Self::Image { name, tool } => spec.with_tool(name, tool),
             Self::Video { name, tool } => spec.with_tool(name, tool),
+            Self::Memory { name, tool } => spec.with_tool(name, tool),
             Self::Subagent { name, tool } => spec.with_tool(name, tool),
         }
     }
@@ -3888,6 +4037,7 @@ where
             Self::Status { name, tool } => builder.with_tool(name, tool),
             Self::Image { name, tool } => builder.with_tool(name, tool),
             Self::Video { name, tool } => builder.with_tool(name, tool),
+            Self::Memory { name, tool } => builder.with_tool(name, tool),
             Self::Subagent { name, tool } => builder.with_tool(name, tool),
         }
     }
@@ -4507,7 +4657,7 @@ fn video_tool_schema() -> ToolInputSchema {
             },
             "image": {
                 "type": "string",
-                "description": "Optional media URI or public URL for an image to animate."
+                "description": "Optional media URI or public URL for an image to animate. Use file:// media URIs from prior tool results; do not invent local filesystem paths."
             },
             "image_url": {
                 "type": "string",
@@ -4591,6 +4741,54 @@ fn collect_generated_media_reply_refs(value: &serde_json::Value, out: &mut Vec<S
         }
         out.push(reference.to_string());
     }
+}
+
+fn append_client_tool_replay(transcript: &mut Transcript, traces: &[ToolTrace]) {
+    let mut call_blocks = Vec::new();
+    let mut result_blocks = Vec::new();
+    for trace in traces {
+        let ToolTrace::Client { trace } = trace else {
+            continue;
+        };
+        call_blocks.push(ContentBlock::ClientToolCall(trace.call.clone()));
+        result_blocks.push(ContentBlock::ClientToolResult(trace.result.clone()));
+    }
+    if call_blocks.is_empty() {
+        return;
+    }
+    transcript.push(TranscriptTurn {
+        role: TurnRole::Assistant,
+        blocks: call_blocks,
+        metadata: serde_json::Value::Null,
+    });
+    transcript.push(TranscriptTurn {
+        role: TurnRole::User,
+        blocks: result_blocks,
+        metadata: serde_json::Value::Null,
+    });
+}
+
+async fn media_reply_refs_from_transcript(transcript: &Transcript) -> Vec<String> {
+    let mut out = Vec::new();
+    for turn in &transcript.turns {
+        for block in &turn.blocks {
+            let ContentBlock::Media { media } = block else {
+                continue;
+            };
+            push_unique_string(&mut out, media.uri().as_str());
+            if let Ok(public_url) = media.public_url().await {
+                push_unique_string(&mut out, public_url.as_str());
+            }
+        }
+    }
+    out
+}
+
+fn push_unique_string(out: &mut Vec<String>, value: &str) {
+    if value.is_empty() || out.iter().any(|seen| seen == value) {
+        return;
+    }
+    out.push(value.to_string());
 }
 
 fn strip_generated_media_refs(text: &str, refs: &[String]) -> String {
@@ -5154,6 +5352,16 @@ fn available_agents(config: &BotConfig) -> String {
     format!("Available agents: {names}")
 }
 
+fn ensure_client_tool_enabled(tools: &mut Option<Vec<ToolName>>, name: &str) {
+    let Some(tools) = tools else {
+        return;
+    };
+    if tools.iter().any(|tool| tool.as_str() == name) {
+        return;
+    }
+    tools.push(ToolName::new(name));
+}
+
 fn option_tick(value: Option<&str>) -> String {
     value
         .map(|value| format!("`{value}`"))
@@ -5457,7 +5665,10 @@ fn platform_message_reference_kind(reference: &PlatformMessageReference) -> &'st
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chudbot_api::{ExternalId, PlatformName};
+    use chudbot_api::{
+        ExternalId, MediaError, MediaFuture, MediaMetadata, MediaRef, MediaUri, PlatformName,
+        PublicMediaUrl,
+    };
     use serde_json::json;
 
     fn user(platform: &str, guild: Option<&str>, id: &str) -> chudbot_api::UserRef {
@@ -5632,6 +5843,121 @@ mod tests {
             reply,
             "Done.\n\n-# [full trace](https://chud.example/c/abc)"
         );
+    }
+
+    #[derive(Debug, Clone)]
+    struct PromptMediaRef {
+        metadata: MediaMetadata,
+        public_url: PublicMediaUrl,
+    }
+
+    impl PromptMediaRef {
+        fn boxed(uri: &str, public_url: &str) -> chudbot_api::BoxedMediaRef {
+            Box::new(Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "generated.jpg".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: "image/jpeg".to_string(),
+                    size_bytes: 42,
+                },
+                public_url: PublicMediaUrl::new(public_url),
+            })
+        }
+    }
+
+    impl MediaRef for PromptMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> chudbot_api::BoxedMediaRef {
+            Box::new(self.clone())
+        }
+
+        fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
+            Box::pin(async move { Ok(self.public_url.clone()) })
+        }
+
+        fn load(&self) -> MediaFuture<'_, chudbot_api::LoadedMedia> {
+            Box::pin(async move {
+                Err(MediaError::BytesUnavailable {
+                    uri: self.metadata.uri.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_media_refs_are_sanitized_from_replies() {
+        let media = PromptMediaRef::boxed(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        );
+        let transcript = Transcript {
+            id: None,
+            instructions: None,
+            turns: vec![TranscriptTurn {
+                role: TurnRole::User,
+                blocks: vec![
+                    ContentBlock::Media {
+                        media: media.clone(),
+                    },
+                    ContentBlock::Media { media },
+                ],
+                metadata: serde_json::Value::Null,
+            }],
+        };
+
+        let refs = media_reply_refs_from_transcript(&transcript).await;
+        assert_eq!(
+            refs,
+            vec![
+                "file://images/generated.jpg".to_string(),
+                "https://chud.example/images/generated.jpg".to_string()
+            ]
+        );
+        let reply = strip_generated_media_refs(
+            "Done.\n\nhttps://chud.example/images/generated.jpg\nfile://images/generated.jpg",
+            &refs,
+        );
+
+        assert_eq!(reply, "Done.");
+    }
+
+    #[test]
+    fn client_tool_trace_replays_as_call_then_result() {
+        let trace = generated_image_trace(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        );
+        let mut transcript = Transcript::new();
+
+        append_client_tool_replay(&mut transcript, &[trace]);
+
+        assert_eq!(transcript.turns.len(), 2);
+        assert_eq!(transcript.turns[0].role, TurnRole::Assistant);
+        assert_eq!(transcript.turns[1].role, TurnRole::User);
+        let [ContentBlock::ClientToolCall(call)] = transcript.turns[0].blocks.as_slice() else {
+            panic!("expected client tool call replay");
+        };
+        assert_eq!(call.name.as_str(), "generate_image");
+        let [ContentBlock::ClientToolResult(result)] = transcript.turns[1].blocks.as_slice() else {
+            panic!("expected client tool result replay");
+        };
+        assert_eq!(result.tool_use_id, call.id);
+        let ClientToolResultContent::Json { value } = &result.content else {
+            panic!("expected json result");
+        };
+        assert_eq!(value["uri"], "file://images/generated.jpg");
+    }
+
+    #[test]
+    fn client_tool_replay_skips_non_client_traces() {
+        let mut transcript = Transcript::new();
+        append_client_tool_replay(&mut transcript, &[]);
+
+        assert!(transcript.turns.is_empty());
     }
 
     #[test]

@@ -515,6 +515,322 @@ pub struct StoredUserProfile {
     pub avatar: Option<MediaUri>,
 }
 
+/// Platform-neutral key for one user's memory in one workspace/scope.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct UserMemoryKey {
+    /// Messaging platform, e.g. `discord`.
+    pub platform: PlatformName,
+    /// Workspace/server scope, e.g. `guild:<guild_id>`.
+    pub scope_key: String,
+    /// Platform user id inside the scope.
+    pub user_key: String,
+}
+
+impl UserMemoryKey {
+    /// Stable key used by durable memory job leases and dedupe records.
+    pub fn memory_key(&self) -> String {
+        format!("{}:{}:{}", self.platform, self.scope_key, self.user_key)
+    }
+}
+
+/// Raw user-memory event kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UserMemoryEventKind {
+    /// Explicit or inferred memory addition.
+    Remember,
+    /// Correction to older memory.
+    Correction,
+    /// Tombstone/forget request.
+    Forget,
+    /// Observation emitted by the diary pipeline.
+    DiaryObservation,
+    /// Operator-authored note.
+    OperatorNote,
+}
+
+/// Raw user-memory ledger event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMemoryEvent {
+    /// Event id.
+    pub id: uuid::Uuid,
+    /// Subject user.
+    pub key: UserMemoryKey,
+    /// Acting user key, when known.
+    pub actor_user_key: Option<String>,
+    /// Event kind.
+    pub kind: UserMemoryEventKind,
+    /// Event body.
+    pub body: String,
+    /// Lightweight tags.
+    pub tags: Vec<String>,
+    /// Confidence score supplied by a tool or operator.
+    pub confidence: Option<f32>,
+    /// Source conversation.
+    pub source_conversation_id: Option<ConversationId>,
+    /// Source turn.
+    pub source_turn_id: Option<TurnId>,
+    /// Source tool trace row id.
+    pub source_tool_trace_id: Option<i64>,
+    /// Superseded event id, when this event replaces another.
+    pub supersedes_event_id: Option<uuid::Uuid>,
+    /// Created timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// Updated timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// Input for appending a memory ledger event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewUserMemoryEvent {
+    /// Subject user.
+    pub key: UserMemoryKey,
+    /// Acting user key, when known.
+    pub actor_user_key: Option<String>,
+    /// Event kind.
+    pub kind: UserMemoryEventKind,
+    /// Event body.
+    pub body: String,
+    /// Lightweight tags.
+    pub tags: Vec<String>,
+    /// Confidence score supplied by a tool or operator.
+    pub confidence: Option<f32>,
+    /// Source conversation.
+    pub source_conversation_id: Option<ConversationId>,
+    /// Source turn.
+    pub source_turn_id: Option<TurnId>,
+    /// Source tool trace row id.
+    pub source_tool_trace_id: Option<i64>,
+    /// Superseded event id, when this event replaces another.
+    pub supersedes_event_id: Option<uuid::Uuid>,
+}
+
+/// Generated diary artifact for one user's recent turns.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMemoryDiaryEntry {
+    /// Entry id.
+    pub id: uuid::Uuid,
+    /// Subject user.
+    pub key: UserMemoryKey,
+    /// Window start.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_start: OffsetDateTime,
+    /// Window end.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: OffsetDateTime,
+    /// Source turns summarized.
+    pub source_turn_ids: Vec<TurnId>,
+    /// Generated Markdown.
+    pub markdown: String,
+    /// Memory agent name.
+    pub agent_name: String,
+    /// LLM provider registry key.
+    pub llm_provider: ProviderName,
+    /// LLM model id.
+    pub llm_model: ModelId,
+    /// Usage records for the diary generation.
+    pub usage: Vec<UsageRecord>,
+    /// Created timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// Updated timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// Input for saving a generated diary artifact.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewUserMemoryDiaryEntry {
+    /// Subject user.
+    pub key: UserMemoryKey,
+    /// Window start.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_start: OffsetDateTime,
+    /// Window end.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: OffsetDateTime,
+    /// Source turns summarized.
+    pub source_turn_ids: Vec<TurnId>,
+    /// Generated Markdown.
+    pub markdown: String,
+    /// Memory agent name.
+    pub agent_name: String,
+    /// LLM provider registry key.
+    pub llm_provider: ProviderName,
+    /// LLM model id.
+    pub llm_model: ModelId,
+    /// Usage records for the diary generation.
+    pub usage: Vec<UsageRecord>,
+}
+
+/// Current compact user memory profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMemoryDocument {
+    /// Subject user.
+    pub key: UserMemoryKey,
+    /// Monotonic profile revision.
+    pub revision: i64,
+    /// Complete Markdown profile.
+    pub markdown: String,
+    /// Last compaction timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub last_compacted_at: OffsetDateTime,
+    /// Highest event timestamp included in the profile.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub source_event_cutoff: Option<OffsetDateTime>,
+    /// Highest diary timestamp included in the profile.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub source_diary_cutoff: Option<OffsetDateTime>,
+    /// Created timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// Updated timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// Input for replacing the compact memory document.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NewUserMemoryDocumentRevision {
+    /// Subject user.
+    pub key: UserMemoryKey,
+    /// Complete replacement Markdown profile.
+    pub markdown: String,
+    /// Source memory event ids included in this revision.
+    pub source_event_ids: Vec<uuid::Uuid>,
+    /// Source diary entry ids included in this revision.
+    pub source_diary_entry_ids: Vec<uuid::Uuid>,
+    /// Highest event timestamp included in this revision.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub source_event_cutoff: Option<OffsetDateTime>,
+    /// Highest diary timestamp included in this revision.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub source_diary_cutoff: Option<OffsetDateTime>,
+}
+
+/// Durable memory job kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryJobKind {
+    /// Generate a diary entry from recent turns.
+    Diary,
+    /// Compact events and diary entries into the current profile.
+    Compact,
+}
+
+/// Durable memory job claimed for processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMemoryJob {
+    /// Job id.
+    pub id: uuid::Uuid,
+    /// Job kind.
+    pub kind: MemoryJobKind,
+    /// Subject user.
+    pub key: UserMemoryKey,
+    /// Durable parallelism key.
+    pub memory_key: String,
+    /// Optional turn window start.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub window_start: Option<OffsetDateTime>,
+    /// Optional turn window end.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub window_end: Option<OffsetDateTime>,
+    /// Number of times this job has been claimed.
+    pub attempts: i32,
+    /// Current lease owner.
+    pub leased_by: Option<String>,
+    /// Current lease expiry.
+    #[serde(with = "time::serde::rfc3339::option", default)]
+    pub leased_until: Option<OffsetDateTime>,
+    /// Active-job dedupe key.
+    pub dedupe_key: String,
+}
+
+/// Scheduler inputs for enqueueing due memory work.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MemoryJobSchedule {
+    /// Scheduler timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub now: OffsetDateTime,
+    /// Documents compacted before this timestamp are due for refresh.
+    #[serde(with = "time::serde::rfc3339")]
+    pub compact_due_before: OffsetDateTime,
+}
+
+/// Memory job completion status.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum MemoryJobCompletion {
+    /// Job completed successfully.
+    Completed {
+        /// Job id.
+        job_id: uuid::Uuid,
+    },
+    /// Job failed but should be retried.
+    Retry {
+        /// Job id.
+        job_id: uuid::Uuid,
+        /// Error text.
+        error: String,
+        /// Next attempt timestamp.
+        #[serde(with = "time::serde::rfc3339")]
+        next_run_at: OffsetDateTime,
+    },
+    /// Job exhausted retries or should not be retried.
+    Failed {
+        /// Job id.
+        job_id: uuid::Uuid,
+        /// Error text.
+        error: String,
+    },
+}
+
+impl MemoryJobCompletion {
+    /// Borrow the completed job id.
+    pub fn job_id(&self) -> uuid::Uuid {
+        match self {
+            Self::Completed { job_id }
+            | Self::Retry { job_id, .. }
+            | Self::Failed { job_id, .. } => *job_id,
+        }
+    }
+}
+
+/// Request for a bounded memory diary transcript window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryTurnWindow {
+    /// Subject user.
+    pub key: UserMemoryKey,
+    /// Window start.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_start: OffsetDateTime,
+    /// Window end.
+    #[serde(with = "time::serde::rfc3339")]
+    pub window_end: OffsetDateTime,
+    /// Maximum completed turns to return.
+    pub max_turns: u32,
+}
+
+/// One completed turn loaded for the memory pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMemoryTurn {
+    /// Conversation id.
+    pub conversation_id: ConversationId,
+    /// Turn id.
+    pub turn_id: TurnId,
+    /// Completed timestamp.
+    #[serde(with = "time::serde::rfc3339")]
+    pub completed_at: OffsetDateTime,
+    /// User display name at turn time.
+    pub user_display_name: String,
+    /// User message text.
+    pub user_content: String,
+    /// Assistant reply text, if any.
+    pub assistant_content: Option<String>,
+}
+
 /// Bot persistence API.
 pub trait BotStorage: Send + Sync {
     /// Storage error type.
@@ -699,6 +1015,72 @@ pub trait BotStorage: Send + Sync {
         &self,
         input: UpdateVideoJob,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Load the current compact memory profile for one user.
+    fn load_user_memory_document(
+        &self,
+        key: UserMemoryKey,
+    ) -> impl Future<Output = Result<Option<UserMemoryDocument>, Self::Error>> + Send;
+
+    /// Append one raw user-memory ledger event.
+    fn append_user_memory_event(
+        &self,
+        event: NewUserMemoryEvent,
+    ) -> impl Future<Output = Result<UserMemoryEvent, Self::Error>> + Send;
+
+    /// List memory events that have not yet been compacted into the current
+    /// profile according to the supplied cutoff.
+    fn list_pending_memory_events(
+        &self,
+        key: UserMemoryKey,
+        since: Option<OffsetDateTime>,
+    ) -> impl Future<Output = Result<Vec<UserMemoryEvent>, Self::Error>> + Send;
+
+    /// List diary entries that have not yet been compacted into the current
+    /// profile according to the supplied cutoff.
+    fn list_pending_memory_diary_entries(
+        &self,
+        key: UserMemoryKey,
+        since: Option<OffsetDateTime>,
+    ) -> impl Future<Output = Result<Vec<UserMemoryDiaryEntry>, Self::Error>> + Send;
+
+    /// Save one generated diary entry.
+    fn save_user_memory_diary_entry(
+        &self,
+        entry: NewUserMemoryDiaryEntry,
+    ) -> impl Future<Output = Result<UserMemoryDiaryEntry, Self::Error>> + Send;
+
+    /// Atomically save a new current memory document and document-version row.
+    fn save_user_memory_document_revision(
+        &self,
+        document: NewUserMemoryDocumentRevision,
+    ) -> impl Future<Output = Result<UserMemoryDocument, Self::Error>> + Send;
+
+    /// Enqueue all memory jobs due at this scheduler tick.
+    fn enqueue_due_memory_jobs(
+        &self,
+        schedule: MemoryJobSchedule,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+
+    /// Claim due memory jobs with SQL leases.
+    fn claim_memory_jobs(
+        &self,
+        worker_id: String,
+        limit: u32,
+        lease_until: OffsetDateTime,
+    ) -> impl Future<Output = Result<Vec<UserMemoryJob>, Self::Error>> + Send;
+
+    /// Mark a memory job completed, retryable, or failed.
+    fn finish_memory_job(
+        &self,
+        completion: MemoryJobCompletion,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Load a bounded completed-turn window for one user's diary job.
+    fn load_memory_turn_window(
+        &self,
+        window: MemoryTurnWindow,
+    ) -> impl Future<Output = Result<Vec<UserMemoryTurn>, Self::Error>> + Send;
 }
 
 #[cfg(test)]

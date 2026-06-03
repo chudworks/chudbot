@@ -50,9 +50,12 @@ pub use platform::{
 pub use storage::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ContextItem, Conversation,
     ConversationLookup, ConversationSnapshot, ConversationStop, CreateVideoJob, FinishTurn,
-    MessageLink, OpenConversation, PrivacyMode, ResolveAgent, RetryTurn, RuntimeSettings,
-    SaveTurnInput, StoredUserProfile, StoredVideoJob, Turn, TurnAsset, TurnSnapshot, TurnStatus,
-    UpdateVideoJob,
+    MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, MessageLink,
+    NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, OpenConversation,
+    PrivacyMode, ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile,
+    StoredVideoJob, Turn, TurnAsset, TurnSnapshot, TurnStatus, UpdateVideoJob,
+    UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryJob,
+    UserMemoryKey, UserMemoryTurn,
 };
 pub use tool::{
     ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,

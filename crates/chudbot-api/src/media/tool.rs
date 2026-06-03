@@ -636,7 +636,7 @@ fn image_tool_schema() -> ToolInputSchema {
             },
             "reference_images": {
                 "type": "array",
-                "description": "Optional media URIs or public URLs to use as image references.",
+                "description": "Optional media URIs or public URLs to use as image references. Use file:// media URIs from prior tool results; do not invent local filesystem paths.",
                 "maxItems": MAX_REFERENCE_IMAGES,
                 "items": { "type": "string" }
             },
@@ -664,7 +664,7 @@ fn video_tool_schema() -> ToolInputSchema {
             },
             "image": {
                 "type": "string",
-                "description": "Optional media URI or public URL for an image to animate."
+                "description": "Optional media URI or public URL for an image to animate. Use file:// media URIs from prior tool results; do not invent local filesystem paths."
             },
             "duration_seconds": {
                 "type": "integer",

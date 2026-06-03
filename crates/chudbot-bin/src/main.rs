@@ -17,7 +17,7 @@ use chudbot_api::{
 use chudbot_asset_local::LocalMediaStore;
 use chudbot_bot::{
     BotConfig, BotRunOptions, BotRuntime, BotRuntimeParts, ImageGeneratorRegistry,
-    LlmProviderRegistry, MessagePlatformRegistry, VideoGeneratorRegistry,
+    LlmProviderRegistry, MemoryConfig, MessagePlatformRegistry, VideoGeneratorRegistry,
 };
 use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::{EventBus, WebConfig, WebState};
@@ -86,6 +86,7 @@ async fn main() -> ExitCode {
         image_providers = config.image.len(),
         video_providers = config.video.len(),
         platforms = config.platforms.len(),
+        memory_enabled = config.memory.enabled,
         "chudbot starting"
     );
     match run(args.command, args.config, config).await {
@@ -159,6 +160,7 @@ async fn run(
                     images: plan.images,
                     videos: plan.videos,
                     events: plan.events.clone(),
+                    memory: config.memory,
                 },
                 config.bot,
             );
@@ -332,6 +334,9 @@ pub struct RuntimeConfig {
     pub logging: LoggingConfig,
     /// Bot agent/platform binding config.
     pub bot: BotConfig,
+    /// User-memory runtime config.
+    #[serde(default)]
+    pub memory: MemoryConfig,
     /// Deployment fallback privacy mode before a guild stores an override.
     #[serde(default = "default_privacy")]
     pub default_privacy: PrivacyMode,
@@ -466,10 +471,36 @@ impl RuntimeConfig {
         self.validate_database()?;
         self.logging.filter()?;
         self.bot.validate()?;
+        self.memory.compaction_interval_seconds()?;
 
         let provider_names = self.llm.keys().collect::<BTreeSet<_>>();
         let image_provider_names = self.image.keys().collect::<BTreeSet<_>>();
         let video_provider_names = self.video.keys().collect::<BTreeSet<_>>();
+        if self.memory.enabled {
+            if !provider_names.contains(&self.memory.provider) {
+                tracing::warn!(
+                    provider = %self.memory.provider,
+                    "memory references missing provider config"
+                );
+                return Err(BinError::MissingMemoryProviderConfig {
+                    provider: self.memory.provider.clone(),
+                });
+            }
+            if matches!(
+                self.llm.get(&self.memory.provider),
+                Some(LlmProviderConfig::OpenAiCompat { .. })
+            ) {
+                tracing::warn!(
+                    provider = %self.memory.provider,
+                    kind = "openai_compat",
+                    "memory references an LLM provider kind that is planned but not implemented"
+                );
+                return Err(BinError::UnimplementedMemoryProvider {
+                    provider: self.memory.provider.clone(),
+                    kind: "openai_compat",
+                });
+            }
+        }
         for (agent_name, agent) in &self.bot.agents {
             if !provider_names.contains(&agent.provider) {
                 tracing::warn!(
@@ -1633,6 +1664,9 @@ pub enum BinError {
     /// Logging filter failed validation.
     #[error(transparent)]
     LoggingFilter(#[from] LoggingFilterError),
+    /// Memory config failed validation.
+    #[error(transparent)]
+    MemoryConfig(#[from] chudbot_bot::memory::MemoryConfigError),
     /// A service task failed to join.
     #[error("{task} service task join failed: {source}")]
     TaskJoin {
@@ -1646,6 +1680,12 @@ pub enum BinError {
     MissingProviderConfig {
         /// Agent name.
         agent: String,
+        /// Provider name.
+        provider: ProviderName,
+    },
+    /// Memory provider has no matching `[llm.<name>]` config.
+    #[error("memory uses provider `{provider}` but no matching [llm] entry exists")]
+    MissingMemoryProviderConfig {
         /// Provider name.
         provider: ProviderName,
     },
@@ -1676,6 +1716,16 @@ pub enum BinError {
     UnimplementedLlmProvider {
         /// Agent name.
         agent: String,
+        /// Provider name.
+        provider: ProviderName,
+        /// Provider kind.
+        kind: &'static str,
+    },
+    /// Memory references an LLM provider kind with no runtime implementation.
+    #[error(
+        "memory uses llm provider `{provider}` with kind `{kind}`, which is planned but not implemented"
+    )]
+    UnimplementedMemoryProvider {
         /// Provider name.
         provider: ProviderName,
         /// Provider kind.
