@@ -30,6 +30,11 @@ export default function Turn({ turnView, users }: Props) {
             · model <code>{modelLabel}</code>
           </span>
         )}
+        {turn.app_version_id != null && (
+          <span className="turn__version">
+            · build <code>v{turn.app_version_id}</code>
+          </span>
+        )}
         <span className="turn__time">
           · <RelativeTime iso={turn.created_at} />
         </span>

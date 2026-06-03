@@ -14,7 +14,12 @@ pub struct UserProfile {
     pub id: UserRef,
     /// Platform username.
     pub username: String,
+    /// Platform-wide display/profile name.
+    #[serde(default)]
+    pub name: Option<String>,
     /// Display name at the event boundary.
+    ///
+    /// On Discord this is the guild display name/nickname when available.
     pub display_name: Option<String>,
     /// Optional avatar URL.
     pub avatar_url: Option<String>,
@@ -42,6 +47,12 @@ pub struct AttachmentRef {
 pub struct PlatformMessage {
     /// Message id.
     pub id: MessageRef,
+    /// Platform guild/workspace/server name when known.
+    #[serde(default)]
+    pub guild_name: Option<String>,
+    /// Platform channel name when known.
+    #[serde(default)]
+    pub channel_name: Option<String>,
     /// Author.
     pub author: UserProfile,
     /// Raw content.
@@ -51,14 +62,60 @@ pub struct PlatformMessage {
     /// Mentioned user profiles when the platform supplies them.
     #[serde(default)]
     pub mention_profiles: Vec<UserProfile>,
-    /// Message quoted/replied to by this message, if provided by the platform
-    /// event.
-    pub referenced_message: Option<Box<PlatformMessage>>,
+    /// Message quoted/replied to by this message, if provided by the platform.
+    #[serde(default)]
+    pub reference: PlatformMessageReference,
     /// Attachments.
     pub attachments: Vec<AttachmentRef>,
     /// Creation timestamp.
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+impl PlatformMessage {
+    /// Message id quoted/replied to by this message, if known.
+    pub fn referenced_message_id(&self) -> Option<&MessageRef> {
+        self.reference.message_id()
+    }
+
+    /// Hydrated message quoted/replied to by this message, if the platform
+    /// supplied it.
+    pub fn referenced_message(&self) -> Option<&PlatformMessage> {
+        self.reference.hydrated_message()
+    }
+}
+
+/// Reference data for a platform message reply/quote.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "message", rename_all = "snake_case")]
+pub enum PlatformMessageReference {
+    /// No referenced message.
+    #[default]
+    None,
+    /// The platform supplied only a referenced message id.
+    Id(MessageRef),
+    /// The platform supplied the full referenced message payload.
+    Hydrated(Box<PlatformMessage>),
+}
+
+impl PlatformMessageReference {
+    /// Referenced message id, whether the platform supplied only an id or a
+    /// fully hydrated message.
+    pub fn message_id(&self) -> Option<&MessageRef> {
+        match self {
+            Self::None => None,
+            Self::Id(message) => Some(message),
+            Self::Hydrated(message) => Some(&message.id),
+        }
+    }
+
+    /// Hydrated referenced message payload, if available.
+    pub fn hydrated_message(&self) -> Option<&PlatformMessage> {
+        match self {
+            Self::None | Self::Id(_) => None,
+            Self::Hydrated(message) => Some(message),
+        }
+    }
 }
 
 /// Reaction kind.
@@ -393,4 +450,23 @@ pub trait MessagePlatform: Send + Sync {
         &self,
         channel: ChannelRef,
     ) -> impl Future<Output = Result<ChannelRef, Self::Error>> + Send;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn id_reference_exposes_message_id_without_hydrated_message() {
+        let id = MessageRef {
+            platform: PlatformName::new("discord"),
+            guild_id: Some(ExternalId::new("guild-1")),
+            channel_id: ExternalId::new("channel-1"),
+            message_id: ExternalId::new("message-1"),
+        };
+        let reference = PlatformMessageReference::Id(id.clone());
+
+        assert_eq!(reference.message_id(), Some(&id));
+        assert!(reference.hydrated_message().is_none());
+    }
 }

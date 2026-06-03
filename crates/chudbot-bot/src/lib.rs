@@ -17,18 +17,18 @@ use chudbot_api::{
     BotStorage, ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput,
     ClientToolResultContent, ClientToolSpec, ContentBlock, Conversation, ConversationEventKind,
     ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop, CreateMedia,
-    CreateVideoJob, EventSink, FetchMessages, FinishTurn, GeneratedImage, ImageGenerator,
-    ImageGeneratorTool, ImageRequest, LiveEvent, LlmBackend, MediaCategory, MediaStore, MediaUri,
-    MessageLink, MessagePlatform, MessageRef, Model, ModelId, ModelSpec, ModelStep,
-    ModelStepRequest, OpenConversation, OutgoingAttachment, PlatformCommand,
+    CreateVideoJob, EventSink, ExternalId, FetchMessages, FinishTurn, GeneratedImage,
+    ImageGenerator, ImageGeneratorTool, ImageRequest, LiveEvent, LlmBackend, MediaCategory,
+    MediaStore, MediaUri, MessageLink, MessagePlatform, MessageRef, Model, ModelId, ModelSpec,
+    ModelStep, ModelStepRequest, OpenConversation, OutgoingAttachment, PlatformCommand,
     PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
     PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
-    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformName, PlatformReaction,
-    PostedMessage, PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings,
-    SamplingOptions, SaveTurnInput, SendMessage, Subagent, ThreadRequest, ToolInputSchema,
-    ToolName, ToolTrace, Transcript, TranscriptTurn, Turn, TurnId, TurnRole, TurnSnapshot,
-    UpdateVideoJob, UrlMediaRef, UserProfile, VideoGenerator, VideoJobId, VideoJobStatus,
-    VideoRequest,
+    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference, PlatformName,
+    PlatformReaction, PostedMessage, PrivacyMode, ProviderName, ReactionKind, ResolveAgent,
+    RuntimeSettings, SamplingOptions, SaveTurnInput, SendMessage, Subagent, ThreadRequest,
+    ToolInputSchema, ToolName, ToolTrace, Transcript, TranscriptTurn, Turn, TurnId, TurnRole,
+    TurnSnapshot, UpdateVideoJob, UrlMediaRef, UserProfile, VideoGenerator, VideoJobId,
+    VideoJobStatus, VideoRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -53,6 +53,9 @@ const HISTORY_SIZE_MIN: i64 = 1;
 const HISTORY_SIZE_MAX: i64 = 100;
 const TITLE_MAX_CHARS: usize = 80;
 const TITLE_MAX_TOKENS: u32 = 96;
+const DEFAULT_THREAD_THRESHOLD_CHARS: usize = 1500;
+const DEFAULT_THREAD_THRESHOLD_LINES: usize = 20;
+const THREAD_REPLY_WRAP_WIDTH: usize = 80;
 
 const TITLE_SYSTEM_PROMPT: &str = "You write very short conversation titles. \
 Output ONLY a title for the conversation below: five words or fewer, no quotes, \
@@ -160,6 +163,11 @@ pub trait MessagePlatformRegistry: Clone + Send + Sync {
 
     /// Read the next event from any configured platform.
     fn next_event(&self) -> impl Future<Output = Result<PlatformEvent, Self::Error>> + Send;
+
+    /// Gracefully stop platform services owned by this registry.
+    fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        async { Ok(()) }
+    }
 
     /// Respond to a command invocation.
     fn respond_to_command(
@@ -475,8 +483,12 @@ pub struct BotConfig {
     pub limits: AgentLimits,
     /// Reply length above which a new conversation asks the platform to open a
     /// thread when supported.
-    #[serde(default = "default_thread_threshold")]
+    #[serde(default = "default_thread_threshold_chars")]
     pub thread_threshold_chars: usize,
+    /// Approximate visible reply rows above which a new conversation asks the
+    /// platform to open a thread when supported.
+    #[serde(default = "default_thread_threshold_lines")]
+    pub thread_threshold_lines: usize,
 }
 
 impl BotConfig {
@@ -582,8 +594,12 @@ impl BotConfig {
     }
 }
 
-fn default_thread_threshold() -> usize {
-    1500
+fn default_thread_threshold_chars() -> usize {
+    DEFAULT_THREAD_THRESHOLD_CHARS
+}
+
+fn default_thread_threshold_lines() -> usize {
+    DEFAULT_THREAD_THRESHOLD_LINES
 }
 
 fn validate_generation_binding(
@@ -914,6 +930,7 @@ where
 
         drain_event_tasks(&mut tasks, options.drain_timeout).await;
         drain_background_tasks(&self.background, options.drain_timeout).await;
+        self.platforms.shutdown().await.map_err(platform_error)?;
         tracing::info!("bot event loop stopped");
         Ok(())
     }
@@ -971,6 +988,22 @@ where
         &self,
         mut message: PlatformMessage,
     ) -> Result<BotAction, BotError> {
+        let referenced = message.referenced_message_id();
+        tracing::debug!(
+            author_is_bot = message.author.is_bot,
+            mentions = message.mentions.len(),
+            mention_profiles = message.mention_profiles.len(),
+            attachments = message.attachments.len(),
+            content_chars = message.content.chars().count(),
+            reference_kind = platform_message_reference_kind(&message.reference),
+            reference_platform = ?referenced.map(|message| message.platform.as_str()),
+            reference_guild = ?referenced
+                .and_then(|message| message.guild_id.as_ref().map(ExternalId::as_str)),
+            reference_channel = ?referenced.map(|message| message.channel_id.as_str()),
+            reference_message = ?referenced.map(|message| message.message_id.as_str()),
+            has_hydrated_reference = message.referenced_message().is_some(),
+            "received platform message"
+        );
         let bot_user = self
             .platforms
             .bot_user(&message.id.platform)
@@ -1633,10 +1666,12 @@ where
                     answer.text.clone()
                 };
                 let content = self.format_reply(&text, execution.is_new, execution.conversation.id);
+                let rendered_lines = rendered_line_count(&content);
                 let open_thread = should_thread(
                     execution.is_new,
                     &content,
                     self.config.thread_threshold_chars,
+                    self.config.thread_threshold_lines,
                 )
                 .then(|| ThreadRequest {
                     title: thread_title(&execution),
@@ -1648,7 +1683,7 @@ where
                         reply_to: Some(execution.reply_to.clone()),
                         content: content.clone(),
                         attachments: generated_attachments,
-                        suppress_embeds: false,
+                        suppress_embeds: true,
                         open_thread,
                     })
                     .await
@@ -1657,6 +1692,9 @@ where
                     reply_message = %posted.id.message_id,
                     reply_channel = %posted.channel.channel_id,
                     answer_chars = content.chars().count(),
+                    rendered_lines,
+                    thread_threshold_chars = self.config.thread_threshold_chars,
+                    thread_threshold_lines = self.config.thread_threshold_lines,
                     opened_thread = posted.channel != channel_from_message(&execution.reply_to),
                     "posted assistant reply"
                 );
@@ -2901,17 +2939,25 @@ where
             guild = ?message.id.guild_id,
             channel = %message.id.channel_id,
             message = %message.id.message_id,
-            has_reference = message.referenced_message.is_some(),
+            has_reference = message.referenced_message_id().is_some(),
         )
     )]
     async fn lookup_existing_conversation(
         &self,
         message: &PlatformMessage,
     ) -> Result<Option<ConversationSnapshot>, BotError> {
+        let channel = channel_from_message(&message.id);
+        tracing::debug!(
+            lookup = "channel",
+            lookup_platform = %channel.platform,
+            lookup_guild = ?channel.guild_id.as_ref().map(ExternalId::as_str),
+            lookup_channel = %channel.channel_id,
+            "looking up existing conversation by channel"
+        );
         if let Some(snapshot) = self
             .storage
             .load_conversation(ConversationLookup::Channel {
-                channel: channel_from_message(&message.id),
+                channel: channel.clone(),
             })
             .await
             .map_err(storage_error)?
@@ -2923,24 +2969,67 @@ where
             );
             return Ok(Some(snapshot));
         }
+        tracing::debug!(
+            lookup = "channel",
+            lookup_platform = %channel.platform,
+            lookup_guild = ?channel.guild_id.as_ref().map(ExternalId::as_str),
+            lookup_channel = %channel.channel_id,
+            "no existing conversation found by channel"
+        );
 
-        if let Some(referenced) = &message.referenced_message
-            && let Some(snapshot) = self
+        if let Some(referenced) = message.referenced_message_id().cloned() {
+            tracing::debug!(
+                lookup = "referenced_message",
+                reference_kind = platform_message_reference_kind(&message.reference),
+                lookup_platform = %referenced.platform,
+                lookup_guild = ?referenced.guild_id.as_ref().map(ExternalId::as_str),
+                lookup_channel = %referenced.channel_id,
+                lookup_message = %referenced.message_id,
+                "looking up existing conversation by referenced message"
+            );
+            if let Some(snapshot) = self
                 .storage
                 .load_conversation(ConversationLookup::Message {
-                    message: referenced.id.clone(),
+                    message: referenced.clone(),
                 })
                 .await
                 .map_err(storage_error)?
-        {
+            {
+                tracing::debug!(
+                    conversation = %snapshot.conversation.id,
+                    source = "referenced_message",
+                    lookup_platform = %referenced.platform,
+                    lookup_guild = ?referenced.guild_id.as_ref().map(ExternalId::as_str),
+                    lookup_channel = %referenced.channel_id,
+                    lookup_message = %referenced.message_id,
+                    "found existing conversation"
+                );
+                return Ok(Some(snapshot));
+            }
             tracing::debug!(
-                conversation = %snapshot.conversation.id,
-                source = "referenced_message",
-                "found existing conversation"
+                lookup = "referenced_message",
+                reference_kind = platform_message_reference_kind(&message.reference),
+                lookup_platform = %referenced.platform,
+                lookup_guild = ?referenced.guild_id.as_ref().map(ExternalId::as_str),
+                lookup_channel = %referenced.channel_id,
+                lookup_message = %referenced.message_id,
+                "no existing conversation found by referenced message"
             );
-            return Ok(Some(snapshot));
+        } else {
+            tracing::debug!(
+                reference_kind = platform_message_reference_kind(&message.reference),
+                "skipping referenced-message lookup because no referenced message id was available"
+            );
         }
 
+        tracing::debug!(
+            lookup = "message",
+            lookup_platform = %message.id.platform,
+            lookup_guild = ?message.id.guild_id.as_ref().map(ExternalId::as_str),
+            lookup_channel = %message.id.channel_id,
+            lookup_message = %message.id.message_id,
+            "looking up existing conversation by current message"
+        );
         let snapshot = self
             .storage
             .load_conversation(ConversationLookup::Message {
@@ -2952,10 +3041,21 @@ where
             tracing::debug!(
                 conversation = %snapshot.conversation.id,
                 source = "message",
+                lookup_platform = %message.id.platform,
+                lookup_guild = ?message.id.guild_id.as_ref().map(ExternalId::as_str),
+                lookup_channel = %message.id.channel_id,
+                lookup_message = %message.id.message_id,
                 "found existing conversation"
             );
         } else {
-            tracing::debug!("no existing conversation found");
+            tracing::debug!(
+                lookup = "message",
+                lookup_platform = %message.id.platform,
+                lookup_guild = ?message.id.guild_id.as_ref().map(ExternalId::as_str),
+                lookup_channel = %message.id.channel_id,
+                lookup_message = %message.id.message_id,
+                "no existing conversation found by current message"
+            );
         }
         Ok(snapshot)
     }
@@ -3077,9 +3177,12 @@ where
         let mut items = Vec::new();
         let mut position = 0;
 
-        if let Some(referenced) = message.referenced_message.as_deref()
+        if let Some(referenced) = message.referenced_message()
             && self
                 .quoted_message_allowed(referenced, settings, conversation)
+                .await?
+            && !self
+                .quoted_assistant_message_already_replays(referenced, conversation)
                 .await?
         {
             self.push_message_context(&mut items, &mut position, "quoted", referenced, true)
@@ -3100,13 +3203,11 @@ where
         message: &PlatformMessage,
         quoted: bool,
     ) {
-        let label = display_name(message);
-        let prefix = if quoted { "Quoted" } else { "Message" };
         items.push(chudbot_api::ContextItem {
             position: *position,
             source: format!("platform:{kind}:{}", message.id.message_id.as_str()),
             role: "user".to_string(),
-            content: format!("{prefix} from [{label}]: {}", message.content),
+            content: platform_message_context_json(message, quoted),
             message: Some(message.id.clone()),
         });
         *position += 1;
@@ -3185,6 +3286,30 @@ where
                     .map(|opted_in| opted_in.unwrap_or(false))
             }
         }
+    }
+
+    async fn quoted_assistant_message_already_replays(
+        &self,
+        referenced: &PlatformMessage,
+        conversation: &Conversation,
+    ) -> Result<bool, BotError> {
+        let Some(link) = self
+            .storage
+            .load_message_link(referenced.id.clone())
+            .await
+            .map_err(storage_error)?
+        else {
+            return Ok(false);
+        };
+        let already_replays = message_link_replays_as_assistant(&link, conversation.id);
+        if already_replays {
+            tracing::trace!(
+                conversation = %conversation.id,
+                message = %referenced.id.message_id,
+                "skipping quoted assistant message already present in transcript"
+            );
+        }
+        Ok(already_replays)
     }
 
     async fn save_image_attachments(
@@ -3437,12 +3562,7 @@ where
     }
 
     fn format_reply(&self, text: &str, is_new: bool, conversation_id: ConversationId) -> String {
-        let text = fix_bare_mentions(text);
-        if !is_new {
-            return text;
-        }
-        let base = self.config.web_base_url.trim_end_matches('/');
-        format!("{text}\n\nTrace: {base}/c/{conversation_id}")
+        format_reply_content(text, is_new, conversation_id, &self.config.web_base_url)
     }
 
     fn ensure_provider_exists(
@@ -4066,7 +4186,7 @@ where
             message.content = "[redacted: user has not opted in]".to_string();
             message.mentions.clear();
             message.attachments.clear();
-            message.referenced_message = None;
+            message.reference = PlatformMessageReference::None;
         }
         redacted.push(message);
     }
@@ -4485,11 +4605,64 @@ fn channel_from_message(message: &MessageRef) -> ChannelRef {
     }
 }
 
+fn platform_message_context_json(message: &PlatformMessage, quoted: bool) -> String {
+    let value = serde_json::json!({
+        "type": "platform_message",
+        "relationship": if quoted { "referenced" } else { "current" },
+        "platform": message.id.platform.as_str(),
+        "guild": platform_entity_json(
+            message.id.guild_id.as_ref(),
+            message.guild_name.as_deref(),
+        ),
+        "channel": {
+            "id": message.id.channel_id.as_str(),
+            "name": message.channel_name.as_deref(),
+        },
+        "message": {
+            "id": message.id.message_id.as_str(),
+            "created_at": message.created_at.to_string(),
+        },
+        "author": {
+            "id": message.author.id.user_id.as_str(),
+            "username": message.author.username.as_str(),
+            "name": message.author.name.as_deref(),
+            "guild_display_name": message.author.display_name.as_deref(),
+            "is_bot": message.author.is_bot,
+        },
+        "content": message.content.as_str(),
+        "attachments": message.attachments.iter().map(|attachment| {
+            serde_json::json!({
+                "id": attachment.id.as_ref().map(ExternalId::as_str),
+                "filename": attachment.filename.as_str(),
+                "content_type": attachment.content_type.as_deref(),
+                "size_bytes": attachment.size_bytes,
+            })
+        }).collect::<Vec<_>>(),
+    });
+    serde_json::to_string_pretty(&value).unwrap_or_else(|_| {
+        format!(
+            "{{\"type\":\"platform_message\",\"content\":{}}}",
+            serde_json::to_string(&message.content).unwrap_or_else(|_| "\"\"".to_string())
+        )
+    })
+}
+
+fn platform_entity_json(id: Option<&ExternalId>, name: Option<&str>) -> serde_json::Value {
+    id.map(|id| {
+        serde_json::json!({
+            "id": id.as_str(),
+            "name": name,
+        })
+    })
+    .unwrap_or(serde_json::Value::Null)
+}
+
 fn display_name(message: &PlatformMessage) -> String {
     message
         .author
         .display_name
         .clone()
+        .or_else(|| message.author.name.clone())
         .unwrap_or_else(|| message.author.username.clone())
 }
 
@@ -4531,7 +4704,12 @@ fn display_name_for_profile(profile: &UserProfile) -> String {
     profile
         .display_name
         .clone()
+        .or_else(|| profile.name.clone())
         .unwrap_or_else(|| profile.username.clone())
+}
+
+fn message_link_replays_as_assistant(link: &MessageLink, conversation_id: ConversationId) -> bool {
+    link.conversation_id == conversation_id && link.role == "assistant"
 }
 
 fn looks_like_image(content_type: Option<&str>, filename: &str) -> bool {
@@ -5009,8 +5187,47 @@ fn requested_channel(
     })
 }
 
-fn should_thread(is_new: bool, content: &str, threshold: usize) -> bool {
-    is_new && content.chars().count() > threshold
+fn should_thread(
+    is_new: bool,
+    content: &str,
+    char_threshold: usize,
+    line_threshold: usize,
+) -> bool {
+    if !is_new {
+        return false;
+    }
+    if content.chars().count() > char_threshold {
+        return true;
+    }
+    rendered_line_count(content) > line_threshold
+}
+
+fn rendered_line_count(content: &str) -> usize {
+    content
+        .split('\n')
+        .map(|line| {
+            let chars = line.chars().count();
+            if chars == 0 {
+                1
+            } else {
+                chars.div_ceil(THREAD_REPLY_WRAP_WIDTH)
+            }
+        })
+        .sum()
+}
+
+fn format_reply_content(
+    text: &str,
+    is_new: bool,
+    conversation_id: ConversationId,
+    web_base_url: &str,
+) -> String {
+    let text = fix_bare_mentions(text);
+    if !is_new {
+        return text;
+    }
+    let base = web_base_url.trim_end_matches('/');
+    format!("{text}\n\n-# 🔎 [full trace]({base}/c/{conversation_id})")
 }
 
 fn thread_title(execution: &TurnExecution) -> String {
@@ -5098,6 +5315,14 @@ fn privacy_mode_kind(mode: &PrivacyMode) -> &'static str {
     }
 }
 
+fn platform_message_reference_kind(reference: &PlatformMessageReference) -> &'static str {
+    match reference {
+        PlatformMessageReference::None => "none",
+        PlatformMessageReference::Id(_) => "id",
+        PlatformMessageReference::Hydrated(_) => "hydrated",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5129,6 +5354,7 @@ mod tests {
         let profiles = [UserProfile {
             id: mentioned.clone(),
             username: "alice".to_string(),
+            name: Some("Alice Global".to_string()),
             display_name: Some("Alice".to_string()),
             avatar_url: None,
             is_bot: false,
@@ -5145,6 +5371,51 @@ mod tests {
     }
 
     #[test]
+    fn profile_label_falls_back_to_platform_name_before_username() {
+        let profile = UserProfile {
+            id: user("discord", Some("guild-1"), "222222222222222222"),
+            username: "alice".to_string(),
+            name: Some("Alice Global".to_string()),
+            display_name: None,
+            avatar_url: None,
+            is_bot: false,
+        };
+
+        assert_eq!(display_name_for_profile(&profile), "Alice Global");
+    }
+
+    #[test]
+    fn linked_assistant_message_replays_only_for_same_conversation() {
+        let conversation_id = ConversationId::new();
+        let other_conversation_id = ConversationId::new();
+        let link = MessageLink {
+            message: MessageRef {
+                platform: PlatformName::new("discord"),
+                guild_id: Some(ExternalId::new("guild-1")),
+                channel_id: ExternalId::new("channel-1"),
+                message_id: ExternalId::new("assistant-message-1"),
+            },
+            conversation_id,
+            turn_id: TurnId::new(),
+            role: "assistant".to_string(),
+        };
+        let user_link = MessageLink {
+            role: "user".to_string(),
+            ..link.clone()
+        };
+
+        assert!(message_link_replays_as_assistant(&link, conversation_id));
+        assert!(!message_link_replays_as_assistant(
+            &link,
+            other_conversation_id
+        ));
+        assert!(!message_link_replays_as_assistant(
+            &user_link,
+            conversation_id
+        ));
+    }
+
+    #[test]
     fn repairs_bare_snowflake_mentions() {
         assert_eq!(
             fix_bare_mentions("talk to @123456789012345678"),
@@ -5155,6 +5426,78 @@ mod tests {
             "already <@123456789012345678>"
         );
         assert_eq!(fix_bare_mentions("short @123"), "short @123");
+    }
+
+    #[test]
+    fn formats_new_conversation_reply_with_legacy_trace_link() {
+        let conversation_id = ConversationId::new();
+
+        let reply = format_reply_content("answer", true, conversation_id, "https://chud.example/");
+
+        assert_eq!(
+            reply,
+            format!("answer\n\n-# 🔎 [full trace](https://chud.example/c/{conversation_id})")
+        );
+    }
+
+    #[test]
+    fn formats_continuation_reply_without_trace_link() {
+        let reply = format_reply_content(
+            "talk to @123456789012345678",
+            false,
+            ConversationId::new(),
+            "https://chud.example",
+        );
+
+        assert_eq!(reply, "talk to <@123456789012345678>");
+    }
+
+    #[test]
+    fn rendered_lines_count_short_blank_and_wrapped_rows() {
+        assert_eq!(rendered_line_count("a\nb\nc"), 3);
+        assert_eq!(rendered_line_count("a\n\nb"), 3);
+
+        let wrapped = "x".repeat(THREAD_REPLY_WRAP_WIDTH * 3);
+        assert_eq!(rendered_line_count(&wrapped), 3);
+
+        let mixed = format!("hi\n{}", "y".repeat(THREAD_REPLY_WRAP_WIDTH + 1));
+        assert_eq!(rendered_line_count(&mixed), 3);
+    }
+
+    #[test]
+    fn should_thread_respects_char_and_visible_line_thresholds() {
+        let big = "x".repeat(DEFAULT_THREAD_THRESHOLD_CHARS + 1);
+        assert!(!should_thread(
+            false,
+            &big,
+            DEFAULT_THREAD_THRESHOLD_CHARS,
+            DEFAULT_THREAD_THRESHOLD_LINES,
+        ));
+        assert!(should_thread(
+            true,
+            &big,
+            DEFAULT_THREAD_THRESHOLD_CHARS,
+            DEFAULT_THREAD_THRESHOLD_LINES,
+        ));
+
+        let tall = (1..=24)
+            .map(|index| format!("{index}. short line"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(tall.chars().count() < DEFAULT_THREAD_THRESHOLD_CHARS);
+        assert!(rendered_line_count(&tall) > DEFAULT_THREAD_THRESHOLD_LINES);
+        assert!(should_thread(
+            true,
+            &tall,
+            DEFAULT_THREAD_THRESHOLD_CHARS,
+            DEFAULT_THREAD_THRESHOLD_LINES,
+        ));
+        assert!(!should_thread(
+            true,
+            "hi",
+            DEFAULT_THREAD_THRESHOLD_CHARS,
+            DEFAULT_THREAD_THRESHOLD_LINES,
+        ));
     }
 
     #[test]

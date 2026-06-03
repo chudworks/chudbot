@@ -44,8 +44,8 @@ pub use platform::{
     PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
     PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
     PlatformCommandResponseTarget, PlatformCommandValue, PlatformEvent, PlatformMessage,
-    PlatformReaction, PlatformReady, PostedMessage, ReactionKind, SendMessage, ThreadRequest,
-    UserProfile,
+    PlatformMessageReference, PlatformReaction, PlatformReady, PostedMessage, ReactionKind,
+    SendMessage, ThreadRequest, UserProfile,
 };
 pub use storage::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ContextItem, Conversation,

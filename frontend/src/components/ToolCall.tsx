@@ -16,11 +16,11 @@ export default function ToolCall({ trace }: Props) {
       </header>
       {media.length > 0 && (
         <div className="tool-call__media">
-          {media.map((m, i) =>
+          {media.map((m) =>
             m.kind === 'image' ? (
-              <img key={i} className="context-image" src={m.path} alt={view.name} />
+              <img key={m.uri} className="context-image" src={m.path} alt={view.name} />
             ) : (
-              <video key={i} className="context-video" controls src={m.path} />
+              <video key={m.uri} className="context-video" controls src={m.path} />
             )
           )}
         </div>
@@ -72,32 +72,44 @@ function traceView(trace: ToolTrace) {
   }
 }
 
-type MediaRef = { kind: 'image' | 'video'; path: string };
+type MediaRef = { kind: 'image' | 'video'; uri: string; path: string };
 
 /** Walk the value, collecting any string that looks like a
  *  `file://images/...` or `file://videos/...` URI. */
 function collectMediaUris(value: unknown): MediaRef[] {
   const out: MediaRef[] = [];
-  walk(value, out);
+  const seen = new Set<string>();
+  walk(value, out, seen);
   return out;
 }
 
-function walk(value: unknown, out: MediaRef[]) {
+function walk(value: unknown, out: MediaRef[], seen: Set<string>) {
   if (typeof value === 'string') {
     if (value.startsWith('file://images/')) {
-      out.push({ kind: 'image', path: '/' + value.slice('file://'.length) });
+      pushMediaRef(out, seen, 'image', value);
     } else if (value.startsWith('file://videos/')) {
-      out.push({ kind: 'video', path: '/' + value.slice('file://'.length) });
+      pushMediaRef(out, seen, 'video', value);
     }
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((v) => walk(v, out));
+    value.forEach((v) => walk(v, out, seen));
     return;
   }
   if (value && typeof value === 'object') {
-    Object.values(value).forEach((v) => walk(v, out));
+    Object.values(value).forEach((v) => walk(v, out, seen));
   }
+}
+
+function pushMediaRef(
+  out: MediaRef[],
+  seen: Set<string>,
+  kind: 'image' | 'video',
+  uri: string
+) {
+  if (seen.has(uri)) return;
+  seen.add(uri);
+  out.push({ kind, uri, path: '/' + uri.slice('file://'.length) });
 }
 
 function prettyJson(value: unknown): string {

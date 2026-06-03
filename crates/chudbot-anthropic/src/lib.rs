@@ -5,6 +5,7 @@ mod llm;
 use chudbot_api::ProviderName;
 use chudbot_api::retry::{ClassifyError, ErrorClass, RetryPolicy, with_retry};
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 
 pub use llm::AnthropicOptions;
@@ -67,6 +68,7 @@ impl AnthropicClient {
         T: for<'de> Deserialize<'de>,
     {
         let url = format!("{}{}", self.base_url, endpoint);
+        log_json_request(&self.provider_name, endpoint, body);
         tracing::debug!(
             provider = %self.provider_name,
             endpoint = %endpoint,
@@ -96,20 +98,33 @@ impl AnthropicClient {
                     status = %resp.status(),
                     "received Anthropic response"
                 );
-                decode_response(resp).await
+                decode_response(resp, &self.provider_name, endpoint).await
             }
         })
         .await
     }
 }
 
-pub(crate) async fn decode_response<T>(resp: reqwest::Response) -> Result<T, AnthropicError>
+pub(crate) async fn decode_response<T>(
+    resp: reqwest::Response,
+    provider: &ProviderName,
+    endpoint: &str,
+) -> Result<T, AnthropicError>
 where
     T: for<'de> Deserialize<'de>,
 {
     let status = resp.status();
+    let body = resp.text().await.map_err(|e| {
+        tracing::warn!(
+            status = status.as_u16(),
+            error = %e,
+            "failed to read Anthropic response body"
+        );
+        AnthropicError::Decode(e.to_string())
+    })?;
     if !status.is_success() {
-        let body = truncate_body(resp.text().await.unwrap_or_default(), 600);
+        log_text_response(provider, endpoint, status.as_u16(), &body);
+        let body = truncate_body(body, 600);
         tracing::warn!(
             status = status.as_u16(),
             body_chars = body.chars().count(),
@@ -120,11 +135,21 @@ where
             body,
         });
     }
-    resp.json().await.map_err(|e| {
+
+    let value = serde_json::from_str::<Value>(&body).map_err(|e| {
         tracing::warn!(
             status = status.as_u16(),
             error = %e,
             "failed to decode Anthropic response"
+        );
+        AnthropicError::Decode(e.to_string())
+    })?;
+    log_json_response(provider, endpoint, status.as_u16(), &value);
+    serde_json::from_value(value).map_err(|e| {
+        tracing::warn!(
+            status = status.as_u16(),
+            error = %e,
+            "failed to decode Anthropic response shape"
         );
         AnthropicError::Decode(e.to_string())
     })
@@ -135,6 +160,110 @@ pub(crate) fn truncate_body(mut body: String, max: usize) -> String {
         body.truncate(max);
     }
     body
+}
+
+fn log_json_request(provider: &ProviderName, endpoint: &str, body: &Value) {
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let body = stringify_redacted_json(body);
+        tracing::debug!(
+            provider = %provider,
+            endpoint = %endpoint,
+            request = %body,
+            "Anthropic JSON request payload",
+        );
+    }
+}
+
+fn log_json_response(provider: &ProviderName, endpoint: &str, status: u16, body: &Value) {
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let body = stringify_redacted_json(body);
+        tracing::debug!(
+            provider = %provider,
+            endpoint = %endpoint,
+            status,
+            response = %body,
+            "Anthropic JSON response payload",
+        );
+    }
+}
+
+fn log_text_response(provider: &ProviderName, endpoint: &str, status: u16, body: &str) {
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let body = redact_text_body(body);
+        tracing::debug!(
+            provider = %provider,
+            endpoint = %endpoint,
+            status,
+            response = %body,
+            "Anthropic non-JSON response payload",
+        );
+    }
+}
+
+fn stringify_redacted_json(value: &Value) -> String {
+    serde_json::to_string(&redact_json(value, None))
+        .unwrap_or_else(|_| "[unserializable JSON payload]".to_string())
+}
+
+fn redact_json(value: &Value, key: Option<&str>) -> Value {
+    match value {
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|item| redact_json(item, None)).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), redact_json(value, Some(key))))
+                .collect(),
+        ),
+        Value::String(text) => Value::String(redact_string(key, text)),
+        other => other.clone(),
+    }
+}
+
+fn redact_string(key: Option<&str>, text: &str) -> String {
+    if let Some(redacted) = redact_data_uri(text) {
+        return redacted;
+    }
+
+    let known_payload_key = matches!(key, Some("b64_json" | "encrypted_content"));
+    let possible_payload_key = matches!(key, Some("data"));
+    if known_payload_key || (possible_payload_key && looks_like_base64(text)) {
+        return format!(
+            "[redacted base64-like string; chars={}]",
+            text.chars().count()
+        );
+    }
+
+    text.to_string()
+}
+
+fn redact_data_uri(text: &str) -> Option<String> {
+    let (prefix, payload) = text.split_once(";base64,")?;
+    if !prefix.starts_with("data:") {
+        return None;
+    }
+    Some(format!(
+        "{prefix};base64,[redacted base64 data; chars={}]",
+        payload.chars().count()
+    ))
+}
+
+fn redact_text_body(body: &str) -> String {
+    if looks_like_base64(body) {
+        return format!(
+            "[redacted base64-like body; chars={}]",
+            body.chars().count()
+        );
+    }
+    truncate_body(body.to_string(), 4_000)
+}
+
+fn looks_like_base64(text: &str) -> bool {
+    text.len() >= 256
+        && text.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
+        })
 }
 
 /// Anthropic provider error.

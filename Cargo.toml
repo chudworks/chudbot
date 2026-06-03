@@ -54,6 +54,9 @@ version = "0.9"
 default-features = false
 features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "time", "macros", "migrate", "derive"]
 
+[profile.dev]
+opt-level = 1
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

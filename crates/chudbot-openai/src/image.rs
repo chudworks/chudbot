@@ -10,7 +10,7 @@ use chudbot_api::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{OpenAiClient, OpenAiError, truncate_body};
+use crate::{OpenAiClient, OpenAiError, decode_response, log_json_request};
 
 const DEFAULT_IMAGE_MODEL: &str = "gpt-image-1";
 
@@ -72,17 +72,10 @@ impl OpenAiClient {
             body["size"] = json!(size);
         }
 
-        let url = format!("{}/images/generations", self.base_url());
-        let resp = with_retry(RetryPolicy::default(), "imagegen[openai].generate", || {
-            let request = self
-                .http()
-                .post(&url)
-                .bearer_auth(self.api_key())
-                .json(&body);
-            async move { send_and_check(request, "OpenAI text-to-image").await }
-        })
-        .await?;
-        decode_image_response(resp, self.provider_name(), model).await
+        let parsed: ImagesResponse = self
+            .post_json("/images/generations", &body, "imagegen[openai].generate")
+            .await?;
+        image_from_response(parsed, self.provider_name(), model)
     }
 
     async fn generate_from_edit(
@@ -105,35 +98,43 @@ impl OpenAiClient {
             references.push(reference_image(reference.as_ref(), self).await?);
         }
 
-        let url = format!("{}/images/edits", self.base_url());
-        let resp = with_retry(RetryPolicy::default(), "imagegen[openai].edit", || async {
-            let mut form = reqwest::multipart::Form::new()
-                .text("model", model.to_string())
-                .text("prompt", request.prompt.clone())
-                .text("n", "1");
-            if let Some(quality) = quality {
-                form = form.text("quality", quality.to_string());
-            }
-            if let Some(size) = size {
-                form = form.text("size", size.to_string());
-            }
-            for (i, reference) in references.iter().enumerate() {
-                let file_name = format!("image_{i}.{}", reference.ext);
-                let part = reqwest::multipart::Part::bytes(reference.bytes.clone())
-                    .file_name(file_name)
-                    .mime_str(reference.mime)
-                    .map_err(|e| OpenAiError::Reference(format!("reference MIME: {e}")))?;
-                form = form.part("image[]", part);
-            }
-            let request = self
-                .http()
-                .post(&url)
-                .bearer_auth(self.api_key())
-                .multipart(form);
-            send_and_check(request, "OpenAI image edit").await
-        })
-        .await?;
-        decode_image_response(resp, self.provider_name(), model).await
+        let endpoint = "/images/edits";
+        log_json_request(
+            self.provider_name(),
+            endpoint,
+            &image_edit_log_body(request, model, quality, size, &references),
+        );
+        let url = format!("{}{}", self.base_url(), endpoint);
+        let parsed: ImagesResponse =
+            with_retry(RetryPolicy::default(), "imagegen[openai].edit", || async {
+                let mut form = reqwest::multipart::Form::new()
+                    .text("model", model.to_string())
+                    .text("prompt", request.prompt.clone())
+                    .text("n", "1");
+                if let Some(quality) = quality {
+                    form = form.text("quality", quality.to_string());
+                }
+                if let Some(size) = size {
+                    form = form.text("size", size.to_string());
+                }
+                for (i, reference) in references.iter().enumerate() {
+                    let file_name = format!("image_{i}.{}", reference.ext);
+                    let part = reqwest::multipart::Part::bytes(reference.bytes.clone())
+                        .file_name(file_name)
+                        .mime_str(reference.mime)
+                        .map_err(|e| OpenAiError::Reference(format!("reference MIME: {e}")))?;
+                    form = form.part("image[]", part);
+                }
+                let request = self
+                    .http()
+                    .post(&url)
+                    .bearer_auth(self.api_key())
+                    .multipart(form);
+                let resp = send_image_request(request, "OpenAI image edit").await?;
+                decode_response(resp, self.provider_name(), endpoint).await
+            })
+            .await?;
+        image_from_response(parsed, self.provider_name(), model)
     }
 }
 
@@ -285,33 +286,45 @@ async fn reference_from_url_or_data(
     )))
 }
 
-async fn decode_image_response(
-    resp: reqwest::Response,
+fn image_edit_log_body(
+    request: &ImageRequest,
+    model: &str,
+    quality: Option<&str>,
+    size: Option<&str>,
+    references: &[RefImage],
+) -> Value {
+    let images = references
+        .iter()
+        .enumerate()
+        .map(|(i, reference)| {
+            json!({
+                "field": "image[]",
+                "file_name": format!("image_{i}.{}", reference.ext),
+                "mime_type": reference.mime,
+                "bytes": reference.bytes.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut body = json!({
+        "model": model,
+        "prompt": request.prompt.as_str(),
+        "n": 1,
+        "images": images,
+    });
+    if let Some(quality) = quality {
+        body["quality"] = json!(quality);
+    }
+    if let Some(size) = size {
+        body["size"] = json!(size);
+    }
+    body
+}
+
+fn image_from_response(
+    parsed: ImagesResponse,
     provider: &ProviderName,
     requested_model: &str,
 ) -> Result<GeneratedImage, OpenAiError> {
-    let status = resp.status();
-    if !status.is_success() {
-        let body = truncate_body(resp.text().await.unwrap_or_default(), 600);
-        tracing::warn!(
-            status = status.as_u16(),
-            body_chars = body.chars().count(),
-            "OpenAI image API returned non-success status"
-        );
-        return Err(OpenAiError::Api {
-            status: status.as_u16(),
-            body,
-        });
-    }
-
-    let parsed: ImagesResponse = resp.json().await.map_err(|e| {
-        tracing::warn!(
-            status = status.as_u16(),
-            error = %e,
-            "failed to decode OpenAI image response"
-        );
-        OpenAiError::Decode(e.to_string())
-    })?;
     let model = parsed
         .model
         .as_deref()
@@ -352,7 +365,7 @@ async fn decode_image_response(
     })
 }
 
-async fn send_and_check(
+async fn send_image_request(
     request: reqwest::RequestBuilder,
     label: &str,
 ) -> Result<reqwest::Response, OpenAiError> {
@@ -362,19 +375,6 @@ async fn send_and_check(
     })?;
     let status = resp.status();
     tracing::debug!(label, status = %status, "received OpenAI image response");
-    if !status.is_success() {
-        let body = truncate_body(resp.text().await.unwrap_or_default(), 600);
-        tracing::warn!(
-            label,
-            status = status.as_u16(),
-            body_chars = body.chars().count(),
-            "OpenAI image API returned non-success status"
-        );
-        return Err(OpenAiError::Api {
-            status: status.as_u16(),
-            body,
-        });
-    }
     Ok(resp)
 }
 

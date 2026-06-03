@@ -373,7 +373,6 @@ impl OpenAiOptions {
         request
             .provider_options
             .as_ref()
-            .filter(|opts| opts.provider.as_str() == "openai")
             .and_then(|opts| serde_json::from_value(opts.value.clone()).ok())
             .unwrap_or_default()
     }
@@ -492,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_openai_options_for_matching_provider() {
+    fn parses_openai_options_from_routed_provider_value() {
         let request = ModelStepRequest {
             model: ModelId::new("gpt-5"),
             transcript: Transcript::from_user_text("hi"),
@@ -500,7 +499,6 @@ mod tests {
             server_tools: ServerToolSet::new(),
             sampling: chudbot_api::SamplingOptions::default(),
             provider_options: Some(ProviderOptions {
-                provider: ProviderName::new("openai"),
                 value: json!({ "reasoning_effort": "high" }),
             }),
         };

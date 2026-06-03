@@ -15,8 +15,10 @@ url = "postgres://chud@localhost/chudbot"
 [logging]
 # Tracing filter expression. Useful examples:
 #   "info"
-#   "chudbot_bot=debug,chudbot_web=debug,chudbot_bin=debug,info"
-filter = "info"
+#   "info,chudbot=debug"
+# `chudbot=debug` matches every first-party crate target, including
+# `chudbot_bot`, `chudbot_web`, and provider crates such as `chudbot_xai`.
+filter = "info,chudbot=debug"
 # One of: "pretty", "compact", "json".
 format = "pretty"
 # Disable ANSI when logs are written to a file or systemd journal.
@@ -64,9 +66,11 @@ operator explicitly asks for them.
 version = ""
 # Default agent loop limit. Individual agents can override it.
 limits = { max_iterations = 8 }
-# New conversations ask the platform to open a thread once the answer is above
-# this character count. Discord's hard message limit is 2000.
+# New conversations ask the platform to open a thread once the answer exceeds
+# either threshold. Visible lines count literal newlines plus approximate
+# Discord soft-wrap rows.
 thread_threshold_chars = 1500
+thread_threshold_lines = 20
 
 [bot.platforms.discord]
 # Default agent for this message platform. Platform bindings are optional; when
@@ -161,7 +165,6 @@ temperature = 0.7
 top_p = 0.95
 
 [bot.agents.default.model.provider_options]
-provider = "xai"
 value = { reasoning_effort = "high" }
 
 [bot.agents.default.image_generation]
@@ -191,7 +194,6 @@ server_tools = ["web_search"]
 max_output_tokens = 4096
 
 [bot.agents.research.model.provider_options]
-provider = "openai"
 value = { reasoning_effort = "medium" }
 
 [bot.agents.research.image_generation]

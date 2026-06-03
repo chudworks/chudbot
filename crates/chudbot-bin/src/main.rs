@@ -23,12 +23,13 @@ use chudbot_web::{EventBus, WebConfig, WebState};
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::task::JoinError;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
 const VERSION: &str = env!("GIT_VERSION");
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
+const PLATFORM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
 #[command(name = "chudbot")]
@@ -127,11 +128,23 @@ async fn run(
             Ok(())
         }
         Command::Serve => {
+            let mut config = config;
             config.validate()?;
-            let plan = ServicePlan::build(&config)?;
             let storage = SqlxStorage::connect(&config.database.url)
                 .await?
                 .with_default_privacy(config.default_privacy.clone());
+            let app_version = storage.register_app_version(VERSION).await?;
+            let version_label = format!("v{}", app_version.id);
+            tracing::info!(
+                version_number = app_version.id,
+                git_version = %app_version.git_version,
+                first_seen = %app_version.first_seen_at,
+                "resolved build version"
+            );
+            config.bot.version = version_label.clone();
+            let mut plan = ServicePlan::build(&config)?;
+            plan.web.version = format!("{version_label} ({VERSION})");
+            let storage = storage.with_app_version_id(app_version.id);
             let platforms =
                 ConfiguredMessagePlatforms::connect_from_config(&config.platforms).await?;
             let listen = SocketAddr::from_str(&config.web.listen)?;
@@ -327,7 +340,7 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig {
     /// Tracing filter expression, e.g. `info` or
-    /// `chudbot_bot=debug,chudbot_bin=debug,info`.
+    /// `info,chudbot=debug`.
     #[serde(default = "default_log_filter")]
     pub filter: String,
     /// Output format.
@@ -1112,6 +1125,7 @@ struct ConfiguredMessagePlatformsInner {
     events: tokio::sync::Mutex<
         tokio::sync::mpsc::Receiver<Result<PlatformEvent, ConfiguredPlatformError>>,
     >,
+    event_pumps: tokio::sync::Mutex<Vec<JoinHandle<()>>>,
 }
 
 struct ConfiguredDiscordPlatform {
@@ -1126,6 +1140,7 @@ impl Default for ConfiguredMessagePlatforms {
             inner: Arc::new(ConfiguredMessagePlatformsInner {
                 discord: BTreeMap::new(),
                 events: tokio::sync::Mutex::new(events),
+                event_pumps: tokio::sync::Mutex::new(Vec::new()),
             }),
         }
     }
@@ -1135,7 +1150,7 @@ fn spawn_discord_event_pump(
     platform_name: chudbot_api::PlatformName,
     platform: chudbot_discord::DiscordPlatform,
     events: tokio::sync::mpsc::Sender<Result<PlatformEvent, ConfiguredPlatformError>>,
-) {
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             let event = MessagePlatform::next_event(&platform)
@@ -1149,6 +1164,28 @@ fn spawn_discord_event_pump(
                 );
             }
             let should_stop = matches!(&event, Ok(PlatformEvent::Shutdown));
+            if should_stop {
+                match events.try_send(event) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::debug!(
+                            platform = %platform_name,
+                            "message platform event pump stopped because receiver closed"
+                        );
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        tracing::debug!(
+                            platform = %platform_name,
+                            "message platform shutdown event dropped because receiver was full"
+                        );
+                    }
+                }
+                tracing::debug!(
+                    platform = %platform_name,
+                    "message platform event pump stopped after platform shutdown"
+                );
+                break;
+            }
             if events.send(event).await.is_err() {
                 tracing::debug!(
                     platform = %platform_name,
@@ -1156,15 +1193,8 @@ fn spawn_discord_event_pump(
                 );
                 break;
             }
-            if should_stop {
-                tracing::debug!(
-                    platform = %platform_name,
-                    "message platform event pump stopped after platform shutdown"
-                );
-                break;
-            }
         }
-    });
+    })
 }
 
 impl ConfiguredMessagePlatforms {
@@ -1178,6 +1208,7 @@ impl ConfiguredMessagePlatforms {
         config: &BTreeMap<chudbot_api::PlatformName, MessagePlatformConfig>,
     ) -> Result<Self, ConfiguredPlatformError> {
         let mut discord = BTreeMap::new();
+        let mut event_pumps = Vec::new();
         let (events_tx, events) = tokio::sync::mpsc::channel(256);
         for (name, platform) in config {
             match platform {
@@ -1197,7 +1228,11 @@ impl ConfiguredMessagePlatforms {
                     )
                     .await?;
                     tracing::info!(platform = %name, kind = "discord", "registered platform");
-                    spawn_discord_event_pump(name.clone(), platform.clone(), events_tx.clone());
+                    event_pumps.push(spawn_discord_event_pump(
+                        name.clone(),
+                        platform.clone(),
+                        events_tx.clone(),
+                    ));
                     discord.insert(
                         name.clone(),
                         ConfiguredDiscordPlatform {
@@ -1213,6 +1248,7 @@ impl ConfiguredMessagePlatforms {
             inner: Arc::new(ConfiguredMessagePlatformsInner {
                 discord,
                 events: tokio::sync::Mutex::new(events),
+                event_pumps: tokio::sync::Mutex::new(event_pumps),
             }),
         })
     }
@@ -1230,6 +1266,64 @@ impl ConfiguredMessagePlatforms {
             .discord
             .get(platform)
             .ok_or_else(|| ConfiguredPlatformError::Missing(platform.clone()))
+    }
+
+    async fn shutdown_platforms(&self) -> Result<(), ConfiguredPlatformError> {
+        if self.inner.discord.is_empty() {
+            return Ok(());
+        }
+
+        for (name, configured) in &self.inner.discord {
+            tracing::debug!(platform = %name, "requesting message platform shutdown");
+            configured.platform.request_shutdown();
+        }
+
+        let mut handles = {
+            let mut event_pumps = self.inner.event_pumps.lock().await;
+            std::mem::take(&mut *event_pumps)
+        };
+        if handles.is_empty() {
+            return Ok(());
+        }
+
+        let deadline = tokio::time::sleep(PLATFORM_SHUTDOWN_TIMEOUT);
+        tokio::pin!(deadline);
+        let mut timed_out = false;
+        for handle in &mut handles {
+            tokio::select! {
+                result = handle => {
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            error = %error,
+                            "message platform event pump join failed during shutdown"
+                        );
+                    }
+                }
+                () = &mut deadline => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+
+        if timed_out {
+            let remaining = handles
+                .iter()
+                .filter(|handle| !handle.is_finished())
+                .count();
+            tracing::warn!(
+                remaining,
+                timeout_ms = PLATFORM_SHUTDOWN_TIMEOUT.as_millis(),
+                "timed out waiting for message platform shutdown"
+            );
+            for handle in handles {
+                if !handle.is_finished() {
+                    handle.abort();
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1272,6 +1366,10 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
             .recv()
             .await
             .unwrap_or(Err(ConfiguredPlatformError::EventsClosed))
+    }
+
+    async fn shutdown(&self) -> Result<(), Self::Error> {
+        self.shutdown_platforms().await
     }
 
     async fn respond_to_command(

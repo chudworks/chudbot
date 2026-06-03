@@ -132,21 +132,10 @@ pub struct SamplingOptions {
     pub top_p: Option<f32>,
 }
 
-/// Provider-specific options.
+/// Provider-specific options for the already-routed backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderOptions {
-    /// Provider these options are for.
-    pub provider: ProviderName,
     /// Provider-owned serialized value.
     pub value: serde_json::Value,
-}
-
-impl ProviderOptions {
-    /// Empty options for a provider.
-    pub fn empty(provider: impl Into<ProviderName>) -> Self {
-        Self {
-            provider: provider.into(),
-            value: serde_json::Value::Null,
-        }
-    }
 }

@@ -51,6 +51,7 @@ export interface Turn {
   agent_name: string | null;
   provider: string | null;
   model: string | null;
+  app_version_id: number | null;
 }
 
 export interface ContextItem {

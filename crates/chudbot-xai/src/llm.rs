@@ -377,7 +377,6 @@ impl XaiOptions {
         request
             .provider_options
             .as_ref()
-            .filter(|opts| opts.provider.as_str() == "xai")
             .and_then(|opts| serde_json::from_value(opts.value.clone()).ok())
             .unwrap_or_default()
     }
@@ -498,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn xai_options_only_parse_for_matching_provider() {
+    fn xai_options_parse_routed_provider_value() {
         let request = ModelStepRequest {
             model: ModelId::new("grok-4.3"),
             transcript: Transcript::from_user_text("hi"),
@@ -506,7 +505,6 @@ mod tests {
             server_tools: ServerToolSet::new(),
             sampling: chudbot_api::SamplingOptions::default(),
             provider_options: Some(ProviderOptions {
-                provider: ProviderName::new("xai"),
                 value: json!({ "reasoning_effort": "high" }),
             }),
         };

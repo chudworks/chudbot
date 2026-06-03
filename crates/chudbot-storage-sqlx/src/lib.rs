@@ -16,6 +16,7 @@ use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
@@ -25,6 +26,18 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 pub struct SqlxStorage {
     pool: PgPool,
     default_privacy: PrivacyMode,
+    app_version_id: Option<i32>,
+}
+
+/// Registered build version row.
+#[derive(Debug, Clone)]
+pub struct AppVersion {
+    /// Human-facing ordered version number.
+    pub id: i32,
+    /// Full `git describe --tags --always --dirty` string.
+    pub git_version: String,
+    /// First time this build was seen by this database.
+    pub first_seen_at: OffsetDateTime,
 }
 
 impl SqlxStorage {
@@ -39,6 +52,7 @@ impl SqlxStorage {
         Ok(Self {
             pool,
             default_privacy: PrivacyMode::OptIn,
+            app_version_id: None,
         })
     }
 
@@ -47,12 +61,20 @@ impl SqlxStorage {
         Self {
             pool,
             default_privacy: PrivacyMode::OptIn,
+            app_version_id: None,
         }
     }
 
     /// Override the fallback privacy mode when no database row exists.
     pub fn with_default_privacy(mut self, privacy: PrivacyMode) -> Self {
         self.default_privacy = privacy;
+        self
+    }
+
+    /// Stamp newly written conversations, turns, and attempts with an app
+    /// version row resolved by [`Self::register_app_version`].
+    pub fn with_app_version_id(mut self, app_version_id: i32) -> Self {
+        self.app_version_id = Some(app_version_id);
         self
     }
 
@@ -67,6 +89,43 @@ impl SqlxStorage {
         MIGRATOR.run(&self.pool).await?;
         tracing::info!("database migrations complete");
         Ok(())
+    }
+
+    /// Resolve or insert the ordered version row for the running build.
+    ///
+    /// This deliberately selects before inserting instead of using an upsert:
+    /// `app_versions.id` is the user-facing `vN` number, and Postgres
+    /// sequences advance even when `ON CONFLICT DO NOTHING` rejects a row.
+    #[tracing::instrument(
+        name = "storage_sqlx.register_app_version",
+        skip_all,
+        fields(git_version)
+    )]
+    pub async fn register_app_version(
+        &self,
+        git_version: &str,
+    ) -> Result<AppVersion, SqlxStorageError> {
+        if let Some(row) = sqlx::query(
+            "SELECT id, git_version, first_seen_at \
+               FROM app_versions \
+              WHERE git_version = $1",
+        )
+        .bind(git_version)
+        .fetch_optional(&self.pool)
+        .await?
+        {
+            return Ok(app_version_from_row(row));
+        }
+
+        let row = sqlx::query(
+            "INSERT INTO app_versions (git_version) \
+             VALUES ($1) \
+             RETURNING id, git_version, first_seen_at",
+        )
+        .bind(git_version)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(app_version_from_row(row))
     }
 
     async fn load_snapshot(
@@ -110,7 +169,7 @@ impl SqlxStorage {
                     t.user_message_channel, t.user_message, t.user_key, t.user_display_name, \
                     t.user_content, t.assistant_message_provider, t.assistant_message_channel, \
                     t.assistant_message, t.assistant_content, t.status, t.error, \
-                    t.continuation, ta.agent_name, ta.llm_provider, ta.llm_model \
+                    t.continuation, t.app_version_id, ta.agent_name, ta.llm_provider, ta.llm_model \
                FROM turns t \
                LEFT JOIN LATERAL ( \
                     SELECT agent_name, llm_provider, llm_model \
@@ -301,8 +360,8 @@ impl BotStorage for SqlxStorage {
             "INSERT INTO conversations \
                (id, message_provider, channel, created_by_user_key, root_message_provider, \
                 root_message_channel, root_message, agent_name, llm_provider, llm_model, \
-                system_instructions, title) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                system_instructions, title, created_app_version_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
         )
         .bind(id.0)
         .bind(input.channel.platform.as_str())
@@ -316,6 +375,7 @@ impl BotStorage for SqlxStorage {
         .bind(input.initial_model.as_str())
         .bind(&input.system_instructions)
         .bind(&input.title)
+        .bind(self.app_version_id)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -359,14 +419,15 @@ impl BotStorage for SqlxStorage {
             "INSERT INTO turns \
                (id, conversation_id, ordinal, history_cutoff, status, user_message_created_at, \
                 user_message_provider, user_message_channel, user_message, user_key, \
-                user_display_name, user_content) \
-             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11) \
+                user_display_name, user_content, app_version_id) \
+             VALUES ($1, $2, $3, $4, 'pending', $5, $6, $7, $8, $9, $10, $11, $12) \
              RETURNING id, ordinal, history_cutoff, response_ordinal, created_at, \
                        user_message_created_at, completed_at, user_message_provider, \
                        user_message_channel, user_message, user_key, user_display_name, \
                        user_content, assistant_message_provider, assistant_message_channel, \
                        assistant_message, assistant_content, status, error, continuation, \
-                       NULL::text AS agent_name, NULL::text AS llm_provider, NULL::text AS llm_model",
+                       app_version_id, NULL::text AS agent_name, NULL::text AS llm_provider, \
+                       NULL::text AS llm_model",
         )
         .bind(id.0)
         .bind(input.conversation_id.0)
@@ -379,6 +440,7 @@ impl BotStorage for SqlxStorage {
         .bind(input.user.user_id.as_str())
         .bind(&input.user_display_name)
         .bind(&input.user_content)
+        .bind(self.app_version_id)
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
@@ -409,10 +471,16 @@ impl BotStorage for SqlxStorage {
         .fetch_one(&mut *tx)
         .await?;
         let attempt_id = Uuid::new_v4();
+        sqlx::query("UPDATE turns SET app_version_id = COALESCE($2, app_version_id) WHERE id = $1")
+            .bind(input.turn_id.0)
+            .bind(self.app_version_id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query(
             "INSERT INTO turn_attempts \
-               (id, turn_id, attempt_ordinal, agent_name, llm_provider, llm_model, system_instructions) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+               (id, turn_id, attempt_ordinal, agent_name, llm_provider, llm_model, \
+                system_instructions, app_version_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(attempt_id)
         .bind(input.turn_id.0)
@@ -421,6 +489,7 @@ impl BotStorage for SqlxStorage {
         .bind(input.provider.as_str())
         .bind(input.model.as_str())
         .bind(&input.system_instructions)
+        .bind(self.app_version_id)
         .execute(&mut *tx)
         .await?;
         for item in input.context {
@@ -491,24 +560,27 @@ impl BotStorage for SqlxStorage {
         upsert_channel_from_message(&mut tx, &link.message).await?;
         upsert_message(&mut tx, &link.message, None, None).await?;
         let attempt_id = self.latest_attempt_id(link.turn_id).await?;
-        sqlx::query(
-            "INSERT INTO message_links \
-               (message_provider, channel, message, conversation_id, turn_id, attempt_id, role) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7) \
-             ON CONFLICT (message_provider, channel, message) DO UPDATE \
-               SET conversation_id = EXCLUDED.conversation_id, turn_id = EXCLUDED.turn_id, \
-                   attempt_id = EXCLUDED.attempt_id, role = EXCLUDED.role",
+        upsert_message_link(
+            &mut tx,
+            &link.message,
+            link.conversation_id,
+            link.turn_id,
+            attempt_id,
+            &link.role,
         )
-        .bind(link.message.platform.as_str())
-        .bind(channel_key_from_message(&link.message))
-        .bind(link.message.message_id.as_str())
-        .bind(link.conversation_id.0)
-        .bind(link.turn_id.0)
-        .bind(attempt_id)
-        .bind(&link.role)
-        .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        tracing::debug!(
+            platform = %link.message.platform,
+            guild = ?link.message.guild_id.as_ref().map(ExternalId::as_str),
+            channel = %link.message.channel_id,
+            message = %link.message.message_id,
+            conversation = %link.conversation_id,
+            turn = %link.turn_id,
+            attempt = ?attempt_id,
+            role = %link.role,
+            "linked platform message to conversation"
+        );
         Ok(())
     }
 
@@ -1255,6 +1327,7 @@ impl BotStorage for SqlxStorage {
                 profile: UserProfile {
                     id: user,
                     username: row.get("username"),
+                    name: None,
                     display_name: row.get("display_name"),
                     avatar_url: row.get("avatar_url"),
                     is_bot: row.get("is_bot"),
@@ -1824,6 +1897,34 @@ async fn update_latest_attempt(
     Ok(())
 }
 
+async fn upsert_message_link(
+    tx: &mut Transaction<'_, Postgres>,
+    message: &MessageRef,
+    conversation_id: ConversationId,
+    turn_id: TurnId,
+    attempt_id: Option<Uuid>,
+    role: &str,
+) -> Result<(), SqlxStorageError> {
+    sqlx::query(
+        "INSERT INTO message_links \
+           (message_provider, channel, message, conversation_id, turn_id, attempt_id, role) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         ON CONFLICT (message_provider, channel, message) DO UPDATE \
+           SET conversation_id = EXCLUDED.conversation_id, turn_id = EXCLUDED.turn_id, \
+               attempt_id = EXCLUDED.attempt_id, role = EXCLUDED.role",
+    )
+    .bind(message.platform.as_str())
+    .bind(channel_key_from_message(message))
+    .bind(message.message_id.as_str())
+    .bind(conversation_id.0)
+    .bind(turn_id.0)
+    .bind(attempt_id)
+    .bind(role)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn insert_usage(
     tx: &mut Transaction<'_, Postgres>,
     conversation_id: ConversationId,
@@ -1906,6 +2007,14 @@ fn conversation_from_row(row: sqlx::postgres::PgRow) -> Result<Conversation, Sql
     })
 }
 
+fn app_version_from_row(row: sqlx::postgres::PgRow) -> AppVersion {
+    AppVersion {
+        id: row.get("id"),
+        git_version: row.get("git_version"),
+        first_seen_at: row.get("first_seen_at"),
+    }
+}
+
 fn turn_from_row(row: &sqlx::postgres::PgRow) -> Result<Turn, SqlxStorageError> {
     let status: String = row.get("status");
     let continuation = row
@@ -1945,6 +2054,7 @@ fn turn_from_row(row: &sqlx::postgres::PgRow) -> Result<Turn, SqlxStorageError> 
             .get::<Option<String>, _>("llm_provider")
             .map(ProviderName::new),
         model: row.get::<Option<String>, _>("llm_model").map(ModelId::new),
+        app_version_id: row.get("app_version_id"),
         continuation,
     })
 }
@@ -2097,6 +2207,7 @@ fn usage_subject(subject: &UsageSubject) -> (&'static str, Option<String>) {
 fn display_name_for_user(user: &UserProfile) -> String {
     user.display_name
         .clone()
+        .or_else(|| user.name.clone())
         .unwrap_or_else(|| user.username.clone())
 }
 

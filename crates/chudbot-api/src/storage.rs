@@ -179,6 +179,11 @@ pub struct Turn {
     pub provider: Option<ProviderName>,
     /// Model that answered this turn.
     pub model: Option<ModelId>,
+    /// Build version (`app_versions.id`) active when this turn last ran.
+    ///
+    /// `None` for turns imported from storage that predate version tracking.
+    #[serde(default)]
+    pub app_version_id: Option<i32>,
     /// Provider continuation from the final assistant step.
     ///
     /// Replay-only provider plumbing. This may contain encrypted reasoning
@@ -741,6 +746,7 @@ mod tests {
             agent_name: Some("grok".to_string()),
             provider: Some(ProviderName::new("xai")),
             model: Some(ModelId::new("grok-4.3")),
+            app_version_id: Some(7),
             continuation: Some(ProviderContinuation {
                 provider: ProviderName::new("xai"),
                 data: serde_json::json!([
