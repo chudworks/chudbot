@@ -1,0 +1,17 @@
+[package]
+name = "chudbot-api"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+uuid.workspace = true
+futures.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]

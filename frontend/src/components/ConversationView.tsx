@@ -37,11 +37,11 @@ export default function ConversationView() {
       'created',
       'turn_started',
       'turn_updated',
-      'tool_call_recorded',
-      'context_item_added',
+      'tool_trace_recorded',
+      'context_recorded',
       'title_updated',
       'conversation_updated',
-      'user_avatar_updated',
+      'user_profile_updated',
       'lag',
     ].forEach((name) => source.addEventListener(name, onAny));
     source.onerror = () => {
@@ -83,8 +83,13 @@ export default function ConversationView() {
     );
   }
 
-  const { conversation, turns, users, versions } = state.view;
+  const { conversation, turns, users } = state.view;
   const title = conversation.title ?? 'Untitled conversation';
+  const model = `${conversation.provider}/${conversation.initial_model}`;
+  const starter = users[userKey(conversation.created_by)]?.label;
+  const stopper = conversation.stopped_by
+    ? users[userKey(conversation.stopped_by)]?.label
+    : null;
 
   return (
     <>
@@ -92,12 +97,20 @@ export default function ConversationView() {
         <h1>{title}</h1>
         <p className="meta">
           <RelativeTime iso={conversation.created_at} prefix="Started " />
+          {starter && (
+            <>
+              {' by '}
+              <strong>{starter}</strong>
+            </>
+          )}
           {' · model '}
-          <code>{conversation.model}</code>
+          <code>{model}</code>
+          {' · agent '}
+          <code>{conversation.agent_name}</code>
         </p>
         {conversation.stopped_at && (
           <p className="stopped-banner" role="status">
-            🛑 An admin paused the bot in this conversation
+            🛑 {stopper ?? 'An admin'} paused the bot in this conversation
             {' '}
             <RelativeTime iso={conversation.stopped_at} prefix="" />.
             {' '}It won’t reply until the 🛑 reaction is removed.
@@ -106,10 +119,14 @@ export default function ConversationView() {
       </header>
       <main className="conv">
         {turns.map((tv) => (
-          <Turn key={tv.turn.id} turnView={tv} users={users} versions={versions} />
+          <Turn key={tv.turn.id} turnView={tv} users={users} />
         ))}
         {turns.length === 0 && <p className="empty">No turns yet.</p>}
       </main>
     </>
   );
+}
+
+function userKey(user: { platform: string; guild_id: string | null; user_id: string }): string {
+  return `${user.platform}:${user.guild_id ?? 'global'}:${user.user_id}`;
 }

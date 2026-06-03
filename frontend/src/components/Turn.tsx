@@ -1,45 +1,33 @@
-import type { AppVersion, ContextItem, DiscordUser, TurnView } from '../types';
+import type { ContextItem, TurnAsset, TurnSnapshot, UserMetadata } from '../types';
 import Avatar from './Avatar';
 import RelativeTime from './RelativeTime';
 import ToolCall from './ToolCall';
-import { displayNameFor } from '../users';
 
 interface Props {
-  turnView: TurnView;
-  users: Record<string, DiscordUser>;
-  versions: Record<string, AppVersion>;
+  turnView: TurnSnapshot;
+  users: Record<string, UserMetadata>;
 }
 
-export default function Turn({ turnView, users, versions }: Props) {
-  const { turn, system_prompt, context, tool_calls } = turnView;
-  // discord_user_id is a snowflake string and the `users` map is keyed
-  // by the same string, so this lookup is exact (see types.ts on why
-  // IDs are strings, not numbers).
-  const user =
-    turn.discord_user_id != null ? users[turn.discord_user_id] : undefined;
-  const userLabel =
-    displayNameFor(user) ?? turn.discord_user_name ?? 'user';
-  // The version map is keyed by the stringified integer id (JSON object
-  // keys are strings). Present for any non-legacy turn.
-  const version =
-    turn.version_id != null ? versions[String(turn.version_id)] : undefined;
-  const versionTitle = version
-    ? `${version.git_version} · first seen ${new Date(version.first_seen).toLocaleString()}`
-    : undefined;
+export default function Turn({ turnView, users }: Props) {
+  const { turn, system_instructions, context, tool_trace, replay_assets } = turnView;
+  const user = users[userKey(turn.user)];
+  const userLabel = user?.label || turn.user_display_name || 'user';
+  const avatarPath = avatarPathFromUri(user?.avatar_media_uri);
+  const modelLabel = turn.provider && turn.model ? `${turn.provider}/${turn.model}` : turn.model;
 
   return (
     <section className="turn">
       <header className="turn__header">
-        <span className="turn__index">Turn {turn.turn_index + 1}</span>
+        <span className="turn__index">Turn {turn.ordinal + 1}</span>
         <StatusBadge status={turn.status} />
-        {turn.persona_name && (
-          <span className="turn__persona">
-            · persona <code>{turn.persona_name}</code>
+        {turn.agent_name && (
+          <span className="turn__agent">
+            · agent <code>{turn.agent_name}</code>
           </span>
         )}
-        {turn.version_id != null && (
-          <span className="turn__version" title={versionTitle}>
-            · <code>v{turn.version_id}</code>
+        {modelLabel && (
+          <span className="turn__model">
+            · model <code>{modelLabel}</code>
           </span>
         )}
         <span className="turn__time">
@@ -49,18 +37,21 @@ export default function Turn({ turnView, users, versions }: Props) {
 
       <div className="turn__user">
         <div className="turn__user-row">
-          <Avatar user={user} fallbackName={userLabel} size={32} />
+          <Avatar name={userLabel} avatarPath={avatarPath} size={32} />
           <div className="turn__user-meta">
             <strong>{userLabel}</strong>
+            {user?.username && user.username !== userLabel && (
+              <span className="turn__username">@{user.username}</span>
+            )}
           </div>
         </div>
         <pre className="turn__content">{turn.user_content}</pre>
       </div>
 
-      {system_prompt && (
+      {system_instructions && (
         <details className="context">
-          <summary>System prompt</summary>
-          <pre className="turn__content">{system_prompt}</pre>
+          <summary>System instructions</summary>
+          <pre className="turn__content">{system_instructions}</pre>
         </details>
       )}
 
@@ -73,14 +64,16 @@ export default function Turn({ turnView, users, versions }: Props) {
         </details>
       )}
 
-      {tool_calls.length > 0 && (
+      {tool_trace.length > 0 && (
         <section className="tools">
-          <h3>Tool calls ({tool_calls.length})</h3>
-          {tool_calls.map((tc, i) => (
-            <ToolCall key={i} call={tc} />
+          <h3>Tool trace ({tool_trace.length})</h3>
+          {tool_trace.map((tc, i) => (
+            <ToolCall key={i} trace={tc} />
           ))}
         </section>
       )}
+
+      <TurnAssets assets={replay_assets} />
 
       <div className="turn__assistant">
         <h3>Assistant</h3>
@@ -100,6 +93,29 @@ export default function Turn({ turnView, users, versions }: Props) {
         ) : (
           <em>(no response yet)</em>
         )}
+      </div>
+    </section>
+  );
+}
+
+function TurnAssets({ assets }: { assets: TurnAsset[] }) {
+  const media = collectMediaAssets(assets);
+  if (media.length === 0) return null;
+
+  return (
+    <section className="turn-assets">
+      <h3>Turn media ({media.length})</h3>
+      <div className="turn-assets__grid">
+        {media.map((asset) => (
+          <figure className="turn-assets__item" key={asset.uri}>
+            {asset.kind === 'image' ? (
+              <img className="context-image" src={asset.path} alt={asset.source} />
+            ) : (
+              <video className="context-video" controls src={asset.path} />
+            )}
+            <figcaption>{asset.source}</figcaption>
+          </figure>
+        ))}
       </div>
     </section>
   );
@@ -140,8 +156,30 @@ function ContextItemView({ item }: { item: ContextItem }) {
   );
 }
 
-// These mirror the helpers in `core::storage`. Duplicated here because
-// the frontend is the only place that needs them in JS-land.
+type MediaAsset = TurnAsset & { kind: 'image' | 'video'; path: string };
+
+function collectMediaAssets(assets: TurnAsset[]): MediaAsset[] {
+  const seen = new Set<string>();
+  const media: MediaAsset[] = [];
+  for (const asset of assets) {
+    if (seen.has(asset.uri)) continue;
+    const kind = assetKind(asset);
+    if (!kind) continue;
+    seen.add(asset.uri);
+    media.push({ ...asset, kind, path: toWebPath(asset.uri) });
+  }
+  return media;
+}
+
+function assetKind(asset: TurnAsset): 'image' | 'video' | null {
+  const mimeType = asset.mime_type ?? '';
+  if (mimeType.startsWith('image/') || isImageUri(asset.uri)) return 'image';
+  if (mimeType.startsWith('video/') || isVideoUri(asset.uri)) return 'video';
+  return null;
+}
+
+// These mirror the file-backed media URI shape exposed by `chudbot-api`.
+// Duplicated here because the frontend is the only place that needs them in JS.
 function isImageUri(s: string): boolean {
   return s.startsWith('file://images/');
 }
@@ -149,5 +187,15 @@ function isVideoUri(s: string): boolean {
   return s.startsWith('file://videos/');
 }
 function toWebPath(s: string): string {
-  return '/' + s.slice('file://'.length);
+  return s.startsWith('file://') ? '/' + s.slice('file://'.length) : s;
+}
+
+function avatarPathFromUri(uri: string | null | undefined): string | null {
+  return uri?.startsWith('file://avatars/')
+    ? uri.slice('file://avatars/'.length)
+    : null;
+}
+
+function userKey(user: { platform: string; guild_id: string | null; user_id: string }): string {
+  return `${user.platform}:${user.guild_id ?? 'global'}:${user.user_id}`;
 }

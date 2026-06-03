@@ -1,0 +1,806 @@
+//! Web trace viewer service.
+
+use std::convert::Infallible;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::{Path as FsPath, PathBuf};
+use std::time::Duration;
+
+use axum::extract::Request;
+use axum::extract::{Path, State};
+use axum::http::{HeaderName, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::get;
+use axum::{Json, Router};
+use chudbot_api::{
+    BotStorage, Conversation, ConversationId, ConversationLookup, EventSink, LiveEvent,
+    MediaCategory, MediaStore, MediaUri, TurnSnapshot, UserRef,
+};
+use futures::{Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_util::sync::CancellationToken;
+use tower::ServiceBuilder;
+use tower_http::services::ServeDir;
+use tower_http::set_header::SetResponseHeaderLayer;
+use uuid::Uuid;
+
+const SSE_KEEPALIVE: Duration = Duration::from_secs(30);
+const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
+const CACHE_NO_CACHE: &str = "no-cache, must-revalidate";
+const CACHE_NO_STORE: &str = "no-store";
+const X_ROBOTS_TAG: &str = "noindex, nofollow, noarchive, nosnippet";
+const ROBOTS_TXT: &str = "\
+# This host serves unauthenticated, UUID-gated conversation traces.
+# Nothing here may be indexed, archived, or used for model training.
+User-agent: *
+Disallow: /
+
+User-agent: GPTBot
+Disallow: /
+
+User-agent: OAI-SearchBot
+Disallow: /
+
+User-agent: ChatGPT-User
+Disallow: /
+
+User-agent: Google-Extended
+Disallow: /
+
+User-agent: anthropic-ai
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+User-agent: Claude-Web
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: PerplexityBot
+Disallow: /
+
+User-agent: Applebot-Extended
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: meta-externalagent
+Disallow: /
+";
+const CRAWLER_UA_TOKENS: &[&str] = &[
+    // Major search engines.
+    "googlebot",
+    "google-inspectiontool",
+    "storebot-google",
+    "bingbot",
+    "bingpreview",
+    "msnbot",
+    "slurp",
+    "duckduckbot",
+    "duckassistbot",
+    "baiduspider",
+    "yandex",
+    "sogou",
+    "exabot",
+    "seznambot",
+    "petalbot",
+    "applebot",
+    "ia_archiver",
+    "archive.org_bot",
+    // AI / answer-engine crawlers.
+    "gptbot",
+    "oai-searchbot",
+    "chatgpt-user",
+    "ccbot",
+    "claudebot",
+    "claude-web",
+    "anthropic-ai",
+    "perplexitybot",
+    "perplexity-user",
+    "amazonbot",
+    "bytespider",
+    "meta-externalagent",
+    "cohere-ai",
+    "diffbot",
+    "google-extended",
+    // Aggressive SEO / backlink scrapers.
+    "semrushbot",
+    "ahrefsbot",
+    "mj12bot",
+    "dotbot",
+    "dataforseobot",
+    "blexbot",
+];
+
+/// Web service configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// Browser tab title prefix.
+    pub title_prefix: String,
+    /// Build/version label.
+    pub version: String,
+    /// Directory containing the built frontend bundle.
+    pub frontend_dir: PathBuf,
+    /// Optional favicon served at /favicon.ico.
+    #[serde(default)]
+    pub favicon_path: Option<PathBuf>,
+}
+
+/// State shared by web handlers.
+#[derive(Debug, Clone)]
+pub struct WebState<S, M> {
+    storage: S,
+    media_store: M,
+    events: EventBus,
+    config: WebConfig,
+    shutdown: CancellationToken,
+}
+
+impl<S, M> WebState<S, M> {
+    /// Build web state from concrete services.
+    pub fn new(storage: S, media_store: M, events: EventBus, config: WebConfig) -> Self {
+        tracing::debug!(
+            frontend_dir = %config.frontend_dir.display(),
+            title_prefix = %config.title_prefix,
+            version = %config.version,
+            "constructing web state"
+        );
+        Self {
+            storage,
+            media_store,
+            events,
+            config,
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    /// Borrow the event bus.
+    pub fn events(&self) -> &EventBus {
+        &self.events
+    }
+
+    fn with_shutdown_token(mut self, shutdown: CancellationToken) -> Self {
+        self.shutdown = shutdown;
+        self
+    }
+}
+
+/// Broadcast event bus shared with the bot runtime.
+#[derive(Debug, Clone)]
+pub struct EventBus {
+    sender: tokio::sync::broadcast::Sender<LiveEvent>,
+}
+
+impl EventBus {
+    /// Construct a new event bus.
+    pub fn new(capacity: usize) -> Self {
+        let (sender, _receiver) = tokio::sync::broadcast::channel(capacity);
+        tracing::debug!(capacity, "constructed web event bus");
+        Self { sender }
+    }
+
+    /// Subscribe to live events.
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<LiveEvent> {
+        tracing::trace!(
+            receivers = self.sender.receiver_count(),
+            "subscribing to event bus"
+        );
+        self.sender.subscribe()
+    }
+}
+
+impl EventSink for EventBus {
+    fn publish(&self, event: LiveEvent) {
+        let event_name = event.event_name();
+        match &event {
+            LiveEvent::Conversation {
+                conversation_id,
+                kind,
+            } => tracing::trace!(
+                event = event_name,
+                conversation = %conversation_id,
+                kind = ?kind,
+                receivers = self.sender.receiver_count(),
+                "publishing live event"
+            ),
+            LiveEvent::UserProfileUpdated { user } => tracing::trace!(
+                event = event_name,
+                platform = %user.platform,
+                guild = ?user.guild_id,
+                user = %user.user_id,
+                receivers = self.sender.receiver_count(),
+                "publishing live event"
+            ),
+        }
+        if self.sender.send(event).is_err() {
+            tracing::trace!("live event dropped because there are no subscribers");
+        }
+    }
+}
+
+/// Run the web server.
+#[tracing::instrument(
+    name = "web.run",
+    skip_all,
+    fields(
+        listen = %listen,
+        frontend_dir = %state.config.frontend_dir.display(),
+    )
+)]
+pub async fn run<S, M>(state: WebState<S, M>, listen: SocketAddr) -> Result<(), WebServerError>
+where
+    S: BotStorage + Clone + Send + Sync + 'static,
+    M: MediaStore + Clone + Send + Sync + 'static,
+{
+    run_until_shutdown(state, listen, std::future::pending::<()>()).await
+}
+
+/// Run the web server until the supplied shutdown future resolves.
+#[tracing::instrument(
+    name = "web.run_until_shutdown",
+    skip_all,
+    fields(
+        listen = %listen,
+        frontend_dir = %state.config.frontend_dir.display(),
+    )
+)]
+pub async fn run_until_shutdown<S, M, F>(
+    state: WebState<S, M>,
+    listen: SocketAddr,
+    shutdown: F,
+) -> Result<(), WebServerError>
+where
+    S: BotStorage + Clone + Send + Sync + 'static,
+    M: MediaStore + Clone + Send + Sync + 'static,
+    F: Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind(listen).await?;
+    let shutdown_token = CancellationToken::new();
+    let state = state.with_shutdown_token(shutdown_token.clone());
+    tracing::info!("web server listening");
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            shutdown_token.cancel();
+            tracing::info!("web server shutdown requested");
+        })
+        .await?;
+    tracing::info!("web server stopped");
+    Ok(())
+}
+
+/// Build an Axum router for the viewer.
+pub fn router<S, M>(state: WebState<S, M>) -> Router
+where
+    S: BotStorage + Clone + Send + Sync + 'static,
+    M: MediaStore + Clone + Send + Sync + 'static,
+{
+    tracing::debug!(
+        frontend_dir = %state.config.frontend_dir.display(),
+        "building web router"
+    );
+    let assets = ServiceBuilder::new()
+        .layer(cache_layer(CACHE_IMMUTABLE))
+        .service(ServeDir::new(state.config.frontend_dir.join("assets")));
+    let api = Router::new()
+        .route("/api/config", get(get_config::<S, M>))
+        .route("/api/conversations/{id}", get(get_conversation::<S, M>))
+        .route(
+            "/api/conversations/{id}/events",
+            get(conversation_events::<S, M>),
+        )
+        .layer(cache_layer(CACHE_NO_STORE));
+
+    Router::new()
+        .merge(api)
+        .route("/videos/{name}", get(get_video::<S, M>))
+        .route("/avatars/{name}", get(get_avatar::<S, M>))
+        .route("/images/{name}", get(get_image::<S, M>))
+        .route("/favicon.ico", get(get_favicon::<S, M>))
+        .route("/robots.txt", get(get_robots))
+        .nest_service("/assets", assets)
+        .fallback(spa_index::<S, M>)
+        .layer(x_robots_layer())
+        .layer(middleware::from_fn(block_crawlers))
+        .with_state(state)
+}
+
+/// Web server startup error.
+#[derive(Debug, Error)]
+pub enum WebServerError {
+    /// TCP/server I/O failed.
+    #[error("io: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+#[derive(Debug, Error)]
+enum ApiError {
+    #[error("conversation not found")]
+    NotFound,
+    #[error("storage error: {0}")]
+    Storage(String),
+    #[error("media error: {0}")]
+    Media(String),
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = match self {
+            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::Storage(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Media(_) => StatusCode::NOT_FOUND,
+        };
+        match status {
+            StatusCode::INTERNAL_SERVER_ERROR => {
+                tracing::error!(error = %self, status = status.as_u16(), "api error")
+            }
+            _ => tracing::warn!(error = %self, status = status.as_u16(), "api error"),
+        }
+        let body = serde_json::json!({ "error": self.to_string() });
+        (status, Json(body)).into_response()
+    }
+}
+
+#[tracing::instrument(name = "web.get_config", skip_all)]
+async fn get_config<S, M>(State(state): State<WebState<S, M>>) -> Json<serde_json::Value>
+where
+    S: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+{
+    tracing::debug!("serving web config");
+    Json(serde_json::json!({
+        "title_prefix": state.config.title_prefix,
+        "version": state.config.version,
+    }))
+}
+
+#[tracing::instrument(
+    name = "web.get_conversation",
+    skip_all,
+    fields(conversation = %id)
+)]
+async fn get_conversation<S, M>(
+    State(state): State<WebState<S, M>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ConversationView>, ApiError>
+where
+    S: BotStorage + Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+{
+    let snapshot = state
+        .storage
+        .load_conversation(ConversationLookup::Id {
+            id: ConversationId(id),
+        })
+        .await
+        .map_err(|error| ApiError::Storage(error.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+    tracing::debug!(
+        turns = snapshot.turns.len(),
+        stopped = snapshot.conversation.stopped_at.is_some(),
+        "loaded conversation snapshot"
+    );
+    let users = user_metadata(&state.storage, &snapshot).await?;
+    Ok(Json(ConversationView {
+        conversation: snapshot.conversation,
+        turns: snapshot.turns,
+        users,
+    }))
+}
+
+/// Conversation read model served to the React viewer.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationView {
+    /// Conversation metadata.
+    pub conversation: Conversation,
+    /// Ordered turn snapshots.
+    pub turns: Vec<TurnSnapshot>,
+    /// User metadata keyed by `platform:guild:user` string.
+    pub users: std::collections::BTreeMap<String, UserMetadata>,
+}
+
+/// User metadata for frontend rendering.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserMetadata {
+    /// Stable platform user reference.
+    pub id: UserRef,
+    /// Last platform username seen.
+    pub username: String,
+    /// Best display name seen by the bot.
+    pub display_name: Option<String>,
+    /// Resolved label the UI can render directly.
+    pub label: String,
+    /// Platform avatar URL, usually remote/CDN-backed.
+    pub avatar_url: Option<String>,
+    /// Cached local avatar media URI, when available.
+    pub avatar_media_uri: Option<MediaUri>,
+    /// Whether the platform marked this user as a bot.
+    pub is_bot: bool,
+}
+
+async fn user_metadata<S>(
+    storage: &S,
+    snapshot: &chudbot_api::ConversationSnapshot,
+) -> Result<std::collections::BTreeMap<String, UserMetadata>, ApiError>
+where
+    S: BotStorage,
+{
+    let mut users = std::collections::BTreeMap::<String, UserMetadata>::new();
+    insert_user_fallback(&mut users, snapshot.conversation.created_by.clone(), None);
+    if let Some(user) = snapshot.conversation.stopped_by.clone() {
+        insert_user_fallback(&mut users, user, None);
+    }
+    for turn in &snapshot.turns {
+        insert_user_fallback(
+            &mut users,
+            turn.turn.user.clone(),
+            Some(turn.turn.user_display_name.clone()),
+        );
+    }
+
+    let refs = users
+        .values()
+        .map(|user| user.id.clone())
+        .collect::<Vec<_>>();
+    let stored = storage
+        .load_user_profiles(refs)
+        .await
+        .map_err(|error| ApiError::Storage(error.to_string()))?;
+    for stored in stored {
+        let key = user_key(&stored.profile.id);
+        users.insert(
+            key,
+            UserMetadata {
+                label: stored
+                    .profile
+                    .display_name
+                    .clone()
+                    .unwrap_or_else(|| stored.profile.username.clone()),
+                username: stored.profile.username,
+                display_name: stored.profile.display_name,
+                avatar_url: stored.profile.avatar_url,
+                avatar_media_uri: stored.avatar,
+                is_bot: stored.profile.is_bot,
+                id: stored.profile.id,
+            },
+        );
+    }
+    Ok(users)
+}
+
+fn insert_user_fallback(
+    users: &mut std::collections::BTreeMap<String, UserMetadata>,
+    user: UserRef,
+    label: Option<String>,
+) {
+    let key = user_key(&user);
+    users.entry(key).or_insert_with(|| {
+        let label = label.unwrap_or_else(|| user.user_id.as_str().to_string());
+        UserMetadata {
+            id: user,
+            username: label.clone(),
+            display_name: Some(label.clone()),
+            label,
+            avatar_url: None,
+            avatar_media_uri: None,
+            is_bot: false,
+        }
+    });
+}
+
+fn user_key(user: &UserRef) -> String {
+    format!(
+        "{}:{}:{}",
+        user.platform.as_str(),
+        user.guild_id
+            .as_ref()
+            .map(|id| id.as_str())
+            .unwrap_or("global"),
+        user.user_id.as_str()
+    )
+}
+
+#[tracing::instrument(
+    name = "web.conversation_events",
+    skip_all,
+    fields(conversation = %id)
+)]
+async fn conversation_events<S, M>(
+    State(state): State<WebState<S, M>>,
+    Path(id): Path<Uuid>,
+) -> Result<Response, ApiError>
+where
+    S: BotStorage + Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+{
+    let conversation_id = ConversationId(id);
+    state
+        .storage
+        .load_conversation(ConversationLookup::Id {
+            id: conversation_id,
+        })
+        .await
+        .map_err(|error| ApiError::Storage(error.to_string()))?
+        .ok_or(ApiError::NotFound)?;
+
+    tracing::info!("opening conversation event stream");
+    let stream = BroadcastStream::new(state.events.subscribe()).filter_map(move |item| {
+        let event = match item {
+            Ok(event) if event.applies_to_conversation(conversation_id) => event,
+            Ok(_) => return futures::future::ready(None),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(n)) => {
+                tracing::warn!(
+                    conversation = %conversation_id,
+                    skipped = n,
+                    "conversation event stream lagged"
+                );
+                return futures::future::ready(Some(Ok(Event::default()
+                    .event("lag")
+                    .data(n.to_string()))));
+            }
+        };
+        tracing::trace!(
+            conversation = %conversation_id,
+            event = event.event_name(),
+            "forwarding live event to SSE client"
+        );
+        let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+        futures::future::ready(Some(Ok(Event::default()
+            .event(event.event_name())
+            .data(data))))
+    });
+    let stream = stream.take_until(state.shutdown.clone().cancelled_owned());
+    let mut response = Sse::new(typed_stream(stream))
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
+        .into_response();
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
+    Ok(response)
+}
+
+fn typed_stream<S>(stream: S) -> impl Stream<Item = Result<Event, Infallible>>
+where
+    S: Stream<Item = Result<Event, Infallible>>,
+{
+    stream
+}
+
+#[tracing::instrument(name = "web.get_favicon", skip_all)]
+async fn get_favicon<S, M>(State(state): State<WebState<S, M>>) -> Response
+where
+    S: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+{
+    let Some(path) = state.config.favicon_path.as_deref() else {
+        return (StatusCode::NOT_FOUND, "no favicon configured").into_response();
+    };
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            let content_type = match path.extension().and_then(|e| e.to_str()) {
+                Some("png") => "image/png",
+                Some("svg") => "image/svg+xml",
+                Some("gif") => "image/gif",
+                Some("jpg") | Some("jpeg") => "image/jpeg",
+                _ => "image/x-icon",
+            };
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, HeaderValue::from_static(content_type)),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static(CACHE_NO_CACHE),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                path = %path.display(),
+                "configured favicon could not be read"
+            );
+            (StatusCode::NOT_FOUND, "favicon not found").into_response()
+        }
+    }
+}
+
+#[tracing::instrument(name = "web.get_robots")]
+async fn get_robots() -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=86400"),
+            ),
+        ],
+        ROBOTS_TXT,
+    )
+        .into_response()
+}
+
+fn cache_layer(value: &'static str) -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static(value))
+}
+
+fn x_robots_layer() -> SetResponseHeaderLayer<HeaderValue> {
+    SetResponseHeaderLayer::overriding(
+        HeaderName::from_static("x-robots-tag"),
+        HeaderValue::from_static(X_ROBOTS_TAG),
+    )
+}
+
+fn is_blocked_crawler(user_agent: &str) -> bool {
+    let ua = user_agent.to_ascii_lowercase();
+    CRAWLER_UA_TOKENS.iter().any(|token| ua.contains(token))
+}
+
+async fn block_crawlers(req: Request, next: Next) -> Response {
+    if req.uri().path() != "/robots.txt"
+        && let Some(ua) = req
+            .headers()
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+        && is_blocked_crawler(ua)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            [(
+                HeaderName::from_static("x-robots-tag"),
+                HeaderValue::from_static(X_ROBOTS_TAG),
+            )],
+            "crawling and indexing of this host are not permitted\n",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+#[tracing::instrument(name = "web.get_image", skip_all, fields(name = %name))]
+async fn get_image<S, M>(
+    State(state): State<WebState<S, M>>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError>
+where
+    S: Clone + Send + Sync + 'static,
+    M: MediaStore + Clone + Send + Sync + 'static,
+{
+    load_media_response(&state.media_store, MediaCategory::Image, &name).await
+}
+
+#[tracing::instrument(name = "web.get_video", skip_all, fields(name = %name))]
+async fn get_video<S, M>(
+    State(state): State<WebState<S, M>>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError>
+where
+    S: Clone + Send + Sync + 'static,
+    M: MediaStore + Clone + Send + Sync + 'static,
+{
+    load_media_response(&state.media_store, MediaCategory::Video, &name).await
+}
+
+#[tracing::instrument(name = "web.get_avatar", skip_all, fields(name = %name))]
+async fn get_avatar<S, M>(
+    State(state): State<WebState<S, M>>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError>
+where
+    S: Clone + Send + Sync + 'static,
+    M: MediaStore + Clone + Send + Sync + 'static,
+{
+    load_media_response(&state.media_store, MediaCategory::Avatar, &name).await
+}
+
+#[tracing::instrument(
+    name = "web.load_media",
+    skip_all,
+    fields(category = ?category, name = %name)
+)]
+async fn load_media_response<M>(
+    media_store: &M,
+    category: MediaCategory,
+    name: &str,
+) -> Result<Response, ApiError>
+where
+    M: MediaStore,
+{
+    let media = media_store
+        .media_from_name(category, name)
+        .await
+        .map_err(|error| ApiError::Media(error.to_string()))?;
+    let loaded = media
+        .load()
+        .await
+        .map_err(|error| ApiError::Media(error.to_string()))?;
+    let content_type = HeaderValue::from_str(loaded.media.mime_type())
+        .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
+    tracing::debug!(
+        mime_type = loaded.media.mime_type(),
+        bytes = loaded.bytes.len(),
+        uri = %loaded.media.uri(),
+        "loaded media response"
+    );
+    Ok((
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static(CACHE_IMMUTABLE),
+            ),
+        ],
+        loaded.bytes,
+    )
+        .into_response())
+}
+
+#[tracing::instrument(name = "web.spa_index", skip_all, fields(path = %uri.path()))]
+async fn spa_index<S, M>(State(state): State<WebState<S, M>>, uri: axum::http::Uri) -> Response
+where
+    S: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+{
+    render_spa(&state.config.frontend_dir, uri.path()).await
+}
+
+#[tracing::instrument(
+    name = "web.render_spa",
+    skip_all,
+    fields(frontend_dir = %frontend_dir.display(), request_path = %request_path)
+)]
+async fn render_spa(frontend_dir: &FsPath, request_path: &str) -> Response {
+    let last_segment = request_path.rsplit('/').next().unwrap_or("");
+    if last_segment.contains('.') {
+        tracing::debug!("asset-looking SPA fallback path not found");
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let index = frontend_dir.join("index.html");
+    match tokio::fs::read(index).await {
+        Ok(bytes) => {
+            tracing::debug!(bytes = bytes.len(), "serving SPA index");
+            (
+                StatusCode::OK,
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("text/html; charset=utf-8"),
+                    ),
+                    (
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_static(CACHE_NO_CACHE),
+                    ),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "SPA index is missing or unreadable"
+            );
+            (
+                StatusCode::NOT_FOUND,
+                "frontend not built (index.html missing)",
+            )
+                .into_response()
+        }
+    }
+}

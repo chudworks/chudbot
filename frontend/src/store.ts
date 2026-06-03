@@ -1,11 +1,11 @@
 import { create } from 'zustand';
-import type { ConversationView } from './types';
+import type { ConversationSnapshot } from './types';
 import { fetchConversation } from './api';
 
 type LoadState =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'ready'; view: ConversationView }
+  | { kind: 'ready'; view: ConversationSnapshot }
   | { kind: 'error'; status: number; message: string };
 
 interface ConversationStore {

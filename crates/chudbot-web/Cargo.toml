@@ -1,0 +1,25 @@
+[package]
+name = "chudbot-web"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+chudbot-api = { path = "../chudbot-api" }
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tokio-util.workspace = true
+tower = "0.5"
+tracing.workspace = true
+uuid.workspace = true
+
+[dependencies.axum]
+version = "0.8"
+
+[dependencies.tower-http]
+version = "0.6"
+features = ["fs", "set-header"]

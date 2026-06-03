@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "grok-discord-bot-frontend",
+      "name": "chudbot-frontend",
       "dependencies": {
         "react": "^19.0.0",
         "react-dom": "^19.0.0",

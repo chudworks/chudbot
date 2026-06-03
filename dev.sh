@@ -16,12 +16,12 @@ case "$cmd" in
         cargo test "$@"
         ;;
     run)
-        # Forwards to the `grok` binary's subcommands.
+        # Forwards to the `chudbot` binary's subcommands.
         # Examples:
         #   ./dev.sh run serve
         #   ./dev.sh run migrate
-        #   ./dev.sh run -- --config /path/to/config.toml serve
-        cargo run -- "$@"
+        #   ./dev.sh run --config /path/to/config.toml serve
+        cargo run -p chudbot-bin -- "$@"
         ;;
     lint)
         cargo fmt --all --check
@@ -50,7 +50,8 @@ usage: ./dev.sh <command> [args...]
 commands:
   build [...]    cargo build (forwards args)
   test  [...]    cargo test  (forwards args; e.g. ./dev.sh test bot::)
-  run   <sub>    cargo run -- <sub>  (sub: serve | migrate)
+  run   [...]    cargo run -p chudbot-bin -- ... (forwards args)
+                 e.g. ./dev.sh run --config config.example.toml check-config
   lint           cargo fmt --check + cargo clippy + frontend ESLint + tsc
                  (set FRONTEND_LINT=skip to skip the frontend pass)
   fmt            cargo fmt (writes)

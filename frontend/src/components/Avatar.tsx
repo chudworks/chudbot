@@ -1,26 +1,16 @@
-import type { DiscordUser } from '../types';
-import { displayNameFor } from '../users';
-
 interface Props {
-  user: DiscordUser | undefined;
-  /** Fallback text to render as initials when we have no user record
-   *  (e.g. historical turns before identity tracking shipped). */
-  fallbackName?: string | null;
+  name: string;
+  avatarPath?: string | null;
   /** Pixel size. Defaults to 32 (matches the turn header avatar). */
   size?: number;
 }
 
-/** Round avatar tile. Uses the cached avatar at `/avatars/<file>` when
- *  available; otherwise renders the first letter of the user's name
- *  on a colored background. */
-export default function Avatar({ user, fallbackName, size = 32 }: Props) {
-  const name = displayNameFor(user) ?? fallbackName ?? 'user';
-  const initial = name.trim()[0]?.toUpperCase() ?? '?';
-  // The avatar fetcher writes files to <avatars_dir>/<file> and the
-  // backend serves them at /avatars/<file>.
-  const src = user?.avatar_local_path
-    ? `/avatars/${user.avatar_local_path}`
-    : null;
+/** Round avatar tile. Uses a cached avatar path when supplied; otherwise
+ *  renders stable initials from the display name. */
+export default function Avatar({ name, avatarPath, size = 32 }: Props) {
+  const label = name || 'user';
+  const initial = label.trim()[0]?.toUpperCase() ?? '?';
+  const src = avatarPath ? `/avatars/${avatarPath}` : null;
 
   if (src) {
     return (
@@ -29,7 +19,7 @@ export default function Avatar({ user, fallbackName, size = 32 }: Props) {
         src={src}
         width={size}
         height={size}
-        alt={name}
+        alt={label}
         loading="lazy"
       />
     );
@@ -40,9 +30,9 @@ export default function Avatar({ user, fallbackName, size = 32 }: Props) {
       style={{
         width: size,
         height: size,
-        background: colorFor(name),
+        background: colorFor(label),
       }}
-      aria-label={name}
+      aria-label={label}
     >
       {initial}
     </div>
@@ -55,7 +45,6 @@ function colorFor(name: string): string {
   for (let i = 0; i < name.length; i++) {
     h = (h * 31 + name.charCodeAt(i)) | 0;
   }
-  // hsl with reasonable saturation/lightness for readability on dark + light.
   const hue = ((h % 360) + 360) % 360;
   return `hsl(${hue}deg 45% 55%)`;
 }

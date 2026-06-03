@@ -1,0 +1,15 @@
+[package]
+name = "chudbot-storage-sqlx"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[dependencies]
+chudbot-api = { path = "../chudbot-api" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tracing.workspace = true
+uuid.workspace = true
