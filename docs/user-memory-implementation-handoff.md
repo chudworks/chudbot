@@ -617,8 +617,11 @@ Initial policy:
   starts at `T`, wait until `T + diary_interval <= now`, then summarize
   `[T, T + diary_interval]`.
 - Enqueue compact jobs only when the user has pending diary entries or explicit
-  memory events and their last compaction is older than
-  `now - compaction_interval`.
+  memory events, their last compaction is older than `now - compaction_interval`
+  or missing, and no diary job/window is due or inflight for that user. This
+  lets first-time backfill diary rows compact as soon as the due backfill diary
+  work is drained, without waiting another `compaction_interval` after the diary
+  rows were created.
 - If a user has no pending source changes, do not enqueue a compact job just
   because the existing profile is old.
 - Do not rescan full history every tick.

@@ -53,9 +53,9 @@ enabled = true
 # LLM provider registry key used by background diary/compaction jobs.
 provider = "grok"
 poll_interval_seconds = 60
-# Pending memory events and diary entries are rolled into the compact profile
-# only when the user's last compaction is at least this old. Users with no
-# pending changes do not get compact jobs.
+# Pending memory events and diary entries are rolled into the compact profile only
+# when the user's last compaction is at least this old and no diary job/window is
+# due or inflight. Users with no pending changes do not get compact jobs.
 compaction_interval = "24h"
 # Only completed turns newer than this are considered when creating diary
 # backfill jobs, so enabling memory on an old database does not summarize full

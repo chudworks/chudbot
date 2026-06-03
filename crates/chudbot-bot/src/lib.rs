@@ -1227,11 +1227,12 @@ where
             .map_err(storage_error)?;
         tracing::debug!("linked user message to turn");
 
-        let mut turn_context = self
+        let turn_context = self
             .prepare_turn_context(&message, &settings, &snapshot.conversation)
             .await?;
+        let mut model_context = turn_context.items.clone();
         if self.agent_memory_enabled(&agent_config) {
-            self.push_memory_context(&mut turn_context.items, &message.author.id)
+            self.push_memory_context(&mut model_context, &message.author.id)
                 .await?;
         }
         let prompt_snapshot = self
@@ -1245,7 +1246,7 @@ where
                 conversation_id: snapshot.conversation.id,
             })?;
         let transcript = self
-            .transcript_for_turn(&prompt_snapshot, &turn, &turn_context.items)
+            .transcript_for_turn(&prompt_snapshot, &turn, &model_context)
             .await?;
         tracing::debug!(
             transcript_turns = transcript.turns.len(),
@@ -1422,8 +1423,19 @@ where
             .system_instructions
             .clone()
             .unwrap_or_else(|| self.compose_system_prompt(&agent_config, &settings.privacy));
+        let stored_context = replayable_context_items(&turn_snapshot.context);
+        let has_stored_context = !stored_context.is_empty();
+        let mut model_context = stored_context.clone();
+        if self.agent_memory_enabled(&agent_config) {
+            self.push_memory_context(&mut model_context, &turn.user).await?;
+        }
         let transcript = self
-            .transcript_for_retry(&retry.conversation, turn_snapshot)
+            .transcript_for_retry(
+                &retry.conversation,
+                turn_snapshot,
+                &model_context,
+                has_stored_context,
+            )
             .await?;
         self.storage
             .save_turn_input(SaveTurnInput {
@@ -1432,7 +1444,7 @@ where
                 provider: agent_config.provider.clone(),
                 model: agent_config.model.id.clone(),
                 system_instructions: system_instructions.clone(),
-                context: turn_snapshot.context.clone(),
+                context: stored_context,
                 transcript: Some(transcript.clone()),
             })
             .await
@@ -3212,11 +3224,18 @@ where
         &self,
         snapshot: &ConversationSnapshot,
         retry_turn: &TurnSnapshot,
+        context: &[chudbot_api::ContextItem],
+        has_stored_context: bool,
     ) -> Result<Transcript, BotError> {
         let mut transcript = self
             .transcript_from_snapshot(snapshot, retry_turn.turn.history_cutoff)
             .await?;
-        if retry_turn.context.is_empty() {
+        if has_stored_context {
+            transcript.push(
+                self.transcript_turn_from_context(retry_turn.turn.id, context)
+                    .await,
+            );
+        } else {
             let mut turn = TranscriptTurn::text(
                 TurnRole::User,
                 format!(
@@ -3226,12 +3245,9 @@ where
             );
             turn.metadata =
                 transcript_message_metadata(turn_transcript_message_id(retry_turn.turn.id, "user"));
+            let mut extra_blocks = self.context_blocks_from_items(context).await;
+            turn.blocks.append(&mut extra_blocks);
             transcript.push(turn);
-        } else {
-            transcript.push(
-                self.transcript_turn_from_context(retry_turn.turn.id, &retry_turn.context)
-                    .await,
-            );
         }
         tracing::debug!(
             turns = transcript.turns.len(),
@@ -3245,6 +3261,23 @@ where
         turn_id: TurnId,
         context: &[chudbot_api::ContextItem],
     ) -> TranscriptTurn {
+        let mut blocks = self.context_blocks_from_items(context).await;
+        if blocks.is_empty() {
+            blocks.push(ContentBlock::Text {
+                text: "(no message content)".to_string(),
+            });
+        }
+        TranscriptTurn {
+            role: TurnRole::User,
+            blocks,
+            metadata: transcript_message_metadata(turn_transcript_message_id(turn_id, "user")),
+        }
+    }
+
+    async fn context_blocks_from_items(
+        &self,
+        context: &[chudbot_api::ContextItem],
+    ) -> Vec<ContentBlock> {
         let mut blocks = Vec::new();
         for item in context {
             if item.content.starts_with("file://") {
@@ -3267,16 +3300,7 @@ where
                 text: item.content.clone(),
             });
         }
-        if blocks.is_empty() {
-            blocks.push(ContentBlock::Text {
-                text: "(no message content)".to_string(),
-            });
-        }
-        TranscriptTurn {
-            role: TurnRole::User,
-            blocks,
-            metadata: transcript_message_metadata(turn_transcript_message_id(turn_id, "user")),
-        }
+        blocks
     }
 
     async fn prepare_turn_context(
@@ -3589,7 +3613,8 @@ where
         });
 
         for turn in replay_turns {
-            let mut user_turn = if turn.context.is_empty() {
+            let replay_context = replayable_context_items(&turn.context);
+            let mut user_turn = if replay_context.is_empty() {
                 TranscriptTurn {
                     role: TurnRole::User,
                     blocks: vec![ContentBlock::Text {
@@ -3604,11 +3629,10 @@ where
                     )),
                 }
             } else {
-                self.transcript_turn_from_context(turn.turn.id, &turn.context)
+                self.transcript_turn_from_context(turn.turn.id, &replay_context)
                     .await
             };
-            let mut replayed_media = turn
-                .context
+            let mut replayed_media = replay_context
                 .iter()
                 .filter_map(|item| {
                     item.content
@@ -5677,6 +5701,20 @@ fn platform_message_reference_kind(reference: &PlatformMessageReference) -> &'st
     }
 }
 
+fn replayable_context_items(
+    context: &[chudbot_api::ContextItem],
+) -> Vec<chudbot_api::ContextItem> {
+    context
+        .iter()
+        .filter(|item| !is_memory_context_item(item))
+        .cloned()
+        .collect()
+}
+
+fn is_memory_context_item(item: &chudbot_api::ContextItem) -> bool {
+    item.source.starts_with("memory:")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5810,6 +5848,30 @@ mod tests {
             &user_link,
             conversation_id
         ));
+    }
+
+    #[test]
+    fn replayable_context_items_drop_memory_context() {
+        let platform_item = chudbot_api::ContextItem {
+            position: 0,
+            source: "platform:message:message-1".to_string(),
+            role: "user".to_string(),
+            content: "{\"content\":\"hi\"}".to_string(),
+            message: None,
+        };
+        let memory_item = chudbot_api::ContextItem {
+            position: 1,
+            source: "memory:user:user-1".to_string(),
+            role: "user".to_string(),
+            content: "Background memory for the current user.".to_string(),
+            message: None,
+        };
+
+        let replayable = replayable_context_items(&[platform_item.clone(), memory_item]);
+
+        assert_eq!(replayable.len(), 1);
+        assert_eq!(replayable[0].source, platform_item.source);
+        assert_eq!(replayable[0].content, platform_item.content);
     }
 
     #[test]

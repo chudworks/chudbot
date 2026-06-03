@@ -1714,11 +1714,61 @@ impl BotStorage for SqlxStorage {
                  ON d.message_provider = p.message_provider \
                 AND d.scope_key = p.scope_key \
                 AND d.subject_user_key = p.subject_user_key \
+               LEFT JOIN ( \
+                    SELECT DISTINCT message_provider, scope_key, subject_user_key \
+                      FROM user_memory_jobs \
+                     WHERE kind = 'diary' \
+                       AND status IN ('pending', 'running') \
+               ) active_diary \
+                 ON active_diary.message_provider = p.message_provider \
+                AND active_diary.scope_key = p.scope_key \
+                AND active_diary.subject_user_key = p.subject_user_key \
+               LEFT JOIN ( \
+                    SELECT t.user_message_provider AS message_provider, \
+                           CASE \
+                             WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
+                             THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
+                             ELSE 'global' \
+                           END AS scope_key, \
+                           t.user_key AS subject_user_key \
+                      FROM turns t \
+                      LEFT JOIN ( \
+                           SELECT message_provider, scope_key, subject_user_key, \
+                                  MAX(window_end) AS window_end \
+                             FROM user_memory_diary_entries \
+                            GROUP BY message_provider, scope_key, subject_user_key \
+                      ) latest_diary \
+                        ON latest_diary.message_provider = t.user_message_provider \
+                       AND latest_diary.scope_key = CASE \
+                             WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
+                             THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
+                             ELSE 'global' \
+                           END \
+                       AND latest_diary.subject_user_key = t.user_key \
+                     WHERE t.status = 'completed' \
+                       AND t.completed_at IS NOT NULL \
+                       AND t.completed_at >= $2 \
+                       AND t.completed_at > COALESCE(latest_diary.window_end, '-infinity'::timestamptz) \
+                     GROUP BY t.user_message_provider, \
+                           CASE \
+                             WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
+                             THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
+                             ELSE 'global' \
+                           END, \
+                           t.user_key \
+                    HAVING MIN(t.completed_at) <= $3 \
+               ) due_diary \
+                 ON due_diary.message_provider = p.message_provider \
+                AND due_diary.scope_key = p.scope_key \
+                AND due_diary.subject_user_key = p.subject_user_key \
+              WHERE active_diary.message_provider IS NULL \
+                AND due_diary.message_provider IS NULL \
               GROUP BY p.message_provider, p.scope_key, p.subject_user_key, d.last_compacted_at \
-             HAVING (d.last_compacted_at IS NOT NULL AND d.last_compacted_at <= $1) \
-                 OR (d.last_compacted_at IS NULL AND MIN(p.created_at) <= $1)",
+             HAVING COALESCE(d.last_compacted_at, '-infinity'::timestamptz) <= $1",
         )
         .bind(schedule.compact_due_before)
+        .bind(schedule.diary_cutoff)
+        .bind(schedule.diary_due_before)
         .fetch_all(&self.pool)
         .await?;
         for row in compact_rows {
