@@ -15,8 +15,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use chudbot_api::{
-    BotStorage, Conversation, ConversationId, ConversationLookup, EventSink, LiveEvent,
-    MediaCategory, MediaStore, MediaUri, TurnSnapshot, UserRef,
+    BotStorage, ClientToolCall, ClientToolResult, ClientToolResultContent, ContextItem,
+    Conversation, ConversationId, ConversationLookup, EventSink, GroundingMetadata, LiveEvent,
+    MediaCategory, MediaStore, MediaUri, ServerToolUse, ToolTrace, Turn, TurnAsset, TurnSnapshot,
+    UsageRecord, UserRef,
 };
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -389,9 +391,10 @@ where
         "loaded conversation snapshot"
     );
     let users = user_metadata(&state.storage, &snapshot).await?;
+    let turns = snapshot.turns.into_iter().map(TurnView::from).collect();
     Ok(Json(ConversationView {
         conversation: snapshot.conversation,
-        turns: snapshot.turns,
+        turns,
         users,
     }))
 }
@@ -401,10 +404,131 @@ where
 pub struct ConversationView {
     /// Conversation metadata.
     pub conversation: Conversation,
-    /// Ordered turn snapshots.
-    pub turns: Vec<TurnSnapshot>,
+    /// Ordered turn snapshots, shaped for the viewer.
+    pub turns: Vec<TurnView>,
     /// User metadata keyed by `platform:guild:user` string.
     pub users: std::collections::BTreeMap<String, UserMetadata>,
+}
+
+/// One turn plus viewer-safe trace data.
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnView {
+    /// Turn metadata.
+    pub turn: Turn,
+    /// System/developer instructions used for this attempt/turn.
+    pub system_instructions: Option<String>,
+    /// Novel context items captured for this turn.
+    pub context: Vec<ContextItem>,
+    /// Tool/server/grounding trace events.
+    pub tool_trace: Vec<ToolTraceView>,
+    /// Assets that should be replayed with this turn.
+    pub replay_assets: Vec<TurnAsset>,
+    /// Usage/cost accumulated by this turn.
+    pub usage: Vec<UsageRecord>,
+}
+
+impl From<TurnSnapshot> for TurnView {
+    fn from(snapshot: TurnSnapshot) -> Self {
+        Self {
+            turn: snapshot.turn,
+            system_instructions: snapshot.system_instructions,
+            context: snapshot.context,
+            tool_trace: snapshot
+                .tool_trace
+                .into_iter()
+                .map(ToolTraceView::from)
+                .collect(),
+            replay_assets: snapshot.replay_assets,
+            usage: snapshot.usage,
+        }
+    }
+}
+
+/// Viewer-facing tool trace event.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolTraceView {
+    /// Client-side tool call/result.
+    Client {
+        /// Trace record.
+        trace: ClientToolTraceView,
+    },
+    /// Provider-side tool use, with no client-furnished result.
+    Server {
+        /// Server tool use.
+        tool: ServerToolUse,
+    },
+    /// Provider grounding/citation metadata.
+    Grounding {
+        /// Grounding metadata.
+        metadata: GroundingMetadata,
+    },
+}
+
+impl From<ToolTrace> for ToolTraceView {
+    fn from(trace: ToolTrace) -> Self {
+        match trace {
+            ToolTrace::Client { trace } => Self::Client {
+                trace: ClientToolTraceView::from(trace),
+            },
+            ToolTrace::Server { tool } => Self::Server { tool },
+            ToolTrace::Grounding { metadata } => Self::Grounding { metadata },
+        }
+    }
+}
+
+/// Viewer-facing client-side tool trace.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientToolTraceView {
+    /// Tool call requested by the model.
+    pub call: ClientToolCall,
+    /// Tool result furnished back to the model.
+    pub result: ClientToolResult,
+    /// Extra trace/debug payload, omitted when it duplicates the result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trace_payload: Option<serde_json::Value>,
+    /// Usage/cost incurred by this client tool.
+    pub usage: Vec<UsageRecord>,
+}
+
+impl From<chudbot_api::ClientToolTrace> for ClientToolTraceView {
+    fn from(trace: chudbot_api::ClientToolTrace) -> Self {
+        let trace_payload = if trace_response_matches_result(&trace.trace_response, &trace.result) {
+            None
+        } else {
+            Some(trace.trace_response)
+        };
+        Self {
+            call: trace.call,
+            result: trace.result,
+            trace_payload,
+            usage: trace.usage,
+        }
+    }
+}
+
+fn trace_response_matches_result(
+    trace_response: &serde_json::Value,
+    result: &ClientToolResult,
+) -> bool {
+    if let Ok(content) = serde_json::to_value(&result.content)
+        && trace_response == &content
+    {
+        return true;
+    }
+
+    match &result.content {
+        ClientToolResultContent::Json { value } => trace_response == value,
+        ClientToolResultContent::Text { text } => {
+            trace_response.as_str() == Some(text.as_str())
+                || trace_response
+                    .as_object()
+                    .filter(|object| object.len() == 1)
+                    .and_then(|object| object.get("text"))
+                    .and_then(serde_json::Value::as_str)
+                    == Some(text.as_str())
+        }
+    }
 }
 
 /// User metadata for frontend rendering.
@@ -802,5 +926,62 @@ async fn render_spa(frontend_dir: &FsPath, request_path: &str) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chudbot_api::{ClientToolTrace, ToolName, ToolUseId};
+    use serde_json::json;
+
+    fn client_trace_view(
+        content: ClientToolResultContent,
+        trace_response: serde_json::Value,
+    ) -> ClientToolTraceView {
+        ClientToolTraceView::from(ClientToolTrace {
+            call: ClientToolCall {
+                id: ToolUseId::from("call-1"),
+                name: ToolName::from("test_tool"),
+                input: json!({ "prompt": "draw this" }),
+            },
+            result: ClientToolResult {
+                tool_use_id: ToolUseId::from("call-1"),
+                content,
+                is_error: false,
+            },
+            trace_response,
+            usage: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn viewer_trace_omits_duplicate_json_trace_payload() {
+        let view = client_trace_view(
+            ClientToolResultContent::Json {
+                value: json!({ "ok": true }),
+            },
+            json!({ "ok": true }),
+        );
+
+        assert!(view.trace_payload.is_none());
+        let value = serde_json::to_value(view).expect("serialize trace view");
+        assert!(value.get("trace_payload").is_none());
+    }
+
+    #[test]
+    fn viewer_trace_keeps_distinct_trace_payload() {
+        let trace_payload = json!({
+            "uri": "file://images/generated.png",
+            "public_url": "https://media.example/generated.png"
+        });
+        let view = client_trace_view(
+            ClientToolResultContent::Json {
+                value: json!({ "uri": "file://images/generated.png" }),
+            },
+            trace_payload.clone(),
+        );
+
+        assert_eq!(view.trace_payload, Some(trace_payload));
     }
 }

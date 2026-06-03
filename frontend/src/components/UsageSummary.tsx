@@ -1,7 +1,7 @@
-import type { CostAmount, ToolTrace, TurnSnapshot, UsageRecord, UsageSubject } from '../types';
+import type { CostAmount, ToolTrace, TurnView, UsageRecord, UsageSubject } from '../types';
 
 interface Props {
-  turns: TurnSnapshot[];
+  turns: TurnView[];
 }
 
 type Metric = {
@@ -104,11 +104,11 @@ function UsageMetric({ label, value }: { label: string; value: string }) {
   );
 }
 
-function collectConversationUsage(turns: TurnSnapshot[]): UsageRecord[] {
+function collectConversationUsage(turns: TurnView[]): UsageRecord[] {
   return turns.flatMap(collectTurnUsage);
 }
 
-function collectTurnUsage(turn: TurnSnapshot): UsageRecord[] {
+function collectTurnUsage(turn: TurnView): UsageRecord[] {
   const records = [...turn.usage];
   const persistedCounts = new Map<string, number>();
   for (const record of records) {

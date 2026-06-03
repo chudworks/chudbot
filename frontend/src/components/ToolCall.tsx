@@ -1,4 +1,4 @@
-import type { ToolTrace } from '../types';
+import type { ClientToolResultContent, ToolTrace } from '../types';
 
 interface Props {
   trace: ToolTrace;
@@ -8,7 +8,9 @@ interface Props {
  *  tool use, or provider grounding metadata. */
 export default function ToolCall({ trace }: Props) {
   const view = traceView(trace);
-  const media = collectMediaUris(view.response);
+  const media = collectMediaUris([view.response, view.tracePayload]);
+  const showTracePayload =
+    view.tracePayload !== undefined && !jsonEqual(view.response, view.tracePayload);
   return (
     <article className="tool-call">
       <header>
@@ -33,11 +35,26 @@ export default function ToolCall({ trace }: Props) {
         <summary>{view.responseLabel}</summary>
         <pre>{prettyJson(view.response)}</pre>
       </details>
+      {showTracePayload && (
+        <details>
+          <summary>Trace payload</summary>
+          <pre>{prettyJson(view.tracePayload)}</pre>
+        </details>
+      )}
     </article>
   );
 }
 
-function traceView(trace: ToolTrace) {
+interface TraceView {
+  name: string;
+  requestLabel: string;
+  request: unknown;
+  responseLabel: string;
+  response: unknown;
+  tracePayload?: unknown;
+}
+
+function traceView(trace: ToolTrace): TraceView {
   switch (trace.kind) {
     case 'client':
       return {
@@ -45,10 +62,8 @@ function traceView(trace: ToolTrace) {
         requestLabel: 'Request',
         request: trace.trace.call.input,
         responseLabel: trace.trace.result.is_error ? 'Error result' : 'Result',
-        response: {
-          result: trace.trace.result.content,
-          trace_response: trace.trace.trace_response,
-        },
+        response: resultContentValue(trace.trace.result.content),
+        tracePayload: trace.trace.trace_payload,
       };
     case 'server':
       return {
@@ -69,6 +84,15 @@ function traceView(trace: ToolTrace) {
         responseLabel: 'Raw payload',
         response: trace.metadata.raw,
       };
+  }
+}
+
+function resultContentValue(content: ClientToolResultContent): unknown {
+  switch (content.kind) {
+    case 'json':
+      return content.value;
+    case 'text':
+      return content.text;
   }
 }
 
@@ -118,4 +142,8 @@ function prettyJson(value: unknown): string {
   } catch {
     return String(value);
   }
+}
+
+function jsonEqual(left: unknown, right: unknown): boolean {
+  return prettyJson(left) === prettyJson(right);
 }

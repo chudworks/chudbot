@@ -1,10 +1,10 @@
-// Mirrors the v2 `chudbot_api` DTOs serialized by `chudbot-web`.
+// Mirrors the v2 viewer DTOs serialized by `chudbot-web`.
 // Provider/platform/model ids are opaque strings. Do not parse or do
 // arithmetic on Discord snowflakes or platform ids.
 
-export interface ConversationSnapshot {
+export interface ConversationView {
   conversation: Conversation;
-  turns: TurnSnapshot[];
+  turns: TurnView[];
   users: Record<string, UserMetadata>;
 }
 
@@ -23,7 +23,7 @@ export interface Conversation {
   stopped_by: UserRef | null;
 }
 
-export interface TurnSnapshot {
+export interface TurnView {
   turn: Turn;
   system_instructions: string | null;
   context: ContextItem[];
@@ -106,7 +106,7 @@ export type ToolTrace =
 export interface ClientToolTrace {
   call: ClientToolCall;
   result: ClientToolResult;
-  trace_response: unknown;
+  trace_payload?: unknown;
   usage: UsageRecord[];
 }
 

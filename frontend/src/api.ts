@@ -1,4 +1,4 @@
-import type { ConversationSnapshot, SiteConfig } from './types';
+import type { ConversationView, SiteConfig } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -19,7 +19,7 @@ export async function fetchSiteConfig(): Promise<SiteConfig> {
 }
 
 /** Fetch a conversation's full read-model from the backend. */
-export async function fetchConversation(id: string): Promise<ConversationSnapshot> {
+export async function fetchConversation(id: string): Promise<ConversationView> {
   const resp = await fetch(`/api/conversations/${id}`, {
     headers: { Accept: 'application/json' },
   });
@@ -30,5 +30,5 @@ export async function fetchConversation(id: string): Promise<ConversationSnapsho
       body || resp.statusText || `request failed (${resp.status})`
     );
   }
-  return (await resp.json()) as ConversationSnapshot;
+  return (await resp.json()) as ConversationView;
 }

@@ -1,10 +1,10 @@
-import type { ContextItem, TurnAsset, TurnSnapshot, UserMetadata } from '../types';
+import type { ContextItem, TurnAsset, TurnView, UserMetadata } from '../types';
 import Avatar from './Avatar';
 import RelativeTime from './RelativeTime';
 import ToolCall from './ToolCall';
 
 interface Props {
-  turnView: TurnSnapshot;
+  turnView: TurnView;
   users: Record<string, UserMetadata>;
 }
 
