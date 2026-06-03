@@ -5652,9 +5652,7 @@ fn platform_message_reference_kind(reference: &PlatformMessageReference) -> &'st
     }
 }
 
-fn replayable_context_items(
-    context: &[chudbot_api::ContextItem],
-) -> Vec<chudbot_api::ContextItem> {
+fn replayable_context_items(context: &[chudbot_api::ContextItem]) -> Vec<chudbot_api::ContextItem> {
     context
         .iter()
         .filter(|item| !is_memory_context_item(item))

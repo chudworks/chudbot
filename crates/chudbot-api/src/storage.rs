@@ -1152,4 +1152,186 @@ mod tests {
             "provider continuation leaked into serialized turn"
         );
     }
+
+    #[test]
+    fn memory_dto_timestamps_serialize_as_rfc3339_strings() {
+        let timestamp = datetime!(2026-06-03 22:27:01.816929 UTC);
+        let key = UserMemoryKey {
+            platform: PlatformName::new("discord"),
+            scope_key: "guild:guild-1".to_string(),
+            user_key: "user-1".to_string(),
+        };
+
+        assert_timestamp_fields(
+            "UserMemoryEvent",
+            serde_json::to_value(UserMemoryEvent {
+                id: Uuid::nil(),
+                key: key.clone(),
+                actor_user_key: Some("user-1".to_string()),
+                kind: UserMemoryEventKind::Remember,
+                body: "memory".to_string(),
+                tags: Vec::new(),
+                confidence: None,
+                source_conversation_id: None,
+                source_turn_id: None,
+                source_tool_trace_id: None,
+                supersedes_event_id: None,
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .unwrap(),
+            &["created_at", "updated_at"],
+        );
+        assert_timestamp_fields(
+            "UserMemoryDiaryEntry",
+            serde_json::to_value(UserMemoryDiaryEntry {
+                id: Uuid::nil(),
+                key: key.clone(),
+                window_start: timestamp,
+                window_end: timestamp,
+                source_turn_ids: Vec::new(),
+                markdown: "diary".to_string(),
+                agent_name: "memory_diary".to_string(),
+                llm_provider: ProviderName::new("xai"),
+                llm_model: ModelId::new("grok-4.3"),
+                usage: Vec::new(),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .unwrap(),
+            &["window_start", "window_end", "created_at", "updated_at"],
+        );
+        assert_timestamp_fields(
+            "NewUserMemoryDiaryEntry",
+            serde_json::to_value(NewUserMemoryDiaryEntry {
+                key: key.clone(),
+                window_start: timestamp,
+                window_end: timestamp,
+                source_turn_ids: Vec::new(),
+                markdown: "diary".to_string(),
+                agent_name: "memory_diary".to_string(),
+                llm_provider: ProviderName::new("xai"),
+                llm_model: ModelId::new("grok-4.3"),
+                usage: Vec::new(),
+            })
+            .unwrap(),
+            &["window_start", "window_end"],
+        );
+        assert_timestamp_fields(
+            "UserMemoryDocument",
+            serde_json::to_value(UserMemoryDocument {
+                key: key.clone(),
+                revision: 1,
+                markdown: "profile".to_string(),
+                last_compacted_at: timestamp,
+                source_event_cutoff: Some(timestamp),
+                source_diary_cutoff: Some(timestamp),
+                created_at: timestamp,
+                updated_at: timestamp,
+            })
+            .unwrap(),
+            &[
+                "last_compacted_at",
+                "source_event_cutoff",
+                "source_diary_cutoff",
+                "created_at",
+                "updated_at",
+            ],
+        );
+        assert_timestamp_fields(
+            "NewUserMemoryDocumentRevision",
+            serde_json::to_value(NewUserMemoryDocumentRevision {
+                key: key.clone(),
+                markdown: "profile".to_string(),
+                source_event_ids: Vec::new(),
+                source_diary_entry_ids: Vec::new(),
+                source_event_cutoff: Some(timestamp),
+                source_diary_cutoff: Some(timestamp),
+            })
+            .unwrap(),
+            &["source_event_cutoff", "source_diary_cutoff"],
+        );
+        assert_timestamp_fields(
+            "UserMemoryJob",
+            serde_json::to_value(UserMemoryJob {
+                id: Uuid::nil(),
+                kind: MemoryJobKind::Diary,
+                key: key.clone(),
+                memory_key: key.memory_key(),
+                window_start: Some(timestamp),
+                window_end: Some(timestamp),
+                attempts: 1,
+                leased_by: Some("worker".to_string()),
+                leased_until: Some(timestamp),
+                dedupe_key: "diary:key".to_string(),
+            })
+            .unwrap(),
+            &["window_start", "window_end", "leased_until"],
+        );
+        assert_timestamp_fields(
+            "MemoryJobSchedule",
+            serde_json::to_value(MemoryJobSchedule {
+                now: timestamp,
+                diary_cutoff: timestamp,
+                diary_due_before: timestamp,
+                diary_window_seconds: 86_400,
+                compact_due_before: timestamp,
+            })
+            .unwrap(),
+            &[
+                "now",
+                "diary_cutoff",
+                "diary_due_before",
+                "compact_due_before",
+            ],
+        );
+        assert_timestamp_fields(
+            "MemoryJobCompletion",
+            serde_json::to_value(MemoryJobCompletion::Retry {
+                job_id: Uuid::nil(),
+                error: "retry".to_string(),
+                next_run_at: timestamp,
+            })
+            .unwrap(),
+            &["next_run_at"],
+        );
+        assert_timestamp_fields(
+            "MemoryTurnWindow",
+            serde_json::to_value(MemoryTurnWindow {
+                key: key.clone(),
+                window_start: timestamp,
+                window_end: timestamp,
+                max_turns: 40,
+            })
+            .unwrap(),
+            &["window_start", "window_end"],
+        );
+        assert_timestamp_fields(
+            "UserMemoryTurn",
+            serde_json::to_value(UserMemoryTurn {
+                conversation_id: ConversationId(Uuid::nil()),
+                turn_id: TurnId(Uuid::nil()),
+                completed_at: timestamp,
+                user_display_name: "Chud".to_string(),
+                user_content: "hi".to_string(),
+                assistant_content: Some("hello".to_string()),
+            })
+            .unwrap(),
+            &["completed_at"],
+        );
+    }
+
+    fn assert_timestamp_fields(name: &str, value: serde_json::Value, fields: &[&str]) {
+        for field in fields {
+            assert_eq!(
+                value
+                    .get(*field)
+                    .and_then(serde_json::Value::as_str)
+                    .map(|timestamp| timestamp.starts_with("2026-06-03T22:27:01.816929")),
+                Some(true),
+                "{name}.{field} was not an RFC3339 string: {:?}",
+                value.get(*field)
+            );
+        }
+    }
 }

@@ -446,6 +446,10 @@ agent's configured prompt, for example:
 Memory behavior:
 - User memory is available only through the memory tools. It is not preloaded
   into ordinary message context.
+- You MUST call lookup_user_memory the first time you encounter a human user in
+  a conversation/thread, before answering that user. This applies to the current
+  message author when they have not appeared earlier in the visible
+  conversation. Do this even if you think you can answer without memory.
 - Use lookup_user_memory when remembered context would materially improve the
   reply, especially for recurring preferences, relationships, projects, server
   lore, good-natured roast material, or direct questions about what you
@@ -477,12 +481,13 @@ tools and the instructions evolve together. `compose_system_prompt` should call 
 small helper such as `memory::prompt_guidance()` instead of embedding a large
 string directly in the already-large `lib.rs`.
 
-Do not instruct the model to call `lookup_user_memory` on every turn. Lookup is
-for memory-specific questions, other users, or cases where remembered context
-would materially improve the response. It is okay for the model to be more
-proactive about `remember_user_memory`, but do not instruct it to save every
-throwaway statement. Real-time memory writes are side effects and should be
-reserved for facts likely to be useful later.
+Do not instruct the model to call `lookup_user_memory` on every turn after the
+same speaker is already known in the conversation/thread. Lookup is mandatory
+for first-seen human speakers, memory-specific questions, other users, or cases
+where remembered context would materially improve the response. It is okay for
+the model to be more proactive about `remember_user_memory`, but do not instruct
+it to save every throwaway statement. Real-time memory writes are side effects
+and should be reserved for facts likely to be useful later.
 
 Add tests that verify:
 
