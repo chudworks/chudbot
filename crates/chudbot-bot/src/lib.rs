@@ -23,12 +23,12 @@ use chudbot_api::{
     ModelStep, ModelStepRequest, OpenConversation, OutgoingAttachment, PlatformCommand,
     PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
     PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
-    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference, PlatformName,
-    PlatformReaction, PostedMessage, PrivacyMode, ProviderName, ReactionKind, ResolveAgent,
-    RuntimeSettings, SamplingOptions, SaveTurnInput, SendMessage, Subagent, ThreadRequest,
-    ToolInputSchema, ToolName, ToolTrace, Transcript, TranscriptTurn, Turn, TurnId, TurnRole,
-    TurnSnapshot, UpdateVideoJob, UrlMediaRef, UserProfile, VideoGenerator, VideoJobId,
-    VideoJobStatus, VideoRequest,
+    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
+    PlatformMessageRelationship, PlatformName, PlatformReaction, PostedMessage, PrivacyMode,
+    ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput,
+    SendMessage, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, Transcript,
+    TranscriptTurn, Turn, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UserProfile,
+    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -210,6 +210,13 @@ pub trait MessagePlatformRegistry: Clone + Send + Sync {
         request: FetchMessages,
     ) -> impl Future<Output = Result<Vec<PlatformMessage>, Self::Error>> + Send;
 
+    /// Render a platform message for model context.
+    fn message_context(
+        &self,
+        message: &PlatformMessage,
+        relationship: PlatformMessageRelationship,
+    ) -> impl Future<Output = Result<serde_json::Value, Self::Error>> + Send;
+
     /// Resolve a platform channel's parent channel.
     fn parent_channel(
         &self,
@@ -278,6 +285,14 @@ where
         request: FetchMessages,
     ) -> Result<Vec<PlatformMessage>, Self::Error> {
         MessagePlatform::fetch_messages(self, request).await
+    }
+
+    async fn message_context(
+        &self,
+        message: &PlatformMessage,
+        relationship: PlatformMessageRelationship,
+    ) -> Result<serde_json::Value, Self::Error> {
+        MessagePlatform::message_context(self, message, relationship).await
     }
 
     async fn parent_channel(&self, channel: ChannelRef) -> Result<ChannelRef, Self::Error> {
@@ -1656,14 +1671,16 @@ where
                 .await;
         }
 
+        let generated_media_refs = generated_media_reply_refs(&run.trace);
         let generated_attachments = self.generated_attachments(&run.trace).await;
 
         match &run.outcome {
             AgentOutcome::Completed { answer } => {
-                let text = if answer.text.trim().is_empty() {
+                let text = strip_generated_media_refs(&answer.text, &generated_media_refs);
+                let text = if text.trim().is_empty() {
                     "Done.".to_string()
                 } else {
-                    answer.text.clone()
+                    text
                 };
                 let content = self.format_reply(&text, execution.is_new, execution.conversation.id);
                 let rendered_lines = rendered_line_count(&content);
@@ -3185,12 +3202,24 @@ where
                 .quoted_assistant_message_already_replays(referenced, conversation)
                 .await?
         {
-            self.push_message_context(&mut items, &mut position, "quoted", referenced, true)
-                .await;
+            self.push_message_context(
+                &mut items,
+                &mut position,
+                "quoted",
+                referenced,
+                PlatformMessageRelationship::Referenced,
+            )
+            .await?;
         }
 
-        self.push_message_context(&mut items, &mut position, "message", message, false)
-            .await;
+        self.push_message_context(
+            &mut items,
+            &mut position,
+            "message",
+            message,
+            PlatformMessageRelationship::Current,
+        )
+        .await?;
 
         Ok(PreparedTurnContext { items })
     }
@@ -3201,13 +3230,19 @@ where
         position: &mut i32,
         kind: &str,
         message: &PlatformMessage,
-        quoted: bool,
-    ) {
+        relationship: PlatformMessageRelationship,
+    ) -> Result<(), BotError> {
+        let value = self
+            .platforms
+            .message_context(message, relationship)
+            .await
+            .map_err(platform_error)?;
+        let content = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
         items.push(chudbot_api::ContextItem {
             position: *position,
             source: format!("platform:{kind}:{}", message.id.message_id.as_str()),
             role: "user".to_string(),
-            content: platform_message_context_json(message, quoted),
+            content,
             message: Some(message.id.clone()),
         });
         *position += 1;
@@ -3245,6 +3280,7 @@ where
             });
             *position += 1;
         }
+        Ok(())
     }
 
     async fn quoted_message_allowed(
@@ -3544,7 +3580,9 @@ where
         if !agent.subagents.is_empty() {
             out.push_str("- Specialist subagents are available as tools.\n");
         }
-        out.push_str("- Slow work can be narrated with post_status_message.\n\n");
+        out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, file:// URIs, filenames, or markdown media links in user-facing text.\n");
+        out.push_str("- Slow work (video generation, subagent calls, research) SHOULD be narrated with calls to the post_status_message tool.\n");
+        out.push_str("Agent Persona Prompt:\n");
         out.push_str(agent.system_prompt.trim());
         out
     }
@@ -3973,12 +4011,19 @@ where
                         .await
                         .map_err(|error| BotToolError::Storage(error.to_string()))?;
                     let public_url = media.public_url().await.ok();
-                    let result = media_tool_result_json(
+                    let trace_response = media_tool_trace_json(
                         media.as_ref(),
                         public_url.as_ref().map(|url| url.as_str()),
                         serde_json::json!({
                             "provider_job_id": job_id.as_str(),
                             "download_url": meta.url,
+                            "duration_seconds": meta.duration_seconds,
+                        }),
+                    );
+                    let result = media_tool_model_result_json(
+                        media.as_ref(),
+                        serde_json::json!({
+                            "provider_job_id": job_id.as_str(),
                             "duration_seconds": meta.duration_seconds,
                         }),
                     );
@@ -3988,7 +4033,7 @@ where
                             value: result.clone(),
                         },
                         is_error: false,
-                        trace_response: result,
+                        trace_response,
                         usage: meta.usage,
                     });
                 }
@@ -4143,8 +4188,16 @@ where
             limit,
             "fetched platform messages"
         );
-        let value = serde_json::to_value(messages)
-            .map_err(|error| BotToolError::Serialize(error.to_string()))?;
+        let mut rendered = Vec::with_capacity(messages.len());
+        for message in &messages {
+            rendered.push(
+                self.platforms
+                    .message_context(message, PlatformMessageRelationship::Fetched)
+                    .await
+                    .map_err(|error| BotToolError::Platform(error.to_string()))?,
+            );
+        }
+        let value = serde_json::Value::Array(rendered);
         Ok(ClientToolOutput {
             result: ClientToolResultContent::Json {
                 value: value.clone(),
@@ -4312,8 +4365,6 @@ enum BotToolError {
     Generator(String),
     #[error("media error: {0}")]
     Media(String),
-    #[error("serialize error: {0}")]
-    Serialize(String),
 }
 
 async fn video_request_from_tool_input<M>(
@@ -4413,7 +4464,7 @@ fn tool_optional_u8_bounded(
     Ok(value)
 }
 
-fn media_tool_result_json(
+fn media_tool_trace_json(
     media: &dyn chudbot_api::MediaRef,
     public_url: Option<&str>,
     extra: serde_json::Value,
@@ -4425,6 +4476,22 @@ fn media_tool_result_json(
         "mime_type": media.mime_type(),
         "size_bytes": media.size_bytes(),
         "public_url": public_url,
+        "extra": extra,
+    })
+}
+
+fn media_tool_model_result_json(
+    media: &dyn chudbot_api::MediaRef,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "uri": media.uri().as_str(),
+        "category": media.category(),
+        "mime_type": media.mime_type(),
+        "size_bytes": media.size_bytes(),
+        "delivery": {
+            "platform_reply": "The generated media will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown image/video links in user-facing text."
+        },
         "extra": extra,
     })
 }
@@ -4495,6 +4562,102 @@ fn media_uris_from_tool_traces(trace: &[ToolTrace]) -> Vec<MediaUri> {
         out.push(MediaUri::new(uri));
     }
     out
+}
+
+fn generated_media_reply_refs(trace: &[ToolTrace]) -> Vec<String> {
+    let mut out = Vec::new();
+    for trace in trace {
+        let ToolTrace::Client { trace } = trace else {
+            continue;
+        };
+        if trace.result.is_error {
+            continue;
+        }
+        collect_generated_media_reply_refs(&trace.trace_response, &mut out);
+        if let ClientToolResultContent::Json { value } = &trace.result.content {
+            collect_generated_media_reply_refs(value, &mut out);
+        }
+    }
+    out
+}
+
+fn collect_generated_media_reply_refs(value: &serde_json::Value, out: &mut Vec<String>) {
+    for key in ["public_url", "uri", "image_uri", "video_uri"] {
+        let Some(reference) = value.get(key).and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        if reference.is_empty() || out.iter().any(|seen| seen == reference) {
+            continue;
+        }
+        out.push(reference.to_string());
+    }
+}
+
+fn strip_generated_media_refs(text: &str, refs: &[String]) -> String {
+    if refs.is_empty() {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+    for reference in refs {
+        if reference.is_empty() {
+            continue;
+        }
+        while let Some(index) = out.find(reference) {
+            let (start, end) = markdown_link_bounds(&out, index, reference.len())
+                .unwrap_or((index, index + reference.len()));
+            out.replace_range(start..end, "");
+        }
+    }
+    normalize_stripped_reply(&out)
+}
+
+fn markdown_link_bounds(
+    text: &str,
+    reference_start: usize,
+    reference_len: usize,
+) -> Option<(usize, usize)> {
+    let open_paren = reference_start.checked_sub(1)?;
+    if text.as_bytes().get(open_paren) != Some(&b'(') {
+        return None;
+    }
+    let close_paren = reference_start.checked_add(reference_len)?;
+    if text.as_bytes().get(close_paren) != Some(&b')') {
+        return None;
+    }
+    let before_open = &text[..open_paren];
+    if !before_open.ends_with(']') {
+        return None;
+    }
+    let close_bracket = before_open.len().checked_sub(1)?;
+    let open_bracket = before_open[..close_bracket].rfind('[')?;
+    let start = if open_bracket > 0 && text.as_bytes().get(open_bracket - 1) == Some(&b'!') {
+        open_bracket - 1
+    } else {
+        open_bracket
+    };
+    Some((start, close_paren + 1))
+}
+
+fn normalize_stripped_reply(text: &str) -> String {
+    let mut lines = Vec::new();
+    let mut previous_blank = true;
+    for line in text.lines() {
+        let line = line.trim_end();
+        let blank = line.trim().is_empty();
+        if blank {
+            if !previous_blank {
+                lines.push(String::new());
+            }
+        } else {
+            lines.push(line.to_string());
+        }
+        previous_blank = blank;
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
 }
 
 fn platform_error(error: impl std::fmt::Display) -> BotError {
@@ -4603,58 +4766,6 @@ fn channel_from_message(message: &MessageRef) -> ChannelRef {
         guild_id: message.guild_id.clone(),
         channel_id: message.channel_id.clone(),
     }
-}
-
-fn platform_message_context_json(message: &PlatformMessage, quoted: bool) -> String {
-    let value = serde_json::json!({
-        "type": "platform_message",
-        "relationship": if quoted { "referenced" } else { "current" },
-        "platform": message.id.platform.as_str(),
-        "guild": platform_entity_json(
-            message.id.guild_id.as_ref(),
-            message.guild_name.as_deref(),
-        ),
-        "channel": {
-            "id": message.id.channel_id.as_str(),
-            "name": message.channel_name.as_deref(),
-        },
-        "message": {
-            "id": message.id.message_id.as_str(),
-            "created_at": message.created_at.to_string(),
-        },
-        "author": {
-            "id": message.author.id.user_id.as_str(),
-            "username": message.author.username.as_str(),
-            "name": message.author.name.as_deref(),
-            "guild_display_name": message.author.display_name.as_deref(),
-            "is_bot": message.author.is_bot,
-        },
-        "content": message.content.as_str(),
-        "attachments": message.attachments.iter().map(|attachment| {
-            serde_json::json!({
-                "id": attachment.id.as_ref().map(ExternalId::as_str),
-                "filename": attachment.filename.as_str(),
-                "content_type": attachment.content_type.as_deref(),
-                "size_bytes": attachment.size_bytes,
-            })
-        }).collect::<Vec<_>>(),
-    });
-    serde_json::to_string_pretty(&value).unwrap_or_else(|_| {
-        format!(
-            "{{\"type\":\"platform_message\",\"content\":{}}}",
-            serde_json::to_string(&message.content).unwrap_or_else(|_| "\"\"".to_string())
-        )
-    })
-}
-
-fn platform_entity_json(id: Option<&ExternalId>, name: Option<&str>) -> serde_json::Value {
-    id.map(|id| {
-        serde_json::json!({
-            "id": id.as_str(),
-            "name": name,
-        })
-    })
-    .unwrap_or(serde_json::Value::Null)
 }
 
 fn display_name(message: &PlatformMessage) -> String {
@@ -5337,6 +5448,46 @@ mod tests {
         }
     }
 
+    fn generated_image_trace(uri: &str, public_url: &str) -> ToolTrace {
+        let tool_use_id = chudbot_api::ToolUseId::new("call-1");
+        ToolTrace::Client {
+            trace: chudbot_api::ClientToolTrace {
+                call: ClientToolCall {
+                    id: tool_use_id.clone(),
+                    name: ToolName::new("generate_image"),
+                    input: json!({ "prompt": "a worm" }),
+                },
+                result: chudbot_api::ClientToolResult {
+                    tool_use_id,
+                    content: ClientToolResultContent::Json {
+                        value: json!({
+                            "uri": uri,
+                            "category": "image",
+                            "name": "generated.jpg",
+                            "mime_type": "image/jpeg",
+                            "size_bytes": 42,
+                            "delivery": {
+                                "platform_reply": "attached automatically"
+                            },
+                            "extra": {}
+                        }),
+                    },
+                    is_error: false,
+                },
+                trace_response: json!({
+                    "uri": uri,
+                    "category": "image",
+                    "name": "generated.jpg",
+                    "mime_type": "image/jpeg",
+                    "size_bytes": 42,
+                    "public_url": public_url,
+                    "extra": {}
+                }),
+                usage: Vec::new(),
+            },
+        }
+    }
+
     #[test]
     fn platform_user_match_ignores_guild_scope() {
         let global_bot = user("discord", None, "123456789012345678");
@@ -5426,6 +5577,41 @@ mod tests {
             "already <@123456789012345678>"
         );
         assert_eq!(fix_bare_mentions("short @123"), "short @123");
+    }
+
+    #[test]
+    fn strips_generated_media_markdown_from_reply_text() {
+        let trace = generated_image_trace(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        );
+        let refs = generated_media_reply_refs(&[trace]);
+
+        let reply = strip_generated_media_refs(
+            "Worm generated.\n\n![image](https://chud.example/images/generated.jpg)\n\nfile://images/generated.jpg",
+            &refs,
+        );
+
+        assert_eq!(reply, "Worm generated.");
+    }
+
+    #[test]
+    fn generated_media_strip_preserves_unrelated_links() {
+        let trace = generated_image_trace(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        );
+        let refs = generated_media_reply_refs(&[trace]);
+
+        let reply = strip_generated_media_refs(
+            "Done.\n\n-# [full trace](https://chud.example/c/abc)",
+            &refs,
+        );
+
+        assert_eq!(
+            reply,
+            "Done.\n\n-# [full trace](https://chud.example/c/abc)"
+        );
     }
 
     #[test]

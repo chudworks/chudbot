@@ -13,8 +13,8 @@ use chudbot_api::{
     OutgoingAttachment, PlatformCommand, PlatformCommandDefinition, PlatformCommandInput,
     PlatformCommandOption, PlatformCommandOptionKind, PlatformCommandResponse,
     PlatformCommandResponseTarget, PlatformCommandValue, PlatformEvent, PlatformMessage,
-    PlatformMessageReference, PlatformName, PlatformReaction, PlatformReady, PostedMessage,
-    ReactionKind, SendMessage, UserProfile, UserRef,
+    PlatformMessageReference, PlatformMessageRelationship, PlatformName, PlatformReaction,
+    PlatformReady, PostedMessage, ReactionKind, SendMessage, UserProfile, UserRef,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -308,8 +308,7 @@ impl DiscordPlatform {
     }
 
     async fn platform_message(&self, message: Message) -> PlatformMessage {
-        let cache = self.inner.name_cache.lock().await.clone();
-        platform_message_with_cache(&self.inner.platform, message, None, &cache)
+        platform_message_with_guild(&self.inner.platform, message, None)
     }
 
     async fn update_name_cache(&self, event: &GuildCreate) {
@@ -652,12 +651,20 @@ impl MessagePlatform for DiscordPlatform {
         let mut messages = response.models().await?;
         messages.reverse();
 
-        let cache = self.inner.name_cache.lock().await.clone();
         Ok(messages
             .into_iter()
             .filter(|message| message.author.id != self.inner.bot_user_id)
-            .map(|message| platform_message_with_cache(&self.inner.platform, message, None, &cache))
+            .map(|message| platform_message_with_guild(&self.inner.platform, message, None))
             .collect())
+    }
+
+    async fn message_context(
+        &self,
+        message: &PlatformMessage,
+        relationship: PlatformMessageRelationship,
+    ) -> Result<serde_json::Value, Self::Error> {
+        let cache = self.inner.name_cache.lock().await.clone();
+        Ok(discord_message_context_json(message, relationship, &cache))
     }
 
     async fn parent_channel(&self, channel: ChannelRef) -> Result<ChannelRef, Self::Error> {
@@ -707,11 +714,10 @@ pub enum DiscordError {
     },
 }
 
-fn platform_message_with_cache(
+fn platform_message_with_guild(
     platform: &PlatformName,
     message: Message,
     fallback_guild_id: Option<ExternalId>,
-    cache: &DiscordNameCache,
 ) -> PlatformMessage {
     let guild_id = message.guild_id.map(external_id).or(fallback_guild_id);
     let reference_guild_id = message
@@ -720,11 +726,10 @@ fn platform_message_with_cache(
         .and_then(|reference| reference.guild_id.map(external_id))
         .or_else(|| guild_id.clone());
     let reference = match message.referenced_message {
-        Some(message) => PlatformMessageReference::Hydrated(Box::new(platform_message_with_cache(
+        Some(message) => PlatformMessageReference::Hydrated(Box::new(platform_message_with_guild(
             platform,
             *message,
             reference_guild_id,
-            cache,
         ))),
         None => message
             .reference
@@ -735,10 +740,6 @@ fn platform_message_with_cache(
     };
     PlatformMessage {
         id: message_ref_from_ids(platform, guild_id.clone(), message.channel_id, message.id),
-        guild_name: guild_id
-            .as_ref()
-            .and_then(|guild| cache.guilds.get(guild.as_str()).cloned()),
-        channel_name: cache.channels.get(&message.channel_id.to_string()).cloned(),
         author: user_profile(
             platform,
             guild_id.clone(),
@@ -764,6 +765,70 @@ fn platform_message_with_cache(
         attachments: message.attachments.iter().map(attachment_ref).collect(),
         created_at: timestamp_to_offset(message.timestamp),
     }
+}
+
+fn discord_message_context_json(
+    message: &PlatformMessage,
+    relationship: PlatformMessageRelationship,
+    cache: &DiscordNameCache,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "discord_message",
+        "relationship": discord_message_relationship(relationship),
+        "platform": message.id.platform.as_str(),
+        "guild": discord_entity_json(
+            message.id.guild_id.as_ref(),
+            message.id
+                .guild_id
+                .as_ref()
+                .and_then(|guild| cache.guilds.get(guild.as_str()).map(String::as_str)),
+        ),
+        "channel": {
+            "id": message.id.channel_id.as_str(),
+            "name": cache
+                .channels
+                .get(message.id.channel_id.as_str())
+                .map(String::as_str),
+        },
+        "message": {
+            "id": message.id.message_id.as_str(),
+            "created_at": message.created_at.to_string(),
+        },
+        "author": {
+            "id": message.author.id.user_id.as_str(),
+            "username": message.author.username.as_str(),
+            "global_name": message.author.name.as_deref(),
+            "guild_display_name": message.author.display_name.as_deref(),
+            "is_bot": message.author.is_bot,
+        },
+        "content": message.content.as_str(),
+        "attachments": message.attachments.iter().map(|attachment| {
+            serde_json::json!({
+                "id": attachment.id.as_ref().map(ExternalId::as_str),
+                "filename": attachment.filename.as_str(),
+                "content_type": attachment.content_type.as_deref(),
+                "size_bytes": attachment.size_bytes,
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn discord_message_relationship(relationship: PlatformMessageRelationship) -> &'static str {
+    match relationship {
+        PlatformMessageRelationship::Current => "current",
+        PlatformMessageRelationship::Referenced => "referenced",
+        PlatformMessageRelationship::Fetched => "fetched",
+    }
+}
+
+fn discord_entity_json(id: Option<&ExternalId>, name: Option<&str>) -> serde_json::Value {
+    id.map(|id| {
+        serde_json::json!({
+            "id": id.as_str(),
+            "name": name,
+        })
+    })
+    .unwrap_or(serde_json::Value::Null)
 }
 
 fn platform_reaction(platform: &PlatformName, reaction: GatewayReaction) -> PlatformReaction {
@@ -1456,16 +1521,20 @@ fn log_guild_create(event: &GuildCreate) {
 mod tests {
     use std::time::Duration;
 
-    use chudbot_api::{ExternalId, PlatformName, ReactionKind};
+    use chudbot_api::{
+        AttachmentRef, ExternalId, MessageRef, PlatformMessage, PlatformMessageReference,
+        PlatformMessageRelationship, PlatformName, ReactionKind, UserProfile, UserRef,
+    };
+    use time::OffsetDateTime;
     use twilight_model::channel::message::{
         EmojiReactionType, MessageReference, MessageReferenceType,
     };
     use twilight_model::id::Id;
 
     use super::{
-        DISCORD_MESSAGE_LIMIT, DiscordError, GATEWAY_RECONNECT_MAX_DELAY,
-        message_ref_from_reference, next_reconnect_delay, parse_channel_id, reaction_kind,
-        split_discord_content,
+        DISCORD_MESSAGE_LIMIT, DiscordError, DiscordNameCache, GATEWAY_RECONNECT_MAX_DELAY,
+        discord_message_context_json, message_ref_from_reference, next_reconnect_delay,
+        parse_channel_id, reaction_kind, split_discord_content,
     };
 
     #[test]
@@ -1597,6 +1666,69 @@ mod tests {
         );
         assert_eq!(message.channel_id.as_str(), "111");
         assert_eq!(message.message_id.as_str(), "333");
+    }
+
+    #[test]
+    fn discord_message_context_uses_discord_vocabulary_and_cached_names() {
+        let platform = PlatformName::new("discord");
+        let guild = ExternalId::new("222");
+        let channel = ExternalId::new("111");
+        let mut cache = DiscordNameCache::default();
+        cache
+            .guilds
+            .insert(guild.as_str().to_string(), "Test Guild".to_string());
+        cache
+            .channels
+            .insert(channel.as_str().to_string(), "general".to_string());
+        let message = PlatformMessage {
+            id: MessageRef {
+                platform: platform.clone(),
+                guild_id: Some(guild.clone()),
+                channel_id: channel,
+                message_id: ExternalId::new("333"),
+            },
+            author: UserProfile {
+                id: UserRef {
+                    platform,
+                    guild_id: Some(guild),
+                    user_id: ExternalId::new("444"),
+                },
+                username: "robert".to_string(),
+                name: Some("Robert".to_string()),
+                display_name: Some("Robert Guild".to_string()),
+                avatar_url: None,
+                is_bot: false,
+            },
+            content: "hello".to_string(),
+            mentions: Vec::new(),
+            mention_profiles: Vec::new(),
+            reference: PlatformMessageReference::None,
+            attachments: vec![AttachmentRef {
+                id: Some(ExternalId::new("555")),
+                url: "https://cdn.example/img.png".to_string(),
+                filename: "img.png".to_string(),
+                content_type: Some("image/png".to_string()),
+                size_bytes: Some(123),
+            }],
+            created_at: OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let value =
+            discord_message_context_json(&message, PlatformMessageRelationship::Referenced, &cache);
+
+        assert_eq!(value["type"].as_str(), Some("discord_message"));
+        assert_eq!(value["relationship"].as_str(), Some("referenced"));
+        assert_eq!(value["guild"]["name"].as_str(), Some("Test Guild"));
+        assert_eq!(value["channel"]["name"].as_str(), Some("general"));
+        assert_eq!(
+            value["author"]["guild_display_name"].as_str(),
+            Some("Robert Guild")
+        );
+        assert_eq!(
+            value["attachments"][0]["filename"].as_str(),
+            Some("img.png")
+        );
+        assert!(value["attachments"][0].get("url").is_none());
     }
 
     #[test]

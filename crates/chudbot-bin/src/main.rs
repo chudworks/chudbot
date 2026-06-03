@@ -10,8 +10,8 @@ use chudbot_api::{
     BotStorage, ChannelRef, EventSink, ExternalId, FetchMessages, GeneratedImage, ImageGenerator,
     ImageRequest, LlmBackend, MediaStore, MessagePlatform, MessageRef, ModelStep, ModelStepRequest,
     PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
-    PostedMessage, PrivacyMode, ProviderName, ReactionKind, SendMessage, UserProfile,
-    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    PlatformMessageRelationship, PostedMessage, PrivacyMode, ProviderName, ReactionKind,
+    SendMessage, UserProfile, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
 use chudbot_bot::{
@@ -1431,6 +1431,17 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
     ) -> Result<Vec<PlatformMessage>, Self::Error> {
         let platform = self.discord(&request.channel.platform)?;
         MessagePlatform::fetch_messages(&platform.platform, request)
+            .await
+            .map_err(ConfiguredPlatformError::Discord)
+    }
+
+    async fn message_context(
+        &self,
+        message: &PlatformMessage,
+        relationship: PlatformMessageRelationship,
+    ) -> Result<serde_json::Value, Self::Error> {
+        let platform = self.discord(&message.id.platform)?;
+        MessagePlatform::message_context(&platform.platform, message, relationship)
             .await
             .map_err(ConfiguredPlatformError::Discord)
     }

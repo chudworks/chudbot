@@ -113,9 +113,16 @@ where
             }
         };
         let public_url = media.public_url().await.ok();
-        let result = media_result_json(
+        let trace_response = media_result_json(
             media.as_ref(),
             public_url.as_ref(),
+            serde_json::json!({
+                "model": model.as_str(),
+                "revised_prompt": revised_prompt,
+            }),
+        );
+        let result = model_media_result_json(
+            media.as_ref(),
             serde_json::json!({
                 "model": model.as_str(),
                 "revised_prompt": revised_prompt,
@@ -134,7 +141,7 @@ where
                 value: result.clone(),
             },
             is_error: false,
-            trace_response: result,
+            trace_response,
             usage,
         })
     }
@@ -301,12 +308,19 @@ where
                         }
                     };
                     let public_url = media.public_url().await.ok();
-                    let result = media_result_json(
+                    let trace_response = media_result_json(
                         media.as_ref(),
                         public_url.as_ref(),
                         serde_json::json!({
                             "provider_job_id": job_id.as_str(),
                             "download_url": meta.url,
+                            "duration_seconds": meta.duration_seconds,
+                        }),
+                    );
+                    let result = model_media_result_json(
+                        media.as_ref(),
+                        serde_json::json!({
+                            "provider_job_id": job_id.as_str(),
                             "duration_seconds": meta.duration_seconds,
                         }),
                     );
@@ -324,7 +338,7 @@ where
                             value: result.clone(),
                         },
                         is_error: false,
-                        trace_response: result,
+                        trace_response,
                         usage: meta.usage,
                     });
                 }
@@ -598,6 +612,19 @@ fn media_result_json(
     })
 }
 
+fn model_media_result_json(media: &dyn MediaRef, extra: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "uri": media.uri().as_str(),
+        "category": media.category(),
+        "mime_type": media.mime_type(),
+        "size_bytes": media.size_bytes(),
+        "delivery": {
+            "platform_reply": "The generated media will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown image/video links in user-facing text."
+        },
+        "extra": extra,
+    })
+}
+
 fn image_tool_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",
@@ -865,7 +892,17 @@ mod tests {
         };
         assert_eq!(value["uri"], "memory://images/generated.images");
         assert_eq!(value["mime_type"], "image/png");
-        assert_eq!(value["public_url"], "https://media.example/generated");
+        assert!(value.get("public_url").is_none());
+        assert!(
+            value["delivery"]["platform_reply"]
+                .as_str()
+                .unwrap()
+                .contains("attached")
+        );
+        assert_eq!(
+            output.trace_response["public_url"],
+            "https://media.example/generated"
+        );
         assert_eq!(output.usage.len(), 1);
     }
 

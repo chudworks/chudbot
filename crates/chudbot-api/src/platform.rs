@@ -18,8 +18,6 @@ pub struct UserProfile {
     #[serde(default)]
     pub name: Option<String>,
     /// Display name at the event boundary.
-    ///
-    /// On Discord this is the guild display name/nickname when available.
     pub display_name: Option<String>,
     /// Optional avatar URL.
     pub avatar_url: Option<String>,
@@ -47,12 +45,6 @@ pub struct AttachmentRef {
 pub struct PlatformMessage {
     /// Message id.
     pub id: MessageRef,
-    /// Platform guild/workspace/server name when known.
-    #[serde(default)]
-    pub guild_name: Option<String>,
-    /// Platform channel name when known.
-    #[serde(default)]
-    pub channel_name: Option<String>,
     /// Author.
     pub author: UserProfile,
     /// Raw content.
@@ -96,6 +88,18 @@ pub enum PlatformMessageReference {
     Id(MessageRef),
     /// The platform supplied the full referenced message payload.
     Hydrated(Box<PlatformMessage>),
+}
+
+/// Relationship between a platform message and the current model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMessageRelationship {
+    /// The user message that directly started the current turn.
+    Current,
+    /// A platform message explicitly referenced/quoted by the current turn.
+    Referenced,
+    /// A platform message fetched as recent channel context.
+    Fetched,
 }
 
 impl PlatformMessageReference {
@@ -443,6 +447,16 @@ pub trait MessagePlatform: Send + Sync {
         &self,
         request: FetchMessages,
     ) -> impl Future<Output = Result<Vec<PlatformMessage>, Self::Error>> + Send;
+
+    /// Render a platform message into the JSON value shown to the model.
+    ///
+    /// Platform implementations own the vocabulary here, such as whether a
+    /// workspace is called a server, guild, team, room, or channel.
+    fn message_context(
+        &self,
+        message: &PlatformMessage,
+        relationship: PlatformMessageRelationship,
+    ) -> impl Future<Output = Result<serde_json::Value, Self::Error>> + Send;
 
     /// Resolve a platform channel's parent, if any. Non-thread channels can
     /// return themselves.
