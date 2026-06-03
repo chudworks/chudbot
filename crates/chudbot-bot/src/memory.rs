@@ -250,7 +250,7 @@ pub fn parse_duration_seconds(value: &str) -> Result<u64, MemoryConfigError> {
 /// Prompt guidance inserted into top-level memory-enabled agents.
 pub fn prompt_guidance() -> &'static str {
     "CRITICAL: Memory System\n\
-- CRITICAL: If a user is mentioned or is the `author` of a message, you MUST load memory about that user. Use the `lookup_user_memory` any time you see a user for the first time.\n\
+- CRITICAL: If a user is the `author` of a message, you MUST load memory about that user. Do not respond to a user if you do not load their memory document first. Use the `lookup_user_memory` any time you see a user for the first time.\n\
 - CRITICAL: If a user's memory has not been loaded, then any **mention** of a user should trigger a `lookup_user_memory` call, even if they are not the author.\n\
 - The `lookup_user_memory` tool gives you a memory document about a user, and recent events. These recent events can be `remember` or `forget`.\n\
 - Use the `remember_user_memory` tool to store facts about a user. If there's something you think would be useful in the future, you should use this tool to remember it.\n\
@@ -259,7 +259,8 @@ pub fn prompt_guidance() -> &'static str {
 - If a user tells you a fact about another user, you are allowed to remember / forget it. Take memories from 3rd parties with a \"grain of salt\".\n\
 - If the current message conflicts with stored memory, trust the current message and remember the correction when appropriate.\n\
 - Avoid repeating or storing any memory which reveals sensitive personal information (credit card, physical address, legal name, SSN, etc)\n\n\n\
-IT IS CRITICAL TO USE THE MEMORY SYSTEM PROACTIVELY! The tool calls are cheap, use the tools!\n"
+IT IS CRITICAL TO USE THE MEMORY SYSTEM PROACTIVELY! The tool calls are cheap, use the tools!\n\
+VERY IMPORTANT: If a user is the `author` of a message, you MUST load memory about that user. Do not respond to a user if you do not load their memory document first. Use the `lookup_user_memory` any time you see a user for the first time.\n"
 }
 
 /// Build the neutral memory key for a platform user.
