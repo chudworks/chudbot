@@ -30,7 +30,7 @@ pub const REMEMBER_USER_MEMORY_TOOL: &str = "remember_user_memory";
 pub const FORGET_USER_MEMORY_TOOL: &str = "forget_user_memory";
 
 const MEMORY_MODEL_ID: &str = "grok-4.3";
-const MEMORY_REASONING_EFFORT: &str = "medium";
+const MEMORY_REASONING_EFFORT: &str = "high";
 const MEMORY_DIARY_AGENT: &str = "memory_diary";
 
 const DIARY_PROMPT: &str = "You write concise user-memory diary entries for Chudbot. \
