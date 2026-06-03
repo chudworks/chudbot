@@ -250,7 +250,8 @@ pub fn parse_duration_seconds(value: &str) -> Result<u64, MemoryConfigError> {
 /// Prompt guidance inserted into top-level memory-enabled agents.
 pub fn prompt_guidance() -> &'static str {
     "CRITICAL: Memory System\n\
-- If a user is mentioned or is the `author` of a message, you MUST load memory about that user. Use the `lookup_user_memory` any time you see a user for the first time.\n\
+- CRITICAL: If a user is mentioned or is the `author` of a message, you MUST load memory about that user. Use the `lookup_user_memory` any time you see a user for the first time.\n\
+- CRITICAL: If a user's memory has not been loaded, then any **mention** of a user should trigger a `lookup_user_memory` call, even if they are not the author.\n\
 - The `lookup_user_memory` tool gives you a memory document about a user, and recent events. These recent events can be `remember` or `forget`.\n\
 - Use the `remember_user_memory` tool to store facts about a user. If there's something you think would be useful in the future, you should use this tool to remember it.\n\
 - There is a `forget_user_memory` which works like `remember_user_memory`, but instead stores a fact to forget about a user.\n\
