@@ -62,11 +62,7 @@ impl LlmBackend for XaiClient {
         );
         log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
 
-        let output = Value::Array(parsed.output.clone());
-        let continuation = (!parsed.output.is_empty()).then_some(ProviderContinuation {
-            provider: self.provider_name().clone(),
-            data: output,
-        });
+        let continuation = continuation_from_output(self.provider_name(), &parsed.output);
 
         let (text, client_tool_calls, server_tool_uses) =
             walk_output(&parsed.output, self.provider_name());
@@ -133,8 +129,14 @@ async fn to_responses_input(
                 && &continuation.provider == provider
             {
                 match &continuation.data {
-                    Value::Array(items) => echo.extend(items.iter().cloned()),
-                    other => echo.push(other.clone()),
+                    Value::Array(items) => {
+                        echo.extend(replayable_continuation_items(items.iter().cloned()))
+                    }
+                    other => {
+                        if let Some(item) = replayable_continuation_item(other.clone()) {
+                            echo.push(item);
+                        }
+                    }
                 }
             }
         }
@@ -202,6 +204,54 @@ async fn to_responses_input(
         input.extend(deferred);
     }
     Ok(input)
+}
+
+fn continuation_from_output(
+    provider: &ProviderName,
+    output: &[Value],
+) -> Option<ProviderContinuation> {
+    let items = replayable_continuation_items(output.iter().cloned());
+    (!items.is_empty()).then_some(ProviderContinuation {
+        provider: provider.clone(),
+        data: Value::Array(items),
+    })
+}
+
+fn replayable_continuation_items(items: impl IntoIterator<Item = Value>) -> Vec<Value> {
+    items
+        .into_iter()
+        .filter_map(replayable_continuation_item)
+        .collect()
+}
+
+fn replayable_continuation_item(item: Value) -> Option<Value> {
+    let Some(encrypted_content) = item.get("encrypted_content") else {
+        return Some(item);
+    };
+    let valid = encrypted_content
+        .as_str()
+        .is_some_and(is_replayable_encrypted_content);
+    if valid {
+        return Some(item);
+    }
+
+    tracing::warn!(
+        item_id = item
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or("<missing>"),
+        encrypted_chars = encrypted_content.as_str().map(|text| text.chars().count()),
+        "skipping malformed xAI encrypted reasoning continuation"
+    );
+    None
+}
+
+fn is_replayable_encrypted_content(text: &str) -> bool {
+    !text.is_empty()
+        && text.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
+        })
 }
 
 fn system_message_id(transcript_id: &str) -> String {
@@ -494,6 +544,97 @@ mod tests {
         assert_eq!(input[2]["call_id"], "call_1");
         assert_eq!(input[3]["type"], "web_search_call");
         assert_eq!(input[3]["id"], "ws_1");
+    }
+
+    #[test]
+    fn skips_malformed_encrypted_content_when_replaying_full_output() {
+        let provider = ProviderName::new("xai");
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::Assistant,
+            blocks: vec![
+                ContentBlock::Continuation(ProviderContinuation {
+                    provider: provider.clone(),
+                    data: json!([
+                        { "type": "reasoning", "id": "rs_good", "encrypted_content": "BLOB_1+/=" },
+                        { "type": "web_search_call", "id": "ws_1", "status": "completed" },
+                        { "type": "reasoning", "id": "rs_bad", "encrypted_content": "bad,blob" },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "id": "msg_1",
+                            "content": [{ "type": "output_text", "text": "the answer" }],
+                        },
+                    ]),
+                }),
+                ContentBlock::Text {
+                    text: "the answer".to_string(),
+                },
+            ],
+            metadata: Value::Null,
+        });
+
+        let input =
+            futures::executor::block_on(to_responses_input(&transcript, &provider)).unwrap();
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["id"], "rs_good");
+        assert_eq!(input[1]["id"], "ws_1");
+        assert_eq!(input[2]["id"], "msg_1");
+        assert!(
+            input
+                .iter()
+                .all(|item| item.get("id").and_then(Value::as_str) != Some("rs_bad"))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_text_when_continuation_items_are_malformed() {
+        let provider = ProviderName::new("xai");
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::Assistant,
+            blocks: vec![
+                ContentBlock::Continuation(ProviderContinuation {
+                    provider: provider.clone(),
+                    data: json!([
+                        { "type": "reasoning", "id": "rs_bad", "encrypted_content": "bad,blob" },
+                    ]),
+                }),
+                ContentBlock::Text {
+                    text: "the answer".to_string(),
+                },
+            ],
+            metadata: json!({ "id": "synthetic_assistant_id" }),
+        });
+
+        let input =
+            futures::executor::block_on(to_responses_input(&transcript, &provider)).unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["id"], "synthetic_assistant_id");
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["content"], "the answer");
+    }
+
+    #[test]
+    fn sanitizes_new_continuations_before_persisting() {
+        let provider = ProviderName::new("xai");
+        let output = vec![
+            json!({ "type": "reasoning", "id": "rs_bad", "encrypted_content": "bad,blob" }),
+            json!({
+                "type": "message",
+                "role": "assistant",
+                "id": "msg_1",
+                "content": [{ "type": "output_text", "text": "the answer" }],
+            }),
+        ];
+
+        let continuation = continuation_from_output(&provider, &output).unwrap();
+        let items = continuation.data.as_array().unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "msg_1");
     }
 
     #[test]

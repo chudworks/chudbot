@@ -140,17 +140,27 @@ export interface GroundingMetadata {
   raw: unknown;
 }
 
-export interface UsageRecord {
+export interface UsageSubject {
   kind: string;
+  name?: string | null;
+}
+
+export interface CostAmount {
+  amount: string;
+  unit: string;
+  estimated: boolean;
+}
+
+export interface UsageRecord {
   provider: string;
   model?: string | null;
-  subject?: string | null;
+  subject: UsageSubject;
   input_tokens?: number | null;
   output_tokens?: number | null;
   total_tokens?: number | null;
   reasoning_tokens?: number | null;
   cached_input_tokens?: number | null;
-  cost?: unknown;
+  cost?: CostAmount | null;
   raw?: unknown;
 }
 

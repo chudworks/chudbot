@@ -4,6 +4,7 @@ import { useConversation } from '../store';
 import { usePageTitle } from '../title';
 import Turn from './Turn';
 import RelativeTime from './RelativeTime';
+import UsageSummary from './UsageSummary';
 
 export default function ConversationView() {
   const { id } = useParams<{ id: string }>();
@@ -116,6 +117,7 @@ export default function ConversationView() {
             {' '}It won’t reply until the 🛑 reaction is removed.
           </p>
         )}
+        <UsageSummary turns={turns} />
       </header>
       <main className="conv">
         {turns.map((tv) => (
