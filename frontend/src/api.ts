@@ -1,4 +1,4 @@
-import type { ConversationView } from './types';
+import type { ConversationSnapshot, SiteConfig } from './types';
 
 export class ApiError extends Error {
   status: number;
@@ -6,16 +6,6 @@ export class ApiError extends Error {
     super(message);
     this.status = status;
   }
-}
-
-/** Front-end config served from `/api/config`. */
-export interface SiteConfig {
-  /** Prefix prepended to every browser-tab title. */
-  title_prefix: string;
-  /** Ordered "vN" build number of the running server. */
-  version_number: number;
-  /** Full `git describe` string of the running server. */
-  git_version: string;
 }
 
 /** Fetch the static site config. Soft-fails to a sensible default so a
@@ -29,7 +19,7 @@ export async function fetchSiteConfig(): Promise<SiteConfig> {
 }
 
 /** Fetch a conversation's full read-model from the backend. */
-export async function fetchConversation(id: string): Promise<ConversationView> {
+export async function fetchConversation(id: string): Promise<ConversationSnapshot> {
   const resp = await fetch(`/api/conversations/${id}`, {
     headers: { Accept: 'application/json' },
   });
@@ -40,5 +30,5 @@ export async function fetchConversation(id: string): Promise<ConversationView> {
       body || resp.statusText || `request failed (${resp.status})`
     );
   }
-  return (await resp.json()) as ConversationView;
+  return (await resp.json()) as ConversationSnapshot;
 }

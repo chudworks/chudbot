@@ -1,75 +1,57 @@
-// Mirrors the Rust `grok_discord_bot_core::domain` types serialized
-// over the JSON API. Keep field names in sync with the Rust structs
-// (serde uses Rust field names by default).
-//
-// Every Discord snowflake ID is a `string`, not a `number`. Snowflakes
-// are 64-bit integers (~10^18) that exceed JS's Number.MAX_SAFE_INTEGER
-// (2^53), so the backend serializes them as JSON strings — a number
-// would be silently rounded by `JSON.parse` and never match the
-// string-keyed `users` map. Treat IDs as opaque strings; never do
-// arithmetic on them.
+// Mirrors the v2 `chudbot_api` DTOs serialized by `chudbot-web`.
+// Provider/platform/model ids are opaque strings. Do not parse or do
+// arithmetic on Discord snowflakes or platform ids.
 
-export interface ConversationView {
+export interface ConversationSnapshot {
   conversation: Conversation;
-  turns: TurnView[];
-  /** Map of discord_user_id -> DiscordUser. Keys are snowflake strings
-   * (JSON object keys are always strings, and the backend emits the
-   * matching ID fields as strings too, so lookups line up exactly). */
-  users: Record<string, DiscordUser>;
-  /** Map of version number -> AppVersion for every build referenced by
-   * a turn. Keys are the integer version id as a string (JSON object
-   * keys are always strings; serde emits the i32 key stringified). Lets
-   * a turn render "vN" with the commit string on hover. */
-  versions: Record<string, AppVersion>;
+  turns: TurnSnapshot[];
+  users: Record<string, UserMetadata>;
 }
 
 export interface Conversation {
   id: string;
   created_at: string;
-  discord_guild_id: string;
-  discord_channel_id: string;
-  created_by_user_id: string;
-  root_discord_message_id: string;
+  channel: ChannelRef;
+  created_by: UserRef;
+  root_message: MessageRef;
+  initial_model: string;
+  agent_name: string;
+  provider: string;
+  system_instructions: string;
   title: string | null;
-  title_generated_at: string | null;
-  model: string;
-  /** When an admin paused the bot in this conversation by reacting 🛑
-   *  on a tracked message. `null` means active; a timestamp means the
-   *  bot is ignoring further mentions until the reaction is removed. */
   stopped_at: string | null;
-  /** Discord user id of the admin who paused it; `null` when active. */
-  stopped_by_user_id: string | null;
+  stopped_by: UserRef | null;
 }
 
-export interface TurnView {
+export interface TurnSnapshot {
   turn: Turn;
-  /** Fully-composed system prompt sent to the model for this turn
-   *  (persona voice + operational block + operator policy). Null for
-   *  legacy turns recorded before snapshotting existed. */
-  system_prompt: string | null;
+  system_instructions: string | null;
   context: ContextItem[];
-  tool_calls: ToolCallRecord[];
+  tool_trace: ToolTrace[];
+  replay_assets: TurnAsset[];
+  usage: UsageRecord[];
 }
 
 export interface Turn {
   id: string;
-  conversation_id: string;
-  turn_index: number;
+  ordinal: number;
+  history_cutoff: number | null;
+  response_ordinal: number | null;
   created_at: string;
+  user_message_created_at: string;
   completed_at: string | null;
-  user_discord_message_id: string;
+  user_message: MessageRef;
+  user: UserRef;
+  user_display_name: string;
   user_content: string;
-  assistant_discord_message_id: string | null;
+  assistant_message: MessageRef | null;
   assistant_content: string | null;
-  status: 'pending' | 'completed' | 'failed' | string;
+  status: 'pending' | 'completed' | 'failed' | 'cancelled' | string;
   error: string | null;
-  persona_name: string | null;
-  /** Ordered build version ("vN") that answered this turn. Null for
-   *  legacy turns recorded before version tracking existed. Resolve the
-   *  commit string via ConversationView.versions[String(version_id)]. */
-  version_id: number | null;
-  discord_user_id: string | null;
-  discord_user_name: string | null;
+  agent_name: string | null;
+  provider: string | null;
+  model: string | null;
+  app_version_id: number | null;
 }
 
 export interface ContextItem {
@@ -77,43 +59,123 @@ export interface ContextItem {
   source: string;
   role: string;
   content: string;
-  discord_message_id: string | null;
+  message: MessageRef | null;
 }
 
-export interface ToolCallRecord {
-  tool_name: string;
-  request: unknown;
-  response: unknown;
+export interface TurnAsset {
+  uri: string;
+  turn_id: string;
+  source: string;
+  mime_type: string | null;
 }
 
-export interface AppVersion {
-  /** The "vN" number (an integer, not a snowflake — safe as a number). */
-  id: number;
-  /** Full `git describe --tags --always --dirty` string for the build. */
-  git_version: string;
-  /** ISO-8601 timestamp of the first boot on this build. */
-  first_seen: string;
+export interface UserRef {
+  platform: string;
+  guild_id: string | null;
+  user_id: string;
 }
 
-export interface DiscordUser {
-  id: string;
+export interface UserMetadata {
+  id: UserRef;
   username: string;
   display_name: string | null;
-  avatar_hash: string | null;
-  avatar_local_path: string | null;
-  last_avatar_fetched_at: string | null;
-  last_seen_at: string;
+  label: string;
+  avatar_url: string | null;
+  avatar_media_uri: string | null;
+  is_bot: boolean;
 }
 
-/** Names of SSE events emitted by the backend. Kept in sync with the
- *  match arm in `crates/grok-discord-bot-bin/src/web.rs::event_payload`. */
+export interface ChannelRef {
+  platform: string;
+  guild_id: string | null;
+  channel_id: string;
+}
+
+export interface MessageRef {
+  platform: string;
+  guild_id: string | null;
+  channel_id: string;
+  message_id: string;
+}
+
+export type ToolTrace =
+  | { kind: 'client'; trace: ClientToolTrace }
+  | { kind: 'server'; tool: ServerToolUse }
+  | { kind: 'grounding'; metadata: GroundingMetadata };
+
+export interface ClientToolTrace {
+  call: ClientToolCall;
+  result: ClientToolResult;
+  trace_response: unknown;
+  usage: UsageRecord[];
+}
+
+export interface ClientToolCall {
+  id: string;
+  name: string;
+  input: unknown;
+}
+
+export interface ClientToolResult {
+  tool_use_id: string;
+  content: ClientToolResultContent;
+  is_error: boolean;
+}
+
+export type ClientToolResultContent =
+  | { kind: 'json'; value: unknown }
+  | { kind: 'text'; text: string };
+
+export interface ServerToolUse {
+  provider: string;
+  name: string;
+  id: string | null;
+  status: string | null;
+  raw: unknown;
+  usage: UsageRecord[];
+}
+
+export interface GroundingMetadata {
+  provider: string;
+  raw: unknown;
+}
+
+export interface UsageSubject {
+  kind: string;
+  name?: string | null;
+}
+
+export interface CostAmount {
+  amount: string;
+  unit: string;
+  estimated: boolean;
+}
+
+export interface UsageRecord {
+  provider: string;
+  model?: string | null;
+  subject: UsageSubject;
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  total_tokens?: number | null;
+  reasoning_tokens?: number | null;
+  cached_input_tokens?: number | null;
+  cost?: CostAmount | null;
+  raw?: unknown;
+}
+
+export interface SiteConfig {
+  title_prefix: string;
+  version: string;
+}
+
 export type ServerEventName =
   | 'created'
   | 'turn_started'
   | 'turn_updated'
-  | 'tool_call_recorded'
-  | 'context_item_added'
+  | 'tool_trace_recorded'
+  | 'context_recorded'
   | 'title_updated'
   | 'conversation_updated'
-  | 'user_avatar_updated'
+  | 'user_profile_updated'
   | 'lag';

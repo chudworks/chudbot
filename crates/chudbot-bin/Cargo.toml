@@ -1,0 +1,37 @@
+[package]
+name = "chudbot-bin"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "chudbot"
+path = "src/main.rs"
+
+[dependencies]
+chudbot-api = { path = "../chudbot-api" }
+chudbot-anthropic = { path = "../chudbot-anthropic" }
+chudbot-asset-local = { path = "../chudbot-asset-local" }
+chudbot-bot = { path = "../chudbot-bot" }
+chudbot-discord = { path = "../chudbot-discord" }
+chudbot-openai = { path = "../chudbot-openai" }
+chudbot-storage-sqlx = { path = "../chudbot-storage-sqlx" }
+chudbot-web = { path = "../chudbot-web" }
+chudbot-xai = { path = "../chudbot-xai" }
+futures.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "logging", "std"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+
+[dependencies.tracing-subscriber]
+version = "0.3"
+features = ["env-filter", "json"]

@@ -4,9 +4,8 @@
 # Deployment layout (on the host):
 #   $CHUDBOT_DIR/
 #     grok-discord-bot/    # this repo (a checkout, kept up to date with `git pull`)
-#     grok                 # the installed binary, copied from target/distribute/grok
+#     chudbot              # the installed binary, copied from target/distribute/chudbot
 #     config.toml          # the production config (gitignored in the repo)
-#     .env                 # optional; KEY=value lines exported into the bot's tmux session
 #     frontend-build/      # built React bundle, copied from frontend/dist on deploy
 #     images/, videos/     # media storage (per [storage] in config.toml)
 #     avatars/             # cached Discord profile pictures
@@ -15,9 +14,9 @@
 # Default $CHUDBOT_DIR is $HOME/chudbot. Override with the CHUDBOT_DIR env var.
 #
 # The bot runs in a tmux session called "chudbot" with one window
-# running `grok serve`, which combines the Discord gateway loop and
+# running `chudbot serve`, which combines the Discord gateway loop and
 # the Axum web/API server in a single process. Output is tee'd to
-# $CHUDBOT_DIR/logs/grok.log so crash output survives a window close.
+# $CHUDBOT_DIR/logs/chudbot.log so crash output survives a window close.
 #
 # The frontend is a React + Vite SPA. `deploy` runs `bun install` and
 # `bun run build` inside grok-discord-bot/frontend/, then atomically
@@ -31,9 +30,8 @@ CHUDBOT_DIR="${CHUDBOT_DIR:-$HOME/chudbot}"
 REPO_DIR="$CHUDBOT_DIR/grok-discord-bot"
 FRONTEND_SRC="$REPO_DIR/frontend"
 FRONTEND_BUILD="$CHUDBOT_DIR/frontend-build"
-BINARY="$CHUDBOT_DIR/grok"
+BINARY="$CHUDBOT_DIR/chudbot"
 LOG_DIR="$CHUDBOT_DIR/logs"
-ENV_FILE="$CHUDBOT_DIR/.env"
 SESSION="chudbot"
 PROFILE="distribute"
 
@@ -48,14 +46,11 @@ commands:
   stop      kill the tmux session
   status    show whether the session is running, with pids per window
   logs      attach to the session (Ctrl-b d to detach)
-  migrate   run \`grok migrate\` with the installed binary
+  migrate   run \`chudbot migrate\` with the installed binary
 
 env vars:
   CHUDBOT_DIR    deployment root (default: \$HOME/chudbot)
 
-files:
-  \$CHUDBOT_DIR/.env   optional; if present, its KEY=value lines are
-                      exported into the bot's tmux session on start
 USAGE
 }
 
@@ -78,34 +73,21 @@ start_session() {
     fi
     mkdir -p "$LOG_DIR"
 
-    # Optionally load $CHUDBOT_DIR/.env into the pane's shell so `grok`
-    # inherits its KEY=value pairs. We source it INSIDE the tmux command
-    # rather than in this script's shell because tmux's `update-environment`
-    # only refreshes a fixed allowlist of vars into new sessions -- arbitrary
-    # vars exported out here would not reliably reach the pane. `set -a`
-    # (allexport) makes every assignment in the file an exported var, then
-    # `set +a` restores normal behavior before `exec`.
-    local env_prefix=""
-    if [[ -f "$ENV_FILE" ]]; then
-        echo "loading environment from $ENV_FILE"
-        env_prefix="set -a; . $ENV_FILE; set +a; "
-    fi
-
-    # `exec` so `grok` replaces the left side of the pipe -- when it
+    # `exec` so `chudbot` replaces the left side of the pipe -- when it
     # exits, the pipeline (and the single-pane session) ends. `tee -a`
     # keeps output visible in the pane AND persists it to a log file.
     #
     # The `trap '' INT` on the tee side is deliberate: `stop` sends
     # Ctrl-C, which the PTY delivers as SIGINT to the WHOLE foreground
-    # group (grok + tee). Without the trap, tee would die instantly and
-    # every line grok logs during its 30s graceful drain would vanish
+    # group (chudbot + tee). Without the trap, tee would die instantly and
+    # every line chudbot logs during its 30s graceful drain would vanish
     # into a broken pipe. Ignoring SIGINT on tee (SIG_IGN survives the
-    # exec) keeps it alive until grok finishes draining and closes the
+    # exec) keeps it alive until chudbot finishes draining and closes the
     # pipe, so the shutdown is fully captured in the log.
-    tmux new-session -d -s "$SESSION" -n grok -c "$CHUDBOT_DIR" \
-        "${env_prefix}exec $BINARY serve 2>&1 | { trap '' INT; exec tee -a $LOG_DIR/grok.log; }"
-    echo "started session $SESSION (running: grok serve)"
-    echo "logs: $LOG_DIR/grok.log"
+    tmux new-session -d -s "$SESSION" -n chudbot -c "$CHUDBOT_DIR" \
+        "exec $BINARY --config $CHUDBOT_DIR/config.toml serve 2>&1 | { trap '' INT; exec tee -a $LOG_DIR/chudbot.log; }"
+    echo "started session $SESSION (running: chudbot serve)"
+    echo "logs: $LOG_DIR/chudbot.log"
     echo "attach with: $0 logs"
 }
 
@@ -122,9 +104,9 @@ stop_session() {
     # `tmux kill-session` tears down the PTY and the processes get
     # SIGHUP, which the binary does NOT treat as a graceful shutdown.
     # Send an actual Ctrl-C instead: the pane's line discipline turns
-    # it into SIGINT for the foreground process group (grok + tee),
-    # which `grok serve` catches and drains in-flight work for up to
-    # 30s before exiting. When grok exits the pipeline ends and the
+    # it into SIGINT for the foreground process group (chudbot + tee),
+    # which `chudbot serve` catches and drains in-flight work for up to
+    # 30s before exiting. When chudbot exits the pipeline ends and the
     # single-pane session closes on its own.
     echo "sending Ctrl-C to $SESSION (graceful drain, up to ${STOP_TIMEOUT}s)..."
     tmux send-keys -t "$SESSION" C-c || true
@@ -190,17 +172,20 @@ cmd_deploy() {
     build_frontend
 
     echo "==> cargo build --profile $PROFILE"
-    (cd "$REPO_DIR" && cargo build --profile "$PROFILE")
-    local built="$REPO_DIR/target/$PROFILE/grok"
+    (cd "$REPO_DIR" && cargo build --profile "$PROFILE" -p chudbot-bin)
+    local built="$REPO_DIR/target/$PROFILE/chudbot"
     if [[ ! -x "$built" ]]; then
         echo "error: cargo build did not produce $built" >&2
         exit 1
     fi
 
+    echo "==> check config"
+    (cd "$CHUDBOT_DIR" && "$built" --config "$CHUDBOT_DIR/config.toml" check-config)
+
     stop_session
 
     echo "==> migrate"
-    (cd "$CHUDBOT_DIR" && "$built" migrate)
+    (cd "$CHUDBOT_DIR" && "$built" --config "$CHUDBOT_DIR/config.toml" migrate)
 
     echo "==> install binary -> $BINARY"
     # Stage then rename so the swap is atomic on the same filesystem;
@@ -238,7 +223,7 @@ cmd_logs() {
 
 cmd_migrate() {
     ensure_binary
-    (cd "$CHUDBOT_DIR" && "$BINARY" migrate)
+    (cd "$CHUDBOT_DIR" && "$BINARY" --config "$CHUDBOT_DIR/config.toml" migrate)
 }
 
 case "${1:-}" in

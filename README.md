@@ -1,73 +1,55 @@
-# grok-discord-bot
+# Chudbot
 
-A Discord bot that integrates an LLM (xAI Grok or Anthropic Claude) with
-server-side web search, plus a companion web viewer that shows each
-conversation's full trace: the messages fed to the model, every tool
-call, and the final answer.
+Discord bot + trace viewer for model-backed agents. Chudbot records each
+conversation turn in Postgres, including model input, client tool results,
+provider-side tool traces, usage records, media references, and final replies.
 
 ## Run
 
 ```sh
-grok serve     # run the Discord gateway loop + Axum API/web server in one process
-grok migrate   # apply pending Postgres migrations
+cargo run -p chudbot-bin -- check-config
+cargo run -p chudbot-bin -- migrate
+cargo run -p chudbot-bin -- serve
 ```
 
-Both subcommands take `-c / --config <path>` (default `config.toml`).
-Ctrl+C drains in-flight work (turn handlers, title generation, avatar
-fetches) with a 30-second grace period before exiting.
+All subcommands accept `--config <path>`; the default is `config.toml`.
 
-The web layer serves a React + Vite SPA from `[web].frontend_dir`
-(default `./frontend-build`). For development:
+For frontend iteration:
 
 ```sh
-# terminal 1 — backend
-cargo run -- serve
-
-# terminal 2 — frontend (Vite dev server on :5173, proxying /api to :1860)
-cd frontend && bun install && bun run dev
+cd frontend
+bun install
+bun run dev
 ```
 
-For production, `./serve.sh deploy` handles the full pipeline: git
-pull → bun install + bun run build (frontend) → cargo build → stop →
-migrate → install → start.
+Vite serves on `:5173` and proxies `/api`, `/images`, `/videos`, and
+`/avatars` to the Rust server on `127.0.0.1:1860`.
+
+Production deploy:
+
+```sh
+./serve.sh deploy
+```
 
 ## Configuration
 
-Copy `config.toml.example` to `config.toml` and fill in your secrets.
-The file is gitignored. The bot supports both xAI and Anthropic; pick
-one with `[llm].provider`. Both providers have native server-side web
-search, enabled automatically.
+Copy `config.example.toml` to `config.toml`. The example is the reference for
+all supported v2 options: logging, database, web serving, storage, default
+privacy, named providers, platforms, agents, media generation bindings, and
+subagents.
 
-## What it does
+The runtime is agent-first. Agents select named provider services and model
+specs; provider credentials live under `[llm.*]`, `[image.*]`, and `[video.*]`.
 
-When you `@Grok` (or whatever you name the bot) in your private Discord
-server, the bot:
+## Crates
 
-1. Reacts 👀 on your message to show it's working.
-2. Figures out whether this is a new conversation or a continuation of an
-   existing one (by checking if you replied to one of its past messages,
-   or if you're in a thread it owns).
-3. Calls the LLM with web search enabled, recording the prompt and every
-   tool call into Postgres.
-4. Replies inline (or auto-opens a thread for long answers), and
-   transitions the reaction to ✅ on success / ❌ on failure.
-5. On a new conversation, includes a link to the viewer where you can
-   inspect what the model saw and what tools it ran.
+- `chudbot-api`: shared contracts.
+- `chudbot-bot`: platform-neutral bot runtime.
+- `chudbot-discord`: Twilight platform adapter.
+- `chudbot-web`: Axum viewer/API/SSE server.
+- `chudbot-storage-sqlx`: Postgres storage.
+- `chudbot-asset-local`: local media storage.
+- `chudbot-xai`, `chudbot-openai`, `chudbot-anthropic`: provider crates.
+- `chudbot-bin`: process launcher.
 
-## Privacy
-
-Per-guild and configurable at runtime via slash commands:
-
-- `/grok-privacy {in|out|status}` — per-user opt-in (Design 3).
-- `/grok-mode {show|set}` — admins choose the design for this guild
-  (one of `open`, `channel_only`, `opt_in`, `conversation_only`).
-
-The default for guilds with no explicit mode is `opt_in`. See `CLAUDE.md`
-for the four designs in detail.
-
-## Storage
-
-Everything lives in Postgres. Discord is just the I/O surface; no
-state is recovered from channel scrolling. The data layer is
-multi-tenant — every row reaches a `discord_guild_id`, so the bot can
-serve multiple servers from one instance.
+See `AGENTS.md` and `docs/2.0-api-shapes.md` for migration details.

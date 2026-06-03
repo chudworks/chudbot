@@ -12,8 +12,7 @@ export default function App() {
   // reads the title prefix from the same store; the footer reads the
   // build version from it.
   const loadConfig = useSiteConfig((s) => s.load);
-  const versionNumber = useSiteConfig((s) => s.versionNumber);
-  const gitVersion = useSiteConfig((s) => s.gitVersion);
+  const version = useSiteConfig((s) => s.version);
   useEffect(() => {
     void loadConfig();
   }, [loadConfig]);
@@ -21,12 +20,9 @@ export default function App() {
   return (
     <div className="app">
       <Outlet />
-      {versionNumber != null && (
+      {version != null && (
         <footer className="app-footer">
-          <span title={gitVersion ?? undefined}>
-            v{versionNumber}
-            {gitVersion && <> · {gitVersion}</>}
-          </span>
+          <span>{version}</span>
         </footer>
       )}
     </div>

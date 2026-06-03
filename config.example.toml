@@ -1,0 +1,234 @@
+# Chudbot 2.0 configuration.
+#
+# Copy this file to config.toml and replace placeholder secrets. The runtime
+# reads only this TOML file plus CLI flags; it does not read environment
+# variables for bot, provider, database, or web settings.
+#
+# Validate without opening Discord or the web listener:
+#
+#   cargo run -p chudbot-bin -- check-config --config config.toml
+
+[database]
+# Standard libpq/Postgres connection URL.
+url = "postgres://chud@localhost/chudbot"
+
+[logging]
+# Tracing filter expression. Useful examples:
+#   "info"
+#   "info,chudbot=debug"
+# `chudbot=debug` matches every first-party crate target, including
+# `chudbot_bot`, `chudbot_web`, and provider crates such as `chudbot_xai`.
+filter = "info,chudbot=debug"
+# One of: "pretty", "compact", "json".
+format = "pretty"
+# Disable ANSI when logs are written to a file or systemd journal.
+ansi = true
+
+[web]
+# Socket address for the Axum web/API server.
+listen = "127.0.0.1:1860"
+# Browser tab title prefix used by the React trace viewer.
+title_prefix = "Chudbot - "
+# Directory containing the built Vite bundle. `serve.sh deploy` should copy
+# frontend/dist here atomically.
+frontend_dir = "frontend-build"
+# Optional favicon. Keep it outside frontend_dir because deploys replace that
+# directory. Uncomment after setting a real path.
+# favicon_path = "/Users/chud/Documents/chudbot/chudbot.ico"
+
+[storage]
+# Local media directories. The database stores stable URIs such as
+# file://images/<name>, file://videos/<name>, and file://avatars/<name>.
+images_dir = "images"
+videos_dir = "videos"
+avatars_dir = "avatars"
+# Public URL used when providers need to fetch stored media server-side. If this
+# is omitted, the runtime falls back to [bot].web_base_url.
+public_base_url = "http://localhost:1860"
+
+[bot]
+# Public trace-viewer URL posted in the first Discord reply for a conversation.
+web_base_url = "http://localhost:1860"
+# Fallback agent when no platform/DB scoped selection applies.
+default_agent = "default"
+# Operator users allowed to pause/resume a conversation with 🛑 on any
+# Chudbot-tracked message. Omit guild_id to allow the user across the platform.
+admins = [
+  { platform = "discord", user_id = "123456789012345678" }
+]
+# Optional deployment-wide policy prepended before each agent's own prompt.
+extra_system_prompt = """
+This bot runs in a private Discord server. Follow Discord platform policy and
+do not reveal internal ids, file:// URIs, or implementation details unless the
+operator explicitly asks for them.
+"""
+# Usually left empty; chudbot-bin fills this from its package version.
+version = ""
+# Default agent loop limit. Individual agents can override it.
+limits = { max_iterations = 8 }
+# New conversations ask the platform to open a thread once the answer exceeds
+# either threshold. Visible lines count literal newlines plus approximate
+# Discord soft-wrap rows.
+thread_threshold_chars = 1500
+thread_threshold_lines = 20
+
+[bot.platforms.discord]
+# Default agent for this message platform. Platform bindings are optional; when
+# absent, [bot].default_agent is used.
+agent = "default"
+
+[default_privacy]
+# Deployment fallback before a server stores an override through /chudbot-mode.
+# Variants:
+#   mode = "open"; history_size = 20
+#   mode = "channel_only"; channel = { platform = "discord", guild_id = "123", channel_id = "456" }; history_size = 20
+#   mode = "opt_in"
+#   mode = "conversation_only"
+mode = "opt_in"
+
+[platforms.discord]
+kind = "discord"
+token = "DISCORD_BOT_TOKEN"
+# Optional Discord guild id for development command registration. Use a string
+# to keep snowflakes lossless.
+dev_guild_id = "123456789012345678"
+
+# Named language-model provider services. Agent configs reference these names
+# through `provider = "<name>"`. Provider instances are model-agnostic; model
+# ids live on agents.
+
+[llm.grok]
+kind = "xai"
+api_key = "xai-..."
+# base_url = "https://api.x.ai/v1"
+
+[llm.openai]
+kind = "openai"
+api_key = "sk-..."
+# base_url = "https://api.openai.com/v1"
+
+[llm.anthropic]
+kind = "anthropic"
+api_key = "sk-ant-..."
+# base_url = "https://api.anthropic.com/v1"
+
+# Planned but not implemented in the v2 runtime yet. Leave commented until the
+# chudbot-openai-compat crate exists.
+# [llm.local_compat]
+# kind = "openai_compat"
+# base_url = "http://127.0.0.1:8000/v1"
+# api_key = "anything"
+
+# Named image-generation services.
+
+[image.grok_images]
+kind = "xai"
+api_key = "xai-..."
+# base_url = "https://api.x.ai/v1"
+
+[image.openai_images]
+kind = "openai"
+api_key = "sk-..."
+# base_url = "https://api.openai.com/v1"
+
+# Named video-generation services. xAI is the only implemented v2 video backend.
+
+[video.grok_video]
+kind = "xai"
+api_key = "xai-..."
+# base_url = "https://api.x.ai/v1"
+
+# Agents are prompt + provider + model + tool exposure. The name after
+# [bot.agents.<name>] is the runtime selection key used by /chudbot-agent.
+
+[bot.agents.default]
+provider = "grok"
+system_prompt = """
+You are Chudbot, a direct and useful assistant in a private Discord server.
+Answer naturally for Discord. Use available search and fetch tools when they
+would materially improve the answer.
+"""
+# Optional agent-level allowlists. Omit for the full runtime-provided surface.
+# server_tools = ["web_search", "x_search"]
+# client_tools = ["fetch_messages", "generate_image", "generate_video", "post_status_message"]
+limits = { max_iterations = 8 }
+
+[bot.agents.default.model]
+id = "grok-4.3"
+# Provider-side tools allowed by this model config. The agent-level
+# `server_tools` field can further restrict this set.
+server_tools = ["web_search", "x_search"]
+
+[bot.agents.default.model.sampling]
+max_output_tokens = 4096
+temperature = 0.7
+top_p = 0.95
+
+[bot.agents.default.model.provider_options]
+value = { reasoning_effort = "high" }
+
+[bot.agents.default.image_generation]
+provider = "grok_images"
+# Provider-specific image model id or tier.
+model = "quality"
+
+[bot.agents.default.video_generation]
+provider = "grok_video"
+# Provider-specific video model id.
+model = "grok-imagine-video"
+
+[bot.agents.research]
+provider = "openai"
+system_prompt = """
+You are a careful research assistant. Ground claims with current search when
+available, separate facts from judgment, and keep the final answer concise.
+"""
+server_tools = ["web_search"]
+client_tools = ["fetch_messages", "post_status_message"]
+
+[bot.agents.research.model]
+id = "gpt-5.5"
+server_tools = ["web_search"]
+
+[bot.agents.research.model.sampling]
+max_output_tokens = 4096
+
+[bot.agents.research.model.provider_options]
+value = { reasoning_effort = "medium" }
+
+[bot.agents.research.image_generation]
+provider = "openai_images"
+model = "gpt-image-1"
+
+[bot.agents.claude]
+provider = "anthropic"
+system_prompt = """
+You are a concise assistant. Prefer clear, factual answers and ask for missing
+context only when it is necessary.
+"""
+server_tools = ["web_search"]
+client_tools = ["fetch_messages", "post_status_message"]
+limits = { max_iterations = 6 }
+
+[bot.agents.claude.model]
+id = "claude-sonnet-4-6"
+server_tools = ["web_search"]
+
+[bot.agents.claude.model.sampling]
+max_output_tokens = 4096
+temperature = 0.4
+
+# Subagents expose another configured agent as a client-side tool to the parent
+# model. The target agent must exist in [bot.agents].
+[bot.agents.default.subagents.research_helper]
+agent = "research"
+description = "Ask a focused research subagent to gather facts and return a concise summary."
+
+# Example local agent for the planned OpenAI-compatible provider. Keep commented
+# until [llm.local_compat] is implemented in chudbot-openai-compat.
+# [bot.agents.local]
+# provider = "local_compat"
+# system_prompt = "You are a helpful local model running behind an OpenAI-compatible API."
+# client_tools = ["fetch_messages", "post_status_message"]
+# [bot.agents.local.model]
+# id = "qwen3"

@@ -1,68 +1,115 @@
-import type { ToolCallRecord } from '../types';
+import type { ToolTrace } from '../types';
 
 interface Props {
-  call: ToolCallRecord;
+  trace: ToolTrace;
 }
 
-/** Renders one tool call: its name, any media it produced (scanned out
- *  of the response JSON), and collapsible request + response panels. */
-export default function ToolCall({ call }: Props) {
-  const media = collectMediaUris(call.response);
+/** Renders one v2 trace event: client tool call/result, provider-side
+ *  tool use, or provider grounding metadata. */
+export default function ToolCall({ trace }: Props) {
+  const view = traceView(trace);
+  const media = collectMediaUris(view.response);
   return (
     <article className="tool-call">
       <header>
-        <span className="tool-call__name">{call.tool_name}</span>
+        <span className="tool-call__name">{view.name}</span>
       </header>
       {media.length > 0 && (
         <div className="tool-call__media">
-          {media.map((m, i) =>
+          {media.map((m) =>
             m.kind === 'image' ? (
-              <img key={i} className="context-image" src={m.path} alt={call.tool_name} />
+              <img key={m.uri} className="context-image" src={m.path} alt={view.name} />
             ) : (
-              <video key={i} className="context-video" controls src={m.path} />
+              <video key={m.uri} className="context-video" controls src={m.path} />
             )
           )}
         </div>
       )}
       <details>
-        <summary>Request</summary>
-        <pre>{prettyJson(call.request)}</pre>
+        <summary>{view.requestLabel}</summary>
+        <pre>{prettyJson(view.request)}</pre>
       </details>
       <details>
-        <summary>Response</summary>
-        <pre>{prettyJson(call.response)}</pre>
+        <summary>{view.responseLabel}</summary>
+        <pre>{prettyJson(view.response)}</pre>
       </details>
     </article>
   );
 }
 
-type MediaRef = { kind: 'image' | 'video'; path: string };
+function traceView(trace: ToolTrace) {
+  switch (trace.kind) {
+    case 'client':
+      return {
+        name: trace.trace.call.name,
+        requestLabel: 'Request',
+        request: trace.trace.call.input,
+        responseLabel: trace.trace.result.is_error ? 'Error result' : 'Result',
+        response: {
+          result: trace.trace.result.content,
+          trace_response: trace.trace.trace_response,
+        },
+      };
+    case 'server':
+      return {
+        name: `${trace.tool.provider}/${trace.tool.name}`,
+        requestLabel: 'Provider event',
+        request: {
+          id: trace.tool.id,
+          status: trace.tool.status,
+        },
+        responseLabel: 'Raw payload',
+        response: trace.tool.raw,
+      };
+    case 'grounding':
+      return {
+        name: `${trace.metadata.provider}/grounding`,
+        requestLabel: 'Metadata',
+        request: { provider: trace.metadata.provider },
+        responseLabel: 'Raw payload',
+        response: trace.metadata.raw,
+      };
+  }
+}
+
+type MediaRef = { kind: 'image' | 'video'; uri: string; path: string };
 
 /** Walk the value, collecting any string that looks like a
- *  `file://images/…` or `file://videos/…` URI. Mirrors the Rust
- *  `walk_for_media_uris` helper in the old maud renderer. */
+ *  `file://images/...` or `file://videos/...` URI. */
 function collectMediaUris(value: unknown): MediaRef[] {
   const out: MediaRef[] = [];
-  walk(value, out);
+  const seen = new Set<string>();
+  walk(value, out, seen);
   return out;
 }
 
-function walk(value: unknown, out: MediaRef[]) {
+function walk(value: unknown, out: MediaRef[], seen: Set<string>) {
   if (typeof value === 'string') {
     if (value.startsWith('file://images/')) {
-      out.push({ kind: 'image', path: '/' + value.slice('file://'.length) });
+      pushMediaRef(out, seen, 'image', value);
     } else if (value.startsWith('file://videos/')) {
-      out.push({ kind: 'video', path: '/' + value.slice('file://'.length) });
+      pushMediaRef(out, seen, 'video', value);
     }
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((v) => walk(v, out));
+    value.forEach((v) => walk(v, out, seen));
     return;
   }
   if (value && typeof value === 'object') {
-    Object.values(value).forEach((v) => walk(v, out));
+    Object.values(value).forEach((v) => walk(v, out, seen));
   }
+}
+
+function pushMediaRef(
+  out: MediaRef[],
+  seen: Set<string>,
+  kind: 'image' | 'video',
+  uri: string
+) {
+  if (seen.has(uri)) return;
+  seen.add(uri);
+  out.push({ kind, uri, path: '/' + uri.slice('file://'.length) });
 }
 
 function prettyJson(value: unknown): string {
