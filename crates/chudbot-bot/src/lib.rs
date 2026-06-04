@@ -19,21 +19,22 @@ use std::time::Duration;
 use chudbot_api::{
     Agent, AgentBuilder, AgentLimits, AgentOutcome, AgentSelection, AgentSpec, AttachmentRef,
     AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, BeginTurn, BotStorage,
-    ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResultContent,
-    ClientToolSpec, ContentBlock, Conversation, ConversationEventKind, ConversationId,
-    ConversationLookup, ConversationSnapshot, ConversationStop, CreateMedia, CreateVideoJob,
-    EventSink, ExternalId, FetchMessages, FinishTurn, GeneratedImage, ImageGenerator,
-    ImageGeneratorTool, ImageRequest, LiveEvent, LlmBackend, MediaCategory, MediaStore, MediaUri,
-    MessageLink, MessagePlatform, MessageRef, Model, ModelId, ModelSpec, ModelStep,
-    ModelStepRequest, OpenConversation, OutgoingAttachment, PlatformCommand,
-    PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
+    ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult,
+    ClientToolResultContent, ClientToolSpec, ClientToolTrace, ContentBlock, Conversation,
+    ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
+    ConversationStop, CreateMedia, CreateVideoJob, EventSink, ExternalId, FetchMessages,
+    FinishTurn, GeneratedImage, ImageGenerator, ImageGeneratorTool, ImageRequest, LiveEvent,
+    LlmBackend, MediaCategory, MediaStore, MediaUri, MessageLink, MessagePlatform, MessageRef,
+    Model, ModelId, ModelSpec, ModelStep, ModelStepRequest, OpenConversation, OutgoingAttachment,
+    PlatformCommand, PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
     PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
     PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
     PlatformMessageRelationship, PlatformName, PlatformReaction, PostedMessage, PrivacyMode,
     ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput,
-    SendMessage, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, Transcript,
-    TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef,
-    UserProfile, UserRef, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    SendMessage, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, ToolUseId,
+    Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob,
+    UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator, VideoJobId, VideoJobStatus,
+    VideoRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -784,6 +785,16 @@ fn validate_transcription_binding(
             message: "model is empty".to_string(),
         });
     }
+    if let Some(wake_word) = &binding.wake_word
+        && wake_word.trim().is_empty()
+    {
+        tracing::warn!(agent = %agent_name, field, "audio transcription wake word is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "wake_word is empty".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -841,6 +852,19 @@ pub struct TranscriptionBinding {
     /// Provider-specific transcription model id when applicable.
     #[serde(default)]
     pub model: Option<ModelId>,
+    /// Optional spoken wake word for no-mention audio outside an existing
+    /// conversation.
+    #[serde(default)]
+    pub wake_word: Option<String>,
+}
+
+impl TranscriptionBinding {
+    fn wake_word(&self) -> Option<&str> {
+        self.wake_word
+            .as_deref()
+            .map(str::trim)
+            .filter(|wake_word| !wake_word.is_empty())
+    }
 }
 
 /// Platform default binding.
@@ -1204,22 +1228,106 @@ where
             .bot_user(&message.id.platform)
             .await
             .map_err(platform_error)?;
-        if message.author.is_bot
-            || !message
-                .mentions
-                .iter()
-                .any(|user| same_platform_user(user, &bot_user.id))
-        {
+        let mentioned_bot = message
+            .mentions
+            .iter()
+            .any(|user| same_platform_user(user, &bot_user.id));
+        let has_audio_attachments = message_has_audio_attachments(&message);
+        if message.author.is_bot || (!mentioned_bot && !has_audio_attachments) {
             tracing::debug!(
                 author_is_bot = message.author.is_bot,
-                mentioned_bot = message
-                    .mentions
-                    .iter()
-                    .any(|user| same_platform_user(user, &bot_user.id)),
+                mentioned_bot,
+                has_audio_attachments,
                 "ignoring message"
             );
             return Ok(BotAction::Ignored);
         }
+
+        let settings = self.runtime_settings(&message).await?;
+        tracing::debug!(
+            privacy = privacy_mode_kind(&settings.privacy),
+            user_opted_in = settings.user_opted_in,
+            "loaded runtime settings"
+        );
+
+        let existing = self.lookup_existing_conversation(&message).await?;
+        if !self
+            .privacy_allows_message_channel(
+                &settings.privacy,
+                &message.id,
+                existing.as_ref().map(|existing| &existing.snapshot),
+            )
+            .await?
+        {
+            tracing::debug!(
+                privacy = privacy_mode_kind(&settings.privacy),
+                "privacy mode rejected message channel"
+            );
+            return Ok(BotAction::Ignored);
+        }
+        if let Some(snapshot) = &existing
+            && snapshot.snapshot.conversation.stopped_at.is_some()
+        {
+            tracing::debug!(
+                conversation = %snapshot.snapshot.conversation.id,
+                stopped_at = ?snapshot.snapshot.conversation.stopped_at,
+                "ignoring message because conversation is stopped"
+            );
+            return Ok(BotAction::Ignored);
+        }
+
+        let needs_audio_preflight = has_audio_attachments && !mentioned_bot;
+        let resolved_agent = if needs_audio_preflight {
+            Some(
+                self.resolve_turn_agent(&message, existing.as_ref().map(|e| &e.snapshot))
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let audio_preflight_continues_conversation = needs_audio_preflight
+            && existing
+                .as_ref()
+                .is_some_and(|existing| existing.source.counts_as_audio_mention());
+        let should_preflight_audio = needs_audio_preflight
+            && no_mention_audio_preflight_enabled(
+                resolved_agent.as_ref().map(|(_, agent)| agent),
+                audio_preflight_continues_conversation,
+            );
+        let incoming_audio = if should_preflight_audio {
+            self.prepare_incoming_audio_context(
+                &message,
+                resolved_agent.as_ref().map(|(_, agent)| agent),
+            )
+            .await?
+        } else {
+            IncomingAudioContext::default()
+        };
+        let audio_mentions_wake_word = resolved_agent
+            .as_ref()
+            .and_then(|(_, agent)| agent.audio_transcription.as_ref())
+            .and_then(TranscriptionBinding::wake_word)
+            .is_some_and(|wake_word| incoming_audio_mentions_wake_word(&incoming_audio, wake_word));
+        let audio_continues_conversation = audio_preflight_continues_conversation
+            && !incoming_audio.transcriptions.is_empty()
+            && should_preflight_audio;
+        if !mentioned_bot && !audio_continues_conversation && !audio_mentions_wake_word {
+            tracing::debug!(
+                mentioned_bot,
+                has_audio_attachments,
+                audio_transcriptions = incoming_audio.transcriptions.len(),
+                audio_mentions_wake_word,
+                audio_continues_conversation,
+                should_preflight_audio,
+                "ignoring message"
+            );
+            return Ok(BotAction::Ignored);
+        }
+
+        append_audio_transcriptions_to_message_content(
+            &mut message.content,
+            &incoming_audio.transcriptions,
+        );
         message.content = normalize_mention_content(
             &message.content,
             &bot_user.id,
@@ -1234,40 +1342,17 @@ where
         self.spawn_avatar_download(message.author.clone());
         self.publish_user(message.author.id.clone());
 
-        let settings = self.runtime_settings(&message).await?;
-        tracing::debug!(
-            privacy = privacy_mode_kind(&settings.privacy),
-            user_opted_in = settings.user_opted_in,
-            "loaded runtime settings"
-        );
-
-        let existing = self.lookup_existing_conversation(&message).await?;
-        if !self
-            .privacy_allows_message_channel(&settings.privacy, &message.id, existing.as_ref())
-            .await?
-        {
-            tracing::debug!(
-                privacy = privacy_mode_kind(&settings.privacy),
-                "privacy mode rejected message channel"
-            );
-            return Ok(BotAction::Ignored);
-        }
-        if let Some(snapshot) = &existing
-            && snapshot.conversation.stopped_at.is_some()
-        {
-            tracing::debug!(
-                conversation = %snapshot.conversation.id,
-                stopped_at = ?snapshot.conversation.stopped_at,
-                "ignoring message because conversation is stopped"
-            );
-            return Ok(BotAction::Ignored);
-        }
-
         let user_message = message.id.clone();
         self.add_unicode_reaction(&user_message, WORKING_REACTION, "turn_working")
             .await;
         let action = self
-            .process_mentioned_message(message, existing, settings)
+            .process_mentioned_message(
+                message,
+                existing.map(|existing| existing.snapshot),
+                settings,
+                resolved_agent,
+                incoming_audio,
+            )
             .await;
         self.remove_own_unicode_reaction(&user_message, WORKING_REACTION, "turn_working")
             .await;
@@ -1275,23 +1360,16 @@ where
         action
     }
 
-    async fn process_mentioned_message(
+    async fn resolve_turn_agent(
         &self,
-        message: PlatformMessage,
-        existing: Option<ConversationSnapshot>,
-        settings: RuntimeSettings,
-    ) -> Result<BotAction, BotError> {
-        let user_display_name = display_name(&message);
-        if !self.moderation_allows(&message, &user_display_name).await? {
-            tracing::info!("message refused by moderation preflight");
-            return Ok(BotAction::RefusedMessage);
-        }
-
+        message: &PlatformMessage,
+        existing: Option<&ConversationSnapshot>,
+    ) -> Result<(String, AgentConfig), BotError> {
         let resolved_agent = self
             .storage
             .resolve_agent(ResolveAgent {
                 message_provider: message.id.platform.clone(),
-                conversation_id: existing.as_ref().map(|s| s.conversation.id),
+                conversation_id: existing.map(|s| s.conversation.id),
                 guild_key: guild_key(&message.id),
                 channel_key: self
                     .agent_scope_channel(&message.id)
@@ -1308,13 +1386,40 @@ where
             .agent_or_platform_default(resolved_agent.as_deref(), &message.id.platform)?;
         let agent_config = agent_config.clone();
         self.ensure_agent_services_exist(&agent_name, &agent_config)?;
+        tracing::debug!(
+            resolved_agent = %agent_name,
+            storage_agent = ?resolved_agent,
+            provider = %agent_config.provider,
+            model = %agent_config.model.id,
+            "resolved agent for turn"
+        );
+        Ok((agent_name, agent_config))
+    }
+
+    async fn process_mentioned_message(
+        &self,
+        message: PlatformMessage,
+        existing: Option<ConversationSnapshot>,
+        settings: RuntimeSettings,
+        resolved_agent: Option<(String, AgentConfig)>,
+        incoming_audio: IncomingAudioContext,
+    ) -> Result<BotAction, BotError> {
+        let user_display_name = display_name(&message);
+        if !self.moderation_allows(&message, &user_display_name).await? {
+            tracing::info!("message refused by moderation preflight");
+            return Ok(BotAction::RefusedMessage);
+        }
+
+        let (agent_name, agent_config) = match resolved_agent {
+            Some(resolved) => resolved,
+            None => self.resolve_turn_agent(&message, existing.as_ref()).await?,
+        };
         tracing::Span::current().record("agent", tracing::field::display(&agent_name));
         tracing::Span::current()
             .record("provider", tracing::field::display(&agent_config.provider));
         tracing::Span::current().record("model", tracing::field::display(&agent_config.model.id));
         tracing::debug!(
             resolved_agent = %agent_name,
-            storage_agent = ?resolved_agent,
             provider = %agent_config.provider,
             model = %agent_config.model.id,
             "resolved agent for turn"
@@ -1387,8 +1492,10 @@ where
             .map_err(storage_error)?;
         tracing::debug!("linked user message to turn");
 
+        let preflight_tool_traces = incoming_audio.tool_traces();
+        let preflight_usage = incoming_audio.usage_records();
         let turn_context = self
-            .prepare_turn_context(&message, &settings, &snapshot.conversation)
+            .prepare_turn_context(&message, &settings, &snapshot.conversation, incoming_audio)
             .await?;
         let prompt_snapshot = self
             .storage
@@ -1436,6 +1543,8 @@ where
             settings,
             reply_to: message.id,
             is_new,
+            preflight_tool_traces,
+            preflight_usage,
         })
         .await
     }
@@ -1634,6 +1743,8 @@ where
                 settings,
                 reply_to: retry_user_message.clone(),
                 is_new: false,
+                preflight_tool_traces: Vec::new(),
+                preflight_usage: Vec::new(),
             })
             .await;
         self.remove_own_unicode_reaction(&retry_user_message, WORKING_REACTION, "retry_working")
@@ -1735,6 +1846,23 @@ where
         )
     )]
     async fn execute_turn(&self, mut execution: TurnExecution) -> Result<BotAction, BotError> {
+        for (ordinal, trace) in execution.preflight_tool_traces.iter().cloned().enumerate() {
+            let trace_kind = tool_trace_kind(&trace);
+            self.storage
+                .append_tool_trace(
+                    execution.turn.id,
+                    i32::try_from(ordinal).unwrap_or(i32::MAX),
+                    trace,
+                )
+                .await
+                .map_err(storage_error)?;
+            self.publish_conversation(
+                execution.conversation.id,
+                ConversationEventKind::ToolTraceRecorded,
+            );
+            tracing::trace!(ordinal, trace_kind, "recorded preflight tool trace");
+        }
+        let preflight_trace_count = execution.preflight_tool_traces.len();
         if self
             .storage
             .load_conversation(ConversationLookup::Id {
@@ -1750,7 +1878,7 @@ where
                 .finish_turn(FinishTurn::Cancelled {
                     turn_id: execution.turn.id,
                     reason: "cancelled by admin stop reaction".to_string(),
-                    usage: Vec::new(),
+                    usage: execution.usage_with_preflight(Vec::new()),
                 })
                 .await
                 .map_err(storage_error)?;
@@ -1799,7 +1927,7 @@ where
                 .finish_turn(FinishTurn::Cancelled {
                     turn_id: execution.turn.id,
                     reason: "cancelled by admin stop reaction".to_string(),
-                    usage: Vec::new(),
+                    usage: execution.usage_with_preflight(Vec::new()),
                 })
                 .await
                 .map_err(storage_error)?;
@@ -1839,10 +1967,11 @@ where
 
         for (ordinal, trace) in run.trace.iter().cloned().enumerate() {
             let trace_kind = tool_trace_kind(&trace);
+            let storage_ordinal = ordinal.saturating_add(preflight_trace_count);
             self.storage
                 .append_tool_trace(
                     execution.turn.id,
-                    i32::try_from(ordinal).unwrap_or(i32::MAX),
+                    i32::try_from(storage_ordinal).unwrap_or(i32::MAX),
                     trace,
                 )
                 .await
@@ -1851,7 +1980,7 @@ where
                 execution.conversation.id,
                 ConversationEventKind::ToolTraceRecorded,
             );
-            tracing::trace!(ordinal, trace_kind, "recorded tool trace");
+            tracing::trace!(ordinal = storage_ordinal, trace_kind, "recorded tool trace");
         }
 
         if safety_refusal_in_tool_trace(&run.trace) {
@@ -1951,7 +2080,7 @@ where
                         assistant_content: content,
                         assistant_message: posted.id,
                         continuation: run.final_continuation.clone(),
-                        usage: run.all_usage(),
+                        usage: execution.usage_with_preflight(run.all_usage()),
                     })
                     .await
                     .map_err(storage_error)?;
@@ -2000,7 +2129,7 @@ where
                     .finish_turn(FinishTurn::Cancelled {
                         turn_id: execution.turn.id,
                         reason: reason.clone(),
-                        usage: run.all_usage(),
+                        usage: execution.usage_with_preflight(run.all_usage()),
                     })
                     .await
                     .map_err(storage_error)?;
@@ -2313,7 +2442,7 @@ where
                 error,
                 assistant_content: None,
                 assistant_message: Some(posted.id.clone()),
-                usage: Vec::new(),
+                usage: execution.usage_with_preflight(Vec::new()),
             })
             .await
             .map_err(storage_error)?;
@@ -2380,7 +2509,7 @@ where
                 error: reason.to_string(),
                 assistant_content: None,
                 assistant_message: None,
-                usage: Vec::new(),
+                usage: execution.usage_with_preflight(Vec::new()),
             })
             .await
             .map_err(storage_error)?;
@@ -3307,7 +3436,7 @@ where
     async fn lookup_existing_conversation(
         &self,
         message: &PlatformMessage,
-    ) -> Result<Option<ConversationSnapshot>, BotError> {
+    ) -> Result<Option<ExistingConversation>, BotError> {
         let channel = channel_from_message(&message.id);
         tracing::debug!(
             lookup = "channel",
@@ -3329,7 +3458,10 @@ where
                 source = "channel",
                 "found existing conversation"
             );
-            return Ok(Some(snapshot));
+            return Ok(Some(ExistingConversation {
+                snapshot,
+                source: ConversationLookupSource::Channel,
+            }));
         }
         tracing::debug!(
             lookup = "channel",
@@ -3366,7 +3498,10 @@ where
                     lookup_message = %referenced.message_id,
                     "found existing conversation"
                 );
-                return Ok(Some(snapshot));
+                return Ok(Some(ExistingConversation {
+                    snapshot,
+                    source: ConversationLookupSource::ReferencedMessage,
+                }));
             }
             tracing::debug!(
                 lookup = "referenced_message",
@@ -3419,7 +3554,10 @@ where
                 "no existing conversation found by current message"
             );
         }
-        Ok(snapshot)
+        Ok(snapshot.map(|snapshot| ExistingConversation {
+            snapshot,
+            source: ConversationLookupSource::Message,
+        }))
     }
 
     #[tracing::instrument(
@@ -3551,11 +3689,106 @@ where
         blocks
     }
 
+    async fn prepare_incoming_audio_context(
+        &self,
+        message: &PlatformMessage,
+        agent_config: Option<&AgentConfig>,
+    ) -> Result<IncomingAudioContext, BotError> {
+        let Some(binding) = agent_config.and_then(|agent| agent.audio_transcription.as_ref())
+        else {
+            tracing::debug!(
+                "skipping automatic audio transcription because the selected agent has no audio transcription binding"
+            );
+            return Ok(IncomingAudioContext {
+                saved_audio: Some(Vec::new()),
+                expose_audio_to_model: false,
+                transcriptions: Vec::new(),
+            });
+        };
+        let transcriber = RoutedAudioTranscriber::new(
+            self.audio.clone(),
+            binding.provider.clone(),
+            binding.model.clone(),
+        );
+        let keyterms = binding
+            .wake_word()
+            .map(|wake_word| vec![wake_word.to_string()])
+            .unwrap_or_default();
+        let mut transcriptions = Vec::new();
+        for (attachment_index, attachment) in message.attachments.iter().enumerate() {
+            if !looks_like_audio_ref(attachment) {
+                continue;
+            }
+            let audio_mime_type = attachment
+                .content_type
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let request = AudioTranscriptionRequest {
+                audio: UrlMediaRef::new(
+                    MediaCategory::Audio,
+                    attachment.url.clone(),
+                    audio_mime_type.clone(),
+                )
+                .boxed(),
+                language: None,
+                keyterms: keyterms.clone(),
+                model: None,
+            };
+            let audio_size_bytes = attachment.size_bytes.unwrap_or(0);
+            match transcriber.transcribe_audio(request).await {
+                Ok(transcription) => {
+                    let result = audio_transcription_model_result_json(&transcription);
+                    let trace_response = serde_json::json!({
+                        "audio": {
+                            "attachment_index": attachment_index,
+                            "filename": attachment.filename.as_str(),
+                            "mime_type": audio_mime_type,
+                            "size_bytes": audio_size_bytes,
+                        },
+                        "transcription": result,
+                    });
+                    tracing::info!(
+                        attachment_index,
+                        duration_seconds = transcription.duration_seconds,
+                        text_chars = transcription.text.chars().count(),
+                        usage_records = transcription.usage.len(),
+                        "automatically transcribed incoming audio"
+                    );
+                    transcriptions.push(IncomingAudioTranscription {
+                        attachment_index,
+                        audio_uri: None,
+                        text: transcription.text.clone(),
+                        language: transcription.language.clone(),
+                        duration_seconds: transcription.duration_seconds,
+                        result,
+                        trace_response,
+                        usage: transcription.usage,
+                    });
+                }
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    attachment_index,
+                    "automatic incoming audio transcription failed"
+                ),
+            }
+        }
+        Ok(IncomingAudioContext {
+            saved_audio: if transcriptions.is_empty() {
+                None
+            } else {
+                Some(Vec::new())
+            },
+            expose_audio_to_model: transcriptions.is_empty(),
+            transcriptions,
+        })
+    }
+
     async fn prepare_turn_context(
         &self,
         message: &PlatformMessage,
         settings: &RuntimeSettings,
         conversation: &Conversation,
+        incoming_audio: IncomingAudioContext,
     ) -> Result<PreparedTurnContext, BotError> {
         let mut items = Vec::new();
         let mut position = 0;
@@ -3574,9 +3807,17 @@ where
                 "quoted",
                 referenced,
                 PlatformMessageRelationship::Referenced,
+                None,
+                &[],
             )
             .await?;
         }
+
+        let current_audio_media = match incoming_audio.saved_audio {
+            Some(audio_media) if incoming_audio.expose_audio_to_model => Some(audio_media),
+            Some(_) => Some(Vec::new()),
+            None => None,
+        };
 
         self.push_message_context(
             &mut items,
@@ -3584,6 +3825,8 @@ where
             "message",
             message,
             PlatformMessageRelationship::Current,
+            current_audio_media,
+            &incoming_audio.transcriptions,
         )
         .await?;
 
@@ -3597,13 +3840,24 @@ where
         kind: &str,
         message: &PlatformMessage,
         relationship: PlatformMessageRelationship,
+        saved_audio: Option<Vec<StoredAttachmentMedia>>,
+        audio_transcriptions: &[IncomingAudioTranscription],
     ) -> Result<(), BotError> {
         let image_media = self
             .save_matching_attachments(message, MediaCategory::Image, "image", looks_like_image_ref)
             .await;
-        let audio_media = self
-            .save_matching_attachments(message, MediaCategory::Audio, "audio", looks_like_audio_ref)
-            .await;
+        let audio_media = match saved_audio {
+            Some(audio_media) => audio_media,
+            None => {
+                self.save_matching_attachments(
+                    message,
+                    MediaCategory::Audio,
+                    "audio",
+                    looks_like_audio_ref,
+                )
+                .await
+            }
+        };
 
         let mut value = self
             .platforms
@@ -3611,6 +3865,7 @@ where
             .await
             .map_err(platform_error)?;
         inject_audio_attachment_refs(&mut value, &audio_media);
+        inject_audio_transcriptions(&mut value, audio_transcriptions);
         let content = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
         items.push(chudbot_api::ContextItem {
             position: *position,
@@ -4314,11 +4569,103 @@ struct TurnExecution {
     settings: RuntimeSettings,
     reply_to: MessageRef,
     is_new: bool,
+    preflight_tool_traces: Vec<ToolTrace>,
+    preflight_usage: Vec<UsageRecord>,
+}
+
+impl TurnExecution {
+    fn usage_with_preflight(&self, mut usage: Vec<UsageRecord>) -> Vec<UsageRecord> {
+        if self.preflight_usage.is_empty() {
+            return usage;
+        }
+        let mut out = self.preflight_usage.clone();
+        out.append(&mut usage);
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExistingConversation {
+    snapshot: ConversationSnapshot,
+    source: ConversationLookupSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConversationLookupSource {
+    Channel,
+    ReferencedMessage,
+    Message,
+}
+
+impl ConversationLookupSource {
+    fn counts_as_audio_mention(self) -> bool {
+        matches!(self, Self::Channel | Self::ReferencedMessage)
+    }
 }
 
 #[derive(Debug, Clone)]
 struct PreparedTurnContext {
     items: Vec<chudbot_api::ContextItem>,
+}
+
+#[derive(Debug, Default)]
+struct IncomingAudioContext {
+    saved_audio: Option<Vec<StoredAttachmentMedia>>,
+    expose_audio_to_model: bool,
+    transcriptions: Vec<IncomingAudioTranscription>,
+}
+
+impl IncomingAudioContext {
+    fn usage_records(&self) -> Vec<UsageRecord> {
+        self.transcriptions
+            .iter()
+            .flat_map(|transcription| transcription.usage.iter().cloned())
+            .collect()
+    }
+
+    fn tool_traces(&self) -> Vec<ToolTrace> {
+        self.transcriptions
+            .iter()
+            .map(IncomingAudioTranscription::tool_trace)
+            .collect()
+    }
+}
+
+#[derive(Debug)]
+struct IncomingAudioTranscription {
+    attachment_index: usize,
+    audio_uri: Option<String>,
+    text: String,
+    language: Option<String>,
+    duration_seconds: f64,
+    result: serde_json::Value,
+    trace_response: serde_json::Value,
+    usage: Vec<UsageRecord>,
+}
+
+impl IncomingAudioTranscription {
+    fn tool_trace(&self) -> ToolTrace {
+        let call = ClientToolCall {
+            id: ToolUseId::new(format!("auto-transcribe-audio-{}", self.attachment_index)),
+            name: ToolName::new(TRANSCRIBE_AUDIO_TOOL),
+            input: incoming_audio_tool_input(self),
+        };
+        let result = ClientToolResult {
+            tool_use_id: call.id.clone(),
+            content: ClientToolResultContent::Json {
+                value: self.result.clone(),
+            },
+            is_error: false,
+        };
+        ToolTrace::Client {
+            trace: ClientToolTrace {
+                call,
+                result,
+                trace_response: self.trace_response.clone(),
+                usage: self.usage.clone(),
+            },
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -5681,6 +6028,151 @@ fn inject_audio_attachment_refs(
     );
 }
 
+fn inject_audio_transcriptions(
+    value: &mut serde_json::Value,
+    transcriptions: &[IncomingAudioTranscription],
+) {
+    if transcriptions.is_empty() {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let transcription_values = transcriptions
+        .iter()
+        .map(audio_transcription_context_json)
+        .collect::<Vec<_>>();
+    if let Some(attachments) = object
+        .get_mut("attachments")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for transcription in transcriptions {
+            let Some(attachment) = attachments
+                .get_mut(transcription.attachment_index)
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            attachment.insert(
+                "audio_transcription".to_string(),
+                audio_transcription_context_json(transcription),
+            );
+        }
+    }
+    object.insert(
+        "audio_transcriptions".to_string(),
+        serde_json::Value::Array(transcription_values),
+    );
+}
+
+fn audio_transcription_context_json(
+    transcription: &IncomingAudioTranscription,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "attachment_index": transcription.attachment_index,
+        "text": transcription.text,
+        "language": transcription.language,
+        "duration_seconds": transcription.duration_seconds,
+    });
+    if let Some(audio_uri) = &transcription.audio_uri
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "audio_uri".to_string(),
+            serde_json::Value::String(audio_uri.clone()),
+        );
+    }
+    value
+}
+
+fn incoming_audio_tool_input(transcription: &IncomingAudioTranscription) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "attachment_index": transcription.attachment_index,
+    });
+    if let Some(audio_uri) = &transcription.audio_uri
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "audio_uri".to_string(),
+            serde_json::Value::String(audio_uri.clone()),
+        );
+    }
+    value
+}
+
+fn message_has_audio_attachments(message: &PlatformMessage) -> bool {
+    message.attachments.iter().any(looks_like_audio_ref)
+}
+
+fn no_mention_audio_preflight_enabled(
+    agent_config: Option<&AgentConfig>,
+    audio_continues_conversation: bool,
+) -> bool {
+    no_mention_audio_preflight_enabled_for_binding(
+        agent_config.and_then(|agent| agent.audio_transcription.as_ref()),
+        audio_continues_conversation,
+    )
+}
+
+fn no_mention_audio_preflight_enabled_for_binding(
+    binding: Option<&TranscriptionBinding>,
+    audio_continues_conversation: bool,
+) -> bool {
+    let Some(binding) = binding else {
+        return false;
+    };
+    audio_continues_conversation || binding.wake_word().is_some()
+}
+
+fn incoming_audio_mentions_wake_word(audio: &IncomingAudioContext, wake_word: &str) -> bool {
+    audio
+        .transcriptions
+        .iter()
+        .any(|transcription| text_mentions_wake_word(&transcription.text, wake_word))
+}
+
+fn text_mentions_wake_word(text: &str, wake_word: &str) -> bool {
+    let normalized_text = normalize_wake_word_match_text(text);
+    let normalized_wake_word = normalize_wake_word_match_text(wake_word);
+    !normalized_wake_word.is_empty() && normalized_text.contains(&normalized_wake_word)
+}
+
+fn normalize_wake_word_match_text(text: &str) -> String {
+    text.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+fn append_audio_transcriptions_to_message_content(
+    content: &mut String,
+    transcriptions: &[IncomingAudioTranscription],
+) {
+    let texts = transcriptions
+        .iter()
+        .map(|transcription| transcription.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>();
+    if texts.is_empty() {
+        return;
+    }
+    let transcription_text = if texts.len() == 1 {
+        format!("Voice message transcription: {}", texts[0])
+    } else {
+        let mut out = String::from("Voice message transcriptions:");
+        for (index, text) in texts.iter().enumerate() {
+            out.push_str(&format!("\n{}. {}", index + 1, text));
+        }
+        out
+    };
+    if content.trim().is_empty() {
+        *content = transcription_text;
+    } else {
+        content.push_str("\n\n");
+        content.push_str(&transcription_text);
+    }
+}
+
 fn looks_like_image_ref(attachment: &AttachmentRef) -> bool {
     looks_like_image(attachment.content_type.as_deref(), &attachment.filename)
 }
@@ -6661,6 +7153,68 @@ mod tests {
             "file://audio/voice.ogg"
         );
         assert!(value["attachments"][0].get("audio_uri").is_none());
+    }
+
+    #[test]
+    fn spoken_wake_word_detection_uses_configured_term() {
+        assert!(text_mentions_wake_word(
+            "Hello, Chudbot, can you hear me?",
+            "chudbot"
+        ));
+        assert!(text_mentions_wake_word("hello chud bot", "Chudbot"));
+        assert!(text_mentions_wake_word(
+            "Computer, status report.",
+            "computer"
+        ));
+        assert!(!text_mentions_wake_word("hello chat bot", "Chudbot"));
+        assert!(!text_mentions_wake_word("hello Chudbot", ""));
+    }
+
+    #[test]
+    fn no_mention_audio_preflight_requires_wake_word_outside_conversation() {
+        let without_wake_word = TranscriptionBinding {
+            provider: ProviderName::new("grok_audio"),
+            model: None,
+            wake_word: None,
+        };
+        let with_wake_word = TranscriptionBinding {
+            provider: ProviderName::new("grok_audio"),
+            model: None,
+            wake_word: Some("Chudbot".to_string()),
+        };
+
+        assert!(!no_mention_audio_preflight_enabled_for_binding(
+            Some(&without_wake_word),
+            false
+        ));
+        assert!(no_mention_audio_preflight_enabled_for_binding(
+            Some(&without_wake_word),
+            true
+        ));
+        assert!(no_mention_audio_preflight_enabled_for_binding(
+            Some(&with_wake_word),
+            false
+        ));
+        assert!(!no_mention_audio_preflight_enabled_for_binding(None, true));
+    }
+
+    #[test]
+    fn automatic_audio_context_omits_audio_uri_when_hidden_from_model() {
+        let transcription = IncomingAudioTranscription {
+            attachment_index: 0,
+            audio_uri: None,
+            text: "Hello, Chudbot.".to_string(),
+            language: Some("en".to_string()),
+            duration_seconds: 2.6,
+            result: json!({ "text": "Hello, Chudbot." }),
+            trace_response: json!({ "transcription": { "text": "Hello, Chudbot." } }),
+            usage: Vec::new(),
+        };
+
+        let value = audio_transcription_context_json(&transcription);
+
+        assert_eq!(value["text"], "Hello, Chudbot.");
+        assert!(value.get("audio_uri").is_none());
     }
 
     #[tokio::test]

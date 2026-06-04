@@ -220,6 +220,9 @@ model = "grok-imagine-video"
 
 [bot.agents.default.audio_transcription]
 provider = "grok_audio"
+# Optional spoken wake word for audio messages that are not already in a
+# Chudbot thread/reply. Omit this to ignore standalone no-text audio.
+wake_word = "Chudbot"
 
 [bot.agents.research]
 provider = "openai"

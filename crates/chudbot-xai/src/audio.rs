@@ -13,8 +13,7 @@ use crate::imagine::{media_provider_url, usage_from_xai_media};
 use crate::{XaiClient, XaiError, decode_response};
 
 const STT_ENDPOINT: &str = "/stt";
-const USD_TICKS_PER_USD: f64 = 10_000_000_000.0;
-const XAI_STT_REST_USD_PER_HOUR: f64 = 0.10;
+const XAI_STT_REST_USD_TICKS_PER_HOUR: f64 = 1_000_000_000.0;
 
 impl AudioTranscriber for XaiClient {
     type Error = XaiError;
@@ -67,24 +66,13 @@ impl AudioTranscriber for XaiClient {
         let language = parsed
             .language
             .filter(|language| !language.trim().is_empty());
-        let usage = usage_from_xai_media(
+        let usage = stt_usage_with_cost_estimate(
             self.provider_name(),
             model.clone(),
-            UsageSubject::AudioTranscription,
             parsed.usage.as_ref(),
-        )
-        .into_iter()
-        .collect::<Vec<_>>();
-        let usage = if usage.is_empty() {
-            vec![estimated_stt_usage(
-                self.provider_name(),
-                model.clone(),
-                duration_seconds,
-                raw.clone(),
-            )]
-        } else {
-            usage
-        };
+            duration_seconds,
+            raw.clone(),
+        );
         tracing::info!(
             duration_seconds,
             text_chars = parsed.text.chars().count(),
@@ -179,6 +167,33 @@ fn build_stt_form(audio: &SttAudio, language: Option<&str>, keyterms: &[String])
     form
 }
 
+fn stt_usage_with_cost_estimate(
+    provider: &ProviderName,
+    model: Option<ModelId>,
+    usage: Option<&Value>,
+    duration_seconds: f64,
+    raw: Value,
+) -> Vec<UsageRecord> {
+    let mut records = usage_from_xai_media(
+        provider,
+        model.clone(),
+        UsageSubject::AudioTranscription,
+        usage,
+    )
+    .into_iter()
+    .collect::<Vec<_>>();
+    let estimate = estimated_stt_usage(provider, model, duration_seconds, raw);
+    if records.is_empty() {
+        return vec![estimate];
+    }
+    if records.iter().all(|record| record.cost.is_none())
+        && let Some(cost) = estimate.cost
+    {
+        records[0].cost = Some(cost);
+    }
+    records
+}
+
 fn estimated_stt_usage(
     provider: &ProviderName,
     model: Option<ModelId>,
@@ -186,8 +201,7 @@ fn estimated_stt_usage(
     raw: Value,
 ) -> UsageRecord {
     let ticks =
-        ((duration_seconds.max(0.0) / 3600.0) * XAI_STT_REST_USD_PER_HOUR * USD_TICKS_PER_USD)
-            .ceil() as u64;
+        ((duration_seconds.max(0.0) * XAI_STT_REST_USD_TICKS_PER_HOUR) / 3600.0).ceil() as u64;
     let cost = (ticks > 0).then(|| CostAmount {
         amount: ticks.to_string(),
         unit: "usd_ticks".to_string(),
@@ -244,6 +258,67 @@ impl From<SttWord> for AudioTranscriptWord {
             confidence: word.confidence,
             speaker: word.speaker,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn stt_usage_estimates_cost_when_provider_usage_lacks_cost() {
+        let provider = ProviderName::new("xai");
+        let usage = json!({
+            "input_tokens": 10,
+            "input_tokens_details": { "cached_tokens": 3 },
+            "output_tokens": 20,
+            "output_tokens_details": { "reasoning_tokens": 4 },
+            "total_tokens": 30,
+            "cost_in_usd_ticks": 0
+        });
+
+        let records = stt_usage_with_cost_estimate(
+            &provider,
+            Some(ModelId::new("grok-stt")),
+            Some(&usage),
+            360.0,
+            json!({ "text": "hello", "duration": 360.0, "usage": usage }),
+        );
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_tokens, Some(10));
+        assert_eq!(records[0].cached_input_tokens, Some(3));
+        let cost = records[0].cost.as_ref().expect("estimated cost");
+        assert_eq!(cost.amount, "100000000");
+        assert_eq!(cost.unit, "usd_ticks");
+        assert!(cost.estimated);
+    }
+
+    #[test]
+    fn stt_usage_preserves_provider_cost_when_present() {
+        let provider = ProviderName::new("xai");
+        let usage = json!({
+            "input_tokens": 0,
+            "input_tokens_details": { "cached_tokens": 0 },
+            "output_tokens": 0,
+            "output_tokens_details": { "reasoning_tokens": 0 },
+            "total_tokens": 0,
+            "cost_in_usd_ticks": 123
+        });
+
+        let records = stt_usage_with_cost_estimate(
+            &provider,
+            None,
+            Some(&usage),
+            360.0,
+            json!({ "text": "hello", "duration": 360.0, "usage": usage }),
+        );
+
+        let cost = records[0].cost.as_ref().expect("provider cost");
+        assert_eq!(cost.amount, "123");
+        assert!(!cost.estimated);
     }
 }
 

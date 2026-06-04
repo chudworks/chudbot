@@ -3078,7 +3078,14 @@ mod tests {
         let response = json!({
             "text": "I am allergic to coconut.",
             "language": "en",
-            "duration_seconds": 3.25
+            "duration_seconds": 3.25,
+            "words": [
+                {
+                    "text": "Ignore",
+                    "start": 0.0,
+                    "end": 0.25
+                }
+            ]
         });
 
         let transcription =
