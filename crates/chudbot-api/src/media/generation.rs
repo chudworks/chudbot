@@ -1,4 +1,4 @@
-//! Image and video generation provider contracts.
+//! Image, video, and audio media provider contracts.
 
 use std::future::Future;
 
@@ -8,6 +8,66 @@ use crate::ids::{ModelId, ProviderName, VideoJobId};
 use crate::usage::UsageRecord;
 
 use super::BoxedMediaRef;
+
+/// Audio transcription request.
+#[derive(Debug, Clone)]
+pub struct AudioTranscriptionRequest {
+    /// Audio file to transcribe.
+    pub audio: BoxedMediaRef,
+    /// Optional language code for provider-side text formatting.
+    pub language: Option<String>,
+    /// Optional key terms to bias transcription toward domain vocabulary.
+    pub keyterms: Vec<String>,
+    /// Provider-specific model id when applicable.
+    pub model: Option<ModelId>,
+}
+
+/// One transcribed word with timing metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptWord {
+    /// Word text.
+    pub text: String,
+    /// Start timestamp in seconds.
+    #[serde(rename = "start")]
+    pub start_seconds: f64,
+    /// End timestamp in seconds.
+    #[serde(rename = "end")]
+    pub end_seconds: f64,
+    /// Provider confidence when reported.
+    pub confidence: Option<f64>,
+    /// Speaker index when diarization is enabled and reported.
+    pub speaker: Option<u32>,
+}
+
+/// Per-channel transcript when multichannel transcription is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptChannel {
+    /// Channel index.
+    pub index: u32,
+    /// Channel transcript text.
+    pub text: String,
+    /// Word-level timing for this channel.
+    pub words: Vec<AudioTranscriptWord>,
+}
+
+/// Audio transcription result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscription {
+    /// Full transcript text.
+    pub text: String,
+    /// Detected or requested language when reported.
+    pub language: Option<String>,
+    /// Audio duration in seconds.
+    pub duration_seconds: f64,
+    /// Word-level timing.
+    pub words: Vec<AudioTranscriptWord>,
+    /// Per-channel transcripts.
+    pub channels: Vec<AudioTranscriptChannel>,
+    /// Actual model used when applicable.
+    pub model: Option<ModelId>,
+    /// Usage/cost reported or estimated for this transcription.
+    pub usage: Vec<UsageRecord>,
+}
 
 /// Image generation request.
 #[derive(Debug, Clone)]
@@ -140,4 +200,19 @@ pub trait VideoGenerator: Send + Sync {
         &self,
         url: String,
     ) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + Send;
+}
+
+/// Audio transcription provider.
+pub trait AudioTranscriber: Send + Sync {
+    /// Provider error type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Short backend name.
+    fn backend_name(&self) -> &ProviderName;
+
+    /// Transcribe one audio file.
+    fn transcribe_audio(
+        &self,
+        request: AudioTranscriptionRequest,
+    ) -> impl Future<Output = Result<AudioTranscription, Self::Error>> + Send;
 }

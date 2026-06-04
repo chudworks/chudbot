@@ -304,7 +304,7 @@ fn data_uri(mime_type: &str, bytes: &[u8]) -> String {
     format!("data:{mime_type};base64,{}", B64.encode(bytes))
 }
 
-fn usage_from_xai_media(
+pub(crate) fn usage_from_xai_media(
     provider: &ProviderName,
     model: Option<ModelId>,
     subject: UsageSubject,

@@ -1,5 +1,6 @@
 //! xAI provider crate for the chudbot 2.0 API.
 
+mod audio;
 mod imagine;
 mod llm;
 

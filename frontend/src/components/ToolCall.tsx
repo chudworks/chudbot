@@ -21,8 +21,10 @@ export default function ToolCall({ trace }: Props) {
           {media.map((m) =>
             m.kind === 'image' ? (
               <img key={m.uri} className="context-image" src={m.path} alt={view.name} />
-            ) : (
+            ) : m.kind === 'video' ? (
               <video key={m.uri} className="context-video" controls src={m.path} />
+            ) : (
+              <audio key={m.uri} className="context-audio" controls src={m.path} />
             )
           )}
         </div>
@@ -96,10 +98,10 @@ function resultContentValue(content: ClientToolResultContent): unknown {
   }
 }
 
-type MediaRef = { kind: 'image' | 'video'; uri: string; path: string };
+type MediaRef = { kind: 'image' | 'video' | 'audio'; uri: string; path: string };
 
 /** Walk the value, collecting any string that looks like a
- *  `file://images/...` or `file://videos/...` URI. */
+ *  `file://images/...`, `file://videos/...`, or `file://audio/...` URI. */
 function collectMediaUris(value: unknown): MediaRef[] {
   const out: MediaRef[] = [];
   const seen = new Set<string>();
@@ -113,6 +115,8 @@ function walk(value: unknown, out: MediaRef[], seen: Set<string>) {
       pushMediaRef(out, seen, 'image', value);
     } else if (value.startsWith('file://videos/')) {
       pushMediaRef(out, seen, 'video', value);
+    } else if (value.startsWith('file://audio/')) {
+      pushMediaRef(out, seen, 'audio', value);
     }
     return;
   }
@@ -128,7 +132,7 @@ function walk(value: unknown, out: MediaRef[], seen: Set<string>) {
 function pushMediaRef(
   out: MediaRef[],
   seen: Set<string>,
-  kind: 'image' | 'video',
+  kind: 'image' | 'video' | 'audio',
   uri: string
 ) {
   if (seen.has(uri)) return;

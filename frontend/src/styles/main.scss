@@ -406,12 +406,17 @@ details {
 }
 
 .context-image,
-.context-video {
+.context-video,
+.context-audio {
     max-width: 100%;
     max-height: 400px;
     border-radius: 6px;
     margin: 0.25rem 0;
     display: block;
+}
+
+.context-audio {
+    width: min(100%, 420px);
 }
 
 .tool-call__media {
@@ -421,7 +426,8 @@ details {
     margin: 0.5rem 0;
 
     .context-image,
-    .context-video {
+    .context-video,
+    .context-audio {
         max-height: 300px;
         flex: 0 0 auto;
     }

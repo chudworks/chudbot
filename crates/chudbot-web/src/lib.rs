@@ -304,6 +304,7 @@ where
     Router::new()
         .merge(api)
         .route("/videos/{name}", get(get_video::<S, M>))
+        .route("/audio/{name}", get(get_audio::<S, M>))
         .route("/avatars/{name}", get(get_avatar::<S, M>))
         .route("/images/{name}", get(get_image::<S, M>))
         .route("/favicon.ico", get(get_favicon::<S, M>))
@@ -818,6 +819,18 @@ where
     M: MediaStore + Clone + Send + Sync + 'static,
 {
     load_media_response(&state.media_store, MediaCategory::Video, &name).await
+}
+
+#[tracing::instrument(name = "web.get_audio", skip_all, fields(name = %name))]
+async fn get_audio<S, M>(
+    State(state): State<WebState<S, M>>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError>
+where
+    S: Clone + Send + Sync + 'static,
+    M: MediaStore + Clone + Send + Sync + 'static,
+{
+    load_media_response(&state.media_store, MediaCategory::Audio, &name).await
 }
 
 #[tracing::instrument(name = "web.get_avatar", skip_all, fields(name = %name))]

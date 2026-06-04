@@ -6,8 +6,9 @@ mod store;
 mod tool;
 
 pub use generation::{
-    GeneratedImage, GeneratedVideo, ImageGenerator, ImageRequest, VideoGenerator, VideoJobStatus,
-    VideoMeta, VideoRequest,
+    AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
+    AudioTranscriptionRequest, GeneratedImage, GeneratedVideo, ImageGenerator, ImageRequest,
+    VideoGenerator, VideoJobStatus, VideoMeta, VideoRequest,
 };
 pub use reference::{
     BoxedMediaRef, MediaCategory, MediaError, MediaFuture, MediaMetadata, MediaRef, MediaUri,

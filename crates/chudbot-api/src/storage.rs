@@ -845,6 +845,24 @@ pub struct UserMemoryTurn {
     pub user_content: String,
     /// Assistant reply text, if any.
     pub assistant_content: Option<String>,
+    /// Audio transcriptions produced during this turn.
+    #[serde(default)]
+    pub audio_transcriptions: Vec<UserMemoryAudioTranscription>,
+}
+
+/// One audio transcription loaded for the memory diary pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMemoryAudioTranscription {
+    /// Tool trace row id that produced the transcription.
+    pub tool_trace_id: i64,
+    /// Stable stored audio URI when available.
+    pub audio_uri: Option<String>,
+    /// Transcribed text.
+    pub text: String,
+    /// Language reported by the provider when available.
+    pub language: Option<String>,
+    /// Audio duration in seconds when available.
+    pub duration_seconds: Option<f64>,
 }
 
 /// Bot persistence API.
@@ -1327,6 +1345,7 @@ mod tests {
                 user_display_name: "Chud".to_string(),
                 user_content: "hi".to_string(),
                 assistant_content: Some("hello".to_string()),
+                audio_transcriptions: Vec::new(),
             })
             .unwrap(),
             &["completed_at"],

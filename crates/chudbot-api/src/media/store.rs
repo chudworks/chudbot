@@ -40,7 +40,8 @@ pub trait MediaStore: Send + Sync {
         input: CreateMedia,
     ) -> impl Future<Output = Result<BoxedMediaRef, MediaError>> + Send;
 
-    /// Resolve a model-facing media URI such as `file://images/abc123.png`.
+    /// Resolve a model-facing media URI such as `file://images/abc123.png` or
+    /// `file://audio/abc123.ogg`.
     fn media_from_uri(
         &self,
         uri: &MediaUri,

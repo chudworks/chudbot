@@ -33,11 +33,12 @@ pub use llm::{
     SamplingOptions, ServerToolSet,
 };
 pub use media::{
-    BoxedMediaRef, CreateMedia, GeneratedImage, GeneratedVideo, ImageGenerator, ImageGeneratorTool,
-    ImageGeneratorToolExt, ImageRequest, LoadedMedia, MediaCategory, MediaError, MediaFuture,
-    MediaMetadata, MediaRef, MediaStore, MediaToolError, MediaUri, PublicMediaUrl, UrlMediaRef,
-    VideoGenerator, VideoGeneratorTool, VideoGeneratorToolExt, VideoJobStatus, VideoMeta,
-    VideoRequest,
+    AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
+    AudioTranscriptionRequest, BoxedMediaRef, CreateMedia, GeneratedImage, GeneratedVideo,
+    ImageGenerator, ImageGeneratorTool, ImageGeneratorToolExt, ImageRequest, LoadedMedia,
+    MediaCategory, MediaError, MediaFuture, MediaMetadata, MediaRef, MediaStore, MediaToolError,
+    MediaUri, PublicMediaUrl, UrlMediaRef, VideoGenerator, VideoGeneratorTool,
+    VideoGeneratorToolExt, VideoJobStatus, VideoMeta, VideoRequest,
 };
 pub use platform::{
     AttachmentRef, FetchMessages, MessagePlatform, OutgoingAttachment, PlatformCommand,
@@ -54,8 +55,8 @@ pub use storage::{
     NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, OpenConversation,
     PrivacyMode, ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile,
     StoredVideoJob, Turn, TurnAsset, TurnSnapshot, TurnStatus, UpdateVideoJob,
-    UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryJob,
-    UserMemoryKey, UserMemoryTurn,
+    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
+    UserMemoryEventKind, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
 };
 pub use tool::{
     ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,

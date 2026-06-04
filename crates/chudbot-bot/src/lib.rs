@@ -17,14 +17,15 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chudbot_api::{
-    Agent, AgentBuilder, AgentLimits, AgentOutcome, AgentSelection, AgentSpec, BeginTurn,
-    BotStorage, ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput,
-    ClientToolResultContent, ClientToolSpec, ContentBlock, Conversation, ConversationEventKind,
-    ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop, CreateMedia,
-    CreateVideoJob, EventSink, ExternalId, FetchMessages, FinishTurn, GeneratedImage,
-    ImageGenerator, ImageGeneratorTool, ImageRequest, LiveEvent, LlmBackend, MediaCategory,
-    MediaStore, MediaUri, MessageLink, MessagePlatform, MessageRef, Model, ModelId, ModelSpec,
-    ModelStep, ModelStepRequest, OpenConversation, OutgoingAttachment, PlatformCommand,
+    Agent, AgentBuilder, AgentLimits, AgentOutcome, AgentSelection, AgentSpec, AttachmentRef,
+    AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, BeginTurn, BotStorage,
+    ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResultContent,
+    ClientToolSpec, ContentBlock, Conversation, ConversationEventKind, ConversationId,
+    ConversationLookup, ConversationSnapshot, ConversationStop, CreateMedia, CreateVideoJob,
+    EventSink, ExternalId, FetchMessages, FinishTurn, GeneratedImage, ImageGenerator,
+    ImageGeneratorTool, ImageRequest, LiveEvent, LlmBackend, MediaCategory, MediaStore, MediaUri,
+    MessageLink, MessagePlatform, MessageRef, Model, ModelId, ModelSpec, ModelStep,
+    ModelStepRequest, OpenConversation, OutgoingAttachment, PlatformCommand,
     PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
     PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
     PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
@@ -43,6 +44,7 @@ use tokio_util::task::TaskTracker;
 const FETCH_MESSAGES_TOOL: &str = "fetch_messages";
 const GENERATE_IMAGE_TOOL: &str = "generate_image";
 const GENERATE_VIDEO_TOOL: &str = "generate_video";
+const TRANSCRIBE_AUDIO_TOOL: &str = "transcribe_audio";
 const POST_STATUS_TOOL: &str = "post_status_message";
 const WORKING_REACTION: &str = "👀";
 const SUCCESS_REACTION: &str = "✅";
@@ -154,6 +156,22 @@ pub trait VideoGeneratorRegistry: Clone + Send + Sync {
         provider: &ProviderName,
         url: String,
     ) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + Send;
+}
+
+/// Registry of named audio transcription services.
+pub trait AudioTranscriberRegistry: Clone + Send + Sync {
+    /// Registry error type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Whether a transcriber is configured.
+    fn contains_transcriber(&self, provider: &ProviderName) -> bool;
+
+    /// Transcribe one audio file through a named provider.
+    fn transcribe_audio(
+        &self,
+        provider: &ProviderName,
+        request: AudioTranscriptionRequest,
+    ) -> impl Future<Output = Result<AudioTranscription, Self::Error>> + Send;
 }
 
 /// Registry of named message platform services.
@@ -483,6 +501,68 @@ where
     }
 }
 
+/// `AudioTranscriber` adapter for one configured provider inside a registry.
+#[derive(Debug, Clone)]
+pub struct RoutedAudioTranscriber<R> {
+    registry: R,
+    provider: ProviderName,
+    model: Option<ModelId>,
+}
+
+impl<R> RoutedAudioTranscriber<R> {
+    /// Build a routed audio transcriber.
+    pub fn new(registry: R, provider: ProviderName, model: Option<ModelId>) -> Self {
+        Self {
+            registry,
+            provider,
+            model,
+        }
+    }
+}
+
+impl<R> AudioTranscriber for RoutedAudioTranscriber<R>
+where
+    R: AudioTranscriberRegistry,
+{
+    type Error = R::Error;
+
+    fn backend_name(&self) -> &ProviderName {
+        &self.provider
+    }
+
+    #[tracing::instrument(
+        name = "audio.routed_transcribe",
+        skip_all,
+        fields(provider = %self.provider, configured_model = ?self.model.as_ref())
+    )]
+    async fn transcribe_audio(
+        &self,
+        mut request: AudioTranscriptionRequest,
+    ) -> Result<AudioTranscription, Self::Error> {
+        if request.model.is_none() {
+            request.model = self.model.clone();
+        }
+        tracing::debug!(
+            request_model = ?request.model.as_ref(),
+            "dispatching audio transcription through registry"
+        );
+        let result = self
+            .registry
+            .transcribe_audio(&self.provider, request)
+            .await;
+        match &result {
+            Ok(transcription) => tracing::info!(
+                duration_seconds = transcription.duration_seconds,
+                text_chars = transcription.text.chars().count(),
+                usage_records = transcription.usage.len(),
+                "audio transcription completed"
+            ),
+            Err(error) => tracing::warn!(error = %error, "audio transcription failed"),
+        }
+        result
+    }
+}
+
 /// Runtime configuration owned by the bot crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotConfig {
@@ -558,6 +638,9 @@ impl BotConfig {
             }
             if let Some(binding) = &agent.video_generation {
                 validate_generation_binding(agent_name, "video_generation", binding)?;
+            }
+            if let Some(binding) = &agent.audio_transcription {
+                validate_transcription_binding(agent_name, "audio_transcription", binding)?;
             }
             for binding in agent.subagents.values() {
                 if !self.agents.contains_key(&binding.agent) {
@@ -678,6 +761,32 @@ fn validate_generation_binding(
     Ok(())
 }
 
+fn validate_transcription_binding(
+    agent_name: &str,
+    field: &'static str,
+    binding: &TranscriptionBinding,
+) -> Result<(), BotError> {
+    if binding.provider.as_str().trim().is_empty() {
+        tracing::warn!(agent = %agent_name, field, "audio transcription provider is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "provider is empty".to_string(),
+        });
+    }
+    if let Some(model) = &binding.model
+        && model.as_str().trim().is_empty()
+    {
+        tracing::warn!(agent = %agent_name, field, "audio transcription model is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "model is empty".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// One named agent: prompt, provider/model, tool exposure, and subagents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
@@ -704,6 +813,9 @@ pub struct AgentConfig {
     /// Optional video generation binding exposed through `generate_video`.
     #[serde(default)]
     pub video_generation: Option<GenerationBinding>,
+    /// Optional audio transcription binding exposed through `transcribe_audio`.
+    #[serde(default)]
+    pub audio_transcription: Option<TranscriptionBinding>,
     /// Whether top-level runs for this agent receive user-memory tools.
     #[serde(default)]
     pub memory: bool,
@@ -719,6 +831,16 @@ pub struct GenerationBinding {
     pub provider: ProviderName,
     /// Provider-specific image/video model id or tier.
     pub model: ModelId,
+}
+
+/// Binding from an agent to an audio transcription provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionBinding {
+    /// Audio transcription provider registry key.
+    pub provider: ProviderName,
+    /// Provider-specific transcription model id when applicable.
+    #[serde(default)]
+    pub model: Option<ModelId>,
 }
 
 /// Platform default binding.
@@ -754,13 +876,14 @@ pub struct SubagentBinding {
 
 /// Platform-neutral bot runtime.
 #[derive(Debug, Clone)]
-pub struct BotRuntime<P, S, M, L, I, V, E> {
+pub struct BotRuntime<P, S, M, L, I, V, A, E> {
     platforms: P,
     storage: S,
     media_store: M,
     llms: L,
     images: I,
     videos: V,
+    audio: A,
     events: E,
     background: TaskTracker,
     turn_cancellations: TurnCancellations,
@@ -771,7 +894,7 @@ pub struct BotRuntime<P, S, M, L, I, V, E> {
 
 /// Runtime service implementations supplied by the binary crate.
 #[derive(Debug, Clone)]
-pub struct BotRuntimeParts<P, S, M, L, I, V, E> {
+pub struct BotRuntimeParts<P, S, M, L, I, V, A, E> {
     /// Message platform registry.
     pub platforms: P,
     /// Durable bot storage.
@@ -784,6 +907,8 @@ pub struct BotRuntimeParts<P, S, M, L, I, V, E> {
     pub images: I,
     /// Video generation registry.
     pub videos: V,
+    /// Audio transcription registry.
+    pub audio: A,
     /// Live event sink.
     pub events: E,
     /// User-memory runtime configuration.
@@ -873,9 +998,9 @@ impl TypingIndicator {
     }
 }
 
-impl<P, S, M, L, I, V, E> BotRuntime<P, S, M, L, I, V, E> {
+impl<P, S, M, L, I, V, A, E> BotRuntime<P, S, M, L, I, V, A, E> {
     /// Construct a bot runtime.
-    pub fn new(parts: BotRuntimeParts<P, S, M, L, I, V, E>, config: BotConfig) -> Self {
+    pub fn new(parts: BotRuntimeParts<P, S, M, L, I, V, A, E>, config: BotConfig) -> Self {
         tracing::debug!(
             agents = config.agents.len(),
             platforms = config.platforms.len(),
@@ -889,6 +1014,7 @@ impl<P, S, M, L, I, V, E> BotRuntime<P, S, M, L, I, V, E> {
             llms: parts.llms,
             images: parts.images,
             videos: parts.videos,
+            audio: parts.audio,
             events: parts.events,
             background: TaskTracker::new(),
             turn_cancellations: TurnCancellations::default(),
@@ -904,7 +1030,7 @@ impl<P, S, M, L, I, V, E> BotRuntime<P, S, M, L, I, V, E> {
     }
 }
 
-impl<P, S, M, L, I, V, E> BotRuntime<P, S, M, L, I, V, E>
+impl<P, S, M, L, I, V, A, E> BotRuntime<P, S, M, L, I, V, A, E>
 where
     P: MessagePlatformRegistry + Clone + 'static,
     S: BotStorage + Clone + 'static,
@@ -912,6 +1038,7 @@ where
     L: LlmProviderRegistry + Clone + 'static,
     I: ImageGeneratorRegistry + Clone + 'static,
     V: VideoGeneratorRegistry + Clone + 'static,
+    A: AudioTranscriberRegistry + Clone + 'static,
     E: EventSink + Clone + 'static,
 {
     /// Run the platform event loop until the registry emits shutdown.
@@ -1935,7 +2062,7 @@ where
             ensure_client_tool_enabled(&mut spec.client_tools, memory::FORGET_USER_MEMORY_TOOL);
         }
 
-        let mut tools: Vec<RuntimeTool<P, S, M, L, I, V>> = Vec::new();
+        let mut tools: Vec<RuntimeTool<P, S, M, L, I, V, A>> = Vec::new();
         if top_level {
             if !matches!(settings.privacy, PrivacyMode::ConversationOnly) {
                 tracing::debug!(tool = FETCH_MESSAGES_TOOL, "attaching runtime tool");
@@ -2047,6 +2174,35 @@ where
                 .with_description(format!(
                     "Generate a video with the configured `{}` video provider and `{}` model, save it to media storage, and return its media URI.",
                     binding.provider, binding.model
+                )),
+            });
+        }
+
+        if let Some(binding) = &agent_config.audio_transcription {
+            tracing::debug!(
+                tool = TRANSCRIBE_AUDIO_TOOL,
+                provider = %binding.provider,
+                model = ?binding.model.as_ref(),
+                "attaching audio transcription tool"
+            );
+            tools.push(RuntimeTool::Audio {
+                name: ToolName::new(TRANSCRIBE_AUDIO_TOOL),
+                tool: AudioTranscriptionTool::new(
+                    RoutedAudioTranscriber::new(
+                        self.audio.clone(),
+                        binding.provider.clone(),
+                        binding.model.clone(),
+                    ),
+                    self.media_store.clone(),
+                )
+                .with_description(format!(
+                    "Transcribe a stored audio attachment with the configured `{}` audio provider{} and return the speech as text.",
+                    binding.provider,
+                    binding
+                        .model
+                        .as_ref()
+                        .map(|model| format!(" and `{model}` model"))
+                        .unwrap_or_default()
                 )),
             });
         }
@@ -3442,11 +3598,19 @@ where
         message: &PlatformMessage,
         relationship: PlatformMessageRelationship,
     ) -> Result<(), BotError> {
-        let value = self
+        let image_media = self
+            .save_matching_attachments(message, MediaCategory::Image, "image", looks_like_image_ref)
+            .await;
+        let audio_media = self
+            .save_matching_attachments(message, MediaCategory::Audio, "audio", looks_like_audio_ref)
+            .await;
+
+        let mut value = self
             .platforms
             .message_context(message, relationship)
             .await
             .map_err(platform_error)?;
+        inject_audio_attachment_refs(&mut value, &audio_media);
         let content = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
         items.push(chudbot_api::ContextItem {
             position: *position,
@@ -3457,19 +3621,33 @@ where
         });
         *position += 1;
 
-        let media = self.save_image_attachments(message).await;
         let mut image_refs = Vec::new();
-        for (index, media) in media.into_iter().enumerate() {
-            let uri = media.uri().to_string();
+        for saved in image_media {
+            let uri = saved.media.uri().to_string();
             image_refs.push(uri.clone());
             items.push(chudbot_api::ContextItem {
                 position: *position,
                 source: format!(
-                    "platform:{kind}:{}:image:{index}",
-                    message.id.message_id.as_str()
+                    "platform:{kind}:{}:image:{}",
+                    message.id.message_id.as_str(),
+                    saved.attachment_index
                 ),
                 role: "user".to_string(),
                 content: uri,
+                message: Some(message.id.clone()),
+            });
+            *position += 1;
+        }
+        for saved in &audio_media {
+            items.push(chudbot_api::ContextItem {
+                position: *position,
+                source: format!(
+                    "platform:{kind}:{}:audio:{}",
+                    message.id.message_id.as_str(),
+                    saved.attachment_index
+                ),
+                role: "user".to_string(),
+                content: saved.media.uri().to_string(),
                 message: Some(message.id.clone()),
             });
             *position += 1;
@@ -3558,13 +3736,16 @@ where
         Ok(already_replays)
     }
 
-    async fn save_image_attachments(
+    async fn save_matching_attachments(
         &self,
         message: &PlatformMessage,
-    ) -> Vec<chudbot_api::BoxedMediaRef> {
+        category: MediaCategory,
+        label: &'static str,
+        predicate: fn(&AttachmentRef) -> bool,
+    ) -> Vec<StoredAttachmentMedia> {
         let mut out = Vec::new();
-        for attachment in &message.attachments {
-            if !looks_like_image(attachment.content_type.as_deref(), &attachment.filename) {
+        for (attachment_index, attachment) in message.attachments.iter().enumerate() {
+            if !predicate(attachment) {
                 continue;
             }
             let response = match self.download_http.get(&attachment.url).send().await {
@@ -3573,7 +3754,8 @@ where
                     tracing::warn!(
                         error = %error,
                         filename = %attachment.filename,
-                        "failed to download image attachment"
+                        media_type = label,
+                        "failed to download media attachment"
                     );
                     continue;
                 }
@@ -3583,7 +3765,8 @@ where
                 tracing::warn!(
                     status = status.as_u16(),
                     filename = %attachment.filename,
-                    "image attachment download returned non-success status"
+                    media_type = label,
+                    "media attachment download returned non-success status"
                 );
                 continue;
             }
@@ -3593,7 +3776,8 @@ where
                     tracing::warn!(
                         error = %error,
                         filename = %attachment.filename,
-                        "failed to read image attachment bytes"
+                        media_type = label,
+                        "failed to read media attachment bytes"
                     );
                     continue;
                 }
@@ -3601,7 +3785,7 @@ where
             match self
                 .media_store
                 .create_media(CreateMedia {
-                    category: MediaCategory::Image,
+                    category: category.clone(),
                     bytes,
                     mime_type: attachment.content_type.clone(),
                     name: None,
@@ -3613,14 +3797,19 @@ where
                     tracing::info!(
                         uri = %media.uri(),
                         filename = %attachment.filename,
-                        "saved image attachment"
+                        media_type = label,
+                        "saved media attachment"
                     );
-                    out.push(media);
+                    out.push(StoredAttachmentMedia {
+                        attachment_index,
+                        media,
+                    });
                 }
                 Err(error) => tracing::warn!(
                     error = %error,
                     filename = %attachment.filename,
-                    "failed to store image attachment"
+                    media_type = label,
+                    "failed to store media attachment"
                 ),
             }
         }
@@ -3829,6 +4018,18 @@ where
                 binding.provider, binding.model
             ));
         }
+        if let Some(binding) = &agent.audio_transcription {
+            out.push_str(&format!(
+                "- Audio transcription is available through transcribe_audio using provider `{}`{}.\n",
+                binding.provider,
+                binding
+                    .model
+                    .as_ref()
+                    .map(|model| format!(" and model `{model}`"))
+                    .unwrap_or_default()
+            ));
+            out.push_str("- Platform message JSON may include `audio_attachments` or attachment `audio_uri` fields. Use transcribe_audio with those file://audio/... URIs when the user's audio is relevant.\n");
+        }
         if !agent.subagents.is_empty() {
             out.push_str("- Specialist subagents are available as tools.\n");
         }
@@ -3919,6 +4120,20 @@ where
                 "agent video generation provider is not configured"
             );
             return Err(BotError::MissingVideoGenerator {
+                agent: agent_name.to_string(),
+                provider: binding.provider.clone(),
+            });
+        }
+        if let Some(binding) = &agent.audio_transcription
+            && !self.audio.contains_transcriber(&binding.provider)
+        {
+            tracing::warn!(
+                agent = %agent_name,
+                provider = %binding.provider,
+                model = ?binding.model.as_ref(),
+                "agent audio transcription provider is not configured"
+            );
+            return Err(BotError::MissingAudioTranscriber {
                 agent: agent_name.to_string(),
                 provider: binding.provider.clone(),
             });
@@ -4048,6 +4263,16 @@ pub enum BotError {
         /// Missing video provider.
         provider: ProviderName,
     },
+    /// Agent references an unavailable audio transcriber.
+    #[error(
+        "agent `{agent}` uses audio provider `{provider}` but that transcriber is not configured"
+    )]
+    MissingAudioTranscriber {
+        /// Agent name.
+        agent: String,
+        /// Missing audio provider.
+        provider: ProviderName,
+    },
     /// Agent media-generation binding is malformed.
     #[error("agent `{agent}` has invalid `{field}` binding: {message}")]
     InvalidGenerationBinding {
@@ -4097,11 +4322,18 @@ struct PreparedTurnContext {
 }
 
 #[derive(Debug)]
-enum RuntimeTool<P, S, M, L, I, V>
+struct StoredAttachmentMedia {
+    attachment_index: usize,
+    media: chudbot_api::BoxedMediaRef,
+}
+
+#[derive(Debug)]
+enum RuntimeTool<P, S, M, L, I, V, A>
 where
     L: LlmProviderRegistry,
     I: ImageGeneratorRegistry,
     V: VideoGeneratorRegistry,
+    A: AudioTranscriberRegistry,
 {
     Fetch {
         name: ToolName,
@@ -4119,6 +4351,10 @@ where
         name: ToolName,
         tool: PersistentVideoGeneratorTool<RoutedVideoGenerator<V>, M, S>,
     },
+    Audio {
+        name: ToolName,
+        tool: AudioTranscriptionTool<RoutedAudioTranscriber<A>, M>,
+    },
     Memory {
         name: ToolName,
         tool: memory::MemoryClientTool<S>,
@@ -4129,7 +4365,7 @@ where
     },
 }
 
-impl<P, S, M, L, I, V> RuntimeTool<P, S, M, L, I, V>
+impl<P, S, M, L, I, V, A> RuntimeTool<P, S, M, L, I, V, A>
 where
     P: MessagePlatformRegistry + Clone + 'static,
     S: BotStorage + Clone + 'static,
@@ -4137,6 +4373,7 @@ where
     L: LlmProviderRegistry + Clone + 'static,
     I: ImageGeneratorRegistry + Clone + 'static,
     V: VideoGeneratorRegistry + Clone + 'static,
+    A: AudioTranscriberRegistry + Clone + 'static,
 {
     fn start(self, spec: AgentSpec) -> AgentBuilder {
         match self {
@@ -4144,6 +4381,7 @@ where
             Self::Status { name, tool } => spec.with_tool(name, tool),
             Self::Image { name, tool } => spec.with_tool(name, tool),
             Self::Video { name, tool } => spec.with_tool(name, tool),
+            Self::Audio { name, tool } => spec.with_tool(name, tool),
             Self::Memory { name, tool } => spec.with_tool(name, tool),
             Self::Subagent { name, tool } => spec.with_tool(name, tool),
         }
@@ -4155,9 +4393,102 @@ where
             Self::Status { name, tool } => builder.with_tool(name, tool),
             Self::Image { name, tool } => builder.with_tool(name, tool),
             Self::Video { name, tool } => builder.with_tool(name, tool),
+            Self::Audio { name, tool } => builder.with_tool(name, tool),
             Self::Memory { name, tool } => builder.with_tool(name, tool),
             Self::Subagent { name, tool } => builder.with_tool(name, tool),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AudioTranscriptionTool<T, M> {
+    transcriber: T,
+    media_store: M,
+    description: String,
+}
+
+impl<T, M> AudioTranscriptionTool<T, M> {
+    fn new(transcriber: T, media_store: M) -> Self {
+        Self {
+            transcriber,
+            media_store,
+            description: "Transcribe a stored audio attachment and return its speech as text."
+                .to_string(),
+        }
+    }
+
+    fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = description.into();
+        self
+    }
+}
+
+impl<T, M> ClientTool for AudioTranscriptionTool<T, M>
+where
+    T: AudioTranscriber,
+    M: MediaStore,
+{
+    type Error = BotToolError;
+
+    fn spec(&self) -> ClientToolSpec {
+        ClientToolSpec {
+            description: self.description.clone(),
+            input_schema: audio_transcription_tool_schema(),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "tool.transcribe_audio",
+        skip_all,
+        fields(tool_call = %call.id)
+    )]
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+        let request =
+            audio_transcription_request_from_tool_input(&self.media_store, call.input).await?;
+        let audio_uri = request.audio.uri().to_string();
+        let audio_mime_type = request.audio.mime_type().to_string();
+        let audio_size_bytes = request.audio.size_bytes();
+        tracing::debug!(
+            audio_uri = %audio_uri,
+            audio_mime_type = %audio_mime_type,
+            audio_size_bytes,
+            language = ?request.language.as_deref(),
+            keyterms = request.keyterms.len(),
+            model = ?request.model.as_ref().map(ModelId::as_str),
+            "parsed audio transcription request"
+        );
+        let transcription = self
+            .transcriber
+            .transcribe_audio(request)
+            .await
+            .map_err(|error| {
+                tracing::warn!(error = %error, "audio transcription failed");
+                BotToolError::Generator(error.to_string())
+            })?;
+        let result = audio_transcription_model_result_json(&transcription);
+        let trace_response = serde_json::json!({
+            "audio": {
+                "uri": audio_uri,
+                "mime_type": audio_mime_type,
+                "size_bytes": audio_size_bytes,
+            },
+            "transcription": result,
+        });
+        tracing::info!(
+            duration_seconds = transcription.duration_seconds,
+            text_chars = transcription.text.chars().count(),
+            usage_records = transcription.usage.len(),
+            "audio transcription tool completed"
+        );
+
+        Ok(ClientToolOutput {
+            result: ClientToolResultContent::Json {
+                value: result.clone(),
+            },
+            is_error: false,
+            trace_response,
+            usage: transcription.usage,
+        })
     }
 }
 
@@ -4660,6 +4991,30 @@ where
     })
 }
 
+async fn audio_transcription_request_from_tool_input<M>(
+    media_store: &M,
+    input: serde_json::Value,
+) -> Result<AudioTranscriptionRequest, BotToolError>
+where
+    M: MediaStore,
+{
+    let audio_value = input
+        .get("audio_uri")
+        .or_else(|| input.get("audio"))
+        .ok_or_else(|| BotToolError::InvalidInput("`audio_uri` is required".to_string()))?;
+    let audio = resolve_tool_media_arg(media_store, MediaCategory::Audio, audio_value).await?;
+    let keyterms = match tool_optional_string_list(&input, "keyterm")? {
+        Some(keyterms) => keyterms,
+        None => tool_optional_string_list(&input, "keyterms")?.unwrap_or_default(),
+    };
+    Ok(AudioTranscriptionRequest {
+        audio,
+        language: tool_optional_string(&input, "language")?,
+        keyterms,
+        model: tool_optional_string(&input, "model")?.map(ModelId::new),
+    })
+}
+
 async fn resolve_tool_media_arg<M>(
     media_store: &M,
     category: MediaCategory,
@@ -4701,6 +5056,32 @@ fn tool_optional_string(
         .map(str::to_string)
         .map(Some)
         .ok_or_else(|| BotToolError::InvalidInput(format!("`{field}` must be a string")))
+}
+
+fn tool_optional_string_list(
+    input: &serde_json::Value,
+    field: &str,
+) -> Result<Option<Vec<String>>, BotToolError> {
+    let Some(value) = input.get(field) else {
+        return Ok(None);
+    };
+    if let Some(text) = value.as_str() {
+        return Ok(Some(vec![text.to_string()]));
+    }
+    let Some(values) = value.as_array() else {
+        return Err(BotToolError::InvalidInput(format!(
+            "`{field}` must be a string or array of strings"
+        )));
+    };
+    values
+        .iter()
+        .map(|value| {
+            value.as_str().map(str::to_string).ok_or_else(|| {
+                BotToolError::InvalidInput(format!("`{field}` must only contain strings"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn tool_optional_u8(input: &serde_json::Value, field: &str) -> Result<Option<u8>, BotToolError> {
@@ -4763,6 +5144,55 @@ fn media_tool_model_result_json(
         },
         "extra": extra,
     })
+}
+
+fn audio_transcription_model_result_json(transcription: &AudioTranscription) -> serde_json::Value {
+    serde_json::json!({
+        "text": transcription.text,
+        "language": transcription.language,
+        "duration_seconds": transcription.duration_seconds,
+        "words": transcription.words,
+        "channels": transcription.channels,
+        "model": transcription.model.as_ref().map(ModelId::as_str),
+    })
+}
+
+fn audio_transcription_tool_schema() -> ToolInputSchema {
+    ToolInputSchema::new(serde_json::json!({
+        "type": "object",
+        "required": ["audio_uri"],
+        "properties": {
+            "audio_uri": {
+                "type": "string",
+                "description": "A file://audio/... URI from the message JSON audio_attachments or attachment audio_uri field."
+            },
+            "audio": {
+                "type": "string",
+                "description": "Alias for audio_uri."
+            },
+            "language": {
+                "type": "string",
+                "description": "Optional language code such as en, fr, de, or ja for text formatting."
+            },
+            "keyterm": {
+                "oneOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "string" } }
+                ],
+                "description": "Optional key term or terms to bias transcription toward."
+            },
+            "keyterms": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Alias for keyterm when passing multiple terms."
+            },
+            "model": {
+                "type": "string",
+                "description": "Optional provider-specific transcription model id."
+            }
+        },
+        "additionalProperties": false
+    }))
 }
 
 fn video_tool_schema() -> ToolInputSchema {
@@ -5214,6 +5644,55 @@ fn model_transcript_supports_image_mime_type(mime_type: &str) -> bool {
         .any(|supported| mime_type.eq_ignore_ascii_case(supported))
 }
 
+fn inject_audio_attachment_refs(
+    value: &mut serde_json::Value,
+    audio_media: &[StoredAttachmentMedia],
+) {
+    if audio_media.is_empty() {
+        return;
+    }
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let audio_attachments = audio_media
+        .iter()
+        .map(|saved| serde_json::Value::String(saved.media.uri().to_string()))
+        .collect::<Vec<_>>();
+    if let Some(attachments) = object
+        .get_mut("attachments")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for saved in audio_media {
+            let Some(attachment) = attachments
+                .get_mut(saved.attachment_index)
+                .and_then(serde_json::Value::as_object_mut)
+            else {
+                continue;
+            };
+            attachment.insert(
+                "audio_uri".to_string(),
+                serde_json::Value::String(saved.media.uri().to_string()),
+            );
+        }
+    }
+    object.insert(
+        "audio_attachments".to_string(),
+        serde_json::Value::Array(audio_attachments),
+    );
+}
+
+fn looks_like_image_ref(attachment: &AttachmentRef) -> bool {
+    looks_like_image(attachment.content_type.as_deref(), &attachment.filename)
+}
+
+fn looks_like_audio_ref(attachment: &AttachmentRef) -> bool {
+    looks_like_audio(
+        attachment.content_type.as_deref(),
+        &attachment.filename,
+        attachment.is_voice_message,
+    )
+}
+
 fn looks_like_image(content_type: Option<&str>, filename: &str) -> bool {
     if content_type
         .map(|content_type| content_type.starts_with("image/"))
@@ -5224,6 +5703,22 @@ fn looks_like_image(content_type: Option<&str>, filename: &str) -> bool {
     matches!(
         extension_from_filename(filename).as_deref(),
         Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif")
+    )
+}
+
+fn looks_like_audio(content_type: Option<&str>, filename: &str, is_voice_message: bool) -> bool {
+    if is_voice_message {
+        return true;
+    }
+    if content_type
+        .map(|content_type| content_type.starts_with("audio/"))
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    matches!(
+        extension_from_filename(filename).as_deref(),
+        Some("mp3" | "wav" | "ogg" | "opus" | "m4a" | "aac" | "flac" | "webm")
     )
 }
 
@@ -6063,6 +6558,19 @@ mod tests {
                 public_url: PublicMediaUrl::new(public_url),
             })
         }
+
+        fn boxed_audio(uri: &str) -> chudbot_api::BoxedMediaRef {
+            Box::new(Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Audio,
+                    name: "voice.ogg".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: "audio/ogg".to_string(),
+                    size_bytes: 42,
+                },
+                public_url: PublicMediaUrl::new("https://chud.example/audio/voice.ogg"),
+            })
+        }
     }
 
     impl MediaRef for PromptMediaRef {
@@ -6093,6 +6601,7 @@ mod tests {
     #[test_case(MediaCategory::Image, "image/gif", false ; "unsupported image mime")]
     #[test_case(MediaCategory::Image, "video/mp4", false ; "image category with video mime")]
     #[test_case(MediaCategory::Video, "video/mp4", false ; "video category")]
+    #[test_case(MediaCategory::Audio, "audio/ogg", false ; "audio category")]
     fn model_transcript_media_support_matches_llm_image_inputs(
         category: MediaCategory,
         mime_type: &str,
@@ -6110,6 +6619,48 @@ mod tests {
         };
 
         assert_eq!(model_transcript_supports_media(&media), expected);
+    }
+
+    #[test_case(None, "voice.dat", true, true ; "voice flag")]
+    #[test_case(Some("audio/ogg"), "voice.dat", false, true ; "audio content type")]
+    #[test_case(None, "voice.m4a", false, true ; "audio extension")]
+    #[test_case(Some("video/mp4"), "clip.mp4", false, false ; "video content type")]
+    #[test_case(None, "clip.mp4", false, false ; "ambiguous mp4 extension")]
+    fn detects_audio_attachments(
+        content_type: Option<&str>,
+        filename: &str,
+        is_voice_message: bool,
+        expected: bool,
+    ) {
+        assert_eq!(
+            looks_like_audio(content_type, filename, is_voice_message),
+            expected
+        );
+    }
+
+    #[test]
+    fn injects_audio_refs_into_message_json() {
+        let mut value = json!({
+            "content": "<@111> voice note",
+            "attachments": [
+                { "filename": "image.png" },
+                { "filename": "voice.ogg" }
+            ]
+        });
+        let audio = PromptMediaRef::boxed_audio("file://audio/voice.ogg");
+        let saved = StoredAttachmentMedia {
+            attachment_index: 1,
+            media: audio,
+        };
+
+        inject_audio_attachment_refs(&mut value, &[saved]);
+
+        assert_eq!(value["audio_attachments"][0], "file://audio/voice.ogg");
+        assert_eq!(
+            value["attachments"][1]["audio_uri"],
+            "file://audio/voice.ogg"
+        );
+        assert!(value["attachments"][0].get("audio_uri").is_none());
     }
 
     #[tokio::test]

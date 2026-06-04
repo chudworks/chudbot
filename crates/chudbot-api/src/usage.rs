@@ -29,6 +29,8 @@ pub enum UsageSubject {
     ImageGeneration,
     /// Video generation.
     VideoGeneration,
+    /// Audio transcription.
+    AudioTranscription,
 }
 
 /// Native provider cost amount.

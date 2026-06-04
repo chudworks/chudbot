@@ -38,9 +38,11 @@ frontend_dir = "frontend-build"
 
 [storage]
 # Local media directories. The database stores stable URIs such as
-# file://images/<name>, file://videos/<name>, and file://avatars/<name>.
+# file://images/<name>, file://videos/<name>, file://audio/<name>, and
+# file://avatars/<name>.
 images_dir = "images"
 videos_dir = "videos"
+audio_dir = "audio"
 avatars_dir = "avatars"
 # Public URL used when providers need to fetch stored media server-side. If this
 # is omitted, the runtime falls back to [bot].web_base_url.
@@ -169,6 +171,13 @@ kind = "xai"
 api_key = "xai-..."
 # base_url = "https://api.x.ai/v1"
 
+# Named audio transcription services. xAI uses the Grok Speech-to-Text endpoint.
+
+[audio.grok_audio]
+kind = "xai"
+api_key = "xai-..."
+# base_url = "https://api.x.ai/v1"
+
 # Agents are prompt + provider + model + tool exposure. The name after
 # [bot.agents.<name>] is the runtime selection key used by /chudbot-agent.
 
@@ -181,7 +190,7 @@ would materially improve the answer.
 """
 # Optional agent-level allowlists. Omit for the full runtime-provided surface.
 # server_tools = ["web_search", "x_search"]
-# client_tools = ["fetch_messages", "generate_image", "generate_video", "post_status_message", "lookup_user_memory", "remember_user_memory", "forget_user_memory"]
+# client_tools = ["fetch_messages", "generate_image", "generate_video", "transcribe_audio", "post_status_message", "lookup_user_memory", "remember_user_memory", "forget_user_memory"]
 memory = true
 limits = { max_iterations = 8 }
 
@@ -208,6 +217,9 @@ model = "quality"
 provider = "grok_video"
 # Provider-specific video model id.
 model = "grok-imagine-video"
+
+[bot.agents.default.audio_transcription]
+provider = "grok_audio"
 
 [bot.agents.research]
 provider = "openai"
