@@ -1185,7 +1185,7 @@ where
     pub async fn handle_event(&self, event: PlatformEvent) -> Result<BotAction, BotError> {
         let action = match event {
             PlatformEvent::Ready { .. } => Ok(BotAction::Ignored),
-            PlatformEvent::MessageCreated { message } => self.handle_message(message).await,
+            PlatformEvent::MessageCreated { message } => self.handle_message(*message).await,
             PlatformEvent::ReactionAdded { reaction } => {
                 self.handle_reaction(reaction, false).await
             }
@@ -3825,11 +3825,13 @@ where
             self.push_message_context(
                 &mut items,
                 &mut position,
-                "quoted",
-                referenced,
-                PlatformMessageRelationship::Referenced,
-                None,
-                &[],
+                MessageContextInput {
+                    kind: "quoted",
+                    message: referenced,
+                    relationship: PlatformMessageRelationship::Referenced,
+                    saved_audio: None,
+                    audio_transcriptions: &[],
+                },
             )
             .await?;
         }
@@ -3843,11 +3845,13 @@ where
         self.push_message_context(
             &mut items,
             &mut position,
-            "message",
-            message,
-            PlatformMessageRelationship::Current,
-            current_audio_media,
-            &incoming_audio.transcriptions,
+            MessageContextInput {
+                kind: "message",
+                message,
+                relationship: PlatformMessageRelationship::Current,
+                saved_audio: current_audio_media,
+                audio_transcriptions: &incoming_audio.transcriptions,
+            },
         )
         .await?;
 
@@ -3858,12 +3862,16 @@ where
         &self,
         items: &mut Vec<chudbot_api::ContextItem>,
         position: &mut i32,
-        kind: &str,
-        message: &PlatformMessage,
-        relationship: PlatformMessageRelationship,
-        saved_audio: Option<Vec<StoredAttachmentMedia>>,
-        audio_transcriptions: &[IncomingAudioTranscription],
+        input: MessageContextInput<'_>,
     ) -> Result<(), BotError> {
+        let MessageContextInput {
+            kind,
+            message,
+            relationship,
+            saved_audio,
+            audio_transcriptions,
+        } = input;
+
         let image_media = self
             .save_matching_attachments(message, MediaCategory::Image, "image", looks_like_image_ref)
             .await;
@@ -4151,11 +4159,8 @@ where
             };
             let mut replayed_media = replay_context
                 .iter()
-                .filter_map(|item| {
-                    item.content
-                        .starts_with("file://")
-                        .then(|| item.content.clone())
-                })
+                .filter(|item| item.content.starts_with("file://"))
+                .map(|item| item.content.clone())
                 .collect::<Vec<_>>();
             let mut generated_media_refs = Vec::new();
             let mut generated_media_blocks = Vec::new();
@@ -4627,6 +4632,14 @@ impl ConversationLookupSource {
 #[derive(Debug, Clone)]
 struct PreparedTurnContext {
     items: Vec<chudbot_api::ContextItem>,
+}
+
+struct MessageContextInput<'a> {
+    kind: &'a str,
+    message: &'a PlatformMessage,
+    relationship: PlatformMessageRelationship,
+    saved_audio: Option<Vec<StoredAttachmentMedia>>,
+    audio_transcriptions: &'a [IncomingAudioTranscription],
 }
 
 #[derive(Debug, Default)]
@@ -6645,7 +6658,7 @@ fn safety_refusal_in_tool_trace(trace: &[ToolTrace]) -> bool {
         match &trace.result.content {
             ClientToolResultContent::Text { text } => error_indicates_safety_refusal(text),
             ClientToolResultContent::Json { value } => error_indicates_safety_refusal(
-                &value
+                value
                     .get("error")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or_else(|| value.as_str().unwrap_or("")),

@@ -547,13 +547,15 @@ impl BotStorage for SqlxStorage {
             let mut tx = self.pool.begin().await?;
             insert_turn_asset(
                 &mut tx,
-                turn_id,
-                Some(attempt_id),
-                &uri,
-                &source,
-                None,
-                Some(tool_trace_id),
-                ordinal,
+                TurnAssetInsert {
+                    turn_id,
+                    attempt_id: Some(attempt_id),
+                    uri: &uri,
+                    source: &source,
+                    context_item_id: None,
+                    tool_trace_id: Some(tool_trace_id),
+                    ordinal,
+                },
             )
             .await?;
             tx.commit().await?;
@@ -861,16 +863,15 @@ impl BotStorage for SqlxStorage {
     }
 
     async fn resolve_agent(&self, input: ResolveAgent) -> Result<Option<String>, Self::Error> {
-        if let Some(conversation_id) = input.conversation_id {
-            if let Some(agent) = sqlx::query_scalar(
+        if let Some(conversation_id) = input.conversation_id
+            && let Some(agent) = sqlx::query_scalar(
                 "SELECT agent_name FROM conversation_agent_selections WHERE conversation_id = $1",
             )
             .bind(conversation_id.0)
             .fetch_optional(&self.pool)
             .await?
-            {
-                return Ok(Some(agent));
-            }
+        {
+            return Ok(Some(agent));
         }
         let provider = input.message_provider.as_str();
         if let Some(guild) = &input.guild_key {
@@ -918,8 +919,8 @@ impl BotStorage for SqlxStorage {
                 return Ok(Some(agent));
             }
         }
-        if let Some(guild) = &input.guild_key {
-            if let Some(agent) = sqlx::query_scalar(
+        if let Some(guild) = &input.guild_key
+            && let Some(agent) = sqlx::query_scalar(
                 "SELECT agent_name FROM channel_agent_selections \
                   WHERE message_provider = $1 AND channel = $2",
             )
@@ -927,9 +928,8 @@ impl BotStorage for SqlxStorage {
             .bind(guild_scope(guild))
             .fetch_optional(&self.pool)
             .await?
-            {
-                return Ok(Some(agent));
-            }
+        {
+            return Ok(Some(agent));
         }
         sqlx::query_scalar(
             "SELECT agent_name FROM provider_agent_selections WHERE message_provider = $1",
@@ -1410,13 +1410,15 @@ impl BotStorage for SqlxStorage {
         if let (Some(uri), Some((turn_id, attempt_id))) = (&input.output_uri, updated) {
             insert_turn_asset(
                 &mut tx,
-                TurnId(turn_id),
-                attempt_id,
-                uri.as_str(),
-                "video_job",
-                None,
-                None,
-                i32::MAX,
+                TurnAssetInsert {
+                    turn_id: TurnId(turn_id),
+                    attempt_id,
+                    uri: uri.as_str(),
+                    source: "video_job",
+                    context_item_id: None,
+                    tool_trace_id: None,
+                    ordinal: i32::MAX,
+                },
             )
             .await?;
         }
@@ -2388,30 +2390,36 @@ async fn insert_context_item(
     if item.content.starts_with("file://") {
         insert_turn_asset(
             tx,
-            turn_id,
-            Some(attempt_id),
-            &item.content,
-            &item.source,
-            Some(context_item_id),
-            None,
-            item.position,
+            TurnAssetInsert {
+                turn_id,
+                attempt_id: Some(attempt_id),
+                uri: &item.content,
+                source: &item.source,
+                context_item_id: Some(context_item_id),
+                tool_trace_id: None,
+                ordinal: item.position,
+            },
         )
         .await?;
     }
     Ok(())
 }
 
-async fn insert_turn_asset(
-    tx: &mut Transaction<'_, Postgres>,
+struct TurnAssetInsert<'a> {
     turn_id: TurnId,
     attempt_id: Option<Uuid>,
-    uri: &str,
-    source: &str,
+    uri: &'a str,
+    source: &'a str,
     context_item_id: Option<i64>,
     tool_trace_id: Option<i64>,
     ordinal: i32,
+}
+
+async fn insert_turn_asset(
+    tx: &mut Transaction<'_, Postgres>,
+    asset: TurnAssetInsert<'_>,
 ) -> Result<(), SqlxStorageError> {
-    upsert_media_asset(tx, uri).await?;
+    upsert_media_asset(tx, asset.uri).await?;
     sqlx::query(
         "INSERT INTO turn_assets \
            (turn_id, attempt_id, media_uri, source, replayable, context_item_id, tool_trace_id, ordinal) \
@@ -2422,13 +2430,13 @@ async fn insert_turn_asset(
                tool_trace_id = COALESCE(EXCLUDED.tool_trace_id, turn_assets.tool_trace_id), \
                ordinal = EXCLUDED.ordinal, replayable = true",
     )
-    .bind(turn_id.0)
-    .bind(attempt_id)
-    .bind(uri)
-    .bind(source)
-    .bind(context_item_id)
-    .bind(tool_trace_id)
-    .bind(ordinal)
+    .bind(asset.turn_id.0)
+    .bind(asset.attempt_id)
+    .bind(asset.uri)
+    .bind(asset.source)
+    .bind(asset.context_item_id)
+    .bind(asset.tool_trace_id)
+    .bind(asset.ordinal)
     .execute(&mut **tx)
     .await?;
     Ok(())

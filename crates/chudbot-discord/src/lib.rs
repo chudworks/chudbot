@@ -263,7 +263,9 @@ impl DiscordPlatform {
                         has_hydrated_reference = message.referenced_message().is_some(),
                         "converted discord message event"
                     );
-                    return Ok(PlatformEvent::MessageCreated { message });
+                    return Ok(PlatformEvent::MessageCreated {
+                        message: Box::new(message),
+                    });
                 }
                 Event::ReactionAdd(reaction) => {
                     let reaction = platform_reaction(&self.inner.platform, reaction.0);

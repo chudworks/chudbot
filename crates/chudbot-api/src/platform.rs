@@ -315,7 +315,7 @@ pub enum PlatformEvent {
     /// New message.
     MessageCreated {
         /// Message payload.
-        message: PlatformMessage,
+        message: Box<PlatformMessage>,
     },
     /// Reaction added.
     ReactionAdded {

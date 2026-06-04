@@ -490,16 +490,14 @@ impl RuntimeConfig {
         let image_provider_names = self.image.keys().collect::<BTreeSet<_>>();
         let video_provider_names = self.video.keys().collect::<BTreeSet<_>>();
         let audio_provider_names = self.audio.keys().collect::<BTreeSet<_>>();
-        if self.memory.enabled {
-            if !provider_names.contains(&self.memory.provider) {
-                tracing::warn!(
-                    provider = %self.memory.provider,
-                    "memory references missing provider config"
-                );
-                return Err(BinError::MissingMemoryProviderConfig {
-                    provider: self.memory.provider.clone(),
-                });
-            }
+        if self.memory.enabled && !provider_names.contains(&self.memory.provider) {
+            tracing::warn!(
+                provider = %self.memory.provider,
+                "memory references missing provider config"
+            );
+            return Err(BinError::MissingMemoryProviderConfig {
+                provider: self.memory.provider.clone(),
+            });
         }
         for (agent_name, agent) in &self.bot.agents {
             if !provider_names.contains(&agent.provider) {
