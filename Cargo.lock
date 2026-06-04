@@ -333,6 +333,7 @@ dependencies = [
  "chudbot-bot",
  "chudbot-discord",
  "chudbot-openai",
+ "chudbot-openai-compat",
  "chudbot-storage-sqlx",
  "chudbot-web",
  "chudbot-xai",
@@ -384,6 +385,20 @@ dependencies = [
 
 [[package]]
 name = "chudbot-openai"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chudbot-api",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "chudbot-openai-compat"
 version = "0.1.0"
 dependencies = [
  "base64",

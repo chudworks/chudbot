@@ -488,20 +488,6 @@ impl RuntimeConfig {
                     provider: self.memory.provider.clone(),
                 });
             }
-            if matches!(
-                self.llm.get(&self.memory.provider),
-                Some(LlmProviderConfig::OpenAiCompat { .. })
-            ) {
-                tracing::warn!(
-                    provider = %self.memory.provider,
-                    kind = "openai_compat",
-                    "memory references an LLM provider kind that is planned but not implemented"
-                );
-                return Err(BinError::UnimplementedMemoryProvider {
-                    provider: self.memory.provider.clone(),
-                    kind: "openai_compat",
-                });
-            }
         }
         for (agent_name, agent) in &self.bot.agents {
             if !provider_names.contains(&agent.provider) {
@@ -513,22 +499,6 @@ impl RuntimeConfig {
                 return Err(BinError::MissingProviderConfig {
                     agent: agent_name.clone(),
                     provider: agent.provider.clone(),
-                });
-            }
-            if matches!(
-                self.llm.get(&agent.provider),
-                Some(LlmProviderConfig::OpenAiCompat { .. })
-            ) {
-                tracing::warn!(
-                    agent = %agent_name,
-                    provider = %agent.provider,
-                    kind = "openai_compat",
-                    "agent references an LLM provider kind that is planned but not implemented"
-                );
-                return Err(BinError::UnimplementedLlmProvider {
-                    agent: agent_name.clone(),
-                    provider: agent.provider.clone(),
-                    kind: "openai_compat",
                 });
             }
             if let Some(binding) = &agent.image_generation
@@ -825,6 +795,7 @@ pub struct ConfiguredLlmProviders {
 struct ConfiguredLlmProvidersInner {
     anthropic: BTreeMap<ProviderName, chudbot_anthropic::AnthropicClient>,
     openai: BTreeMap<ProviderName, chudbot_openai::OpenAiClient>,
+    openai_compat: BTreeMap<ProviderName, chudbot_openai_compat::OpenAiCompatClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
 }
 
@@ -872,6 +843,20 @@ impl ConfiguredLlmProviders {
                     );
                     providers.openai.insert(name.clone(), client);
                 }
+                LlmProviderConfig::OpenAiCompat { base_url, api_key } => {
+                    let mut client =
+                        chudbot_openai_compat::OpenAiCompatClient::new(base_url.clone());
+                    if let Some(api_key) = api_key {
+                        client = client.with_api_key(api_key.clone());
+                    }
+                    tracing::info!(
+                        provider = %name,
+                        kind = "openai_compat",
+                        auth_configured = api_key.is_some(),
+                        "registered LLM provider"
+                    );
+                    providers.openai_compat.insert(name.clone(), client);
+                }
                 LlmProviderConfig::Xai { api_key, base_url } => {
                     let mut client = chudbot_xai::XaiClient::new(api_key.clone());
                     if let Some(base_url) = base_url {
@@ -885,11 +870,6 @@ impl ConfiguredLlmProviders {
                     );
                     providers.xai.insert(name.clone(), client);
                 }
-                LlmProviderConfig::OpenAiCompat { .. } => tracing::warn!(
-                    provider = %name,
-                    kind = "openai_compat",
-                    "LLM provider kind is configured but not implemented in the 2.0 runtime yet"
-                ),
             }
         }
         Self {
@@ -898,7 +878,10 @@ impl ConfiguredLlmProviders {
     }
 
     fn configured_count(&self) -> usize {
-        self.inner.anthropic.len() + self.inner.openai.len() + self.inner.xai.len()
+        self.inner.anthropic.len()
+            + self.inner.openai.len()
+            + self.inner.openai_compat.len()
+            + self.inner.xai.len()
     }
 }
 
@@ -908,6 +891,7 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
     fn contains_provider(&self, provider: &ProviderName) -> bool {
         let contains = self.inner.anthropic.contains_key(provider)
             || self.inner.openai.contains_key(provider)
+            || self.inner.openai_compat.contains_key(provider)
             || self.inner.xai.contains_key(provider);
         tracing::trace!(provider = %provider, contains, "checking LLM provider registry");
         contains
@@ -934,6 +918,12 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
             return LlmBackend::step(client, request)
                 .await
                 .map_err(ConfiguredLlmError::OpenAi);
+        }
+        if let Some(client) = self.inner.openai_compat.get(provider) {
+            tracing::debug!(kind = "openai_compat", "dispatching model step");
+            return LlmBackend::step(client, request)
+                .await
+                .map_err(ConfiguredLlmError::OpenAiCompat);
         }
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching model step");
@@ -1590,6 +1580,9 @@ pub enum ConfiguredLlmError {
     /// OpenAI request failed.
     #[error(transparent)]
     OpenAi(#[from] chudbot_openai::OpenAiError),
+    /// OpenAI-compatible request failed.
+    #[error(transparent)]
+    OpenAiCompat(#[from] chudbot_openai_compat::OpenAiCompatError),
     /// xAI request failed.
     #[error(transparent)]
     Xai(#[from] chudbot_xai::XaiError),
@@ -1710,28 +1703,6 @@ pub enum BinError {
         agent: String,
         /// Provider name.
         provider: ProviderName,
-    },
-    /// An agent references an LLM provider kind with no runtime implementation.
-    #[error(
-        "agent `{agent}` uses llm provider `{provider}` with kind `{kind}`, which is planned but not implemented"
-    )]
-    UnimplementedLlmProvider {
-        /// Agent name.
-        agent: String,
-        /// Provider name.
-        provider: ProviderName,
-        /// Provider kind.
-        kind: &'static str,
-    },
-    /// Memory references an LLM provider kind with no runtime implementation.
-    #[error(
-        "memory uses llm provider `{provider}` with kind `{kind}`, which is planned but not implemented"
-    )]
-    UnimplementedMemoryProvider {
-        /// Provider name.
-        provider: ProviderName,
-        /// Provider kind.
-        kind: &'static str,
     },
     /// Platform binding has no matching platform config.
     #[error("platform `{platform}` is bound in [bot.platforms] but has no [platforms] entry")]

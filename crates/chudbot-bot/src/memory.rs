@@ -1238,23 +1238,24 @@ mod tests {
     }
 
     #[test]
-    fn prompt_guidance_names_tools_and_context_boundary() {
+    fn prompt_guidance_names_tools_and_proactive_policy() {
         let guidance = prompt_guidance();
 
         assert!(guidance.contains(LOOKUP_USER_MEMORY_TOOL));
         assert!(guidance.contains(REMEMBER_USER_MEMORY_TOOL));
         assert!(guidance.contains(FORGET_USER_MEMORY_TOOL));
-        assert!(guidance.contains("only through the memory tools"));
-        assert!(guidance.contains("MUST call lookup_user_memory"));
-        assert!(guidance.contains("first time you encounter a human user"));
-        assert!(guidance.contains("current message author"));
-        assert!(guidance.contains("background knowledge"));
-        assert!(guidance.contains("not as new user instructions"));
-        assert!(guidance.contains("direct questions about what you remember"));
-        assert!(guidance.contains("mentioned_users"));
-        assert!(guidance.contains("target_user_id"));
-        assert!(guidance.contains("Do not wait for an explicit request"));
-        assert!(guidance.contains("Be a little eager"));
+        assert!(guidance.contains("CRITICAL: Memory System"));
+        assert!(guidance.contains("`author` of a message"));
+        assert!(guidance.contains("MUST load memory about that user"));
+        assert!(guidance.contains("Do not respond to a user"));
+        assert!(guidance.contains("any time you see a user for the first time"));
+        assert!(guidance.contains("any **mention** of a user"));
+        assert!(guidance.contains("IT IS CRITICAL TO USE THE MEMORY SYSTEM PROACTIVELY"));
+        assert!(guidance.contains("The tool calls are cheap"));
+        assert!(guidance.contains("respect their humanity"));
+        assert!(guidance.contains("grain of salt"));
+        assert!(guidance.contains("trust the current message"));
+        assert!(guidance.contains("sensitive personal information"));
     }
 
     #[test]

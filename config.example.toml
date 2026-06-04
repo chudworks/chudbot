@@ -140,12 +140,14 @@ kind = "anthropic"
 api_key = "sk-ant-..."
 # base_url = "https://api.anthropic.com/v1"
 
-# Planned but not implemented in the v2 runtime yet. Leave commented until the
-# chudbot-openai-compat crate exists.
-# [llm.local_compat]
-# kind = "openai_compat"
-# base_url = "http://127.0.0.1:8000/v1"
-# api_key = "anything"
+# OpenAI-compatible Chat Completions provider for local/model-gateway hosts.
+# vLLM defaults to http://127.0.0.1:8000/v1 and needs
+# `--enable-auto-tool-choice --tool-call-parser <parser>` for automatic client
+# tool calls.
+[llm.local_compat]
+kind = "openai_compat"
+base_url = "http://127.0.0.1:8000/v1"
+api_key = "EMPTY"
 
 # Named image-generation services.
 
@@ -253,11 +255,12 @@ temperature = 0.4
 agent = "research"
 description = "Ask a focused research subagent to gather facts and return a concise summary."
 
-# Example local agent for the planned OpenAI-compatible provider. Keep commented
-# until [llm.local_compat] is implemented in chudbot-openai-compat.
+# Example local agent for an OpenAI-compatible Chat Completions provider.
 # [bot.agents.local]
 # provider = "local_compat"
 # system_prompt = "You are a helpful local model running behind an OpenAI-compatible API."
 # client_tools = ["fetch_messages", "post_status_message"]
 # [bot.agents.local.model]
 # id = "qwen3"
+# [bot.agents.local.model.provider_options]
+# value = { parallel_tool_calls = false, extra_body = { top_k = 40, min_p = 0.05 } }

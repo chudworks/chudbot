@@ -26,10 +26,10 @@ Workspace crates:
 - `chudbot-asset-local`: local filesystem `MediaStore`.
 - `chudbot-xai`: xAI LLM, image, and video providers.
 - `chudbot-openai`: OpenAI Responses LLM and image providers.
+- `chudbot-openai-compat`: OpenAI-compatible Chat Completions LLM provider
+  for local/model-gateway hosts such as vLLM.
 - `chudbot-anthropic`: Anthropic Messages LLM provider.
 - `chudbot-bin`: thin process launcher and TOML config loader.
-
-Planned but not implemented: `chudbot-openai-compat`.
 
 ## Build And Run
 
