@@ -56,7 +56,7 @@ pub use storage::{
     PrivacyMode, ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile,
     StoredVideoJob, Turn, TurnAsset, TurnSnapshot, TurnStatus, UpdateVideoJob,
     UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
-    UserMemoryEventKind, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
+    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
 };
 pub use tool::{
     ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,

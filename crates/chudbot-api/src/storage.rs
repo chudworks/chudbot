@@ -845,9 +845,23 @@ pub struct UserMemoryTurn {
     pub user_content: String,
     /// Assistant reply text, if any.
     pub assistant_content: Option<String>,
+    /// Image attachments and generated images associated with this turn.
+    #[serde(default)]
+    pub image_context: Vec<UserMemoryImageContext>,
     /// Audio transcriptions produced during this turn.
     #[serde(default)]
     pub audio_transcriptions: Vec<UserMemoryAudioTranscription>,
+}
+
+/// One image reference loaded for the memory diary pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMemoryImageContext {
+    /// Stable stored image URI.
+    pub image_uri: MediaUri,
+    /// Context source label or tool name that produced it.
+    pub source: String,
+    /// MIME type.
+    pub mime_type: Option<String>,
 }
 
 /// One audio transcription loaded for the memory diary pipeline.
@@ -1345,6 +1359,7 @@ mod tests {
                 user_display_name: "Chud".to_string(),
                 user_content: "hi".to_string(),
                 assistant_content: Some("hello".to_string()),
+                image_context: Vec::new(),
                 audio_transcriptions: Vec::new(),
             })
             .unwrap(),

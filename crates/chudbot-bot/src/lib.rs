@@ -3114,6 +3114,7 @@ where
         let runtime = memory::MemoryRuntime::new(
             self.storage.clone(),
             self.llms.clone(),
+            self.media_store.clone(),
             self.memory_config.clone(),
         );
         spawn_background_task(&self.background, "memory runtime", async move {

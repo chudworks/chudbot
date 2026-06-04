@@ -5,12 +5,14 @@ use std::time::Duration;
 
 use chudbot_api::{
     AgentLimits, AgentOutcome, AgentRun, AgentSpec, BotStorage, ClientTool, ClientToolCall,
-    ClientToolOutput, ClientToolResultContent, ClientToolSpec, ConversationId, MemoryJobCompletion,
-    MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, Model, ModelId, ModelSpec,
-    NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, ProviderName,
-    ProviderOptions, SamplingOptions, ToolInputSchema, Transcript, TranscriptTurn, TurnId,
-    TurnRole, UsageRecord, UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument,
-    UserMemoryEvent, UserMemoryEventKind, UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserRef,
+    ClientToolOutput, ClientToolResultContent, ClientToolSpec, ContentBlock, ConversationId,
+    MediaCategory, MediaStore, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
+    MemoryTurnWindow, Model, ModelId, ModelSpec, NewUserMemoryDiaryEntry,
+    NewUserMemoryDocumentRevision, NewUserMemoryEvent, ProviderName, ProviderOptions,
+    SamplingOptions, ToolInputSchema, Transcript, TranscriptTurn, TurnId, TurnRole, UsageRecord,
+    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
+    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
+    UserRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -33,13 +35,15 @@ const MEMORY_MODEL_ID: &str = "grok-4.3";
 const MEMORY_REASONING_EFFORT: &str = "high";
 const MEMORY_DIARY_AGENT: &str = "memory_diary";
 const MEMORY_COMPACT_AGENT: &str = "memory_compact";
+const MEMORY_DIARY_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 
 const DIARY_PROMPT: &str = "You write concise user-memory diary entries for Chudbot. \
 Read the bounded transcript slice and optional current memory profile. Extract only \
 stable, useful observations about the subject user. Include uncertainty when evidence \
 is weak. Prefer factual bullets over prose. Consider relationships, preferences and \
 dislikes, projects, work, hobbies, recurring topics, server lore, running jokes, \
-good-natured roast material, corrections, and stale facts. Do not invent facts.";
+good-natured roast material, corrections, stale facts, and visually meaningful \
+image evidence. Do not invent facts.";
 
 const COMPACTOR_PROMPT: &str = "You maintain a compact Markdown memory profile for one \
 Chudbot user in one server/workspace. Produce a complete replacement profile, not a diff. \
@@ -690,27 +694,30 @@ fn event_kind_label(kind: UserMemoryEventKind) -> &'static str {
 
 /// In-process memory scheduler and worker.
 #[derive(Debug, Clone)]
-pub struct MemoryRuntime<S, L> {
+pub struct MemoryRuntime<S, L, M> {
     storage: S,
     llms: L,
+    media_store: M,
     config: MemoryConfig,
 }
 
-impl<S, L> MemoryRuntime<S, L> {
+impl<S, L, M> MemoryRuntime<S, L, M> {
     /// Construct a memory runtime.
-    pub fn new(storage: S, llms: L, config: MemoryConfig) -> Self {
+    pub fn new(storage: S, llms: L, media_store: M, config: MemoryConfig) -> Self {
         Self {
             storage,
             llms,
+            media_store,
             config,
         }
     }
 }
 
-impl<S, L> MemoryRuntime<S, L>
+impl<S, L, M> MemoryRuntime<S, L, M>
 where
     S: BotStorage + Clone + Send + Sync + 'static,
     L: LlmProviderRegistry + Clone + Send + Sync + 'static,
+    M: MediaStore + Clone + Send + Sync + 'static,
 {
     /// Run the memory scheduler until shutdown.
     pub async fn run_until_shutdown(&self, shutdown: CancellationToken) -> Result<(), MemoryError> {
@@ -896,11 +903,12 @@ where
             .load_user_memory_document(job.key.clone())
             .await
             .map_err(|error| MemoryError::Storage(error.to_string()))?;
-        let input = diary_input(&job.key, document.as_ref(), &turns);
+        let transcript =
+            diary_transcript(&job.key, document.as_ref(), &turns, &self.media_store).await;
         let output = self
             .run_memory_model(
                 DIARY_PROMPT,
-                input,
+                transcript,
                 self.config.max_diary_output_tokens.max(1),
             )
             .await?;
@@ -956,7 +964,7 @@ where
         let output = self
             .run_memory_model(
                 COMPACTOR_PROMPT,
-                input,
+                Transcript::from_user_text(input),
                 self.config.max_profile_output_tokens.max(1),
             )
             .await?;
@@ -1014,11 +1022,9 @@ where
     async fn run_memory_model(
         &self,
         instructions: &'static str,
-        input: String,
+        transcript: Transcript,
         max_output_tokens: u32,
     ) -> Result<MemoryModelOutput, MemoryError> {
-        let mut transcript = Transcript::new();
-        transcript.push(TranscriptTurn::text(TurnRole::User, input));
         let agent = AgentSpec::new(instructions)
             .with_limits(AgentLimits::default())
             .into_agent(Model {
@@ -1089,11 +1095,87 @@ fn memory_model_output(run: AgentRun) -> Result<MemoryModelOutput, MemoryError> 
     }
 }
 
+async fn diary_transcript<M>(
+    key: &UserMemoryKey,
+    document: Option<&UserMemoryDocument>,
+    turns: &[UserMemoryTurn],
+    media_store: &M,
+) -> Transcript
+where
+    M: MediaStore,
+{
+    let mut blocks = Vec::new();
+    blocks.push(ContentBlock::Text {
+        text: diary_header_text(key, document),
+    });
+    for turn in turns {
+        blocks.push(ContentBlock::Text {
+            text: diary_turn_text(turn),
+        });
+        append_diary_image_blocks(&mut blocks, turn, media_store).await;
+    }
+    let mut transcript = Transcript::new();
+    transcript.push(TranscriptTurn {
+        role: TurnRole::User,
+        blocks,
+        metadata: serde_json::Value::Null,
+    });
+    transcript
+}
+
+async fn append_diary_image_blocks<M>(
+    blocks: &mut Vec<ContentBlock>,
+    turn: &UserMemoryTurn,
+    media_store: &M,
+) where
+    M: MediaStore,
+{
+    for (index, image) in turn.image_context.iter().enumerate() {
+        blocks.push(ContentBlock::Text {
+            text: format!(
+                "Visual content for turn {} image {} (source: {}, uri: {}).",
+                turn.turn_id,
+                index + 1,
+                memory_image_source_label(&image.source),
+                image.image_uri
+            ),
+        });
+        match media_store.media_from_uri(&image.image_uri).await {
+            Ok(media) if memory_diary_supports_media(media.as_ref()) => {
+                blocks.push(ContentBlock::Media { media });
+            }
+            Ok(media) => tracing::debug!(
+                turn = %turn.turn_id,
+                source = %image.source,
+                uri = %media.uri(),
+                category = ?media.category(),
+                mime_type = %media.mime_type(),
+                "skipping unsupported diary image media"
+            ),
+            Err(error) => tracing::warn!(
+                turn = %turn.turn_id,
+                source = %image.source,
+                uri = %image.image_uri,
+                error = %error,
+                "skipping diary image media"
+            ),
+        }
+    }
+}
+
 fn diary_input(
     key: &UserMemoryKey,
     document: Option<&UserMemoryDocument>,
     turns: &[UserMemoryTurn],
 ) -> String {
+    let mut out = diary_header_text(key, document);
+    for turn in turns {
+        out.push_str(&diary_turn_text(turn));
+    }
+    out
+}
+
+fn diary_header_text(key: &UserMemoryKey, document: Option<&UserMemoryDocument>) -> String {
     let mut out = String::new();
     out.push_str("# Subject\n");
     out.push_str(&format!(
@@ -1108,19 +1190,66 @@ fn diary_input(
             .unwrap_or(EMPTY_MEMORY),
     );
     out.push_str("\n\n# Completed Turns\n");
-    for turn in turns {
-        out.push_str(&format!(
-            "\n## Turn {} ({})\nUser [{}]: {}\n",
-            turn.turn_id, turn.completed_at, turn.user_display_name, turn.user_content
-        ));
-        if let Some(answer) = &turn.assistant_content {
-            out.push_str("Assistant: ");
-            out.push_str(answer);
-            out.push('\n');
-        }
-        append_audio_transcriptions(&mut out, &turn.audio_transcriptions);
-    }
     out
+}
+
+fn diary_turn_text(turn: &UserMemoryTurn) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "\n## Turn {} ({})\nUser [{}]: {}\n",
+        turn.turn_id, turn.completed_at, turn.user_display_name, turn.user_content
+    ));
+    if let Some(answer) = &turn.assistant_content {
+        out.push_str("Assistant: ");
+        out.push_str(answer);
+        out.push('\n');
+    }
+    append_image_context(&mut out, &turn.image_context);
+    append_audio_transcriptions(&mut out, &turn.audio_transcriptions);
+    out
+}
+
+fn append_image_context(out: &mut String, images: &[UserMemoryImageContext]) {
+    if images.is_empty() {
+        return;
+    }
+    out.push_str("Image content blocks:\n");
+    for (index, image) in images.iter().enumerate() {
+        let mut metadata = vec![
+            format!("source: {}", memory_image_source_label(&image.source)),
+            format!("uri: {}", image.image_uri),
+        ];
+        if let Some(mime_type) = image
+            .mime_type
+            .as_deref()
+            .filter(|mime_type| !mime_type.is_empty())
+        {
+            metadata.push(format!("mime_type: {mime_type}"));
+        }
+        out.push_str(&format!("- Image {} ({})\n", index + 1, metadata.join(", ")));
+    }
+}
+
+fn memory_image_source_label(source: &str) -> &str {
+    if source.starts_with("platform:") {
+        "user_or_quoted_message_attachment"
+    } else if source == "generate_image" {
+        "generated_image"
+    } else {
+        source
+    }
+}
+
+fn memory_diary_supports_media(media: &dyn chudbot_api::MediaRef) -> bool {
+    matches!(media.category(), MediaCategory::Image)
+        && MEMORY_DIARY_IMAGE_MIME_TYPES
+            .iter()
+            .any(|supported| image_mime_type_eq(media.mime_type(), supported))
+}
+
+fn image_mime_type_eq(actual: &str, expected: &str) -> bool {
+    let actual = actual.split(';').next().unwrap_or("").trim();
+    actual.eq_ignore_ascii_case(expected)
 }
 
 fn append_audio_transcriptions(out: &mut String, transcriptions: &[UserMemoryAudioTranscription]) {

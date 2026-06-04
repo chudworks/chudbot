@@ -15,8 +15,8 @@ use chudbot_api::{
     ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob,
     ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob,
     UsageRecord, UsageSubject, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
-    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryJob, UserMemoryKey,
-    UserMemoryTurn, UserProfile, UserRef,
+    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext,
+    UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserProfile, UserRef,
 };
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -1968,12 +1968,18 @@ impl BotStorage for SqlxStorage {
                 user_display_name: row.get("user_display_name"),
                 user_content: row.get("user_content"),
                 assistant_content: row.get("assistant_content"),
+                image_context: Vec::new(),
                 audio_transcriptions: Vec::new(),
             })
             .collect::<Vec<_>>();
         let turn_ids = turns.iter().map(|turn| turn.turn_id.0).collect::<Vec<_>>();
+        let images_by_turn = load_memory_image_context(&self.pool, &turn_ids).await?;
         let audio_by_turn = load_memory_audio_transcriptions(&self.pool, &turn_ids).await?;
         for turn in &mut turns {
+            turn.image_context = images_by_turn
+                .get(&turn.turn_id)
+                .cloned()
+                .unwrap_or_default();
             turn.audio_transcriptions = audio_by_turn
                 .get(&turn.turn_id)
                 .cloned()
@@ -1981,6 +1987,39 @@ impl BotStorage for SqlxStorage {
         }
         Ok(turns)
     }
+}
+
+async fn load_memory_image_context(
+    pool: &PgPool,
+    turn_ids: &[Uuid],
+) -> Result<BTreeMap<TurnId, Vec<UserMemoryImageContext>>, SqlxStorageError> {
+    if turn_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows = sqlx::query(
+        "SELECT a.turn_id, a.media_uri, a.source, m.mime_type \
+           FROM turn_assets a \
+           LEFT JOIN media_assets m ON m.uri = a.media_uri \
+          WHERE a.turn_id = ANY($1) \
+            AND a.replayable \
+            AND (m.category = 'image' OR m.mime_type LIKE 'image/%' OR a.media_uri LIKE 'file://images/%') \
+          ORDER BY a.turn_id, a.ordinal, a.id",
+    )
+    .bind(turn_ids)
+    .fetch_all(pool)
+    .await?;
+    let mut out = BTreeMap::<TurnId, Vec<UserMemoryImageContext>>::new();
+    for row in rows {
+        let turn_id = TurnId(row.get("turn_id"));
+        out.entry(turn_id)
+            .or_default()
+            .push(UserMemoryImageContext {
+                image_uri: MediaUri::new(row.get::<String, _>("media_uri")),
+                source: row.get("source"),
+                mime_type: row.get("mime_type"),
+            });
+    }
+    Ok(out)
 }
 
 async fn load_memory_audio_transcriptions(
