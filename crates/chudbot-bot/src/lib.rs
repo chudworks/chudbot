@@ -1577,11 +1577,11 @@ where
             "resolved agent for turn"
         );
 
-        let system_instructions = self.compose_system_prompt(&agent_config, &settings.privacy);
-
         let (snapshot, is_new) = match existing {
             Some(snapshot) => (snapshot, false),
             None => {
+                let system_instructions =
+                    self.compose_system_prompt(&agent_config, &settings.privacy, None);
                 let snapshot = self
                     .storage
                     .open_conversation(OpenConversation {
@@ -1609,6 +1609,11 @@ where
             tracing::field::display(snapshot.conversation.id),
         );
         tracing::Span::current().record("is_new", is_new);
+        let system_instructions = self.compose_system_prompt(
+            &agent_config,
+            &settings.privacy,
+            Some(snapshot.conversation.id),
+        );
 
         let turn = self
             .storage
@@ -1838,7 +1843,13 @@ where
         let system_instructions = turn_snapshot
             .system_instructions
             .clone()
-            .unwrap_or_else(|| self.compose_system_prompt(&agent_config, &settings.privacy));
+            .unwrap_or_else(|| {
+                self.compose_system_prompt(
+                    &agent_config,
+                    &settings.privacy,
+                    Some(retry.conversation.conversation.id),
+                )
+            });
         let stored_context = replayable_context_items(&turn_snapshot.context);
         let has_stored_context = !stored_context.is_empty();
         let transcript = self
@@ -4331,12 +4342,22 @@ where
         Ok(transcript)
     }
 
-    fn compose_system_prompt(&self, agent: &AgentConfig, privacy: &PrivacyMode) -> String {
-        self.compose_system_prompt_inner(agent, privacy, self.agent_memory_enabled(agent))
+    fn compose_system_prompt(
+        &self,
+        agent: &AgentConfig,
+        privacy: &PrivacyMode,
+        conversation_id: Option<ConversationId>,
+    ) -> String {
+        self.compose_system_prompt_inner(
+            agent,
+            privacy,
+            self.agent_memory_enabled(agent),
+            conversation_id,
+        )
     }
 
     fn compose_subagent_system_prompt(&self, agent: &AgentConfig, privacy: &PrivacyMode) -> String {
-        self.compose_system_prompt_inner(agent, privacy, false)
+        self.compose_system_prompt_inner(agent, privacy, false, None)
     }
 
     fn compose_system_prompt_inner(
@@ -4344,6 +4365,7 @@ where
         agent: &AgentConfig,
         privacy: &PrivacyMode,
         include_memory: bool,
+        conversation_id: Option<ConversationId>,
     ) -> String {
         let mut out = String::new();
         if let Some(extra) = self
@@ -4362,6 +4384,12 @@ where
             "Bot build: {}. You are answering as model `{}` via `{}`.\n",
             self.config.version, agent.model.id, agent.provider
         ));
+        if let Some(conversation_id) = conversation_id {
+            out.push_str(&trace_link_prompt_guidance(
+                &self.config.web_base_url,
+                conversation_id,
+            ));
+        }
         out.push_str("Capabilities this turn:\n");
         if !agent.model.server_tools.is_empty() {
             out.push_str("- Provider-side tools configured on this model.\n");
@@ -7061,8 +7089,38 @@ fn format_reply_content(
     if !is_new {
         return text;
     }
+    format!(
+        "{text}\n\n{}",
+        full_trace_link_markdown(web_base_url, conversation_id)
+    )
+}
+
+fn full_trace_url(web_base_url: &str, conversation_id: ConversationId) -> String {
     let base = web_base_url.trim_end_matches('/');
-    format!("{text}\n\n-# 🔎 [full trace]({base}/c/{conversation_id})")
+    format!("{base}/c/{conversation_id}")
+}
+
+fn full_trace_link_markdown(web_base_url: &str, conversation_id: ConversationId) -> String {
+    format!(
+        "-# 🔎 [full trace]({})",
+        full_trace_url(web_base_url, conversation_id)
+    )
+}
+
+fn trace_link_prompt_guidance(web_base_url: &str, conversation_id: ConversationId) -> String {
+    let url = full_trace_url(web_base_url, conversation_id);
+    let link = full_trace_link_markdown(web_base_url, conversation_id);
+    format!(
+        concat!(
+            "Full trace URL for this conversation: {url}. This is an allowed ",
+            "user-facing trace link even though it contains the conversation UUID. ",
+            "Do not volunteer it, ",
+            "but if the user asks for the trace link, full trace, or full trace link, ",
+            "provide this Discord-friendly line exactly: {link}\n"
+        ),
+        url = url,
+        link = link
+    )
 }
 
 fn thread_title(execution: &TurnExecution) -> String {
@@ -8110,6 +8168,31 @@ mod tests {
             reply,
             format!("answer\n\n-# 🔎 [full trace](https://chud.example/c/{conversation_id})")
         );
+    }
+
+    #[test]
+    fn full_trace_link_markdown_uses_discord_reply_style() {
+        let conversation_id = ConversationId::new();
+
+        let link = full_trace_link_markdown("https://chud.example/", conversation_id);
+
+        assert_eq!(
+            link,
+            format!("-# 🔎 [full trace](https://chud.example/c/{conversation_id})")
+        );
+    }
+
+    #[test]
+    fn trace_link_prompt_guidance_includes_url_and_reply_style() {
+        let conversation_id = ConversationId::new();
+        let url = format!("https://chud.example/c/{conversation_id}");
+
+        let guidance = trace_link_prompt_guidance("https://chud.example/", conversation_id);
+
+        assert!(guidance.contains(&format!("Full trace URL for this conversation: {url}.")));
+        assert!(guidance.contains("trace link"));
+        assert!(guidance.contains("full trace link"));
+        assert!(guidance.contains(&format!("-# 🔎 [full trace]({url})")));
     }
 
     #[test]
