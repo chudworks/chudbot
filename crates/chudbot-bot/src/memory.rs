@@ -1,12 +1,12 @@
 //! User memory tools, prompts, and background compaction runtime.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::time::Duration;
 
 use chudbot_api::{
-    BotStorage, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResultContent,
-    ClientToolSpec, ContentBlock, ConversationId, MemoryJobCompletion, MemoryJobKind,
-    MemoryJobSchedule, MemoryTurnWindow, ModelId, ModelStep, ModelStepRequest,
+    AgentLimits, AgentOutcome, AgentRun, AgentSpec, BotStorage, ClientTool, ClientToolCall,
+    ClientToolOutput, ClientToolResultContent, ClientToolSpec, ConversationId, MemoryJobCompletion,
+    MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, Model, ModelId, ModelSpec,
     NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, ProviderName,
     ProviderOptions, SamplingOptions, ToolInputSchema, Transcript, TranscriptTurn, TurnId,
     TurnRole, UsageRecord, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
@@ -20,7 +20,7 @@ use time::format_description::well_known::Rfc3339;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::LlmProviderRegistry;
+use crate::{LlmProviderRegistry, RoutedLlmBackend};
 
 /// Tool name for current or target user memory lookup.
 pub const LOOKUP_USER_MEMORY_TOOL: &str = "lookup_user_memory";
@@ -1009,16 +1009,13 @@ where
         max_output_tokens: u32,
     ) -> Result<MemoryModelOutput, MemoryError> {
         let mut transcript = Transcript::new();
-        transcript.instructions = Some(instructions.to_string());
         transcript.push(TranscriptTurn::text(TurnRole::User, input));
-        let step = self
-            .llms
-            .step(
-                &self.config.provider,
-                ModelStepRequest {
-                    model: ModelId::new(MEMORY_MODEL_ID),
-                    transcript,
-                    client_tools: BTreeMap::new(),
+        let agent = AgentSpec::new(instructions)
+            .with_limits(AgentLimits::default())
+            .into_agent(Model {
+                backend: RoutedLlmBackend::new(self.llms.clone(), self.config.provider.clone()),
+                spec: ModelSpec {
+                    id: ModelId::new(MEMORY_MODEL_ID),
                     server_tools: BTreeSet::new(),
                     sampling: SamplingOptions {
                         max_output_tokens: Some(max_output_tokens),
@@ -1029,10 +1026,12 @@ where
                         value: json!({ "reasoning_effort": MEMORY_REASONING_EFFORT }),
                     }),
                 },
-            )
+            });
+        let run = agent
+            .run(transcript)
             .await
             .map_err(|error| MemoryError::Model(error.to_string()))?;
-        memory_model_output(step)
+        memory_model_output(run)
     }
 }
 
@@ -1043,34 +1042,42 @@ struct MemoryModelOutput {
     usage: Vec<UsageRecord>,
 }
 
-fn memory_model_output(step: ModelStep) -> Result<MemoryModelOutput, MemoryError> {
-    let step = match step {
-        ModelStep::Final { step }
-        | ModelStep::UseClientTools { step }
-        | ModelStep::Continue { step } => step,
-    };
-    let text = assistant_text(&step.content).trim().to_string();
-    if text.is_empty() {
-        return Err(MemoryError::Model(
-            "memory model returned empty text".to_string(),
-        ));
+fn memory_model_output(run: AgentRun) -> Result<MemoryModelOutput, MemoryError> {
+    let usage = run.all_usage();
+    let model_id = run
+        .last_model_id
+        .unwrap_or_else(|| ModelId::new(MEMORY_MODEL_ID));
+    match run.outcome {
+        AgentOutcome::Completed { answer } => {
+            let text = answer.text.trim().to_string();
+            if text.is_empty() {
+                return Err(MemoryError::Model(
+                    "memory model returned empty text".to_string(),
+                ));
+            }
+            Ok(MemoryModelOutput {
+                text,
+                model_id,
+                usage,
+            })
+        }
+        AgentOutcome::IterationLimit { max_iterations } => Err(MemoryError::Model(format!(
+            "memory model hit iteration limit ({max_iterations})"
+        ))),
+        AgentOutcome::Failed { error, partial } => {
+            let mut message = error.to_string();
+            if let Some(partial) = partial
+                && !partial.text.trim().is_empty()
+            {
+                message.push_str("\n\nPartial answer:\n");
+                message.push_str(&partial.text);
+            }
+            Err(MemoryError::Model(message))
+        }
+        AgentOutcome::Cancelled { reason } => Err(MemoryError::Model(format!(
+            "memory model cancelled: {reason}"
+        ))),
     }
-    Ok(MemoryModelOutput {
-        text,
-        model_id: step.model_id,
-        usage: step.usage,
-    })
-}
-
-fn assistant_text(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn diary_input(

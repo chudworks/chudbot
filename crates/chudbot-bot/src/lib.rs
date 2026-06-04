@@ -2070,6 +2070,21 @@ where
         Ok(builder.into_agent(model))
     }
 
+    fn utility_agent(
+        &self,
+        provider: ProviderName,
+        model: ModelSpec,
+        system_prompt: &'static str,
+        limits: AgentLimits,
+    ) -> Agent<RoutedLlmBackend<L>> {
+        AgentSpec::new(system_prompt)
+            .with_limits(limits)
+            .into_agent(Model {
+                backend: RoutedLlmBackend::new(self.llms.clone(), provider),
+                spec: model,
+            })
+    }
+
     #[tracing::instrument(
         name = "bot.fail_turn",
         skip_all,
@@ -2689,7 +2704,6 @@ where
         }
 
         let mut transcript = Transcript::new();
-        transcript.instructions = Some(MODERATION_PROMPT.to_string());
         transcript.push(TranscriptTurn::text(
             TurnRole::User,
             format!(
@@ -2697,40 +2711,65 @@ where
                 message.content
             ),
         ));
-        let request = ModelStepRequest {
-            model: agent_config.model.id.clone(),
-            transcript,
-            client_tools: BTreeMap::new(),
-            server_tools: Default::default(),
-            sampling: SamplingOptions {
-                max_output_tokens: Some(8),
-                temperature: Some(0.0),
-                top_p: None,
+        let agent = self.utility_agent(
+            agent_config.provider.clone(),
+            ModelSpec {
+                id: agent_config.model.id.clone(),
+                server_tools: Default::default(),
+                sampling: SamplingOptions {
+                    max_output_tokens: Some(8),
+                    temperature: Some(0.0),
+                    top_p: None,
+                },
+                provider_options: None,
             },
-            provider_options: None,
+            MODERATION_PROMPT,
+            agent_config.limits.unwrap_or(self.config.limits),
+        );
+        let run = match agent.run(transcript).await {
+            Ok(run) => run,
+            Err(error) => {
+                let message = error.to_string();
+                if error_indicates_safety_refusal(&message) {
+                    tracing::info!(
+                        error = %error,
+                        "moderation provider refusal detected; treating as refused"
+                    );
+                    return Ok(false);
+                }
+                tracing::warn!(error = %error, "moderation errored; failing open");
+                return Ok(true);
+            }
         };
-        match self.llms.step(&agent_config.provider, request).await {
-            Ok(ModelStep::Final { step }) => {
-                let verdict = assistant_text(&step).trim().to_ascii_uppercase();
+        match run.outcome {
+            AgentOutcome::Completed { answer } => {
+                let verdict = answer.text.trim().to_ascii_uppercase();
                 let allowed = !verdict.starts_with("REFUSE")
                     && !verdict.contains(" REFUSE")
                     && verdict != "REFUSE";
                 tracing::info!(verdict = %verdict, allowed, "moderation classified message");
                 Ok(allowed)
             }
-            Ok(_) => {
-                tracing::warn!("moderation returned non-final step; failing open");
+            AgentOutcome::IterationLimit { max_iterations } => {
+                tracing::warn!(
+                    max_iterations,
+                    "moderation hit iteration limit; failing open"
+                );
                 Ok(true)
             }
-            Err(error) if error_indicates_safety_refusal(&error.to_string()) => {
-                tracing::info!(
-                    error = %error,
-                    "moderation provider refusal detected; treating as refused"
-                );
-                Ok(false)
+            AgentOutcome::Failed { error, .. } => {
+                if error_indicates_safety_refusal(&error.to_string()) {
+                    tracing::info!(
+                        error = %error,
+                        "moderation provider refusal detected; treating as refused"
+                    );
+                    return Ok(false);
+                }
+                tracing::warn!(error = %error, "moderation failed; failing open");
+                Ok(true)
             }
-            Err(error) => {
-                tracing::warn!(error = %error, "moderation errored; failing open");
+            AgentOutcome::Cancelled { reason } => {
+                tracing::warn!(reason = %reason, "moderation was cancelled; failing open");
                 Ok(true)
             }
         }
@@ -2802,30 +2841,50 @@ where
             first.turn.assistant_content.as_deref().unwrap_or("")
         );
         let mut transcript = Transcript::new();
-        transcript.instructions = Some(TITLE_SYSTEM_PROMPT.to_string());
         transcript.push(TranscriptTurn::text(TurnRole::User, user_text));
-        let request = ModelStepRequest {
-            model: agent.model.id.clone(),
-            transcript,
-            client_tools: BTreeMap::new(),
-            server_tools: Default::default(),
-            sampling: SamplingOptions {
-                max_output_tokens: Some(TITLE_MAX_TOKENS),
-                temperature: Some(0.3),
-                top_p: None,
+        let agent_runtime = self.utility_agent(
+            agent.provider.clone(),
+            ModelSpec {
+                id: agent.model.id.clone(),
+                server_tools: Default::default(),
+                sampling: SamplingOptions {
+                    max_output_tokens: Some(TITLE_MAX_TOKENS),
+                    temperature: Some(0.3),
+                    top_p: None,
+                },
+                provider_options: agent.model.provider_options.clone(),
             },
-            provider_options: agent.model.provider_options.clone(),
-        };
-        let step = self
-            .llms
-            .step(&agent.provider, request)
+            TITLE_SYSTEM_PROMPT,
+            agent.limits.unwrap_or(self.config.limits),
+        );
+        let run = agent_runtime
+            .run(transcript)
             .await
             .map_err(|error| BotError::Model {
                 message: error.to_string(),
             })?;
-        let raw = match step {
-            ModelStep::Final { step } | ModelStep::UseClientTools { step } => assistant_text(&step),
-            ModelStep::Continue { step } => assistant_text(&step),
+        let raw = match run.outcome {
+            AgentOutcome::Completed { answer } => answer.text,
+            AgentOutcome::IterationLimit { max_iterations } => {
+                return Err(BotError::Model {
+                    message: format!("title generation hit iteration limit ({max_iterations})"),
+                });
+            }
+            AgentOutcome::Failed { error, partial } => {
+                let mut message = error.to_string();
+                if let Some(partial) = partial
+                    && !partial.text.trim().is_empty()
+                {
+                    message.push_str("\n\nPartial answer:\n");
+                    message.push_str(&partial.text);
+                }
+                return Err(BotError::Model { message });
+            }
+            AgentOutcome::Cancelled { reason } => {
+                return Err(BotError::Model {
+                    message: format!("title generation cancelled: {reason}"),
+                });
+            }
         };
         let title = clean_title(&raw);
         if title.is_empty() {
@@ -5373,17 +5432,6 @@ where
     T: Serialize,
 {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "<unprintable>".to_string())
-}
-
-fn assistant_text(step: &chudbot_api::AssistantStep) -> String {
-    step.content
-        .iter()
-        .filter_map(|block| match block {
-            ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("")
 }
 
 fn clean_title(raw: &str) -> String {
