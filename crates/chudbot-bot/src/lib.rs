@@ -22,19 +22,20 @@ use chudbot_api::{
     ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult,
     ClientToolResultContent, ClientToolSpec, ClientToolTrace, ContentBlock, Conversation,
     ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
-    ConversationStop, CreateMedia, CreateVideoJob, EventSink, ExternalId, FetchMessages,
-    FinishTurn, GeneratedImage, ImageGenerator, ImageGeneratorTool, ImageRequest, LiveEvent,
-    LlmBackend, MediaCategory, MediaRef, MediaStore, MediaUri, MessageLink, MessagePlatform,
-    MessageRef, Model, ModelId, ModelSpec, ModelStep, ModelStepRequest, OpenConversation,
-    OutgoingAttachment, PlatformCommand, PlatformCommandDefinition, PlatformCommandInput,
-    PlatformCommandOption, PlatformCommandOptionChoice, PlatformCommandOptionKind,
-    PlatformCommandResponse, PlatformCommandValue, PlatformEvent, PlatformMessage,
-    PlatformMessageReference, PlatformMessageRelationship, PlatformName, PlatformReaction,
-    PostedMessage, PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings,
-    SamplingOptions, SaveTurnInput, SendMessage, Subagent, ThreadRequest, ToolInputSchema,
-    ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole,
-    TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator,
-    VideoJobId, VideoJobStatus, VideoRequest,
+    ConversationStop, CountSuccessfulVideoGenerations, CreateMedia, CreateVideoJob, EventSink,
+    ExternalId, FetchMessages, FinishTurn, GeneratedImage, ImageGenerator, ImageGeneratorTool,
+    ImageRequest, LiveEvent, LlmBackend, MediaCategory, MediaRef, MediaStore, MediaUri,
+    MessageLink, MessagePlatform, MessageRef, Model, ModelId, ModelSpec, ModelStep,
+    ModelStepRequest, OpenConversation, OutgoingAttachment, PlatformCommand,
+    PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
+    PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
+    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
+    PlatformMessageRelationship, PlatformName, PlatformReaction, PostedMessage, PrivacyMode,
+    ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput,
+    SendMessage, StoredVideoJob, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace,
+    ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot,
+    UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator, VideoJobId,
+    VideoJobStatus, VideoRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -740,6 +741,22 @@ fn image_generation_tool_description(provider: &ProviderName, model: &ModelId) -
     )
 }
 
+fn video_generation_tool_description(binding: &GenerationBinding) -> String {
+    let mut description = format!(
+        "Generate a video with the configured `{}` video provider and `{}` model, save it to media storage, and return its media URI.",
+        binding.provider, binding.model
+    );
+    if let Some(limit) = &binding.rate_limit {
+        description.push_str(&format!(
+            "\n\nThis tool is limited to {} successful video generation{} per {} for users outside bypassed platform scopes.",
+            limit.limit,
+            if limit.limit == 1 { "" } else { "s" },
+            limit.interval
+        ));
+    }
+    description
+}
+
 fn validate_generation_binding(
     agent_name: &str,
     field: &'static str,
@@ -760,6 +777,69 @@ fn validate_generation_binding(
             field,
             message: "model is empty".to_string(),
         });
+    }
+    if let Some(rate_limit) = &binding.rate_limit {
+        if field != "video_generation" {
+            tracing::warn!(agent = %agent_name, field, "rate limit configured on non-video generation binding");
+            return Err(BotError::InvalidGenerationBinding {
+                agent: agent_name.to_string(),
+                field,
+                message: "rate_limit is only supported on video_generation".to_string(),
+            });
+        }
+        validate_video_generation_rate_limit(agent_name, field, rate_limit)?;
+    }
+    Ok(())
+}
+
+fn validate_video_generation_rate_limit(
+    agent_name: &str,
+    field: &'static str,
+    rate_limit: &VideoGenerationRateLimit,
+) -> Result<(), BotError> {
+    if rate_limit.limit == 0 {
+        tracing::warn!(agent = %agent_name, field, "video generation rate limit is zero");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "rate_limit.limit must be greater than zero".to_string(),
+        });
+    }
+    if let Err(message) = rate_limit.interval_seconds() {
+        tracing::warn!(
+            agent = %agent_name,
+            field,
+            interval = %rate_limit.interval,
+            "video generation rate limit interval is invalid"
+        );
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message,
+        });
+    }
+    for scope in &rate_limit.bypass_scopes {
+        if scope.platform.as_str().trim().is_empty() {
+            tracing::warn!(agent = %agent_name, field, "video generation rate limit bypass platform is empty");
+            return Err(BotError::InvalidGenerationBinding {
+                agent: agent_name.to_string(),
+                field,
+                message: "rate_limit.bypass_scopes platform must not be empty".to_string(),
+            });
+        }
+        if scope.scope_id.as_str().trim().is_empty() {
+            tracing::warn!(
+                agent = %agent_name,
+                field,
+                platform = %scope.platform,
+                "video generation rate limit bypass scope id is empty"
+            );
+            return Err(BotError::InvalidGenerationBinding {
+                agent: agent_name.to_string(),
+                field,
+                message: "rate_limit.bypass_scopes scope_id must not be empty".to_string(),
+            });
+        }
     }
     Ok(())
 }
@@ -844,6 +924,54 @@ pub struct GenerationBinding {
     pub provider: ProviderName,
     /// Provider-specific image/video model id or tier.
     pub model: ModelId,
+    /// Optional successful-video rate limit for this video-generation binding.
+    #[serde(default)]
+    pub rate_limit: Option<VideoGenerationRateLimit>,
+}
+
+/// Successful-video rate limit for a video-generation binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VideoGenerationRateLimit {
+    /// Maximum successful video generations per interval.
+    pub limit: u32,
+    /// Rolling interval, e.g. `4h`, `30m`, or `1d`.
+    #[serde(default = "default_video_generation_rate_limit_interval")]
+    pub interval: String,
+    /// Platform scopes that are exempt from this limit.
+    #[serde(default)]
+    pub bypass_scopes: Vec<PlatformScopeBypass>,
+}
+
+/// One platform scope exempt from a video-generation rate limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformScopeBypass {
+    /// Messaging platform, e.g. `discord`.
+    pub platform: PlatformName,
+    /// Platform workspace/server/guild scope id.
+    pub scope_id: ExternalId,
+}
+
+impl VideoGenerationRateLimit {
+    /// Parse the configured rolling interval.
+    pub fn interval_seconds(&self) -> Result<u64, String> {
+        memory::parse_duration_seconds(&self.interval)
+            .map_err(|_| format!("rate_limit.interval `{}` is invalid", self.interval))
+    }
+
+    fn bypasses(&self, user: &UserRef) -> bool {
+        let Some(scope_id) = &user.guild_id else {
+            return false;
+        };
+        self.bypass_scopes
+            .iter()
+            .any(|scope| scope.platform == user.platform && scope.scope_id == *scope_id)
+    }
+}
+
+fn default_video_generation_rate_limit_interval() -> String {
+    "4h".to_string()
 }
 
 /// Binding from an agent to an audio transcription provider.
@@ -2323,12 +2451,11 @@ where
                     self.media_store.clone(),
                     self.storage.clone(),
                     turn_id,
+                    turn_user.clone(),
                     binding.provider.clone(),
+                    binding.rate_limit.clone(),
                 )
-                .with_description(format!(
-                    "Generate a video with the configured `{}` video provider and `{}` model, save it to media storage, and return its media URI.",
-                    binding.provider, binding.model
-                )),
+                .with_description(video_generation_tool_description(binding)),
             });
         }
 
@@ -4258,6 +4385,14 @@ where
                 "- Video generation is available through generate_video using provider `{}` and model `{}`.\n",
                 binding.provider, binding.model
             ));
+            if let Some(limit) = &binding.rate_limit {
+                out.push_str(&format!(
+                    "- Users outside bypassed platform scopes are limited to {} successful video generation{} per {}.\n",
+                    limit.limit,
+                    if limit.limit == 1 { "" } else { "s" },
+                    limit.interval
+                ));
+            }
         }
         if let Some(binding) = &agent.audio_transcription {
             out.push_str(&format!(
@@ -4841,13 +4976,62 @@ where
     }
 }
 
+trait PersistentVideoStorage: Clone + Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn create_video_job(
+        &self,
+        input: CreateVideoJob,
+    ) -> impl Future<Output = Result<StoredVideoJob, Self::Error>> + Send;
+
+    fn update_video_job(
+        &self,
+        input: UpdateVideoJob,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    fn count_successful_video_generations(
+        &self,
+        input: CountSuccessfulVideoGenerations,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+}
+
+impl<T> PersistentVideoStorage for T
+where
+    T: BotStorage + Clone + Send + Sync,
+{
+    type Error = T::Error;
+
+    fn create_video_job(
+        &self,
+        input: CreateVideoJob,
+    ) -> impl Future<Output = Result<StoredVideoJob, Self::Error>> + Send {
+        BotStorage::create_video_job(self, input)
+    }
+
+    fn update_video_job(
+        &self,
+        input: UpdateVideoJob,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        BotStorage::update_video_job(self, input)
+    }
+
+    fn count_successful_video_generations(
+        &self,
+        input: CountSuccessfulVideoGenerations,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+        BotStorage::count_successful_video_generations(self, input)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PersistentVideoGeneratorTool<G, M, S> {
     generator: G,
     media_store: M,
     storage: S,
     turn_id: TurnId,
+    turn_user: UserRef,
     provider: ProviderName,
+    rate_limit: Option<VideoGenerationRateLimit>,
     description: String,
     poll_interval: Duration,
     max_polls: u32,
@@ -4859,14 +5043,18 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
         media_store: M,
         storage: S,
         turn_id: TurnId,
+        turn_user: UserRef,
         provider: ProviderName,
+        rate_limit: Option<VideoGenerationRateLimit>,
     ) -> Self {
         Self {
             generator,
             media_store,
             storage,
             turn_id,
+            turn_user,
             provider,
+            rate_limit,
             description: "Generate a video, save it to media storage, and return its media URI."
                 .to_string(),
             poll_interval: Duration::from_secs(2),
@@ -4884,7 +5072,7 @@ impl<G, M, S> ClientTool for PersistentVideoGeneratorTool<G, M, S>
 where
     G: VideoGenerator,
     M: MediaStore,
-    S: BotStorage,
+    S: PersistentVideoStorage,
 {
     type Error = BotToolError;
 
@@ -4898,9 +5086,43 @@ where
     #[tracing::instrument(
         name = "tool.generate_video",
         skip_all,
-        fields(turn = %self.turn_id, provider = %self.provider, tool_call = %call.id)
+        fields(
+            turn = %self.turn_id,
+            provider = %self.provider,
+            user = %self.turn_user.user_id,
+            tool_call = %call.id
+        )
     )]
     async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+        if let Some(rate_limit) = &self.rate_limit
+            && !rate_limit.bypasses(&self.turn_user)
+        {
+            let interval_seconds = rate_limit
+                .interval_seconds()
+                .map_err(BotToolError::InvalidInput)?;
+            let used = self
+                .storage
+                .count_successful_video_generations(CountSuccessfulVideoGenerations {
+                    user: self.turn_user.clone(),
+                    interval_seconds,
+                })
+                .await
+                .map_err(|error| BotToolError::Storage(error.to_string()))?;
+            if used >= u64::from(rate_limit.limit) {
+                tracing::warn!(
+                    used,
+                    limit = rate_limit.limit,
+                    interval = %rate_limit.interval,
+                    "video generation rate limit exceeded"
+                );
+                return Err(BotToolError::RateLimit(format!(
+                    "video generation rate limit exceeded for this platform user: {} successful video generation{} per {}",
+                    rate_limit.limit,
+                    if rate_limit.limit == 1 { "" } else { "s" },
+                    rate_limit.interval
+                )));
+            }
+        }
         let request = video_request_from_tool_input(&self.media_store, call.input).await?;
         let prompt = request.prompt.clone();
         let job_id = self
@@ -5310,6 +5532,8 @@ enum BotToolError {
     Platform(String),
     #[error("storage error: {0}")]
     Storage(String),
+    #[error("rate limit: {0}")]
+    RateLimit(String),
     #[error("generator error: {0}")]
     Generator(String),
     #[error("media error: {0}")]
@@ -6947,6 +7171,9 @@ fn is_memory_context_item(item: &chudbot_api::ContextItem) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
     use chudbot_api::{
         BoxedMediaRef, CreateMedia, ExternalId, LoadedMedia, MediaError, MediaFuture,
         MediaMetadata, MediaRef, MediaStore, MediaUri, PlatformName, PublicMediaUrl,
@@ -7042,6 +7269,195 @@ mod tests {
                 usage: Vec::new(),
             },
         }
+    }
+
+    #[derive(Debug, Clone)]
+    struct NoopMediaStore;
+
+    impl MediaStore for NoopMediaStore {
+        async fn create_media(&self, _input: CreateMedia) -> Result<BoxedMediaRef, MediaError> {
+            Err(MediaError::UnsupportedCategory("test".to_string()))
+        }
+
+        async fn media_from_uri(&self, uri: &MediaUri) -> Result<BoxedMediaRef, MediaError> {
+            Err(MediaError::UnsupportedUri(uri.to_string()))
+        }
+
+        async fn media_from_name(
+            &self,
+            category: MediaCategory,
+            name: &str,
+        ) -> Result<BoxedMediaRef, MediaError> {
+            Err(MediaError::UnsupportedUri(format!(
+                "file://{}/{name}",
+                category.prefix()
+            )))
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct CountingVideoGenerator {
+        submits: Arc<AtomicUsize>,
+    }
+
+    impl VideoGenerator for CountingVideoGenerator {
+        type Error = TestVideoError;
+
+        fn backend_name(&self) -> &ProviderName {
+            static NAME: std::sync::OnceLock<ProviderName> = std::sync::OnceLock::new();
+            NAME.get_or_init(|| ProviderName::new("test_video"))
+        }
+
+        async fn submit_video(&self, _request: VideoRequest) -> Result<VideoJobId, Self::Error> {
+            self.submits.fetch_add(1, Ordering::SeqCst);
+            Ok(VideoJobId::new("job-1"))
+        }
+
+        async fn check_video(&self, _job: VideoJobId) -> Result<VideoJobStatus, Self::Error> {
+            Err(TestVideoError("unexpected poll".to_string()))
+        }
+
+        async fn download_video(&self, _url: String) -> Result<Vec<u8>, Self::Error> {
+            Err(TestVideoError("unexpected download".to_string()))
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct TestVideoError(String);
+
+    #[derive(Debug, Clone)]
+    struct VideoRateLimitStorage {
+        count: u64,
+        count_requests: Arc<Mutex<Vec<CountSuccessfulVideoGenerations>>>,
+        creates: Arc<AtomicUsize>,
+        updates: Arc<AtomicUsize>,
+    }
+
+    impl VideoRateLimitStorage {
+        fn new(count: u64) -> Self {
+            Self {
+                count,
+                count_requests: Arc::new(Mutex::new(Vec::new())),
+                creates: Arc::new(AtomicUsize::new(0)),
+                updates: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl PersistentVideoStorage for VideoRateLimitStorage {
+        type Error = TestVideoStorageError;
+
+        async fn create_video_job(
+            &self,
+            input: CreateVideoJob,
+        ) -> Result<StoredVideoJob, Self::Error> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            Ok(StoredVideoJob {
+                turn_id: input.turn_id,
+                provider: input.provider,
+                provider_job_id: input.provider_job_id,
+                prompt: input.prompt,
+                status: "pending".to_string(),
+                output_uri: None,
+                error: None,
+            })
+        }
+
+        async fn update_video_job(&self, _input: UpdateVideoJob) -> Result<(), Self::Error> {
+            self.updates.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn count_successful_video_generations(
+            &self,
+            input: CountSuccessfulVideoGenerations,
+        ) -> Result<u64, Self::Error> {
+            self.count_requests.lock().unwrap().push(input);
+            Ok(self.count)
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("test storage error")]
+    struct TestVideoStorageError;
+
+    #[tokio::test]
+    async fn video_rate_limit_fails_before_provider_submit() {
+        let submits = Arc::new(AtomicUsize::new(0));
+        let storage = VideoRateLimitStorage::new(2);
+        let tool = PersistentVideoGeneratorTool::new(
+            CountingVideoGenerator {
+                submits: submits.clone(),
+            },
+            NoopMediaStore,
+            storage.clone(),
+            TurnId::new(),
+            user("discord", Some("guild-1"), "user-1"),
+            ProviderName::new("grok_video"),
+            Some(VideoGenerationRateLimit {
+                limit: 2,
+                interval: "4h".to_string(),
+                bypass_scopes: Vec::new(),
+            }),
+        );
+
+        let error = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new("generate_video"),
+                input: json!({ "prompt": "animate this" }),
+            })
+            .await
+            .expect_err("rate limit should fail the tool call");
+
+        assert!(
+            matches!(error, BotToolError::RateLimit(message) if message.contains("2 successful video generations per 4h"))
+        );
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.creates.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.updates.load(Ordering::SeqCst), 0);
+        let requests = storage.count_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].user.user_id.as_str(), "user-1");
+        assert_eq!(requests[0].interval_seconds, 4 * 60 * 60);
+    }
+
+    #[test]
+    fn video_rate_limit_bypasses_configured_platform_scope() {
+        let rate_limit = VideoGenerationRateLimit {
+            limit: 1,
+            interval: "30m".to_string(),
+            bypass_scopes: vec![PlatformScopeBypass {
+                platform: PlatformName::new("discord"),
+                scope_id: ExternalId::new("guild-1"),
+            }],
+        };
+
+        assert_eq!(rate_limit.interval_seconds().unwrap(), 30 * 60);
+        assert!(rate_limit.bypasses(&user("discord", Some("guild-1"), "user-1")));
+        assert!(rate_limit.bypasses(&user("discord", Some("guild-1"), "user-2")));
+        assert!(!rate_limit.bypasses(&user("discord", Some("guild-2"), "user-1")));
+        assert!(!rate_limit.bypasses(&user("discord", None, "user-1")));
+        assert!(!rate_limit.bypasses(&user("slack", Some("guild-1"), "user-1")));
+    }
+
+    #[test]
+    fn rejects_invalid_video_rate_limit_config() {
+        let binding = GenerationBinding {
+            provider: ProviderName::new("grok_video"),
+            model: ModelId::new("grok-imagine-video"),
+            rate_limit: Some(VideoGenerationRateLimit {
+                limit: 0,
+                interval: "4h".to_string(),
+                bypass_scopes: Vec::new(),
+            }),
+        };
+
+        let error = validate_generation_binding("default", "video_generation", &binding)
+            .expect_err("zero limit should be rejected");
+
+        assert!(error.to_string().contains("must be greater than zero"));
     }
 
     #[test]

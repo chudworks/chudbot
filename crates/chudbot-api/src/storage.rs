@@ -506,6 +506,15 @@ pub struct UpdateVideoJob {
     pub error: Option<String>,
 }
 
+/// Input for counting successful video generations in a rolling window.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CountSuccessfulVideoGenerations {
+    /// User whose successful video generations are counted.
+    pub user: UserRef,
+    /// Rolling window length in seconds.
+    pub interval_seconds: u64,
+}
+
 /// Stored user metadata for viewer read models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredUserProfile {
@@ -1063,6 +1072,12 @@ pub trait BotStorage: Send + Sync {
         &self,
         input: UpdateVideoJob,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Count successful video generations for one user in a rolling window.
+    fn count_successful_video_generations(
+        &self,
+        input: CountSuccessfulVideoGenerations,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
     /// Load the current compact memory profile for one user.
     fn load_user_memory_document(

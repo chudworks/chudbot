@@ -50,13 +50,14 @@ pub use platform::{
 };
 pub use storage::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ContextItem, Conversation,
-    ConversationLookup, ConversationSnapshot, ConversationStop, CreateVideoJob, FinishTurn,
-    MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, MessageLink,
-    NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, OpenConversation,
-    PrivacyMode, ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile,
-    StoredVideoJob, Turn, TurnAsset, TurnSnapshot, TurnStatus, UpdateVideoJob,
-    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
-    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
+    ConversationLookup, ConversationSnapshot, ConversationStop, CountSuccessfulVideoGenerations,
+    CreateVideoJob, FinishTurn, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
+    MemoryTurnWindow, MessageLink, NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision,
+    NewUserMemoryEvent, OpenConversation, PrivacyMode, ResolveAgent, RetryTurn, RuntimeSettings,
+    SaveTurnInput, StoredUserProfile, StoredVideoJob, Turn, TurnAsset, TurnSnapshot, TurnStatus,
+    UpdateVideoJob, UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument,
+    UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey,
+    UserMemoryTurn,
 };
 pub use tool::{
     ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,

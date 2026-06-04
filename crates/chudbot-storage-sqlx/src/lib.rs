@@ -8,15 +8,16 @@ use std::collections::BTreeMap;
 
 use chudbot_api::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ChannelRef, ContextItem, Conversation,
-    ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop, CreateVideoJob,
-    ExternalId, FinishTurn, MediaUri, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
-    MemoryTurnWindow, MessageLink, MessageRef, ModelId, NewUserMemoryDiaryEntry,
-    NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName,
-    ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob,
-    ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob,
-    UsageRecord, UsageSubject, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
-    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext,
-    UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserProfile, UserRef,
+    ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
+    CountSuccessfulVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, MediaUri,
+    MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, MessageLink,
+    MessageRef, ModelId, NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision,
+    NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName, ResolveAgent, RetryTurn,
+    RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob, ToolTrace, Turn, TurnAsset,
+    TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob, UsageRecord, UsageSubject,
+    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
+    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
+    UserProfile, UserRef,
 };
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -1424,6 +1425,30 @@ impl BotStorage for SqlxStorage {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn count_successful_video_generations(
+        &self,
+        input: CountSuccessfulVideoGenerations,
+    ) -> Result<u64, Self::Error> {
+        let interval_seconds = i64::try_from(input.interval_seconds).unwrap_or(i64::MAX);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::BIGINT \
+               FROM video_jobs v \
+               JOIN turns t ON t.id = v.turn_id \
+              WHERE t.user_message_provider = $1 \
+                AND t.user_key = $2 \
+                AND v.status = 'done' \
+                AND v.output_uri IS NOT NULL \
+                AND v.completed_at IS NOT NULL \
+                AND v.completed_at >= now() - ($3::double precision * interval '1 second')",
+        )
+        .bind(input.user.platform.as_str())
+        .bind(input.user.user_id.as_str())
+        .bind(interval_seconds)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     async fn load_user_memory_document(
