@@ -4,6 +4,8 @@
 //! intentionally uses runtime-checked SQLx queries so normal builds do not
 //! require a live `DATABASE_URL`.
 
+use std::collections::BTreeMap;
+
 use chudbot_api::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ChannelRef, ContextItem, Conversation,
     ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop, CreateVideoJob,
@@ -12,8 +14,9 @@ use chudbot_api::{
     NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName,
     ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob,
     ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob,
-    UsageRecord, UsageSubject, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
-    UserMemoryEventKind, UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserProfile, UserRef,
+    UsageRecord, UsageSubject, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
+    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryJob, UserMemoryKey,
+    UserMemoryTurn, UserProfile, UserRef,
 };
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -1974,7 +1977,7 @@ impl BotStorage for SqlxStorage {
         .bind(i64::from(window.max_turns))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
+        let mut turns = rows
             .into_iter()
             .map(|row| UserMemoryTurn {
                 conversation_id: ConversationId(row.get("conversation_id")),
@@ -1983,9 +1986,100 @@ impl BotStorage for SqlxStorage {
                 user_display_name: row.get("user_display_name"),
                 user_content: row.get("user_content"),
                 assistant_content: row.get("assistant_content"),
+                audio_transcriptions: Vec::new(),
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let turn_ids = turns.iter().map(|turn| turn.turn_id.0).collect::<Vec<_>>();
+        let audio_by_turn = load_memory_audio_transcriptions(&self.pool, &turn_ids).await?;
+        for turn in &mut turns {
+            turn.audio_transcriptions = audio_by_turn
+                .get(&turn.turn_id)
+                .cloned()
+                .unwrap_or_default();
+        }
+        Ok(turns)
     }
+}
+
+async fn load_memory_audio_transcriptions(
+    pool: &PgPool,
+    turn_ids: &[Uuid],
+) -> Result<BTreeMap<TurnId, Vec<UserMemoryAudioTranscription>>, SqlxStorageError> {
+    if turn_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let rows = sqlx::query(
+        "SELECT ta.turn_id, tt.id AS tool_trace_id, tt.request, tt.response \
+           FROM turn_attempt_tool_traces tt \
+           JOIN turn_attempts ta ON ta.id = tt.attempt_id \
+          WHERE ta.turn_id = ANY($1) \
+            AND ta.status = 'completed' \
+            AND tt.trace_kind = 'client' \
+            AND tt.tool_name = 'transcribe_audio' \
+            AND COALESCE(tt.is_error, false) = false \
+          ORDER BY ta.turn_id, tt.ordinal",
+    )
+    .bind(turn_ids)
+    .fetch_all(pool)
+    .await?;
+    let mut out = BTreeMap::<TurnId, Vec<UserMemoryAudioTranscription>>::new();
+    for row in rows {
+        let turn_id = TurnId(row.get("turn_id"));
+        let Some(transcription) = memory_audio_transcription_from_tool_row(&row) else {
+            continue;
+        };
+        out.entry(turn_id).or_default().push(transcription);
+    }
+    Ok(out)
+}
+
+fn memory_audio_transcription_from_tool_row(
+    row: &sqlx::postgres::PgRow,
+) -> Option<UserMemoryAudioTranscription> {
+    let response = row.get::<Option<Value>, _>("response")?;
+    let request = row.get::<Option<Value>, _>("request");
+    memory_audio_transcription_from_values(row.get("tool_trace_id"), request.as_ref(), &response)
+}
+
+fn memory_audio_transcription_from_values(
+    tool_trace_id: i64,
+    request: Option<&Value>,
+    response: &Value,
+) -> Option<UserMemoryAudioTranscription> {
+    let text = response
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?
+        .to_string();
+    Some(UserMemoryAudioTranscription {
+        tool_trace_id,
+        audio_uri: request.and_then(audio_uri_from_tool_request),
+        text,
+        language: optional_non_empty_string(response.get("language")),
+        duration_seconds: response
+            .get("duration_seconds")
+            .and_then(Value::as_f64)
+            .filter(|duration| duration.is_finite()),
+    })
+}
+
+fn audio_uri_from_tool_request(request: &Value) -> Option<String> {
+    request
+        .get("input")
+        .and_then(|input| input.get("audio_uri").or_else(|| input.get("audio")))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uri| !uri.is_empty())
+        .map(str::to_string)
+}
+
+fn optional_non_empty_string(value: Option<&Value>) -> Option<String> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 impl SqlxStorage {
@@ -2889,6 +2983,9 @@ fn media_parts(uri: &str) -> (&'static str, String, &'static str) {
     if let Some(name) = uri.strip_prefix("file://videos/") {
         return ("video", name.to_string(), "video/mp4");
     }
+    if let Some(name) = uri.strip_prefix("file://audio/") {
+        return ("audio", name.to_string(), "audio/ogg");
+    }
     if let Some(name) = uri.strip_prefix("file://avatars/") {
         return ("avatar", name.to_string(), "image/png");
     }
@@ -2903,6 +3000,7 @@ fn usage_subject(subject: &UsageSubject) -> (&'static str, Option<String>) {
         UsageSubject::SubAgent { name } => ("sub_agent", Some(name.to_string())),
         UsageSubject::ImageGeneration => ("image_generation", None),
         UsageSubject::VideoGeneration => ("video_generation", None),
+        UsageSubject::AudioTranscription => ("audio_transcription", None),
     }
 }
 
@@ -2966,5 +3064,33 @@ mod tests {
         };
 
         assert_eq!(tool_trace_media_asset(&fields), None);
+    }
+
+    #[test]
+    fn memory_audio_transcription_parses_tool_request_and_response() {
+        let request = json!({
+            "id": "call-1",
+            "name": "transcribe_audio",
+            "input": {
+                "audio_uri": "file://audio/voice.ogg"
+            }
+        });
+        let response = json!({
+            "text": "I am allergic to coconut.",
+            "language": "en",
+            "duration_seconds": 3.25
+        });
+
+        let transcription =
+            memory_audio_transcription_from_values(42, Some(&request), &response).unwrap();
+
+        assert_eq!(transcription.tool_trace_id, 42);
+        assert_eq!(
+            transcription.audio_uri.as_deref(),
+            Some("file://audio/voice.ogg")
+        );
+        assert_eq!(transcription.text, "I am allergic to coconut.");
+        assert_eq!(transcription.language.as_deref(), Some("en"));
+        assert_eq!(transcription.duration_seconds, Some(3.25));
     }
 }

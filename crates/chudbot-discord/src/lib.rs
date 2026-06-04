@@ -762,7 +762,18 @@ fn platform_message_with_guild(
             .map(|mention| mention_user_profile(platform, guild_id.clone(), mention))
             .collect(),
         reference,
-        attachments: message.attachments.iter().map(attachment_ref).collect(),
+        attachments: message
+            .attachments
+            .iter()
+            .map(|attachment| {
+                attachment_ref(
+                    attachment,
+                    message
+                        .flags
+                        .is_some_and(|flags| flags.contains(MessageFlags::IS_VOICE_MESSAGE)),
+                )
+            })
+            .collect(),
         created_at: timestamp_to_offset(message.timestamp),
     }
 }
@@ -823,6 +834,9 @@ fn discord_message_context_json(
                 "filename": attachment.filename.as_str(),
                 "content_type": attachment.content_type.as_deref(),
                 "size_bytes": attachment.size_bytes,
+                "duration_seconds": attachment.duration_seconds,
+                "is_voice_message": attachment.is_voice_message,
+                "waveform": attachment.waveform.as_deref(),
             })
         }).collect::<Vec<_>>(),
     })
@@ -1048,13 +1062,19 @@ fn mention_user_profile(
     }
 }
 
-fn attachment_ref(attachment: &twilight_model::channel::Attachment) -> AttachmentRef {
+fn attachment_ref(
+    attachment: &twilight_model::channel::Attachment,
+    is_voice_message: bool,
+) -> AttachmentRef {
     AttachmentRef {
         id: Some(external_id(attachment.id)),
         url: attachment.url.clone(),
         filename: attachment.filename.clone(),
         content_type: attachment.content_type.clone(),
         size_bytes: Some(attachment.size),
+        duration_seconds: attachment.duration_secs,
+        is_voice_message,
+        waveform: attachment.waveform.clone(),
     }
 }
 
@@ -1739,6 +1759,9 @@ mod tests {
                 filename: "img.png".to_string(),
                 content_type: Some("image/png".to_string()),
                 size_bytes: Some(123),
+                duration_seconds: None,
+                is_voice_message: false,
+                waveform: None,
             }],
             created_at: OffsetDateTime::UNIX_EPOCH,
         };

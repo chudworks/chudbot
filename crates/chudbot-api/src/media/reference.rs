@@ -69,6 +69,8 @@ pub enum MediaCategory {
     Image,
     /// Video media.
     Video,
+    /// Audio media.
+    Audio,
     /// Avatar/user media.
     Avatar,
     /// Any other caller-defined media class.
@@ -81,6 +83,7 @@ impl MediaCategory {
         match self {
             Self::Image => "images",
             Self::Video => "videos",
+            Self::Audio => "audio",
             Self::Avatar => "avatars",
             Self::Other(prefix) => prefix.as_str(),
         }

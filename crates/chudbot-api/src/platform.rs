@@ -38,6 +38,15 @@ pub struct AttachmentRef {
     pub content_type: Option<String>,
     /// Attachment size in bytes.
     pub size_bytes: Option<u64>,
+    /// Audio duration in seconds when the platform supplies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_seconds: Option<f64>,
+    /// Whether the platform marks this attachment as a voice message.
+    #[serde(default)]
+    pub is_voice_message: bool,
+    /// Platform-supplied waveform preview when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waveform: Option<String>,
 }
 
 /// Incoming platform message.

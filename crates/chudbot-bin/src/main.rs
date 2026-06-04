@@ -8,16 +8,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chudbot_api::{
-    BotStorage, ChannelRef, EventSink, ExternalId, FetchMessages, GeneratedImage, ImageGenerator,
-    ImageRequest, LlmBackend, MediaStore, MessagePlatform, MessageRef, ModelStep, ModelStepRequest,
+    AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, BotStorage, ChannelRef,
+    EventSink, ExternalId, FetchMessages, GeneratedImage, ImageGenerator, ImageRequest, LlmBackend,
+    MediaStore, MessagePlatform, MessageRef, ModelStep, ModelStepRequest,
     PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
     PlatformMessageRelationship, PostedMessage, PrivacyMode, ProviderName, ReactionKind,
     SendMessage, UserProfile, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
 use chudbot_bot::{
-    BotConfig, BotRunOptions, BotRuntime, BotRuntimeParts, ImageGeneratorRegistry,
-    LlmProviderRegistry, MemoryConfig, MessagePlatformRegistry, VideoGeneratorRegistry,
+    AudioTranscriberRegistry, BotConfig, BotRunOptions, BotRuntime, BotRuntimeParts,
+    ImageGeneratorRegistry, LlmProviderRegistry, MemoryConfig, MessagePlatformRegistry,
+    VideoGeneratorRegistry,
 };
 use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::{EventBus, WebConfig, WebState};
@@ -85,6 +87,7 @@ async fn main() -> ExitCode {
         llm_providers = config.llm.len(),
         image_providers = config.image.len(),
         video_providers = config.video.len(),
+        audio_providers = config.audio.len(),
         platforms = config.platforms.len(),
         memory_enabled = config.memory.enabled,
         "chudbot starting"
@@ -117,6 +120,7 @@ async fn run(
                 llm_providers = plan.llms.configured_count(),
                 image_providers = plan.images.configured_count(),
                 video_providers = plan.videos.configured_count(),
+                audio_providers = plan.audio.configured_count(),
                 platforms = config.platforms.len(),
                 agents = config.bot.agents.len(),
                 "configuration is valid"
@@ -159,6 +163,7 @@ async fn run(
                     llms: plan.llms,
                     images: plan.images,
                     videos: plan.videos,
+                    audio: plan.audio,
                     events: plan.events.clone(),
                     memory: config.memory,
                 },
@@ -172,8 +177,8 @@ async fn run(
 
 /// Run fully constructed bot and web services until a process shutdown signal
 /// or either service exits.
-pub async fn run_runtime_services<P, S, M, L, I, V, E>(
-    bot: BotRuntime<P, S, M, L, I, V, E>,
+pub async fn run_runtime_services<P, S, M, L, I, V, A, E>(
+    bot: BotRuntime<P, S, M, L, I, V, A, E>,
     web: WebState<S, M>,
     listen: SocketAddr,
 ) -> Result<(), BinError>
@@ -184,6 +189,7 @@ where
     L: LlmProviderRegistry + Clone + 'static,
     I: ImageGeneratorRegistry + Clone + 'static,
     V: VideoGeneratorRegistry + Clone + 'static,
+    A: AudioTranscriberRegistry + Clone + 'static,
     E: EventSink + Clone + 'static,
 {
     let shutdown = CancellationToken::new();
@@ -349,6 +355,9 @@ pub struct RuntimeConfig {
     /// Named video-generation provider configs.
     #[serde(default)]
     pub video: BTreeMap<ProviderName, VideoProviderConfig>,
+    /// Named audio transcription provider configs.
+    #[serde(default)]
+    pub audio: BTreeMap<ProviderName, AudioProviderConfig>,
     /// Named message platform configs.
     #[serde(default)]
     pub platforms: BTreeMap<chudbot_api::PlatformName, MessagePlatformConfig>,
@@ -449,6 +458,7 @@ impl RuntimeConfig {
             llm_providers = config.llm.len(),
             image_providers = config.image.len(),
             video_providers = config.video.len(),
+            audio_providers = config.audio.len(),
             platforms = config.platforms.len(),
             "loaded runtime config"
         );
@@ -464,6 +474,7 @@ impl RuntimeConfig {
             llm_providers = self.llm.len(),
             image_providers = self.image.len(),
             video_providers = self.video.len(),
+            audio_providers = self.audio.len(),
             platforms = self.platforms.len(),
         )
     )]
@@ -478,6 +489,7 @@ impl RuntimeConfig {
         let provider_names = self.llm.keys().collect::<BTreeSet<_>>();
         let image_provider_names = self.image.keys().collect::<BTreeSet<_>>();
         let video_provider_names = self.video.keys().collect::<BTreeSet<_>>();
+        let audio_provider_names = self.audio.keys().collect::<BTreeSet<_>>();
         if self.memory.enabled {
             if !provider_names.contains(&self.memory.provider) {
                 tracing::warn!(
@@ -525,6 +537,20 @@ impl RuntimeConfig {
                     "agent references missing video provider config"
                 );
                 return Err(BinError::MissingVideoProviderConfig {
+                    agent: agent_name.clone(),
+                    provider: binding.provider.clone(),
+                });
+            }
+            if let Some(binding) = &agent.audio_transcription
+                && !audio_provider_names.contains(&binding.provider)
+            {
+                tracing::warn!(
+                    agent = %agent_name,
+                    provider = %binding.provider,
+                    model = ?binding.model.as_ref(),
+                    "agent references missing audio provider config"
+                );
+                return Err(BinError::MissingAudioProviderConfig {
                     agent: agent_name.clone(),
                     provider: binding.provider.clone(),
                 });
@@ -603,6 +629,9 @@ pub struct LocalStorageConfig {
     /// Video directory.
     #[serde(default = "default_videos_dir")]
     pub videos_dir: PathBuf,
+    /// Audio directory.
+    #[serde(default = "default_audio_dir")]
+    pub audio_dir: PathBuf,
     /// Avatar directory.
     #[serde(default = "default_avatars_dir")]
     pub avatars_dir: PathBuf,
@@ -616,6 +645,7 @@ impl Default for LocalStorageConfig {
         Self {
             images_dir: default_images_dir(),
             videos_dir: default_videos_dir(),
+            audio_dir: default_audio_dir(),
             avatars_dir: default_avatars_dir(),
             public_base_url: None,
         }
@@ -628,6 +658,10 @@ fn default_images_dir() -> PathBuf {
 
 fn default_videos_dir() -> PathBuf {
     PathBuf::from("videos")
+}
+
+fn default_audio_dir() -> PathBuf {
+    PathBuf::from("audio")
 }
 
 fn default_avatars_dir() -> PathBuf {
@@ -711,6 +745,20 @@ pub enum VideoProviderConfig {
     },
 }
 
+/// Named audio transcription provider config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AudioProviderConfig {
+    /// xAI speech-to-text provider.
+    Xai {
+        /// API key.
+        api_key: String,
+        /// Optional base URL override.
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+}
+
 /// Named message platform config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -734,6 +782,8 @@ pub struct ServicePlan {
     pub images: ConfiguredImageGenerators,
     /// Video generation registry.
     pub videos: ConfiguredVideoGenerators,
+    /// Audio transcription registry.
+    pub audio: ConfiguredAudioTranscribers,
     /// Local media store.
     pub media_store: LocalMediaStore,
     /// Web event bus.
@@ -749,6 +799,7 @@ impl ServicePlan {
         fields(
             images_dir = %config.storage.images_dir.display(),
             videos_dir = %config.storage.videos_dir.display(),
+            audio_dir = %config.storage.audio_dir.display(),
             avatars_dir = %config.storage.avatars_dir.display(),
             frontend_dir = %config.web.frontend_dir.display(),
         )
@@ -757,6 +808,7 @@ impl ServicePlan {
         let media_store = LocalMediaStore::new(
             config.storage.images_dir.clone(),
             config.storage.videos_dir.clone(),
+            config.storage.audio_dir.clone(),
             config.storage.avatars_dir.clone(),
             config
                 .storage
@@ -767,10 +819,12 @@ impl ServicePlan {
         let llms = ConfiguredLlmProviders::from_config(&config.llm);
         let images = ConfiguredImageGenerators::from_config(&config.image);
         let videos = ConfiguredVideoGenerators::from_config(&config.video);
+        let audio = ConfiguredAudioTranscribers::from_config(&config.audio);
         tracing::info!(
             llm_providers = llms.configured_count(),
             image_providers = images.configured_count(),
             video_providers = videos.configured_count(),
+            audio_providers = audio.configured_count(),
             event_capacity = 256,
             "built service plan"
         );
@@ -778,6 +832,7 @@ impl ServicePlan {
             llms,
             images,
             videos,
+            audio,
             media_store,
             events: EventBus::new(256),
             web: config.web.viewer_config(),
@@ -1152,6 +1207,90 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
         }
         tracing::warn!("requested video provider is missing from registry");
         Err(ConfiguredVideoError::Missing(provider.clone()))
+    }
+}
+
+/// Concrete named audio transcription provider registry.
+#[derive(Debug, Clone)]
+pub struct ConfiguredAudioTranscribers {
+    inner: Arc<ConfiguredAudioTranscribersInner>,
+}
+
+#[derive(Debug, Default)]
+struct ConfiguredAudioTranscribersInner {
+    xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
+}
+
+impl Default for ConfiguredAudioTranscribers {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(ConfiguredAudioTranscribersInner::default()),
+        }
+    }
+}
+
+impl ConfiguredAudioTranscribers {
+    #[tracing::instrument(
+        name = "audio_registry.from_config",
+        skip_all,
+        fields(providers = config.len())
+    )]
+    fn from_config(config: &BTreeMap<ProviderName, AudioProviderConfig>) -> Self {
+        let mut providers = ConfiguredAudioTranscribersInner::default();
+        for (name, provider) in config {
+            match provider {
+                AudioProviderConfig::Xai { api_key, base_url } => {
+                    let mut client = chudbot_xai::XaiClient::new(api_key.clone());
+                    if let Some(base_url) = base_url {
+                        client = client.with_base_url(base_url.clone());
+                    }
+                    tracing::info!(
+                        provider = %name,
+                        kind = "xai",
+                        base_url_override = base_url.is_some(),
+                        "registered audio transcription provider"
+                    );
+                    providers.xai.insert(name.clone(), client);
+                }
+            }
+        }
+        Self {
+            inner: Arc::new(providers),
+        }
+    }
+
+    fn configured_count(&self) -> usize {
+        self.inner.xai.len()
+    }
+}
+
+impl AudioTranscriberRegistry for ConfiguredAudioTranscribers {
+    type Error = ConfiguredAudioError;
+
+    fn contains_transcriber(&self, provider: &ProviderName) -> bool {
+        let contains = self.inner.xai.contains_key(provider);
+        tracing::trace!(provider = %provider, contains, "checking audio provider registry");
+        contains
+    }
+
+    #[tracing::instrument(
+        name = "audio_registry.transcribe",
+        skip_all,
+        fields(provider = %provider, model = ?request.model.as_ref())
+    )]
+    async fn transcribe_audio(
+        &self,
+        provider: &ProviderName,
+        request: AudioTranscriptionRequest,
+    ) -> Result<AudioTranscription, Self::Error> {
+        if let Some(client) = self.inner.xai.get(provider) {
+            tracing::debug!(kind = "xai", "dispatching audio transcription");
+            return AudioTranscriber::transcribe_audio(client, request)
+                .await
+                .map_err(ConfiguredAudioError::Xai);
+        }
+        tracing::warn!("requested audio provider is missing from registry");
+        Err(ConfiguredAudioError::Missing(provider.clone()))
     }
 }
 
@@ -1613,6 +1752,17 @@ pub enum ConfiguredVideoError {
     Xai(#[from] chudbot_xai::XaiError),
 }
 
+/// Errors from the concrete audio transcription registry.
+#[derive(Debug, Error)]
+pub enum ConfiguredAudioError {
+    /// Provider was referenced but not implemented/configured.
+    #[error("audio provider `{0}` is not available in the 2.0 runtime")]
+    Missing(ProviderName),
+    /// xAI audio transcription failed.
+    #[error(transparent)]
+    Xai(#[from] chudbot_xai::XaiError),
+}
+
 /// Errors from the concrete message-platform registry.
 #[derive(Debug, Error)]
 pub enum ConfiguredPlatformError {
@@ -1699,6 +1849,16 @@ pub enum BinError {
         "agent `{agent}` uses video provider `{provider}` but no matching [video] entry exists"
     )]
     MissingVideoProviderConfig {
+        /// Agent name.
+        agent: String,
+        /// Provider name.
+        provider: ProviderName,
+    },
+    /// Agent audio provider has no matching `[audio.<name>]` config.
+    #[error(
+        "agent `{agent}` uses audio provider `{provider}` but no matching [audio] entry exists"
+    )]
+    MissingAudioProviderConfig {
         /// Agent name.
         agent: String,
         /// Provider name.

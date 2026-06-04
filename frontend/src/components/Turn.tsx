@@ -115,8 +115,10 @@ function TurnAssets({ assets }: { assets: TurnAsset[] }) {
           <figure className="turn-assets__item" key={asset.uri}>
             {asset.kind === 'image' ? (
               <img className="context-image" src={asset.path} alt={asset.source} />
-            ) : (
+            ) : asset.kind === 'video' ? (
               <video className="context-video" controls src={asset.path} />
+            ) : (
+              <audio className="context-audio" controls src={asset.path} />
             )}
             <figcaption>{asset.source}</figcaption>
           </figure>
@@ -139,6 +141,7 @@ function StatusBadge({ status }: { status: string }) {
 function ContextItemView({ item }: { item: ContextItem }) {
   const isImage = isImageUri(item.content);
   const isVideo = isVideoUri(item.content);
+  const isAudio = isAudioUri(item.content);
   return (
     <article className="context-item">
       <header>
@@ -154,6 +157,8 @@ function ContextItemView({ item }: { item: ContextItem }) {
         />
       ) : isVideo ? (
         <video className="context-video" controls src={toWebPath(item.content)} />
+      ) : isAudio ? (
+        <audio className="context-audio" controls src={toWebPath(item.content)} />
       ) : (
         <pre>{item.content}</pre>
       )}
@@ -161,7 +166,7 @@ function ContextItemView({ item }: { item: ContextItem }) {
   );
 }
 
-type MediaAsset = TurnAsset & { kind: 'image' | 'video'; path: string };
+type MediaAsset = TurnAsset & { kind: 'image' | 'video' | 'audio'; path: string };
 
 function collectMediaAssets(assets: TurnAsset[]): MediaAsset[] {
   const seen = new Set<string>();
@@ -176,10 +181,11 @@ function collectMediaAssets(assets: TurnAsset[]): MediaAsset[] {
   return media;
 }
 
-function assetKind(asset: TurnAsset): 'image' | 'video' | null {
+function assetKind(asset: TurnAsset): 'image' | 'video' | 'audio' | null {
   const mimeType = asset.mime_type ?? '';
   if (mimeType.startsWith('image/') || isImageUri(asset.uri)) return 'image';
   if (mimeType.startsWith('video/') || isVideoUri(asset.uri)) return 'video';
+  if (mimeType.startsWith('audio/') || isAudioUri(asset.uri)) return 'audio';
   return null;
 }
 
@@ -190,6 +196,9 @@ function isImageUri(s: string): boolean {
 }
 function isVideoUri(s: string): boolean {
   return s.startsWith('file://videos/');
+}
+function isAudioUri(s: string): boolean {
+  return s.startsWith('file://audio/');
 }
 function toWebPath(s: string): string {
   return s.startsWith('file://') ? '/' + s.slice('file://'.length) : s;

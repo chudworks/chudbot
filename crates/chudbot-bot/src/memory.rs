@@ -9,8 +9,8 @@ use chudbot_api::{
     MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, Model, ModelId, ModelSpec,
     NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, ProviderName,
     ProviderOptions, SamplingOptions, ToolInputSchema, Transcript, TranscriptTurn, TurnId,
-    TurnRole, UsageRecord, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
-    UserMemoryEventKind, UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserRef,
+    TurnRole, UsageRecord, UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument,
+    UserMemoryEvent, UserMemoryEventKind, UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1118,8 +1118,47 @@ fn diary_input(
             out.push_str(answer);
             out.push('\n');
         }
+        append_audio_transcriptions(&mut out, &turn.audio_transcriptions);
     }
     out
+}
+
+fn append_audio_transcriptions(out: &mut String, transcriptions: &[UserMemoryAudioTranscription]) {
+    let mut rendered_any = false;
+    for (index, transcription) in transcriptions.iter().enumerate() {
+        let text = transcription.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        if !rendered_any {
+            out.push_str("Audio transcriptions:\n");
+            rendered_any = true;
+        }
+        let mut metadata = Vec::new();
+        if let Some(uri) = transcription
+            .audio_uri
+            .as_deref()
+            .filter(|uri| !uri.is_empty())
+        {
+            metadata.push(format!("uri: {uri}"));
+        }
+        if let Some(language) = transcription
+            .language
+            .as_deref()
+            .filter(|language| !language.is_empty())
+        {
+            metadata.push(format!("language: {language}"));
+        }
+        if let Some(duration) = transcription.duration_seconds {
+            metadata.push(format!("duration_seconds: {duration:.2}"));
+        }
+        let metadata = if metadata.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", metadata.join(", "))
+        };
+        out.push_str(&format!("- Audio {}{}: {}\n", index + 1, metadata, text));
+    }
 }
 
 fn compact_input(
@@ -1265,6 +1304,38 @@ mod tests {
         assert!(guidance.contains("grain of salt"));
         assert!(guidance.contains("trust the current message"));
         assert!(guidance.contains("sensitive personal information"));
+    }
+
+    #[test]
+    fn diary_input_includes_audio_transcriptions() {
+        let key = UserMemoryKey {
+            platform: PlatformName::new("discord"),
+            scope_key: "guild:guild-1".to_string(),
+            user_key: "user-1".to_string(),
+        };
+        let turn = UserMemoryTurn {
+            conversation_id: ConversationId::new(),
+            turn_id: TurnId::new(),
+            completed_at: datetime!(2026-06-03 22:27:01 UTC),
+            user_display_name: "Chud".to_string(),
+            user_content: "@Chudbot".to_string(),
+            assistant_content: Some("Noted.".to_string()),
+            audio_transcriptions: vec![UserMemoryAudioTranscription {
+                tool_trace_id: 42,
+                audio_uri: Some("file://audio/voice.ogg".to_string()),
+                text: "I am allergic to coconut.".to_string(),
+                language: Some("en".to_string()),
+                duration_seconds: Some(3.25),
+            }],
+        };
+
+        let input = diary_input(&key, None, &[turn]);
+
+        assert!(input.contains("Audio transcriptions:"));
+        assert!(input.contains("file://audio/voice.ogg"));
+        assert!(input.contains("language: en"));
+        assert!(input.contains("duration_seconds: 3.25"));
+        assert!(input.contains("I am allergic to coconut."));
     }
 
     #[test]

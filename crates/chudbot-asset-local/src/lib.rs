@@ -1,8 +1,9 @@
 //! Local filesystem media storage for chudbot.
 //!
-//! This backend owns `file://images/...`, `file://videos/...`, and
-//! `file://avatars/...` URIs. The URI is stable and model-facing; the public
-//! URL is deployment-facing and can point at the Axum static routes today.
+//! This backend owns `file://images/...`, `file://videos/...`,
+//! `file://audio/...`, and `file://avatars/...` URIs. The URI is stable and
+//! model-facing; the public URL is deployment-facing and can point at the Axum
+//! static routes today.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +26,7 @@ pub struct LocalMediaStore {
 struct LocalMediaStoreInner {
     images_dir: PathBuf,
     videos_dir: PathBuf,
+    audio_dir: PathBuf,
     avatars_dir: PathBuf,
     public_base_url: Option<String>,
 }
@@ -34,15 +36,18 @@ impl LocalMediaStore {
     pub fn new(
         images_dir: impl Into<PathBuf>,
         videos_dir: impl Into<PathBuf>,
+        audio_dir: impl Into<PathBuf>,
         avatars_dir: impl Into<PathBuf>,
         public_base_url: Option<String>,
     ) -> Self {
         let images_dir = images_dir.into();
         let videos_dir = videos_dir.into();
+        let audio_dir = audio_dir.into();
         let avatars_dir = avatars_dir.into();
         tracing::info!(
             images_dir = %images_dir.display(),
             videos_dir = %videos_dir.display(),
+            audio_dir = %audio_dir.display(),
             avatars_dir = %avatars_dir.display(),
             has_public_base_url = public_base_url.is_some(),
             "created local media store"
@@ -51,6 +56,7 @@ impl LocalMediaStore {
             inner: Arc::new(LocalMediaStoreInner {
                 images_dir,
                 videos_dir,
+                audio_dir,
                 avatars_dir,
                 public_base_url,
             }),
@@ -65,6 +71,11 @@ impl LocalMediaStore {
     /// Directory for video media.
     pub fn videos_dir(&self) -> &Path {
         &self.inner.videos_dir
+    }
+
+    /// Directory for audio media.
+    pub fn audio_dir(&self) -> &Path {
+        &self.inner.audio_dir
     }
 
     /// Directory for avatar media.
@@ -127,6 +138,7 @@ impl LocalMediaStore {
         match category {
             MediaCategory::Image => Ok(&self.inner.images_dir),
             MediaCategory::Video => Ok(&self.inner.videos_dir),
+            MediaCategory::Audio => Ok(&self.inner.audio_dir),
             MediaCategory::Avatar => Ok(&self.inner.avatars_dir),
             MediaCategory::Other(prefix) => Err(MediaError::UnsupportedCategory(prefix.clone())),
         }
@@ -215,7 +227,9 @@ impl MediaStore for LocalMediaStore {
     ) -> Result<BoxedMediaRef, MediaError> {
         let path = self.path_for_name(&category, name)?;
         let metadata = tokio::fs::metadata(&path).await?;
-        let mime_type = mime_for_extension(path.extension().and_then(|s| s.to_str())).to_string();
+        let mime_type =
+            mime_for_category_extension(&category, path.extension().and_then(|s| s.to_str()))
+                .to_string();
         tracing::debug!(
             path = %path.display(),
             mime_type = %mime_type,
@@ -269,6 +283,7 @@ fn parse_local_uri(uri: &MediaUri) -> Result<ParsedLocalUri, MediaError> {
     let category = match prefix {
         "images" => MediaCategory::Image,
         "videos" => MediaCategory::Video,
+        "audio" => MediaCategory::Audio,
         "avatars" => MediaCategory::Avatar,
         _ => return Err(MediaError::UnsupportedUri(uri.to_string())),
     };
@@ -292,7 +307,10 @@ fn public_url_from_base(base: Option<&str>, uri: &MediaUri) -> Option<PublicMedi
 }
 
 fn is_supported_prefix(path: &str) -> bool {
-    path.starts_with("images/") || path.starts_with("videos/") || path.starts_with("avatars/")
+    path.starts_with("images/")
+        || path.starts_with("videos/")
+        || path.starts_with("audio/")
+        || path.starts_with("avatars/")
 }
 
 fn generated_name(extension: Option<&str>, mime_type: &str) -> String {
@@ -312,7 +330,7 @@ fn detect_mime_type(input: &CreateMedia) -> String {
         .extension
         .as_deref()
         .or_else(|| input.name.as_deref().and_then(extension_from_name));
-    let extension_mime = mime_for_extension(extension);
+    let extension_mime = mime_for_category_extension(&input.category, extension);
     if extension_mime != "application/octet-stream" {
         return extension_mime.to_string();
     }
@@ -352,6 +370,19 @@ fn detect_mime_from_bytes(bytes: &[u8]) -> Option<&'static str> {
     }
     if bytes.starts_with(b"\x1a\x45\xdf\xa3") {
         return Some("video/webm");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(b"ID3")
+        || bytes
+            .get(0..2)
+            .is_some_and(|prefix| prefix[0] == 0xff && prefix[1] & 0xe0 == 0xe0)
+    {
+        return Some("audio/mpeg");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
     }
     if bytes.len() >= 12 && &bytes[4..8] == b"ftyp" {
         return Some(mime_for_iso_base_media_brand(&bytes[8..12]));
@@ -407,6 +438,14 @@ pub fn extension_for_mime(mime: &str) -> &'static str {
         "video/mp4" => "mp4",
         "video/webm" => "webm",
         "video/quicktime" => "mov",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/ogg" => "ogg",
+        "audio/opus" => "opus",
+        "audio/webm" => "webm",
+        "audio/mp4" | "audio/m4a" => "m4a",
+        "audio/aac" => "aac",
+        "audio/flac" => "flac",
         _ => "bin",
     }
 }
@@ -422,8 +461,28 @@ pub fn mime_for_extension(extension: Option<&str>) -> &'static str {
         "mp4" => "video/mp4",
         "webm" => "video/webm",
         "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" => "audio/ogg",
+        "opus" => "audio/opus",
+        "m4a" => "audio/m4a",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
         _ => "application/octet-stream",
     }
+}
+
+fn mime_for_category_extension(category: &MediaCategory, extension: Option<&str>) -> &'static str {
+    let normalized = extension.unwrap_or("").to_ascii_lowercase();
+    if matches!(category, MediaCategory::Audio) {
+        return match normalized.as_str() {
+            "mp4" => "audio/mp4",
+            "webm" => "audio/webm",
+            "mkv" => "audio/x-matroska",
+            _ => mime_for_extension(Some(&normalized)),
+        };
+    }
+    mime_for_extension(Some(&normalized))
 }
 
 #[cfg(test)]
@@ -440,6 +499,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(url.as_str(), "https://chudbot.example.com/images/abc.png");
+
+        let url = public_url_from_base(
+            Some("https://chudbot.example.com/"),
+            &MediaUri::new("file://audio/abc.ogg"),
+        )
+        .unwrap();
+        assert_eq!(url.as_str(), "https://chudbot.example.com/audio/abc.ogg");
     }
 
     #[test]
@@ -460,6 +526,7 @@ mod tests {
         let store = LocalMediaStore::new(
             root.join("images"),
             root.join("videos"),
+            root.join("audio"),
             root.join("avatars"),
             Some("https://chudbot.example.com".to_string()),
         );
@@ -502,8 +569,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creates_audio_media_with_audio_uri_and_mime() {
+        let root = std::env::temp_dir().join(format!(
+            "chudbot-local-media-test-{}",
+            Uuid::new_v4().simple()
+        ));
+        let store = LocalMediaStore::new(
+            root.join("images"),
+            root.join("videos"),
+            root.join("audio"),
+            root.join("avatars"),
+            Some("https://chudbot.example.com".to_string()),
+        );
+
+        let media = store
+            .create_media(CreateMedia {
+                category: MediaCategory::Audio,
+                bytes: b"OggSvoice bytes".to_vec(),
+                mime_type: None,
+                name: Some("voice.webm".to_string()),
+                extension: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(media.category(), &MediaCategory::Audio);
+        assert_eq!(media.uri().as_str(), "file://audio/voice.webm");
+        assert_eq!(media.mime_type(), "audio/webm");
+        assert_eq!(
+            media.public_url().await.unwrap().as_str(),
+            "https://chudbot.example.com/audio/voice.webm"
+        );
+
+        let by_uri = store.media_from_uri(media.uri()).await.unwrap();
+        assert_eq!(by_uri.mime_type(), "audio/webm");
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn public_url_errors_when_not_configured() {
-        let store = LocalMediaStore::new("images", "videos", "avatars", None);
+        let store = LocalMediaStore::new("images", "videos", "audio", "avatars", None);
         let media = store
             .media_from_name(MediaCategory::Image, "abc.png")
             .await
@@ -535,6 +641,7 @@ mod tests {
         let store = LocalMediaStore::new(
             root.join("images"),
             root.join("videos"),
+            root.join("audio"),
             root.join("avatars"),
             None,
         );
@@ -566,6 +673,7 @@ mod tests {
         let store = LocalMediaStore::new(
             root.join("images"),
             root.join("videos"),
+            root.join("audio"),
             root.join("avatars"),
             None,
         );
