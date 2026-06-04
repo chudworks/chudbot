@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use chudbot_api::{
     AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, BotStorage, ChannelRef,
-    EventSink, ExternalId, FetchMessages, GeneratedImage, ImageGenerator, ImageRequest, LlmBackend,
-    MediaStore, MessagePlatform, MessageRef, ModelStep, ModelStepRequest,
-    PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
-    PlatformMessageRelationship, PostedMessage, PrivacyMode, ProviderName, ReactionKind,
-    SendMessage, UserProfile, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    EventSink, FetchMessages, GeneratedImage, ImageGenerator, ImageRequest, LlmBackend, MediaStore,
+    MessagePlatform, MessageRef, ModelStep, ModelStepRequest, PlatformCommandDefinition,
+    PlatformCommandResponse, PlatformEvent, PlatformMessage, PlatformMessageRelationship,
+    PostedMessage, PrivacyMode, ProviderName, ReactionKind, SendMessage, UserProfile,
+    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
 use chudbot_bot::{
@@ -765,7 +765,8 @@ pub enum MessagePlatformConfig {
     Discord {
         /// Bot token.
         token: String,
-        /// Optional development guild.
+        /// Deprecated. Commands now register globally so every installed guild
+        /// can use them.
         #[serde(default)]
         dev_guild_id: Option<String>,
     },
@@ -1308,7 +1309,6 @@ struct ConfiguredMessagePlatformsInner {
 
 struct ConfiguredDiscordPlatform {
     platform: chudbot_discord::DiscordPlatform,
-    dev_guild_id: Option<ExternalId>,
 }
 
 struct PlatformEventPump {
@@ -1468,9 +1468,9 @@ impl ConfiguredMessagePlatforms {
                     dev_guild_id,
                 } => {
                     if dev_guild_id.is_some() {
-                        tracing::debug!(
+                        tracing::warn!(
                             platform = %name,
-                            "discord dev guild is configured for command registration"
+                            "discord dev_guild_id is ignored; commands register globally"
                         );
                     }
                     let platform = chudbot_discord::DiscordPlatform::connect_named(
@@ -1484,13 +1484,7 @@ impl ConfiguredMessagePlatforms {
                         platform.clone(),
                         events_tx.clone(),
                     ));
-                    discord.insert(
-                        name.clone(),
-                        ConfiguredDiscordPlatform {
-                            platform,
-                            dev_guild_id: dev_guild_id.clone().map(ExternalId::new),
-                        },
-                    );
+                    discord.insert(name.clone(), ConfiguredDiscordPlatform { platform });
                 }
             }
         }
@@ -1595,13 +1589,9 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
         commands: Vec<PlatformCommandDefinition>,
     ) -> Result<(), Self::Error> {
         for configured in self.inner.discord.values() {
-            MessagePlatform::register_commands(
-                &configured.platform,
-                commands.clone(),
-                configured.dev_guild_id.clone(),
-            )
-            .await
-            .map_err(ConfiguredPlatformError::Discord)?;
+            MessagePlatform::register_commands(&configured.platform, commands.clone(), None)
+                .await
+                .map_err(ConfiguredPlatformError::Discord)?;
         }
         Ok(())
     }

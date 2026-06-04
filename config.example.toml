@@ -120,9 +120,8 @@ mode = "opt_in"
 [platforms.discord]
 kind = "discord"
 token = "DISCORD_BOT_TOKEN"
-# Optional Discord guild id for development command registration. Use a string
-# to keep snowflakes lossless.
-dev_guild_id = "123456789012345678"
+# Slash commands register globally on startup so every guild that installed the
+# app can use them.
 
 # Named language-model provider services. Agent configs reference these names
 # through `provider = "<name>"`. Provider instances are model-agnostic; model
