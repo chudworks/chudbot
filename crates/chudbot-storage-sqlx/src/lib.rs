@@ -1440,13 +1440,10 @@ impl BotStorage for SqlxStorage {
             "SELECT COUNT(*)::BIGINT \
                FROM video_jobs v \
                JOIN turns t ON t.id = v.turn_id \
-               JOIN platform_channels c \
-                 ON c.message_provider = t.user_message_provider \
-                AND c.channel = t.user_message_channel \
               WHERE t.user_message_provider = $1 \
                 AND ( \
-                    ($2::text IS NULL AND c.parent_channel IS NULL) \
-                    OR c.parent_channel = $2 \
+                    ($2::text IS NULL AND t.user_message_channel NOT LIKE 'guild:%') \
+                    OR ($2::text IS NOT NULL AND t.user_message_channel LIKE $2 || ':%') \
                 ) \
                 AND v.status = 'done' \
                 AND v.output_uri IS NOT NULL \
