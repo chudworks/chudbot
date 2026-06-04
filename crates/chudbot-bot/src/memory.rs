@@ -32,6 +32,7 @@ pub const FORGET_USER_MEMORY_TOOL: &str = "forget_user_memory";
 const MEMORY_MODEL_ID: &str = "grok-4.3";
 const MEMORY_REASONING_EFFORT: &str = "high";
 const MEMORY_DIARY_AGENT: &str = "memory_diary";
+const MEMORY_COMPACT_AGENT: &str = "memory_compact";
 
 const DIARY_PROMPT: &str = "You write concise user-memory diary entries for Chudbot. \
 Read the bounded transcript slice and optional current memory profile. Extract only \
@@ -959,8 +960,11 @@ where
                 self.config.max_profile_output_tokens.max(1),
             )
             .await?;
-        let markdown = output.text;
-        let usage_model_id = output.model_id;
+        let MemoryModelOutput {
+            text: markdown,
+            model_id: llm_model,
+            usage,
+        } = output;
         let source_event_cutoff = events
             .iter()
             .map(|event| event.created_at)
@@ -982,10 +986,11 @@ where
                 });
         tracing::debug!(
             job = %job.id,
-            model = %usage_model_id,
+            model = %llm_model,
             events = events.len(),
             diaries = diaries.len(),
             markdown_chars = markdown.chars().count(),
+            usage_records = usage.len(),
             "saving compact memory profile"
         );
         self.storage
@@ -996,6 +1001,10 @@ where
                 source_diary_entry_ids: diaries.iter().map(|entry| entry.id).collect(),
                 source_event_cutoff,
                 source_diary_cutoff,
+                agent_name: MEMORY_COMPACT_AGENT.to_string(),
+                llm_provider: self.config.provider.clone(),
+                llm_model,
+                usage,
             })
             .await
             .map_err(|error| MemoryError::Storage(error.to_string()))?;

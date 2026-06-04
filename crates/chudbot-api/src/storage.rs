@@ -708,6 +708,14 @@ pub struct NewUserMemoryDocumentRevision {
     /// Highest diary timestamp included in this revision.
     #[serde(with = "time::serde::rfc3339::option", default)]
     pub source_diary_cutoff: Option<OffsetDateTime>,
+    /// Memory agent name that generated this revision.
+    pub agent_name: String,
+    /// LLM provider registry key.
+    pub llm_provider: ProviderName,
+    /// LLM model id.
+    pub llm_model: ModelId,
+    /// Usage records for the compaction generation.
+    pub usage: Vec<UsageRecord>,
 }
 
 /// Durable memory job kind.
@@ -1247,6 +1255,10 @@ mod tests {
                 source_diary_entry_ids: Vec::new(),
                 source_event_cutoff: Some(timestamp),
                 source_diary_cutoff: Some(timestamp),
+                agent_name: "memory_compact".to_string(),
+                llm_provider: ProviderName::new("xai"),
+                llm_model: ModelId::new("grok-4.3"),
+                usage: Vec::new(),
             })
             .unwrap(),
             &["source_event_cutoff", "source_diary_cutoff"],

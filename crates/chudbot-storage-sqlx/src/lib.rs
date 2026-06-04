@@ -1575,8 +1575,9 @@ impl BotStorage for SqlxStorage {
         sqlx::query(
             "INSERT INTO user_memory_document_versions \
                (id, message_provider, scope_key, subject_user_key, revision, markdown, \
-                source_event_ids, source_diary_entry_ids) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                source_event_ids, source_diary_entry_ids, agent_name, llm_provider, llm_model, \
+                usage) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(version_id)
         .bind(document.key.platform.as_str())
@@ -1586,6 +1587,10 @@ impl BotStorage for SqlxStorage {
         .bind(&document.markdown)
         .bind(&document.source_event_ids)
         .bind(&document.source_diary_entry_ids)
+        .bind(&document.agent_name)
+        .bind(document.llm_provider.as_str())
+        .bind(document.llm_model.as_str())
+        .bind(serde_json::to_value(&document.usage)?)
         .execute(&mut *tx)
         .await?;
         let row = sqlx::query(

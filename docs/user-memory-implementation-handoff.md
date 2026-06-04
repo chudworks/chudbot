@@ -228,6 +228,10 @@ revision BIGINT NOT NULL,
 markdown TEXT NOT NULL,
 source_event_ids UUID[] NOT NULL,
 source_diary_entry_ids UUID[] NOT NULL,
+agent_name TEXT NOT NULL,
+llm_provider TEXT NOT NULL,
+llm_model TEXT NOT NULL,
+usage JSONB NOT NULL DEFAULT '[]'::jsonb,
 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
