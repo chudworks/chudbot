@@ -24,17 +24,17 @@ use chudbot_api::{
     ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
     ConversationStop, CreateMedia, CreateVideoJob, EventSink, ExternalId, FetchMessages,
     FinishTurn, GeneratedImage, ImageGenerator, ImageGeneratorTool, ImageRequest, LiveEvent,
-    LlmBackend, MediaCategory, MediaStore, MediaUri, MessageLink, MessagePlatform, MessageRef,
-    Model, ModelId, ModelSpec, ModelStep, ModelStepRequest, OpenConversation, OutgoingAttachment,
-    PlatformCommand, PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
-    PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
-    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
-    PlatformMessageRelationship, PlatformName, PlatformReaction, PostedMessage, PrivacyMode,
-    ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput,
-    SendMessage, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, ToolUseId,
-    Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob,
-    UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator, VideoJobId, VideoJobStatus,
-    VideoRequest,
+    LlmBackend, MediaCategory, MediaRef, MediaStore, MediaUri, MessageLink, MessagePlatform,
+    MessageRef, Model, ModelId, ModelSpec, ModelStep, ModelStepRequest, OpenConversation,
+    OutgoingAttachment, PlatformCommand, PlatformCommandDefinition, PlatformCommandInput,
+    PlatformCommandOption, PlatformCommandOptionChoice, PlatformCommandOptionKind,
+    PlatformCommandResponse, PlatformCommandValue, PlatformEvent, PlatformMessage,
+    PlatformMessageReference, PlatformMessageRelationship, PlatformName, PlatformReaction,
+    PostedMessage, PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings,
+    SamplingOptions, SaveTurnInput, SendMessage, Subagent, ThreadRequest, ToolInputSchema,
+    ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole,
+    TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator,
+    VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -55,7 +55,9 @@ const STOP_REACTION: &str = "🛑";
 const REFUSED_REACTION: &str = "❓";
 const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
-const MAX_OUTGOING_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+// Discord's default per-file upload limit is 10 MiB; larger generated media is
+// linked by public URL instead of uploaded.
+const MAX_OUTGOING_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 const HISTORY_SIZE_MIN: i64 = 1;
 const HISTORY_SIZE_MAX: i64 = 100;
 const TITLE_MAX_CHARS: usize = 80;
@@ -2018,7 +2020,7 @@ where
                 generated_media_refs.push(reference);
             }
         }
-        let generated_attachments = self.generated_attachments(&run.trace).await;
+        let generated_media = generated_reply_media(&self.media_store, &run.trace).await;
 
         match &run.outcome {
             AgentOutcome::Completed { answer } => {
@@ -2028,6 +2030,7 @@ where
                 } else {
                     text
                 };
+                let text = append_generated_media_public_urls(text, &generated_media.public_urls);
                 let content = self.format_reply(&text, execution.is_new, execution.conversation.id);
                 let rendered_lines = rendered_line_count(&content);
                 let open_thread = should_thread(
@@ -2045,7 +2048,7 @@ where
                         channel: channel_from_message(&execution.reply_to),
                         reply_to: Some(execution.reply_to.clone()),
                         content: content.clone(),
-                        attachments: generated_attachments,
+                        attachments: generated_media.attachments,
                         suppress_embeds: true,
                         open_thread,
                     })
@@ -2541,49 +2544,6 @@ where
             ConversationEventKind::TurnUpdated,
         );
         Ok(BotAction::RefusedMessage)
-    }
-
-    async fn generated_attachments(&self, trace: &[ToolTrace]) -> Vec<OutgoingAttachment> {
-        let uris = media_uris_from_tool_traces(trace);
-        let mut attachments = Vec::with_capacity(uris.len());
-        for uri in uris {
-            let media = match self.media_store.media_from_uri(&uri).await {
-                Ok(media) => media,
-                Err(error) => {
-                    tracing::warn!(error = %error, uri = %uri, "generated media was not found");
-                    continue;
-                }
-            };
-            let loaded = match media.load().await {
-                Ok(loaded) => loaded,
-                Err(error) => {
-                    tracing::warn!(error = %error, uri = %uri, "failed to load generated media");
-                    continue;
-                }
-            };
-            if loaded.bytes.len() > MAX_OUTGOING_ATTACHMENT_BYTES {
-                tracing::warn!(
-                    uri = %uri,
-                    bytes = loaded.bytes.len(),
-                    limit = MAX_OUTGOING_ATTACHMENT_BYTES,
-                    "generated media exceeds outgoing attachment size limit; skipping"
-                );
-                continue;
-            }
-            tracing::debug!(
-                uri = %uri,
-                filename = loaded.media.name(),
-                mime_type = loaded.media.mime_type(),
-                bytes = loaded.bytes.len(),
-                "prepared generated media attachment"
-            );
-            attachments.push(OutgoingAttachment {
-                filename: loaded.media.name().to_string(),
-                content_type: loaded.media.mime_type().to_string(),
-                bytes: loaded.bytes,
-            });
-        }
-        attachments
     }
 
     fn spawn_typing_indicator(&self, channel: ChannelRef) -> TypingIndicator {
@@ -5623,6 +5583,125 @@ fn video_tool_schema() -> ToolInputSchema {
     }))
 }
 
+#[derive(Debug, Default)]
+struct GeneratedReplyMedia {
+    attachments: Vec<OutgoingAttachment>,
+    public_urls: Vec<String>,
+}
+
+async fn generated_reply_media<M>(media_store: &M, trace: &[ToolTrace]) -> GeneratedReplyMedia
+where
+    M: MediaStore,
+{
+    let uris = media_uris_from_tool_traces(trace);
+    let mut media = GeneratedReplyMedia {
+        attachments: Vec::with_capacity(uris.len()),
+        public_urls: Vec::new(),
+    };
+    for uri in uris {
+        let media_ref = match media_store.media_from_uri(&uri).await {
+            Ok(media) => media,
+            Err(error) => {
+                tracing::warn!(error = %error, uri = %uri, "generated media was not found");
+                continue;
+            }
+        };
+        if media_ref.size_bytes() > MAX_OUTGOING_ATTACHMENT_BYTES as u64 {
+            push_oversized_generated_media_url(
+                media_ref.as_ref(),
+                media_ref.size_bytes(),
+                &mut media.public_urls,
+            )
+            .await;
+            continue;
+        }
+        let loaded = match media_ref.load().await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                tracing::warn!(error = %error, uri = %uri, "failed to load generated media");
+                continue;
+            }
+        };
+        if loaded.bytes.len() > MAX_OUTGOING_ATTACHMENT_BYTES {
+            push_oversized_generated_media_url(
+                loaded.media.as_ref(),
+                loaded.bytes.len() as u64,
+                &mut media.public_urls,
+            )
+            .await;
+            continue;
+        }
+        tracing::debug!(
+            uri = %uri,
+            filename = loaded.media.name(),
+            mime_type = loaded.media.mime_type(),
+            bytes = loaded.bytes.len(),
+            "prepared generated media attachment"
+        );
+        media.attachments.push(OutgoingAttachment {
+            filename: loaded.media.name().to_string(),
+            content_type: loaded.media.mime_type().to_string(),
+            bytes: loaded.bytes,
+        });
+    }
+    media
+}
+
+async fn push_oversized_generated_media_url(
+    media: &dyn MediaRef,
+    bytes: u64,
+    public_urls: &mut Vec<String>,
+) {
+    match media.public_url().await {
+        Ok(public_url) => {
+            tracing::warn!(
+                uri = %media.uri(),
+                bytes,
+                limit = MAX_OUTGOING_ATTACHMENT_BYTES,
+                public_url = %public_url,
+                "generated media exceeds outgoing attachment size limit; using public URL"
+            );
+            push_unique_string(public_urls, public_url.as_str());
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                uri = %media.uri(),
+                bytes,
+                limit = MAX_OUTGOING_ATTACHMENT_BYTES,
+                "generated media exceeds outgoing attachment size limit but no public URL is available"
+            );
+        }
+    }
+}
+
+fn append_generated_media_public_urls(mut text: String, public_urls: &[String]) -> String {
+    if public_urls.is_empty() {
+        return text;
+    }
+
+    let trimmed_len = text.trim_end().len();
+    text.truncate(trimmed_len);
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    if public_urls.len() == 1 {
+        text.push_str("Generated media: ");
+        text.push_str(&public_urls[0]);
+        return text;
+    }
+
+    text.push_str("Generated media:\n");
+    for public_url in public_urls {
+        text.push_str("- ");
+        text.push_str(public_url);
+        text.push('\n');
+    }
+    let trimmed_len = text.trim_end().len();
+    text.truncate(trimmed_len);
+    text
+}
+
 fn media_uris_from_tool_traces(trace: &[ToolTrace]) -> Vec<MediaUri> {
     let mut seen = Vec::<String>::new();
     let mut out = Vec::new();
@@ -6869,8 +6948,8 @@ fn is_memory_context_item(item: &chudbot_api::ContextItem) -> bool {
 mod tests {
     use super::*;
     use chudbot_api::{
-        ExternalId, MediaError, MediaFuture, MediaMetadata, MediaRef, MediaUri, PlatformName,
-        PublicMediaUrl,
+        BoxedMediaRef, CreateMedia, ExternalId, LoadedMedia, MediaError, MediaFuture,
+        MediaMetadata, MediaRef, MediaStore, MediaUri, PlatformName, PublicMediaUrl,
     };
     use serde_json::json;
     use test_case::test_case;
@@ -6915,6 +6994,48 @@ mod tests {
                     "name": "generated.jpg",
                     "mime_type": "image/jpeg",
                     "size_bytes": 42,
+                    "public_url": public_url,
+                    "extra": {}
+                }),
+                usage: Vec::new(),
+            },
+        }
+    }
+
+    fn generated_video_trace(uri: &str, public_url: &str) -> ToolTrace {
+        let tool_use_id = chudbot_api::ToolUseId::new("call-1");
+        ToolTrace::Client {
+            trace: chudbot_api::ClientToolTrace {
+                call: ClientToolCall {
+                    id: tool_use_id.clone(),
+                    name: ToolName::new("generate_video"),
+                    input: json!({ "prompt": "a worm riding a bike" }),
+                },
+                result: chudbot_api::ClientToolResult {
+                    tool_use_id,
+                    content: ClientToolResultContent::Json {
+                        value: json!({
+                            "uri": uri,
+                            "video_uri": uri,
+                            "category": "video",
+                            "name": "generated.mp4",
+                            "mime_type": "video/mp4",
+                            "size_bytes": MAX_OUTGOING_ATTACHMENT_BYTES + 1,
+                            "delivery": {
+                                "platform_reply": "attached automatically"
+                            },
+                            "extra": {}
+                        }),
+                    },
+                    is_error: false,
+                },
+                trace_response: json!({
+                    "uri": uri,
+                    "video_uri": uri,
+                    "category": "video",
+                    "name": "generated.mp4",
+                    "mime_type": "video/mp4",
+                    "size_bytes": MAX_OUTGOING_ATTACHMENT_BYTES + 1,
                     "public_url": public_url,
                     "extra": {}
                 }),
@@ -7073,6 +7194,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn oversized_generated_video_uses_public_url_fallback() {
+        let uri = "file://videos/generated.mp4";
+        let public_url = "https://chud.example/videos/generated.mp4";
+        let trace = generated_video_trace(uri, public_url);
+        let store = ReplyMediaStore::new(ReplyMediaRef::video(
+            uri,
+            (MAX_OUTGOING_ATTACHMENT_BYTES + 1) as u64,
+            public_url,
+        ));
+
+        let media = generated_reply_media(&store, &[trace]).await;
+
+        assert!(media.attachments.is_empty());
+        assert_eq!(media.public_urls, vec![public_url.to_string()]);
+    }
+
+    #[test]
+    fn appends_generated_media_public_urls_to_reply_text() {
+        let reply = append_generated_media_public_urls(
+            "Done.  \n".to_string(),
+            &["https://chud.example/videos/generated.mp4".to_string()],
+        );
+
+        assert_eq!(
+            reply,
+            "Done.\n\nGenerated media: https://chud.example/videos/generated.mp4"
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct PromptMediaRef {
         metadata: MediaMetadata,
@@ -7124,6 +7275,94 @@ mod tests {
             Box::pin(async move {
                 Err(MediaError::BytesUnavailable {
                     uri: self.metadata.uri.clone(),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ReplyMediaStore {
+        media: ReplyMediaRef,
+    }
+
+    impl ReplyMediaStore {
+        fn new(media: ReplyMediaRef) -> Self {
+            Self { media }
+        }
+    }
+
+    impl MediaStore for ReplyMediaStore {
+        async fn create_media(&self, _input: CreateMedia) -> Result<BoxedMediaRef, MediaError> {
+            Err(MediaError::UnsupportedCategory("test".to_string()))
+        }
+
+        async fn media_from_uri(&self, uri: &MediaUri) -> Result<BoxedMediaRef, MediaError> {
+            if self.media.uri() == uri {
+                return Ok(Box::new(self.media.clone()));
+            }
+            Err(MediaError::UnsupportedUri(uri.to_string()))
+        }
+
+        async fn media_from_name(
+            &self,
+            category: MediaCategory,
+            name: &str,
+        ) -> Result<BoxedMediaRef, MediaError> {
+            self.media_from_uri(&MediaUri::new(format!(
+                "file://{}/{name}",
+                category.prefix()
+            )))
+            .await
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ReplyMediaRef {
+        metadata: MediaMetadata,
+        bytes: Vec<u8>,
+        public_url: Option<PublicMediaUrl>,
+    }
+
+    impl ReplyMediaRef {
+        fn video(uri: &str, size_bytes: u64, public_url: &str) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Video,
+                    name: "generated.mp4".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: "video/mp4".to_string(),
+                    size_bytes,
+                },
+                bytes: Vec::new(),
+                public_url: Some(PublicMediaUrl::new(public_url)),
+            }
+        }
+    }
+
+    impl MediaRef for ReplyMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> BoxedMediaRef {
+            Box::new(self.clone())
+        }
+
+        fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
+            Box::pin(async move {
+                self.public_url
+                    .clone()
+                    .ok_or_else(|| MediaError::NoPublicUrl {
+                        uri: self.uri().clone(),
+                    })
+            })
+        }
+
+        fn load(&self) -> MediaFuture<'_, LoadedMedia> {
+            Box::pin(async move {
+                Ok(LoadedMedia {
+                    media: self.clone_box(),
+                    bytes: self.bytes.clone(),
                 })
             })
         }
