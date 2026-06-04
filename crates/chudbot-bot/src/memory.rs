@@ -1163,6 +1163,7 @@ async fn append_diary_image_blocks<M>(
     }
 }
 
+#[cfg(test)]
 fn diary_input(
     key: &UserMemoryKey,
     document: Option<&UserMemoryDocument>,
@@ -1453,6 +1454,7 @@ mod tests {
             user_display_name: "Chud".to_string(),
             user_content: "@Chudbot".to_string(),
             assistant_content: Some("Noted.".to_string()),
+            image_context: Vec::new(),
             audio_transcriptions: vec![UserMemoryAudioTranscription {
                 tool_trace_id: 42,
                 audio_uri: Some("file://audio/voice.ogg".to_string()),
