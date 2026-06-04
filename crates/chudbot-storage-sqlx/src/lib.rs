@@ -1628,21 +1628,22 @@ impl BotStorage for SqlxStorage {
         let diary_window_seconds =
             i64::try_from(schedule.diary_window_seconds.max(1)).unwrap_or(i64::MAX);
         let diary_rows = sqlx::query(
-            "SELECT t.user_message_provider AS message_provider, \
-                    CASE \
-                      WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
-                      THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
-                      ELSE 'global' \
-                    END AS scope_key, \
-                    t.user_key AS subject_user_key, \
-                    MIN(t.completed_at) AS window_start, \
-                    MIN(t.completed_at) + ($2::double precision * INTERVAL '1 second') AS window_end \
-               FROM turns t \
-               LEFT JOIN ( \
+            "WITH latest_diary AS ( \
                     SELECT message_provider, scope_key, subject_user_key, MAX(window_end) AS window_end \
                       FROM user_memory_diary_entries \
                      GROUP BY message_provider, scope_key, subject_user_key \
-               ) d \
+               ), candidate_turns AS ( \
+                    SELECT t.user_message_provider AS message_provider, \
+                           CASE \
+                             WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
+                             THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
+                             ELSE 'global' \
+                           END AS scope_key, \
+                           t.user_key AS subject_user_key, \
+                           d.window_end AS latest_window_end, \
+                           MIN(t.completed_at) AS first_completed_at \
+                      FROM turns t \
+                      LEFT JOIN latest_diary d \
                  ON d.message_provider = t.user_message_provider \
                 AND d.scope_key = CASE \
                       WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
@@ -1650,18 +1651,35 @@ impl BotStorage for SqlxStorage {
                       ELSE 'global' \
                     END \
                 AND d.subject_user_key = t.user_key \
-              WHERE t.status = 'completed' \
-                AND t.completed_at IS NOT NULL \
-                AND t.completed_at >= $1 \
-                AND t.completed_at > COALESCE(d.window_end, '-infinity'::timestamptz) \
-              GROUP BY t.user_message_provider, \
-                    CASE \
-                      WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
-                      THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
-                      ELSE 'global' \
-                    END, \
-                    t.user_key \
-             HAVING MIN(t.completed_at) <= $3",
+                     WHERE t.status = 'completed' \
+                       AND t.completed_at IS NOT NULL \
+                       AND t.completed_at >= $1 \
+                       AND (d.window_end IS NULL OR d.window_end < $1 OR t.completed_at > d.window_end) \
+                     GROUP BY t.user_message_provider, \
+                           CASE \
+                             WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
+                             THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
+                             ELSE 'global' \
+                           END, \
+                           t.user_key, \
+                           d.window_end \
+               ), diary_windows AS ( \
+                    SELECT message_provider, scope_key, subject_user_key, \
+                           CASE \
+                             WHEN latest_window_end IS NULL OR latest_window_end < $1 THEN first_completed_at \
+                             ELSE latest_window_end + ( \
+                               GREATEST( \
+                                 ceil(EXTRACT(EPOCH FROM (first_completed_at - latest_window_end))::double precision / $2::double precision)::bigint - 1, \
+                                 0::bigint \
+                               )::double precision * $2::double precision * INTERVAL '1 second' \
+                             ) \
+                           END AS window_start \
+                      FROM candidate_turns \
+               ) \
+             SELECT message_provider, scope_key, subject_user_key, window_start, \
+                    window_start + ($2::double precision * INTERVAL '1 second') AS window_end \
+               FROM diary_windows \
+              WHERE window_start <= $3",
         )
         .bind(schedule.diary_cutoff)
         .bind(diary_window_seconds)
@@ -1697,8 +1715,7 @@ impl BotStorage for SqlxStorage {
         }
 
         let compact_rows = sqlx::query(
-            "SELECT p.message_provider, p.scope_key, p.subject_user_key \
-               FROM ( \
+            "WITH pending_sources AS ( \
                     SELECT e.message_provider, e.scope_key, e.subject_user_key, e.created_at \
                       FROM user_memory_events e \
                       LEFT JOIN user_memory_documents d \
@@ -1714,55 +1731,74 @@ impl BotStorage for SqlxStorage {
                        AND d.scope_key = de.scope_key \
                        AND d.subject_user_key = de.subject_user_key \
                      WHERE de.created_at > COALESCE(d.source_diary_cutoff, '-infinity'::timestamptz) \
-               ) p \
-               LEFT JOIN user_memory_documents d \
-                 ON d.message_provider = p.message_provider \
-                AND d.scope_key = p.scope_key \
-                AND d.subject_user_key = p.subject_user_key \
-               LEFT JOIN ( \
+               ), active_diary AS ( \
                     SELECT DISTINCT message_provider, scope_key, subject_user_key \
                       FROM user_memory_jobs \
                      WHERE kind = 'diary' \
                        AND status IN ('pending', 'running') \
-               ) active_diary \
-                 ON active_diary.message_provider = p.message_provider \
-                AND active_diary.scope_key = p.scope_key \
-                AND active_diary.subject_user_key = p.subject_user_key \
-               LEFT JOIN ( \
+               ), latest_diary AS ( \
+                    SELECT message_provider, scope_key, subject_user_key, MAX(window_end) AS window_end \
+                      FROM user_memory_diary_entries \
+                     GROUP BY message_provider, scope_key, subject_user_key \
+               ), candidate_turns AS ( \
                     SELECT t.user_message_provider AS message_provider, \
                            CASE \
                              WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
                              THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
                              ELSE 'global' \
                            END AS scope_key, \
-                           t.user_key AS subject_user_key \
+                           t.user_key AS subject_user_key, \
+                           d.window_end AS latest_window_end, \
+                           MIN(t.completed_at) AS first_completed_at \
                       FROM turns t \
-                      LEFT JOIN ( \
-                           SELECT message_provider, scope_key, subject_user_key, \
-                                  MAX(window_end) AS window_end \
-                             FROM user_memory_diary_entries \
-                            GROUP BY message_provider, scope_key, subject_user_key \
-                      ) latest_diary \
-                        ON latest_diary.message_provider = t.user_message_provider \
-                       AND latest_diary.scope_key = CASE \
+                      LEFT JOIN latest_diary d \
+                        ON d.message_provider = t.user_message_provider \
+                       AND d.scope_key = CASE \
                              WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
                              THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
                              ELSE 'global' \
                            END \
-                       AND latest_diary.subject_user_key = t.user_key \
+                       AND d.subject_user_key = t.user_key \
                      WHERE t.status = 'completed' \
                        AND t.completed_at IS NOT NULL \
                        AND t.completed_at >= $2 \
-                       AND t.completed_at > COALESCE(latest_diary.window_end, '-infinity'::timestamptz) \
+                       AND (d.window_end IS NULL OR d.window_end < $2 OR t.completed_at > d.window_end) \
                      GROUP BY t.user_message_provider, \
                            CASE \
                              WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
                              THEN 'guild:' || split_part(t.user_message_channel, ':', 2) \
                              ELSE 'global' \
                            END, \
-                           t.user_key \
-                    HAVING MIN(t.completed_at) <= $3 \
-               ) due_diary \
+                           t.user_key, \
+                           d.window_end \
+               ), diary_windows AS ( \
+                    SELECT message_provider, scope_key, subject_user_key, \
+                           CASE \
+                             WHEN latest_window_end IS NULL OR latest_window_end < $2 THEN first_completed_at \
+                             ELSE latest_window_end + ( \
+                               GREATEST( \
+                                 ceil(EXTRACT(EPOCH FROM (first_completed_at - latest_window_end))::double precision / $4::double precision)::bigint - 1, \
+                                 0::bigint \
+                               )::double precision * $4::double precision * INTERVAL '1 second' \
+                             ) \
+                           END AS window_start \
+                      FROM candidate_turns \
+               ), due_diary AS ( \
+                    SELECT message_provider, scope_key, subject_user_key \
+                      FROM diary_windows \
+                     WHERE window_start <= $3 \
+               ) \
+             SELECT p.message_provider, p.scope_key, p.subject_user_key \
+               FROM pending_sources p \
+               LEFT JOIN user_memory_documents d \
+                 ON d.message_provider = p.message_provider \
+                AND d.scope_key = p.scope_key \
+                AND d.subject_user_key = p.subject_user_key \
+               LEFT JOIN active_diary \
+                 ON active_diary.message_provider = p.message_provider \
+                AND active_diary.scope_key = p.scope_key \
+                AND active_diary.subject_user_key = p.subject_user_key \
+               LEFT JOIN due_diary \
                  ON due_diary.message_provider = p.message_provider \
                 AND due_diary.scope_key = p.scope_key \
                 AND due_diary.subject_user_key = p.subject_user_key \
@@ -1774,6 +1810,7 @@ impl BotStorage for SqlxStorage {
         .bind(schedule.compact_due_before)
         .bind(schedule.diary_cutoff)
         .bind(schedule.diary_due_before)
+        .bind(diary_window_seconds)
         .fetch_all(&self.pool)
         .await?;
         for row in compact_rows {
@@ -1914,7 +1951,17 @@ impl BotStorage for SqlxStorage {
                     END = $3 \
                 AND status = 'completed' \
                 AND completed_at IS NOT NULL \
-                AND completed_at >= $4 \
+                AND ( \
+                      completed_at > $4 \
+                      OR NOT EXISTS ( \
+                           SELECT 1 \
+                             FROM user_memory_diary_entries de \
+                            WHERE de.message_provider = turns.user_message_provider \
+                              AND de.scope_key = $3 \
+                              AND de.subject_user_key = turns.user_key \
+                              AND de.window_end = $4 \
+                      ) \
+                    ) \
                 AND completed_at <= $5 \
               ORDER BY completed_at, ordinal \
               LIMIT $6",

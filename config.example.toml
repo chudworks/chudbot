@@ -62,8 +62,9 @@ compaction_interval = "24h"
 # backfill jobs, so enabling memory on an old database does not summarize full
 # history.
 diary_backfill_window = "3d"
-# Each diary job summarizes one completed source window of this size. The next
-# diary job for a user is not created until the window is complete.
+# Each diary job summarizes one completed source window of this size. After the
+# first diary entry, non-empty windows stay anchored to the previous window end;
+# source-empty intervals are skipped.
 diary_interval = "24h"
 lease_seconds = 300
 max_jobs_per_tick = 4
