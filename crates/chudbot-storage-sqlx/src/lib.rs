@@ -1558,6 +1558,30 @@ impl BotStorage for SqlxStorage {
         rows.into_iter().map(diary_entry_from_row).collect()
     }
 
+    async fn list_recent_memory_diary_entries(
+        &self,
+        key: UserMemoryKey,
+        limit: u32,
+    ) -> Result<Vec<UserMemoryDiaryEntry>, Self::Error> {
+        let mut rows = sqlx::query(
+            "SELECT id, message_provider, scope_key, subject_user_key, window_start, window_end, \
+                    source_turn_ids, markdown, agent_name, llm_provider, llm_model, usage, \
+                    created_at, updated_at \
+               FROM user_memory_diary_entries \
+              WHERE message_provider = $1 AND scope_key = $2 AND subject_user_key = $3 \
+              ORDER BY created_at DESC, id DESC \
+              LIMIT $4",
+        )
+        .bind(key.platform.as_str())
+        .bind(&key.scope_key)
+        .bind(&key.user_key)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.reverse();
+        rows.into_iter().map(diary_entry_from_row).collect()
+    }
+
     async fn save_user_memory_diary_entry(
         &self,
         entry: NewUserMemoryDiaryEntry,

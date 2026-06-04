@@ -35,6 +35,7 @@ const MEMORY_MODEL_ID: &str = "grok-4.3";
 const MEMORY_REASONING_EFFORT: &str = "high";
 const MEMORY_DIARY_AGENT: &str = "memory_diary";
 const MEMORY_COMPACT_AGENT: &str = "memory_compact";
+const LOOKUP_DIARY_ENTRY_LIMIT: u32 = 3;
 const MEMORY_DIARY_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 
 const DIARY_PROMPT: &str = "You write concise user-memory diary entries for Chudbot. \
@@ -257,7 +258,7 @@ pub fn prompt_guidance() -> &'static str {
     "CRITICAL: Memory System\n\
 - CRITICAL: If a user is the `author` of a message, you MUST load memory about that user. Do not respond to a user if you do not load their memory document first. Use the `lookup_user_memory` any time you see a user for the first time.\n\
 - CRITICAL: If a user's memory has not been loaded, then any **mention** of a user should trigger a `lookup_user_memory` call, even if they are not the author.\n\
-- The `lookup_user_memory` tool gives you a memory document about a user, and recent events. These recent events can be `remember` or `forget`.\n\
+- The `lookup_user_memory` tool gives you a memory document about a user, recent events, and recent diary entries. These recent events can be `remember` or `forget`.\n\
 - Use the `remember_user_memory` tool to store facts about a user. If there's something you think would be useful in the future, you should use this tool to remember it.\n\
 - There is a `forget_user_memory` which works like `remember_user_memory`, but instead stores a fact to forget about a user.\n\
 - If a user asks you explicitly to remember or forget something about themselves, then you should absolutely use the tools to store the user's preference and respect their humanity!\n\
@@ -399,12 +400,18 @@ where
             .list_pending_memory_events(key.clone(), since)
             .await
             .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
+        let diary_entries = self
+            .storage
+            .list_recent_memory_diary_entries(key.clone(), LOOKUP_DIARY_ENTRY_LIMIT)
+            .await
+            .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
         tracing::debug!(
             message_provider = %key.platform,
             scope_key = %key.scope_key,
             target_user_id = %key.user_key,
             found_profile = document.is_some(),
             recent_events = events.len(),
+            recent_diary_entries = diary_entries.len(),
             "looked up user memory"
         );
         let value = json!({
@@ -418,6 +425,10 @@ where
                 .map(|document| document.markdown.as_str())
                 .unwrap_or(EMPTY_MEMORY),
             "recent_events": events.iter().map(memory_event_trace).collect::<Vec<_>>(),
+            "recent_diary_entries": diary_entries
+                .iter()
+                .map(memory_diary_entry_trace)
+                .collect::<Vec<_>>(),
         });
         Ok(ClientToolOutput {
             result: ClientToolResultContent::Json {
@@ -673,6 +684,16 @@ fn memory_event_trace(event: &UserMemoryEvent) -> serde_json::Value {
         "tags": event.tags,
         "confidence": event.confidence,
         "created_at": timestamp_rfc3339(event.created_at),
+    })
+}
+
+fn memory_diary_entry_trace(entry: &UserMemoryDiaryEntry) -> serde_json::Value {
+    json!({
+        "id": entry.id,
+        "window_start": timestamp_rfc3339(entry.window_start),
+        "window_end": timestamp_rfc3339(entry.window_end),
+        "created_at": timestamp_rfc3339(entry.created_at),
+        "markdown": entry.markdown,
     })
 }
 
@@ -1501,6 +1522,43 @@ mod tests {
         assert_eq!(
             value["created_at"].as_str(),
             Some("2026-06-03T22:27:01.816929Z")
+        );
+    }
+
+    #[test]
+    fn memory_diary_entry_trace_serializes_compact_rfc3339_entry() {
+        let key = UserMemoryKey {
+            platform: PlatformName::new("discord"),
+            scope_key: "guild:guild-1".to_string(),
+            user_key: "user-1".to_string(),
+        };
+        let entry = UserMemoryDiaryEntry {
+            id: ConversationId::new().0,
+            key,
+            window_start: datetime!(2026-06-03 00:00:00 UTC),
+            window_end: datetime!(2026-06-04 00:00:00 UTC),
+            source_turn_ids: vec![TurnId::new()],
+            markdown: "- Chud prefers concise status updates.".to_string(),
+            agent_name: MEMORY_DIARY_AGENT.to_string(),
+            llm_provider: ProviderName::new("xai"),
+            llm_model: ModelId::new("grok-4.3"),
+            usage: Vec::new(),
+            created_at: datetime!(2026-06-04 00:01:02.123456 UTC),
+            updated_at: datetime!(2026-06-04 00:01:02.123456 UTC),
+        };
+
+        let value = memory_diary_entry_trace(&entry);
+
+        assert_eq!(value.as_object().map(|object| object.len()), Some(5));
+        assert_eq!(value["window_start"].as_str(), Some("2026-06-03T00:00:00Z"));
+        assert_eq!(value["window_end"].as_str(), Some("2026-06-04T00:00:00Z"));
+        assert_eq!(
+            value["created_at"].as_str(),
+            Some("2026-06-04T00:01:02.123456Z")
+        );
+        assert_eq!(
+            value["markdown"].as_str(),
+            Some("- Chud prefers concise status updates.")
         );
     }
 

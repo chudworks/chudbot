@@ -1112,6 +1112,14 @@ pub trait BotStorage: Send + Sync {
         since: Option<OffsetDateTime>,
     ) -> impl Future<Output = Result<Vec<UserMemoryDiaryEntry>, Self::Error>> + Send;
 
+    /// List the latest diary entries for one user, returned oldest-to-newest
+    /// within the bounded result.
+    fn list_recent_memory_diary_entries(
+        &self,
+        key: UserMemoryKey,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<UserMemoryDiaryEntry>, Self::Error>> + Send;
+
     /// Save one generated diary entry.
     fn save_user_memory_diary_entry(
         &self,

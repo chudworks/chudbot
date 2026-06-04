@@ -324,6 +324,18 @@ pub trait MemoryStorage: Send + Sync {
         since: Option<OffsetDateTime>,
     ) -> impl Future<Output = Result<Vec<UserMemoryEvent>, Self::Error>> + Send;
 
+    fn list_pending_memory_diary_entries(
+        &self,
+        key: UserMemoryKey,
+        since: Option<OffsetDateTime>,
+    ) -> impl Future<Output = Result<Vec<UserMemoryDiaryEntry>, Self::Error>> + Send;
+
+    fn list_recent_memory_diary_entries(
+        &self,
+        key: UserMemoryKey,
+        limit: u32,
+    ) -> impl Future<Output = Result<Vec<UserMemoryDiaryEntry>, Self::Error>> + Send;
+
     fn save_user_memory_diary_entry(
         &self,
         entry: NewUserMemoryDiaryEntry,
@@ -372,9 +384,9 @@ Expose these tools from `chudbot-bot::memory`:
 
 ### `lookup_user_memory`
 
-Returns the current Markdown profile and any recent un-compacted events for a
-user. Default target should be the current author. Allow lookup for mentioned
-users by platform user id.
+Returns the current Markdown profile, any recent un-compacted events, and the
+last three diary entries for a user. Default target should be the current
+author. Allow lookup for mentioned users by platform user id.
 
 ### `remember_user_memory`
 
@@ -412,7 +424,7 @@ When building a top-level agent:
 - Do not inject compact memory profiles into turn context. The live agent should
   read memory through `lookup_user_memory`, which returns the compact profile
   followed by explicit memory events newer than the profile's
-  `source_event_cutoff`.
+  `source_event_cutoff` and the last three generated diary entries.
 - Do not attach memory tools to subagents by default unless explicitly needed.
 
 Platform message context should expose mentioned users as structured data, not
