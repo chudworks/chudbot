@@ -867,6 +867,28 @@ impl TranscriptionBinding {
     }
 }
 
+fn audio_transcription_default_keyterms(binding: &TranscriptionBinding) -> Vec<String> {
+    binding
+        .wake_word()
+        .map(|wake_word| vec![wake_word.to_string()])
+        .unwrap_or_default()
+}
+
+fn append_default_audio_keyterms(keyterms: &mut Vec<String>, defaults: &[String]) {
+    for default in defaults {
+        let default = default.trim();
+        if default.is_empty() {
+            continue;
+        }
+        let already_present = keyterms
+            .iter()
+            .any(|keyterm| keyterm.trim().eq_ignore_ascii_case(default));
+        if !already_present {
+            keyterms.push(default.to_string());
+        }
+    }
+}
+
 /// Platform default binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlatformBinding {
@@ -2324,6 +2346,7 @@ where
                     ),
                     self.media_store.clone(),
                 )
+                .with_default_keyterms(audio_transcription_default_keyterms(binding))
                 .with_description(format!(
                     "Transcribe a stored audio attachment with the configured `{}` audio provider{} and return the speech as text.",
                     binding.provider,
@@ -3711,10 +3734,7 @@ where
             binding.provider.clone(),
             binding.model.clone(),
         );
-        let keyterms = binding
-            .wake_word()
-            .map(|wake_word| vec![wake_word.to_string()])
-            .unwrap_or_default();
+        let keyterms = audio_transcription_default_keyterms(binding);
         let mut transcriptions = Vec::new();
         for (attachment_index, attachment) in message.attachments.iter().enumerate() {
             if !looks_like_audio_ref(attachment) {
@@ -4752,6 +4772,7 @@ where
 struct AudioTranscriptionTool<T, M> {
     transcriber: T,
     media_store: M,
+    default_keyterms: Vec<String>,
     description: String,
 }
 
@@ -4760,9 +4781,15 @@ impl<T, M> AudioTranscriptionTool<T, M> {
         Self {
             transcriber,
             media_store,
+            default_keyterms: Vec::new(),
             description: "Transcribe a stored audio attachment and return its speech as text."
                 .to_string(),
         }
+    }
+
+    fn with_default_keyterms(mut self, keyterms: Vec<String>) -> Self {
+        self.default_keyterms = keyterms;
+        self
     }
 
     fn with_description(mut self, description: impl Into<String>) -> Self {
@@ -4791,8 +4818,9 @@ where
         fields(tool_call = %call.id)
     )]
     async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
-        let request =
+        let mut request =
             audio_transcription_request_from_tool_input(&self.media_store, call.input).await?;
+        append_default_audio_keyterms(&mut request.keyterms, &self.default_keyterms);
         let audio_uri = request.audio.uri().to_string();
         let audio_mime_type = request.audio.mime_type().to_string();
         let audio_size_bytes = request.audio.size_bytes();
@@ -7169,6 +7197,40 @@ mod tests {
         ));
         assert!(!text_mentions_wake_word("hello chat bot", "Chudbot"));
         assert!(!text_mentions_wake_word("hello Chudbot", ""));
+    }
+
+    #[test]
+    fn audio_transcription_default_keyterms_use_configured_wake_word() {
+        let binding = TranscriptionBinding {
+            provider: ProviderName::new("grok_audio"),
+            model: None,
+            wake_word: Some(" Chudbot ".to_string()),
+        };
+
+        assert_eq!(
+            audio_transcription_default_keyterms(&binding),
+            vec!["Chudbot".to_string()]
+        );
+    }
+
+    #[test]
+    fn default_audio_keyterms_preserve_and_deduplicate_explicit_terms() {
+        let defaults = vec!["Chudbot".to_string(), " ".to_string()];
+        let mut keyterms = vec!["Universe".to_string()];
+
+        append_default_audio_keyterms(&mut keyterms, &defaults);
+
+        assert_eq!(
+            keyterms,
+            vec!["Universe".to_string(), "Chudbot".to_string()]
+        );
+
+        append_default_audio_keyterms(&mut keyterms, &[" chudbot ".to_string()]);
+
+        assert_eq!(
+            keyterms,
+            vec!["Universe".to_string(), "Chudbot".to_string()]
+        );
     }
 
     #[test]
