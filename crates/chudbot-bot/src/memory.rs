@@ -1226,7 +1226,11 @@ fn append_image_context(out: &mut String, images: &[UserMemoryImageContext]) {
         {
             metadata.push(format!("mime_type: {mime_type}"));
         }
-        out.push_str(&format!("- Image {} ({})\n", index + 1, metadata.join(", ")));
+        out.push_str(&format!(
+            "- Image {} ({})\n",
+            index + 1,
+            metadata.join(", ")
+        ));
     }
 }
 
