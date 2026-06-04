@@ -193,29 +193,11 @@ created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
 
-### `user_memory_documents`
-
-Current compact user profile shown to the live agent.
-
-Suggested columns:
-
-```sql
-message_provider TEXT NOT NULL,
-scope_key TEXT NOT NULL,
-subject_user_key TEXT NOT NULL,
-revision BIGINT NOT NULL,
-markdown TEXT NOT NULL,
-last_compacted_at TIMESTAMPTZ NOT NULL,
-source_event_cutoff TIMESTAMPTZ,
-source_diary_cutoff TIMESTAMPTZ,
-created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-PRIMARY KEY (message_provider, scope_key, subject_user_key)
-```
-
 ### `user_memory_document_versions`
 
-Historical profile revisions for debugging and rollback.
+Compact user profile revisions for live lookup, debugging, and rollback. The
+current compact profile is the latest revision for a
+`(message_provider, scope_key, subject_user_key)` tuple.
 
 Suggested columns:
 
@@ -228,11 +210,15 @@ revision BIGINT NOT NULL,
 markdown TEXT NOT NULL,
 source_event_ids UUID[] NOT NULL,
 source_diary_entry_ids UUID[] NOT NULL,
+last_compacted_at TIMESTAMPTZ NOT NULL,
+source_event_cutoff TIMESTAMPTZ,
+source_diary_cutoff TIMESTAMPTZ,
 agent_name TEXT NOT NULL,
 llm_provider TEXT NOT NULL,
 llm_model TEXT NOT NULL,
 usage JSONB NOT NULL DEFAULT '[]'::jsonb,
-created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+UNIQUE (message_provider, scope_key, subject_user_key, revision)
 ```
 
 ### `user_memory_jobs`
@@ -614,7 +600,7 @@ Initial policy:
   not summarize full historical chat.
 - Do not create a diary job for every new turn. If the next pending diary window
   starts at `T`, wait until `T + diary_interval <= now`, then summarize
-  `[T, T + diary_interval]`.
+  `[T, T + diary_interval)`.
 - Enqueue compact jobs only when the user has pending diary entries or explicit
   memory events, their last compaction is older than `now - compaction_interval`
   or missing, and no diary job/window is due or inflight for that user. This

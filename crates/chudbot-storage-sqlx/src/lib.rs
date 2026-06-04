@@ -1431,9 +1431,11 @@ impl BotStorage for SqlxStorage {
         let row = sqlx::query(
             "SELECT message_provider, scope_key, subject_user_key, revision, markdown, \
                     last_compacted_at, source_event_cutoff, source_diary_cutoff, \
-                    created_at, updated_at \
-               FROM user_memory_documents \
-              WHERE message_provider = $1 AND scope_key = $2 AND subject_user_key = $3",
+                    created_at, created_at AS updated_at \
+               FROM user_memory_document_versions \
+              WHERE message_provider = $1 AND scope_key = $2 AND subject_user_key = $3 \
+              ORDER BY revision DESC \
+              LIMIT 1",
         )
         .bind(key.platform.as_str())
         .bind(&key.scope_key)
@@ -1564,8 +1566,10 @@ impl BotStorage for SqlxStorage {
     ) -> Result<UserMemoryDocument, Self::Error> {
         let mut tx = self.pool.begin().await?;
         let existing_revision: Option<i64> = sqlx::query_scalar(
-            "SELECT revision FROM user_memory_documents \
+            "SELECT revision FROM user_memory_document_versions \
               WHERE message_provider = $1 AND scope_key = $2 AND subject_user_key = $3 \
+              ORDER BY revision DESC \
+              LIMIT 1 \
               FOR UPDATE",
         )
         .bind(document.key.platform.as_str())
@@ -1575,12 +1579,15 @@ impl BotStorage for SqlxStorage {
         .await?;
         let revision = existing_revision.unwrap_or(0) + 1;
         let version_id = Uuid::new_v4();
-        sqlx::query(
+        let row = sqlx::query(
             "INSERT INTO user_memory_document_versions \
                (id, message_provider, scope_key, subject_user_key, revision, markdown, \
                 source_event_ids, source_diary_entry_ids, agent_name, llm_provider, llm_model, \
-                usage) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+                usage, last_compacted_at, source_event_cutoff, source_diary_cutoff) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now(), $13, $14) \
+             RETURNING message_provider, scope_key, subject_user_key, revision, markdown, \
+                       last_compacted_at, source_event_cutoff, source_diary_cutoff, \
+                       created_at, created_at AS updated_at",
         )
         .bind(version_id)
         .bind(document.key.platform.as_str())
@@ -1594,27 +1601,6 @@ impl BotStorage for SqlxStorage {
         .bind(document.llm_provider.as_str())
         .bind(document.llm_model.as_str())
         .bind(serde_json::to_value(&document.usage)?)
-        .execute(&mut *tx)
-        .await?;
-        let row = sqlx::query(
-            "INSERT INTO user_memory_documents \
-               (message_provider, scope_key, subject_user_key, revision, markdown, \
-                last_compacted_at, source_event_cutoff, source_diary_cutoff) \
-             VALUES ($1, $2, $3, $4, $5, now(), $6, $7) \
-             ON CONFLICT (message_provider, scope_key, subject_user_key) DO UPDATE \
-               SET revision = EXCLUDED.revision, markdown = EXCLUDED.markdown, \
-                   last_compacted_at = EXCLUDED.last_compacted_at, \
-                   source_event_cutoff = EXCLUDED.source_event_cutoff, \
-                   source_diary_cutoff = EXCLUDED.source_diary_cutoff \
-             RETURNING message_provider, scope_key, subject_user_key, revision, markdown, \
-                       last_compacted_at, source_event_cutoff, source_diary_cutoff, \
-                       created_at, updated_at",
-        )
-        .bind(document.key.platform.as_str())
-        .bind(&document.key.scope_key)
-        .bind(&document.key.user_key)
-        .bind(revision)
-        .bind(&document.markdown)
         .bind(document.source_event_cutoff)
         .bind(document.source_diary_cutoff)
         .fetch_one(&mut *tx)
@@ -1657,7 +1643,7 @@ impl BotStorage for SqlxStorage {
                      WHERE t.status = 'completed' \
                        AND t.completed_at IS NOT NULL \
                        AND t.completed_at >= $1 \
-                       AND (d.window_end IS NULL OR d.window_end < $1 OR t.completed_at > d.window_end) \
+                       AND (d.window_end IS NULL OR d.window_end < $1 OR t.completed_at >= d.window_end) \
                      GROUP BY t.user_message_provider, \
                            CASE \
                              WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
@@ -1718,10 +1704,16 @@ impl BotStorage for SqlxStorage {
         }
 
         let compact_rows = sqlx::query(
-            "WITH pending_sources AS ( \
+            "WITH latest_document AS ( \
+                    SELECT DISTINCT ON (message_provider, scope_key, subject_user_key) \
+                           message_provider, scope_key, subject_user_key, last_compacted_at, \
+                           source_event_cutoff, source_diary_cutoff \
+                      FROM user_memory_document_versions \
+                     ORDER BY message_provider, scope_key, subject_user_key, revision DESC \
+               ), pending_sources AS ( \
                     SELECT e.message_provider, e.scope_key, e.subject_user_key, e.created_at \
                       FROM user_memory_events e \
-                      LEFT JOIN user_memory_documents d \
+                      LEFT JOIN latest_document d \
                         ON d.message_provider = e.message_provider \
                        AND d.scope_key = e.scope_key \
                        AND d.subject_user_key = e.subject_user_key \
@@ -1729,7 +1721,7 @@ impl BotStorage for SqlxStorage {
                     UNION ALL \
                     SELECT de.message_provider, de.scope_key, de.subject_user_key, de.created_at \
                       FROM user_memory_diary_entries de \
-                      LEFT JOIN user_memory_documents d \
+                      LEFT JOIN latest_document d \
                         ON d.message_provider = de.message_provider \
                        AND d.scope_key = de.scope_key \
                        AND d.subject_user_key = de.subject_user_key \
@@ -1765,7 +1757,7 @@ impl BotStorage for SqlxStorage {
                      WHERE t.status = 'completed' \
                        AND t.completed_at IS NOT NULL \
                        AND t.completed_at >= $2 \
-                       AND (d.window_end IS NULL OR d.window_end < $2 OR t.completed_at > d.window_end) \
+                       AND (d.window_end IS NULL OR d.window_end < $2 OR t.completed_at >= d.window_end) \
                      GROUP BY t.user_message_provider, \
                            CASE \
                              WHEN t.user_message_channel LIKE 'guild:%:channel:%' \
@@ -1793,7 +1785,7 @@ impl BotStorage for SqlxStorage {
                ) \
              SELECT p.message_provider, p.scope_key, p.subject_user_key \
                FROM pending_sources p \
-               LEFT JOIN user_memory_documents d \
+               LEFT JOIN latest_document d \
                  ON d.message_provider = p.message_provider \
                 AND d.scope_key = p.scope_key \
                 AND d.subject_user_key = p.subject_user_key \
@@ -1954,18 +1946,8 @@ impl BotStorage for SqlxStorage {
                     END = $3 \
                 AND status = 'completed' \
                 AND completed_at IS NOT NULL \
-                AND ( \
-                      completed_at > $4 \
-                      OR NOT EXISTS ( \
-                           SELECT 1 \
-                             FROM user_memory_diary_entries de \
-                            WHERE de.message_provider = turns.user_message_provider \
-                              AND de.scope_key = $3 \
-                              AND de.subject_user_key = turns.user_key \
-                              AND de.window_end = $4 \
-                      ) \
-                    ) \
-                AND completed_at <= $5 \
+                AND completed_at >= $4 \
+                AND completed_at < $5 \
               ORDER BY completed_at, ordinal \
               LIMIT $6",
         )
