@@ -179,7 +179,7 @@ impl<G, S> VideoGeneratorTool<G, S> {
             description: "Generate a video, save it to media storage, and return its media URI."
                 .to_string(),
             poll_interval: Duration::from_secs(2),
-            max_polls: 90,
+            max_polls: 600,
         }
     }
 
