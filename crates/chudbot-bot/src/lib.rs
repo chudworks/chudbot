@@ -60,6 +60,14 @@ const TITLE_MAX_TOKENS: u32 = 96;
 const DEFAULT_THREAD_THRESHOLD_CHARS: usize = 1500;
 const DEFAULT_THREAD_THRESHOLD_LINES: usize = 20;
 const THREAD_REPLY_WRAP_WIDTH: usize = 80;
+const MODEL_TRANSCRIPT_IMAGE_MIME_TYPES: &[&str] = &[
+    "image/jpeg",
+    "image/jpg",
+    "image/png",
+    "image/webp",
+    "image/x-icon",
+    "image/vnd.microsoft.icon",
+];
 
 const TITLE_SYSTEM_PROMPT: &str = "You write very short conversation titles. \
 Output ONLY a title for the conversation below: five words or fewer, no quotes, \
@@ -3336,7 +3344,16 @@ where
                     .media_from_uri(&MediaUri::new(item.content.clone()))
                     .await
                 {
-                    Ok(media) => blocks.push(ContentBlock::Media { media }),
+                    Ok(media) if model_transcript_supports_media(media.as_ref()) => {
+                        blocks.push(ContentBlock::Media { media })
+                    }
+                    Ok(media) => tracing::debug!(
+                        source = %item.source,
+                        uri = %media.uri(),
+                        category = ?media.category(),
+                        mime_type = %media.mime_type(),
+                        "skipping unsupported context media while assembling transcript"
+                    ),
                     Err(error) => tracing::warn!(
                         error = %error,
                         source = %item.source,
@@ -3659,6 +3676,16 @@ where
                 }
                 match self.media_store.media_from_uri(&asset.uri).await {
                     Ok(media) => {
+                        if !model_transcript_supports_media(media.as_ref()) {
+                            tracing::debug!(
+                                source = %asset.source,
+                                uri = %media.uri(),
+                                category = ?media.category(),
+                                mime_type = %media.mime_type(),
+                                "skipping unsupported replay media while rebuilding transcript"
+                            );
+                            continue;
+                        }
                         replayed_media.push(asset.uri.as_str().to_string());
                         user_turn.blocks.push(ContentBlock::Media { media });
                     }
@@ -4822,6 +4849,11 @@ async fn media_reply_refs_from_transcript(transcript: &Transcript) -> Vec<String
     for turn in &transcript.turns {
         for block in &turn.blocks {
             let ContentBlock::Media { media } = block else {
+                if let ContentBlock::ClientToolResult(result) = block
+                    && let ClientToolResultContent::Json { value } = &result.content
+                {
+                    collect_generated_media_reply_refs(value, &mut out);
+                }
                 continue;
             };
             push_unique_string(&mut out, media.uri().as_str());
@@ -5088,6 +5120,18 @@ fn display_name_for_profile(profile: &UserProfile) -> String {
 
 fn message_link_replays_as_assistant(link: &MessageLink, conversation_id: ConversationId) -> bool {
     link.conversation_id == conversation_id && link.role == "assistant"
+}
+
+fn model_transcript_supports_media(media: &dyn chudbot_api::MediaRef) -> bool {
+    matches!(media.category(), MediaCategory::Image)
+        && model_transcript_supports_image_mime_type(media.mime_type())
+}
+
+fn model_transcript_supports_image_mime_type(mime_type: &str) -> bool {
+    let mime_type = mime_type.split(';').next().unwrap_or("").trim();
+    MODEL_TRANSCRIPT_IMAGE_MIME_TYPES
+        .iter()
+        .any(|supported| mime_type.eq_ignore_ascii_case(supported))
 }
 
 fn looks_like_image(content_type: Option<&str>, filename: &str) -> bool {
@@ -5720,6 +5764,7 @@ mod tests {
         PublicMediaUrl,
     };
     use serde_json::json;
+    use test_case::test_case;
 
     fn user(platform: &str, guild: Option<&str>, id: &str) -> chudbot_api::UserRef {
         chudbot_api::UserRef {
@@ -5962,6 +6007,31 @@ mod tests {
         }
     }
 
+    #[test_case(MediaCategory::Image, "image/png", true ; "png image")]
+    #[test_case(MediaCategory::Image, "image/jpeg; charset=binary", true ; "jpeg image with params")]
+    #[test_case(MediaCategory::Image, "IMAGE/WEBP", true ; "case insensitive webp")]
+    #[test_case(MediaCategory::Image, "image/gif", false ; "unsupported image mime")]
+    #[test_case(MediaCategory::Image, "video/mp4", false ; "image category with video mime")]
+    #[test_case(MediaCategory::Video, "video/mp4", false ; "video category")]
+    fn model_transcript_media_support_matches_llm_image_inputs(
+        category: MediaCategory,
+        mime_type: &str,
+        expected: bool,
+    ) {
+        let media = PromptMediaRef {
+            metadata: MediaMetadata {
+                category,
+                name: "media.bin".to_string(),
+                uri: MediaUri::new("file://media/generated.bin"),
+                mime_type: mime_type.to_string(),
+                size_bytes: 42,
+            },
+            public_url: PublicMediaUrl::new("https://chud.example/media/generated.bin"),
+        };
+
+        assert_eq!(model_transcript_supports_media(&media), expected);
+    }
+
     #[tokio::test]
     async fn transcript_media_refs_are_sanitized_from_replies() {
         let media = PromptMediaRef::boxed(
@@ -5997,6 +6067,20 @@ mod tests {
         );
 
         assert_eq!(reply, "Done.");
+    }
+
+    #[tokio::test]
+    async fn transcript_reply_refs_include_replayed_tool_result_media() {
+        let trace = generated_image_trace(
+            "file://videos/generated.mp4",
+            "https://chud.example/videos/generated.mp4",
+        );
+        let mut transcript = Transcript::new();
+        append_client_tool_replay(&mut transcript, &[trace]);
+
+        let refs = media_reply_refs_from_transcript(&transcript).await;
+
+        assert_eq!(refs, vec!["file://videos/generated.mp4".to_string()]);
     }
 
     #[test]
