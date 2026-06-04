@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::ids::{
-    ChannelRef, ConversationId, MessageRef, ModelId, PlatformName, ProviderName, TurnId, UserRef,
+    ChannelRef, ConversationId, ExternalId, MessageRef, ModelId, PlatformName, ProviderName,
+    TurnId, UserRef,
 };
 use crate::media::MediaUri;
 use crate::platform::UserProfile;
@@ -509,8 +510,11 @@ pub struct UpdateVideoJob {
 /// Input for counting successful video generations in a rolling window.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountSuccessfulVideoGenerations {
-    /// User whose successful video generations are counted.
-    pub user: UserRef,
+    /// Messaging platform whose successful video generations are counted.
+    pub platform: PlatformName,
+    /// Platform workspace/server scope id. `None` counts unscoped channels for
+    /// the platform.
+    pub scope_id: Option<ExternalId>,
     /// Rolling window length in seconds.
     pub interval_seconds: u64,
 }
@@ -1073,7 +1077,8 @@ pub trait BotStorage: Send + Sync {
         input: UpdateVideoJob,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Count successful video generations for one user in a rolling window.
+    /// Count successful video generations for one platform scope in a rolling
+    /// window.
     fn count_successful_video_generations(
         &self,
         input: CountSuccessfulVideoGenerations,

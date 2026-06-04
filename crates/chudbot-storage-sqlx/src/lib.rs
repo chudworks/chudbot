@@ -1432,19 +1432,29 @@ impl BotStorage for SqlxStorage {
         input: CountSuccessfulVideoGenerations,
     ) -> Result<u64, Self::Error> {
         let interval_seconds = i64::try_from(input.interval_seconds).unwrap_or(i64::MAX);
+        let scope = input
+            .scope_id
+            .as_ref()
+            .map(|scope| guild_scope(scope.as_str()));
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*)::BIGINT \
                FROM video_jobs v \
                JOIN turns t ON t.id = v.turn_id \
+               JOIN platform_channels c \
+                 ON c.message_provider = t.user_message_provider \
+                AND c.channel = t.user_message_channel \
               WHERE t.user_message_provider = $1 \
-                AND t.user_key = $2 \
+                AND ( \
+                    ($2::text IS NULL AND c.parent_channel IS NULL) \
+                    OR c.parent_channel = $2 \
+                ) \
                 AND v.status = 'done' \
                 AND v.output_uri IS NOT NULL \
                 AND v.completed_at IS NOT NULL \
                 AND v.completed_at >= now() - ($3::double precision * interval '1 second')",
         )
-        .bind(input.user.platform.as_str())
-        .bind(input.user.user_id.as_str())
+        .bind(input.platform.as_str())
+        .bind(scope.as_deref())
         .bind(interval_seconds)
         .fetch_one(&self.pool)
         .await?;

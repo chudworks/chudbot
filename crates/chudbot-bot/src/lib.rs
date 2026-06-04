@@ -748,7 +748,7 @@ fn video_generation_tool_description(binding: &GenerationBinding) -> String {
     );
     if let Some(limit) = &binding.rate_limit {
         description.push_str(&format!(
-            "\n\nThis tool is limited to {} successful video generation{} per {} for users outside bypassed platform scopes.",
+            "\n\nThis tool is limited to {} successful video generation{} per {} for each non-bypassed platform scope.",
             limit.limit,
             if limit.limit == 1 { "" } else { "s" },
             limit.interval
@@ -4387,7 +4387,7 @@ where
             ));
             if let Some(limit) = &binding.rate_limit {
                 out.push_str(&format!(
-                    "- Users outside bypassed platform scopes are limited to {} successful video generation{} per {}.\n",
+                    "- Each non-bypassed platform scope is limited to {} successful video generation{} per {}.\n",
                     limit.limit,
                     if limit.limit == 1 { "" } else { "s" },
                     limit.interval
@@ -5090,6 +5090,7 @@ where
             turn = %self.turn_id,
             provider = %self.provider,
             user = %self.turn_user.user_id,
+            scope = ?self.turn_user.guild_id.as_ref().map(ExternalId::as_str),
             tool_call = %call.id
         )
     )]
@@ -5103,7 +5104,8 @@ where
             let used = self
                 .storage
                 .count_successful_video_generations(CountSuccessfulVideoGenerations {
-                    user: self.turn_user.clone(),
+                    platform: self.turn_user.platform.clone(),
+                    scope_id: self.turn_user.guild_id.clone(),
                     interval_seconds,
                 })
                 .await
@@ -5116,7 +5118,7 @@ where
                     "video generation rate limit exceeded"
                 );
                 return Err(BotToolError::RateLimit(format!(
-                    "video generation rate limit exceeded for this platform user: {} successful video generation{} per {}",
+                    "video generation rate limit exceeded for this platform scope: {} successful video generation{} per {}",
                     rate_limit.limit,
                     if rate_limit.limit == 1 { "" } else { "s" },
                     rate_limit.interval
@@ -7419,7 +7421,11 @@ mod tests {
         assert_eq!(storage.updates.load(Ordering::SeqCst), 0);
         let requests = storage.count_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].user.user_id.as_str(), "user-1");
+        assert_eq!(requests[0].platform.as_str(), "discord");
+        assert_eq!(
+            requests[0].scope_id.as_ref().map(ExternalId::as_str),
+            Some("guild-1")
+        );
         assert_eq!(requests[0].interval_seconds, 4 * 60 * 60);
     }
 

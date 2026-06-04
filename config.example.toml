@@ -217,7 +217,7 @@ provider = "grok_video"
 # Provider-specific video model id.
 model = "grok-imagine-video"
 
-# Optional successful-generation rate limit for users outside bypassed platform scopes.
+# Optional successful-generation rate limit for non-bypassed platform scopes.
 # Counts saved video_jobs with status = "done" inside the rolling interval.
 # [bot.agents.default.video_generation.rate_limit]
 # limit = 2
