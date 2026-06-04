@@ -33,8 +33,11 @@ impl<G, S> ImageGeneratorTool<G, S> {
         Self {
             generator,
             media_store,
-            description: "Generate an image, save it to media storage, and return its media URI."
-                .to_string(),
+            description: concat!(
+                "Generate an image, edit/restyle/combine existing images when reference URIs ",
+                "are available, save it to media storage, and return its media URI."
+            )
+            .to_string(),
         }
     }
 
@@ -626,17 +629,30 @@ fn model_media_result_json(media: &dyn MediaRef, extra: serde_json::Value) -> se
 }
 
 fn image_tool_schema() -> ToolInputSchema {
+    let prompt_description = concat!(
+        "Detailed description of the image to generate or the full desired result when editing ",
+        "a reference image."
+    );
+    let reference_images_description = concat!(
+        "Optional list of 1-3 existing images to edit, restyle, transform, vary, or combine. ",
+        "Prefer this when the user refers to an image already visible in the conversation, ",
+        "such as \"this image\", \"the image above\", or \"make it...\". Use exact ",
+        "file://images/... URIs from prior tool results, generated-media notes, or image ",
+        "attachment reference notes; public https URLs also work. Never invent paths. For ",
+        "2-3 references, refer to them in the prompt as <IMAGE_0>, <IMAGE_1>, etc. in this ",
+        "array's order."
+    );
     ToolInputSchema::new(serde_json::json!({
         "type": "object",
         "required": ["prompt"],
         "properties": {
             "prompt": {
                 "type": "string",
-                "description": "The image prompt."
+                "description": prompt_description
             },
             "reference_images": {
                 "type": "array",
-                "description": "Optional media URIs or public URLs to use as image references. Use file:// media URIs from prior tool results; do not invent local filesystem paths.",
+                "description": reference_images_description,
                 "maxItems": MAX_REFERENCE_IMAGES,
                 "items": { "type": "string" }
             },

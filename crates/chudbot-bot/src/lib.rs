@@ -31,8 +31,8 @@ use chudbot_api::{
     PlatformMessageRelationship, PlatformName, PlatformReaction, PostedMessage, PrivacyMode,
     ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput,
     SendMessage, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, Transcript,
-    TranscriptTurn, Turn, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UserProfile,
-    UserRef, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef,
+    UserProfile, UserRef, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -627,6 +627,31 @@ fn default_thread_threshold_chars() -> usize {
 
 fn default_thread_threshold_lines() -> usize {
     DEFAULT_THREAD_THRESHOLD_LINES
+}
+
+fn image_generation_tool_description(provider: &ProviderName, model: &ModelId) -> String {
+    format!(
+        concat!(
+            "Generate an image with the configured `{}` image provider and `{}` model, ",
+            "save it to media storage, and return its media URI.\n\n",
+            "Use this whenever the user asks for an image, picture, drawing, illustration, ",
+            "infographic, or other visual.\n\n",
+            "To edit, restyle, transform, make a variation of, or combine images already ",
+            "visible in the conversation, pass their exact `file://images/...` URI(s) in ",
+            "`reference_images`. This is the expected path for requests like \"turn this ",
+            "image into...\", \"make the image...\", \"use the previous image\", or ",
+            "\"here's a different version\". User-uploaded images are listed in image ",
+            "attachment reference notes; generated images are listed in prior tool ",
+            "results and generated-media reference notes. Never invent or guess paths. ",
+            "For two or three references, refer to them in the prompt as <IMAGE_0>, ",
+            "<IMAGE_1>, etc. in the same order. If no real URI applies, omit ",
+            "`reference_images` and generate from text alone.\n\n",
+            "Generated media is attached to the final platform reply automatically. ",
+            "Do not paste media URIs, filenames, public URLs, or markdown media links ",
+            "in user-facing text."
+        ),
+        provider, model
+    )
 }
 
 fn validate_generation_binding(
@@ -1992,9 +2017,9 @@ where
                     ),
                     self.media_store.clone(),
                 )
-                .with_description(format!(
-                    "Generate an image with the configured `{}` image provider and `{}` model, save it to media storage, and return its media URI.",
-                    binding.provider, binding.model
+                .with_description(image_generation_tool_description(
+                    &binding.provider,
+                    &binding.model,
                 )),
             });
         }
@@ -3667,6 +3692,8 @@ where
                         .then(|| item.content.clone())
                 })
                 .collect::<Vec<_>>();
+            let mut generated_media_refs = Vec::new();
+            let mut generated_media_blocks = Vec::new();
             for asset in &turn.replay_assets {
                 if replayed_media
                     .iter()
@@ -3687,7 +3714,12 @@ where
                             continue;
                         }
                         replayed_media.push(asset.uri.as_str().to_string());
-                        user_turn.blocks.push(ContentBlock::Media { media });
+                        if replay_asset_belongs_to_user_turn(asset) {
+                            user_turn.blocks.push(ContentBlock::Media { media });
+                        } else {
+                            generated_media_refs.push(asset.uri.as_str().to_string());
+                            generated_media_blocks.push(ContentBlock::Media { media });
+                        }
                     }
                     Err(error) => tracing::warn!(
                         error = %error,
@@ -3727,6 +3759,12 @@ where
                     "added prior assistant turn to transcript"
                 );
             }
+            append_generated_media_replay(
+                &mut transcript,
+                turn.turn.id,
+                generated_media_refs,
+                generated_media_blocks,
+            );
         }
 
         tracing::debug!(
@@ -3776,7 +3814,12 @@ where
         }
         if let Some(binding) = &agent.image_generation {
             out.push_str(&format!(
-                "- Image generation is available through generate_image using provider `{}` and model `{}`.\n",
+                concat!(
+                    "- Image generation and image editing are available through generate_image ",
+                    "using provider `{}` and model `{}`. When the user asks to edit, restyle, ",
+                    "transform, or make a variation of an existing image, pass the exact ",
+                    "available URI in reference_images.\n"
+                ),
                 binding.provider, binding.model
             ));
         }
@@ -4817,6 +4860,43 @@ fn collect_generated_media_reply_refs(value: &serde_json::Value, out: &mut Vec<S
         }
         out.push(reference.to_string());
     }
+}
+
+fn replay_asset_belongs_to_user_turn(asset: &TurnAsset) -> bool {
+    asset.source.starts_with("platform:")
+}
+
+fn append_generated_media_replay(
+    transcript: &mut Transcript,
+    turn_id: TurnId,
+    media_refs: Vec<String>,
+    mut media_blocks: Vec<ContentBlock>,
+) {
+    if media_blocks.is_empty() {
+        return;
+    }
+
+    let mut text = "Generated media attached to the previous assistant reply.".to_string();
+    if !media_refs.is_empty() {
+        text.push_str(" Image reference IDs available for tool calls: ");
+        text.push_str(&media_refs.join(", "));
+        text.push_str(concat!(
+            ". Use these exact IDs in generate_image.reference_images when the user asks to ",
+            "edit, restyle, transform, or make a variation of the images."
+        ));
+    }
+
+    let mut blocks = Vec::with_capacity(media_blocks.len() + 1);
+    blocks.push(ContentBlock::Text { text });
+    blocks.append(&mut media_blocks);
+    transcript.push(TranscriptTurn {
+        role: TurnRole::User,
+        blocks,
+        metadata: transcript_message_metadata(turn_transcript_message_id(
+            turn_id,
+            "assistant_media",
+        )),
+    });
 }
 
 fn append_client_tool_replay(transcript: &mut Transcript, traces: &[ToolTrace]) {
@@ -6108,6 +6188,66 @@ mod tests {
             panic!("expected json result");
         };
         assert_eq!(value["uri"], "file://images/generated.jpg");
+    }
+
+    #[test]
+    fn generated_media_replays_after_assistant_message() {
+        let turn_id = TurnId::new();
+        let trace = generated_image_trace(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        );
+        let media = PromptMediaRef::boxed(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        );
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::User, "draw an image"));
+        append_client_tool_replay(&mut transcript, &[trace]);
+        transcript.push(TranscriptTurn::text(
+            TurnRole::Assistant,
+            "Done. Image generated and attached.",
+        ));
+
+        append_generated_media_replay(
+            &mut transcript,
+            turn_id,
+            vec!["file://images/generated.jpg".to_string()],
+            vec![ContentBlock::Media { media }],
+        );
+
+        assert_eq!(transcript.turns.len(), 5);
+        assert_eq!(transcript.turns[0].role, TurnRole::User);
+        assert_eq!(transcript.turns[1].role, TurnRole::Assistant);
+        assert_eq!(transcript.turns[2].role, TurnRole::User);
+        assert_eq!(transcript.turns[3].role, TurnRole::Assistant);
+        assert_eq!(transcript.turns[4].role, TurnRole::User);
+        let expected_id = turn_transcript_message_id(turn_id, "assistant_media");
+        assert_eq!(
+            transcript.turns[4].metadata["id"].as_str(),
+            Some(expected_id.as_str())
+        );
+        let [ContentBlock::Text { text }, ContentBlock::Media { .. }] =
+            transcript.turns[4].blocks.as_slice()
+        else {
+            panic!("expected generated media replay note and media");
+        };
+        assert!(text.contains("file://images/generated.jpg"));
+        assert!(text.contains("reference_images"));
+    }
+
+    #[test_case("platform:message:message-1:image:0", true ; "platform attachment")]
+    #[test_case("platform:quoted:message-1:image:0", true ; "quoted platform attachment")]
+    #[test_case("generate_image", false ; "generated image")]
+    fn replay_asset_user_turn_ownership(source: &str, expected: bool) {
+        let asset = TurnAsset {
+            uri: MediaUri::new("file://images/image.jpg"),
+            turn_id: TurnId::new(),
+            source: source.to_string(),
+            mime_type: Some("image/jpeg".to_string()),
+        };
+
+        assert_eq!(replay_asset_belongs_to_user_turn(&asset), expected);
     }
 
     #[test]
