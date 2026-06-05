@@ -4,9 +4,9 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path as FsPath, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use axum::extract::Request;
+use axum::extract::{ConnectInfo, Request};
 use axum::extract::{Path, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -21,6 +21,7 @@ use chudbot_api::{
     UsageRecord, UserRef,
 };
 use futures::{Stream, StreamExt};
+use http_body::Body as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_stream::wrappers::BroadcastStream;
@@ -35,6 +36,7 @@ const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const CACHE_NO_CACHE: &str = "no-cache, must-revalidate";
 const CACHE_NO_STORE: &str = "no-store";
 const X_ROBOTS_TAG: &str = "noindex, nofollow, noarchive, nosnippet";
+const UA_MAX_LEN: usize = 48;
 const ROBOTS_TXT: &str = "\
 # This host serves unauthenticated, UUID-gated conversation traces.
 # Nothing here may be indexed, archived, or used for model training.
@@ -134,6 +136,9 @@ pub struct WebConfig {
     /// Optional favicon served at /favicon.ico.
     #[serde(default)]
     pub favicon_path: Option<PathBuf>,
+    /// Whether access logs trust proxy-provided client IP headers.
+    #[serde(default = "default_trust_forwarded_for")]
+    pub trust_forwarded_for: bool,
 }
 
 /// State shared by web handlers.
@@ -268,13 +273,16 @@ where
     let shutdown_token = CancellationToken::new();
     let state = state.with_shutdown_token(shutdown_token.clone());
     tracing::info!("web server listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            shutdown_token.cancel();
-            tracing::info!("web server shutdown requested");
-        })
-        .await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        shutdown.await;
+        shutdown_token.cancel();
+        tracing::info!("web server shutdown requested");
+    })
+    .await?;
     tracing::info!("web server stopped");
     Ok(())
 }
@@ -289,6 +297,7 @@ where
         frontend_dir = %state.config.frontend_dir.display(),
         "building web router"
     );
+    let trust_forwarded_for = state.config.trust_forwarded_for;
     let assets = ServiceBuilder::new()
         .layer(cache_layer(CACHE_IMMUTABLE))
         .service(ServeDir::new(state.config.frontend_dir.join("assets")));
@@ -313,6 +322,10 @@ where
         .fallback(spa_index::<S, M>)
         .layer(x_robots_layer())
         .layer(middleware::from_fn(block_crawlers))
+        .layer(middleware::from_fn_with_state(
+            trust_forwarded_for,
+            access_log,
+        ))
         .with_state(state)
 }
 
@@ -771,6 +784,101 @@ fn x_robots_layer() -> SetResponseHeaderLayer<HeaderValue> {
     )
 }
 
+fn default_trust_forwarded_for() -> bool {
+    true
+}
+
+async fn access_log(State(trust_forwarded_for): State<bool>, req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    let path = req.uri().path().to_owned();
+    let remote = client_ip(&req, trust_forwarded_for);
+    let user_agent = req
+        .headers()
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(short_user_agent)
+        .unwrap_or_else(|| "-".to_string());
+    let input_bytes = req.body().size_hint().exact().unwrap_or(0);
+
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let duration = start.elapsed();
+    let output_bytes = response.body().size_hint().exact().unwrap_or(0);
+
+    tracing::info!(
+        target: "web::access",
+        %method,
+        path,
+        remote,
+        status = response.status().as_u16(),
+        duration_ms = duration.as_millis(),
+        input_bytes,
+        output_bytes,
+        user_agent,
+        "request"
+    );
+
+    response
+}
+
+fn client_ip(req: &Request, trust_forwarded_for: bool) -> String {
+    if trust_forwarded_for && let Some(ip) = forwarded_client_ip(req) {
+        return ip;
+    }
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip().to_string())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn forwarded_client_ip(req: &Request) -> Option<String> {
+    header_value(req, "cf-connecting-ip")
+        .or_else(|| header_value(req, "true-client-ip"))
+        .or_else(|| x_forwarded_for(req))
+        .or_else(|| forwarded_for(req))
+}
+
+fn header_value(req: &Request, name: &'static str) -> Option<String> {
+    req.headers()
+        .get(HeaderName::from_static(name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn x_forwarded_for(req: &Request) -> Option<String> {
+    req.headers()
+        .get(HeaderName::from_static("x-forwarded-for"))
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn forwarded_for(req: &Request) -> Option<String> {
+    let forwarded = req
+        .headers()
+        .get(HeaderName::from_static("forwarded"))?
+        .to_str()
+        .ok()?;
+    let first = forwarded.split(',').next()?;
+    first.split(';').find_map(|field| {
+        let (name, value) = field.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("for") {
+            return None;
+        }
+        let value = value.trim().trim_matches('"').trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn short_user_agent(ua: &str) -> String {
+    let token = ua.split_whitespace().next().unwrap_or(ua);
+    token.chars().take(UA_MAX_LEN).collect()
+}
+
 fn is_blocked_crawler(user_agent: &str) -> bool {
     let ua = user_agent.to_ascii_lowercase();
     CRAWLER_UA_TOKENS.iter().any(|token| ua.contains(token))
@@ -945,8 +1053,15 @@ async fn render_spa(frontend_dir: &FsPath, request_path: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
     use chudbot_api::{ClientToolTrace, ToolName, ToolUseId};
     use serde_json::json;
+
+    fn request_with_peer(peer: SocketAddr) -> Request {
+        let mut req = Request::builder().body(Body::empty()).unwrap();
+        req.extensions_mut().insert(ConnectInfo(peer));
+        req
+    }
 
     fn client_trace_view(
         content: ClientToolResultContent,
@@ -996,5 +1111,77 @@ mod tests {
         );
 
         assert_eq!(view.trace_payload, Some(trace_payload));
+    }
+
+    #[test]
+    fn client_ip_prefers_cloudflare_header_when_trusted() {
+        let mut req = request_with_peer(SocketAddr::from(([10, 0, 0, 2], 443)));
+        req.headers_mut().insert(
+            HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("203.0.113.42"),
+        );
+        req.headers_mut().insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("198.51.100.7, 10.0.0.1"),
+        );
+
+        assert_eq!(client_ip(&req, true), "203.0.113.42");
+    }
+
+    #[test]
+    fn client_ip_uses_first_x_forwarded_for_when_trusted() {
+        let mut req = request_with_peer(SocketAddr::from(([10, 0, 0, 2], 443)));
+        req.headers_mut().insert(
+            HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("198.51.100.7, 10.0.0.1"),
+        );
+
+        assert_eq!(client_ip(&req, true), "198.51.100.7");
+    }
+
+    #[test]
+    fn client_ip_uses_standard_forwarded_header_when_trusted() {
+        let mut req = request_with_peer(SocketAddr::from(([10, 0, 0, 2], 443)));
+        req.headers_mut().insert(
+            HeaderName::from_static("forwarded"),
+            HeaderValue::from_static("for=198.51.100.8;proto=https"),
+        );
+
+        assert_eq!(client_ip(&req, true), "198.51.100.8");
+    }
+
+    #[test]
+    fn client_ip_ignores_forwarded_headers_when_untrusted() {
+        let mut req = request_with_peer(SocketAddr::from(([10, 0, 0, 2], 443)));
+        req.headers_mut().insert(
+            HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("203.0.113.42"),
+        );
+
+        assert_eq!(client_ip(&req, false), "10.0.0.2");
+    }
+
+    #[test]
+    fn client_ip_returns_dash_without_peer_or_forwarded_header() {
+        let req = Request::builder().body(Body::empty()).unwrap();
+
+        assert_eq!(client_ip(&req, true), "-");
+    }
+
+    #[test]
+    fn short_user_agent_keeps_first_token() {
+        let ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:151.0)";
+
+        assert_eq!(short_user_agent(ua), "Mozilla/5.0");
+    }
+
+    #[test]
+    fn short_user_agent_caps_long_tokens() {
+        let ua = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ/1.0";
+
+        assert_eq!(
+            short_user_agent(ua),
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"
+        );
     }
 }

@@ -284,6 +284,9 @@ pub struct WebRuntimeConfig {
     /// Optional favicon served at /favicon.ico.
     #[serde(default)]
     pub favicon_path: Option<PathBuf>,
+    /// Whether access logs trust proxy-provided client IP headers.
+    #[serde(default = "default_trust_forwarded_for")]
+    pub trust_forwarded_for: bool,
 }
 
 impl WebRuntimeConfig {
@@ -293,12 +296,17 @@ impl WebRuntimeConfig {
             version: VERSION.to_string(),
             frontend_dir: self.frontend_dir.clone(),
             favicon_path: self.favicon_path.clone(),
+            trust_forwarded_for: self.trust_forwarded_for,
         }
     }
 }
 
 fn default_listen() -> String {
     "127.0.0.1:1860".to_string()
+}
+
+fn default_trust_forwarded_for() -> bool {
+    true
 }
 
 /// Local storage directories.

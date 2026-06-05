@@ -35,6 +35,10 @@ frontend_dir = "frontend-build"
 # Optional favicon. Keep it outside frontend_dir because deploys replace that
 # directory. Uncomment after setting a real path.
 # favicon_path = "/Users/chud/Documents/chudbot/chudbot.ico"
+# Whether access logs trust Cloudflare/proxy headers for client IPs. Defaults
+# to true, which matches the Cloudflare tunnel deploy. Set false for direct
+# public exposure without a trusted proxy in front.
+# trust_forwarded_for = true
 
 [storage]
 # Local media directories. The database stores stable URIs such as

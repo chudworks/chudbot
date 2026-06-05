@@ -7,6 +7,7 @@ authors.workspace = true
 [dependencies]
 chudbot-api = { path = "../chudbot-api" }
 futures.workspace = true
+http-body = "1"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
