@@ -23,7 +23,7 @@ pub use registries::{
 };
 
 pub(crate) use config::{
-    append_default_audio_keyterms, audio_transcription_default_keyterms,
+    SystemAgentConfig, append_default_audio_keyterms, audio_transcription_default_keyterms,
     image_generation_tool_description, video_generation_tool_description,
 };
 
@@ -33,23 +33,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chudbot_api::{
-    Agent, AgentBuilder, AgentLimits, AgentOutcome, AgentSelection, AgentSpec, AttachmentRef,
-    AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, BeginTurn, BotStorage,
-    ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult,
-    ClientToolResultContent, ClientToolSpec, ClientToolTrace, ContentBlock, Conversation,
-    ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
-    ConversationStop, CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink,
-    ExternalId, FetchMessages, FinishTurn, ImageGeneratorTool, LiveEvent, MediaCategory, MediaRef,
-    MediaStore, MediaUri, MessageLink, MessageRef, Model, ModelId, ModelSpec, ModelStep,
-    OpenConversation, OutgoingAttachment, PlatformCommand, PlatformCommandDefinition,
-    PlatformCommandInput, PlatformCommandOption, PlatformCommandOptionChoice,
-    PlatformCommandOptionKind, PlatformCommandResponse, PlatformCommandValue, PlatformEvent,
-    PlatformMessage, PlatformMessageReference, PlatformMessageRelationship, PlatformName,
-    PlatformReaction, PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings,
-    SamplingOptions, SaveTurnInput, SendMessage, StoredVideoJob, Subagent, ThreadRequest,
-    ToolInputSchema, ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset,
-    TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef,
-    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    Agent, AgentBuilder, AgentOutcome, AgentSelection, AgentSpec, AttachmentRef, AudioTranscriber,
+    AudioTranscription, AudioTranscriptionRequest, BeginTurn, BotStorage, ChannelLink, ChannelRef,
+    ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,
+    ClientToolSpec, ClientToolTrace, ContentBlock, Conversation, ConversationEventKind,
+    ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
+    CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink, ExternalId, FetchMessages,
+    FinishTurn, ImageGeneratorTool, LiveEvent, MediaCategory, MediaRef, MediaStore, MediaUri,
+    MessageLink, MessageRef, Model, ModelId, ModelSpec, ModelStep, OpenConversation,
+    OutgoingAttachment, PlatformCommand, PlatformCommandDefinition, PlatformCommandInput,
+    PlatformCommandOption, PlatformCommandOptionChoice, PlatformCommandOptionKind,
+    PlatformCommandResponse, PlatformCommandValue, PlatformEvent, PlatformMessage,
+    PlatformMessageReference, PlatformMessageRelationship, PlatformName, PlatformReaction,
+    PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions,
+    SaveTurnInput, SendMessage, StoredVideoJob, Subagent, ThreadRequest, ToolInputSchema, ToolName,
+    ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole,
+    TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator,
+    VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -78,6 +78,8 @@ const HISTORY_SIZE_MIN: i64 = 1;
 const HISTORY_SIZE_MAX: i64 = 100;
 const TITLE_MAX_CHARS: usize = 80;
 const TITLE_MAX_TOKENS: u32 = 96;
+const TOS_PREFLIGHT_AGENT: &str = "tos_preflight";
+const CONVERSATION_TITLE_AGENT: &str = "conversation_title";
 const DEFAULT_THREAD_THRESHOLD_CHARS: usize = 1500;
 const DEFAULT_THREAD_THRESHOLD_LINES: usize = 20;
 const THREAD_REPLY_WRAP_WIDTH: usize = 80;
@@ -1412,10 +1414,8 @@ where
         }
         stack.push(agent_name.to_string());
 
-        let mut spec = AgentSpec::new(system_prompt)
-            .with_limits(agent_config.limits.unwrap_or(self.config.limits));
-        spec.server_tools = agent_config.server_tools.clone();
-        spec.client_tools = agent_config.client_tools.clone();
+        let mut spec = agent_config.agent_spec(self.config.limits);
+        spec.system_prompt = system_prompt;
         if top_level && self.agent_memory_enabled(agent_config) {
             ensure_client_tool_enabled(&mut spec.client_tools, memory::LOOKUP_USER_MEMORY_TOOL);
             ensure_client_tool_enabled(&mut spec.client_tools, memory::REMEMBER_USER_MEMORY_TOOL);
@@ -1620,19 +1620,11 @@ where
         Ok(builder.into_agent(model))
     }
 
-    fn utility_agent(
-        &self,
-        provider: ProviderName,
-        model: ModelSpec,
-        system_prompt: &'static str,
-        limits: AgentLimits,
-    ) -> Agent<RoutedLlmBackend<L>> {
-        AgentSpec::new(system_prompt)
-            .with_limits(limits)
-            .into_agent(Model {
-                backend: RoutedLlmBackend::new(self.llms.clone(), provider),
-                spec: model,
-            })
+    fn system_agent(&self, agent_config: &SystemAgentConfig) -> Agent<RoutedLlmBackend<L>> {
+        agent_config.spec.clone().into_agent(Model {
+            backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
+            spec: agent_config.model.clone(),
+        })
     }
 
     #[tracing::instrument(
@@ -2051,6 +2043,12 @@ where
         let Some(name) = sub_option_string(sub, "name") else {
             return Ok("Missing `name`.".to_string());
         };
+        if is_system_agent_name(name) {
+            return Ok(format!(
+                "`{name}` is reserved for internal system use. {}",
+                available_agents(&self.config)
+            ));
+        }
         if !self.config.agents.contains_key(name) {
             return Ok(format!(
                 "Unknown agent `{name}`. {}",
@@ -2193,17 +2191,75 @@ where
         }
     }
 
+    fn configured_system_agent(&self, name: &str) -> Option<SystemAgentConfig> {
+        self.config.agents.get(name).map(|agent| {
+            SystemAgentConfig::from_agent_config(name.to_string(), agent, self.config.limits)
+        })
+    }
+
+    fn tos_preflight_agent(&self, platform: &PlatformName) -> Result<SystemAgentConfig, BotError> {
+        if let Some(agent) = self.configured_system_agent(TOS_PREFLIGHT_AGENT) {
+            return Ok(agent);
+        }
+
+        let (_, source) = self.config.agent_or_platform_default(None, platform)?;
+        Ok(SystemAgentConfig::from_parts(
+            TOS_PREFLIGHT_AGENT,
+            source.provider.clone(),
+            MODERATION_PROMPT,
+            ModelSpec {
+                id: source.model.id.clone(),
+                server_tools: Default::default(),
+                sampling: SamplingOptions {
+                    max_output_tokens: Some(8),
+                    temperature: Some(0.0),
+                    top_p: None,
+                },
+                provider_options: None,
+            },
+            source.limits.unwrap_or(self.config.limits),
+        ))
+    }
+
+    fn conversation_title_agent(
+        &self,
+        source_agent_name: &str,
+        platform: &PlatformName,
+    ) -> Result<SystemAgentConfig, BotError> {
+        if let Some(agent) = self.configured_system_agent(CONVERSATION_TITLE_AGENT) {
+            return Ok(agent);
+        }
+
+        let (_, source) = self
+            .config
+            .agent_or_platform_default(Some(source_agent_name), platform)?;
+        Ok(SystemAgentConfig::from_parts(
+            CONVERSATION_TITLE_AGENT,
+            source.provider.clone(),
+            TITLE_SYSTEM_PROMPT,
+            ModelSpec {
+                id: source.model.id.clone(),
+                server_tools: Default::default(),
+                sampling: SamplingOptions {
+                    max_output_tokens: Some(TITLE_MAX_TOKENS),
+                    temperature: Some(0.3),
+                    top_p: None,
+                },
+                provider_options: source.model.provider_options.clone(),
+            },
+            source.limits.unwrap_or(self.config.limits),
+        ))
+    }
+
     async fn moderation_allows(
         &self,
         message: &PlatformMessage,
         display_name: &str,
     ) -> Result<bool, BotError> {
-        let (agent_name, agent_config) = self
-            .config
-            .agent_or_platform_default(None, &message.id.platform)?;
+        let agent_config = self.tos_preflight_agent(&message.id.platform)?;
         if !self.llms.contains_provider(&agent_config.provider) {
             tracing::warn!(
-                agent = %agent_name,
+                agent = %agent_config.name,
                 provider = %agent_config.provider,
                 "moderation provider is missing; failing open"
             );
@@ -2218,21 +2274,7 @@ where
                 message.content
             ),
         ));
-        let agent = self.utility_agent(
-            agent_config.provider.clone(),
-            ModelSpec {
-                id: agent_config.model.id.clone(),
-                server_tools: Default::default(),
-                sampling: SamplingOptions {
-                    max_output_tokens: Some(8),
-                    temperature: Some(0.0),
-                    top_p: None,
-                },
-                provider_options: None,
-            },
-            MODERATION_PROMPT,
-            agent_config.limits.unwrap_or(self.config.limits),
-        );
+        let agent = self.system_agent(&agent_config);
         let run = match agent.run(transcript).await {
             Ok(run) => run,
             Err(error) => {
@@ -2300,11 +2342,15 @@ where
         if !self.memory_config.enabled {
             return;
         }
+        let memory_agents = self
+            .memory_config
+            .resolve_agent_set(&self.config.agents, self.config.limits);
         let runtime = memory::MemoryRuntime::new(
             self.storage.clone(),
             self.llms.clone(),
             self.media_store.clone(),
             self.memory_config.clone(),
+            memory_agents,
         );
         spawn_background_task(&self.background, "memory runtime", async move {
             if let Err(error) = runtime.run_until_shutdown(shutdown).await {
@@ -2340,9 +2386,8 @@ where
             tracing::debug!("no completed turns available for title generation");
             return Ok(());
         };
-        let (_, agent) = self
-            .config
-            .agent_or_platform_default(Some(agent_name), &snapshot.conversation.channel.platform)?;
+        let agent =
+            self.conversation_title_agent(agent_name, &snapshot.conversation.channel.platform)?;
         let user_text = format!(
             "User said:\n{}\n\nAssistant replied:\n{}",
             first.turn.user_content,
@@ -2350,21 +2395,7 @@ where
         );
         let mut transcript = Transcript::new();
         transcript.push(TranscriptTurn::text(TurnRole::User, user_text));
-        let agent_runtime = self.utility_agent(
-            agent.provider.clone(),
-            ModelSpec {
-                id: agent.model.id.clone(),
-                server_tools: Default::default(),
-                sampling: SamplingOptions {
-                    max_output_tokens: Some(TITLE_MAX_TOKENS),
-                    temperature: Some(0.3),
-                    top_p: None,
-                },
-                provider_options: agent.model.provider_options.clone(),
-            },
-            TITLE_SYSTEM_PROMPT,
-            agent.limits.unwrap_or(self.config.limits),
-        );
+        let agent_runtime = self.system_agent(&agent);
         let run = agent_runtime
             .run(transcript)
             .await
@@ -5998,6 +6029,9 @@ fn command_privacy_mode(
 fn agent_list_response(config: &BotConfig) -> String {
     let mut out = String::from("Available agents\n");
     for (name, agent) in &config.agents {
+        if is_system_agent_name(name) {
+            continue;
+        }
         let marker = if name == &config.default_agent {
             " (default)"
         } else {
@@ -6015,10 +6049,21 @@ fn available_agents(config: &BotConfig) -> String {
     let names = config
         .agents
         .keys()
+        .filter(|name| !is_system_agent_name(name))
         .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ");
     format!("Available agents: {names}")
+}
+
+fn is_system_agent_name(name: &str) -> bool {
+    matches!(
+        name,
+        memory::MEMORY_DIARY_AGENT
+            | memory::MEMORY_COMPACT_AGENT
+            | TOS_PREFLIGHT_AGENT
+            | CONVERSATION_TITLE_AGENT
+    )
 }
 
 fn ensure_client_tool_enabled(tools: &mut Option<Vec<ToolName>>, name: &str) {

@@ -1,12 +1,12 @@
 //! User memory tools, prompts, and background compaction runtime.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use chudbot_api::{
-    AgentLimits, AgentOutcome, AgentRun, AgentSpec, BotStorage, ClientTool, ClientToolCall,
-    ClientToolOutput, ClientToolResultContent, ClientToolSpec, ContentBlock, ConversationId,
-    ExternalId, MediaCategory, MediaStore, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
+    AgentLimits, AgentOutcome, AgentRun, BotStorage, ClientTool, ClientToolCall, ClientToolOutput,
+    ClientToolResultContent, ClientToolSpec, ContentBlock, ConversationId, ExternalId,
+    MediaCategory, MediaStore, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
     MemoryTurnWindow, Model, ModelId, ModelSpec, NewUserMemoryDiaryEntry,
     NewUserMemoryDocumentRevision, NewUserMemoryEvent, ProviderName, ProviderOptions,
     SamplingOptions, ToolInputSchema, Transcript, TranscriptTurn, TurnId, TurnRole, UsageRecord,
@@ -23,6 +23,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 
+use crate::config::{AgentConfig, SystemAgentConfig};
 use crate::{LlmProviderRegistry, RoutedLlmBackend};
 
 /// Tool name for current or target user memory lookup.
@@ -34,8 +35,8 @@ pub const FORGET_USER_MEMORY_TOOL: &str = "forget_user_memory";
 
 const MEMORY_MODEL_ID: &str = "grok-4.3";
 const MEMORY_REASONING_EFFORT: &str = "high";
-const MEMORY_DIARY_AGENT: &str = "memory_diary";
-const MEMORY_COMPACT_AGENT: &str = "memory_compact";
+pub const MEMORY_DIARY_AGENT: &str = "memory_diary";
+pub const MEMORY_COMPACT_AGENT: &str = "memory_compact";
 const LOOKUP_DIARY_ENTRY_LIMIT: u32 = 3;
 const MEMORY_DIARY_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp"];
 
@@ -57,13 +58,11 @@ const EMPTY_MEMORY: &str = "(no stored memory)";
 
 /// User-memory runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Global memory switch.
     #[serde(default)]
     pub enabled: bool,
-    /// LLM provider registry key used by memory pipeline jobs.
-    #[serde(default = "default_memory_provider")]
-    pub provider: ProviderName,
     /// Scheduler poll interval in seconds.
     #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
@@ -88,12 +87,6 @@ pub struct MemoryConfig {
     /// Maximum completed turns included in one diary job.
     #[serde(default = "default_max_transcript_turns_per_diary_job")]
     pub max_transcript_turns_per_diary_job: u32,
-    /// Maximum output tokens for diary generation.
-    #[serde(default = "default_max_diary_output_tokens")]
-    pub max_diary_output_tokens: u32,
-    /// Maximum output tokens for profile compaction.
-    #[serde(default = "default_max_profile_output_tokens")]
-    pub max_profile_output_tokens: u32,
     /// Base retry backoff after a failed memory job.
     #[serde(default = "default_retry_backoff_seconds")]
     pub retry_backoff_seconds: u64,
@@ -106,7 +99,6 @@ impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            provider: default_memory_provider(),
             poll_interval_seconds: default_poll_interval_seconds(),
             compaction_interval: default_compaction_interval(),
             diary_backfill_window: default_diary_backfill_window(),
@@ -115,8 +107,6 @@ impl Default for MemoryConfig {
             max_jobs_per_tick: default_max_jobs_per_tick(),
             max_concurrent_jobs: default_max_concurrent_jobs(),
             max_transcript_turns_per_diary_job: default_max_transcript_turns_per_diary_job(),
-            max_diary_output_tokens: default_max_diary_output_tokens(),
-            max_profile_output_tokens: default_max_profile_output_tokens(),
             retry_backoff_seconds: default_retry_backoff_seconds(),
             max_job_attempts: default_max_job_attempts(),
         }
@@ -144,6 +134,79 @@ impl MemoryConfig {
         Duration::from_secs(self.poll_interval_seconds.max(1))
     }
 
+    /// Resolve the configured memory agents, falling back to the built-in
+    /// default specs for any job kind without a matching configured agent.
+    /// Return the memory agents and providers that would be used at runtime.
+    pub fn resolved_agent_providers(
+        &self,
+        agents: &BTreeMap<String, AgentConfig>,
+        default_limits: AgentLimits,
+    ) -> Vec<(String, ProviderName)> {
+        self.resolve_agent_set(agents, default_limits)
+            .iter()
+            .map(|agent| (agent.name.clone(), agent.provider.clone()))
+            .collect()
+    }
+
+    pub(crate) fn resolve_agent_set(
+        &self,
+        agents: &BTreeMap<String, AgentConfig>,
+        default_limits: AgentLimits,
+    ) -> MemoryAgentSet {
+        MemoryAgentSet {
+            diary: self.resolve_agent(
+                MEMORY_DIARY_AGENT,
+                DIARY_PROMPT,
+                default_max_diary_output_tokens(),
+                agents,
+                default_limits,
+            ),
+            compact: self.resolve_agent(
+                MEMORY_COMPACT_AGENT,
+                COMPACTOR_PROMPT,
+                default_max_profile_output_tokens(),
+                agents,
+                default_limits,
+            ),
+        }
+    }
+
+    fn resolve_agent(
+        &self,
+        default_name: &'static str,
+        default_prompt: &'static str,
+        fallback_max_output_tokens: u32,
+        agents: &BTreeMap<String, AgentConfig>,
+        default_limits: AgentLimits,
+    ) -> SystemAgentConfig {
+        if let Some(agent) = agents.get(default_name) {
+            return SystemAgentConfig::from_agent_config(
+                default_name.to_string(),
+                agent,
+                default_limits,
+            );
+        }
+
+        SystemAgentConfig::from_parts(
+            default_name,
+            default_memory_provider(),
+            default_prompt,
+            ModelSpec {
+                id: ModelId::new(MEMORY_MODEL_ID),
+                server_tools: BTreeSet::new(),
+                sampling: SamplingOptions {
+                    max_output_tokens: Some(fallback_max_output_tokens),
+                    temperature: Some(0.2),
+                    top_p: Some(0.9),
+                },
+                provider_options: Some(ProviderOptions {
+                    value: json!({ "reasoning_effort": MEMORY_REASONING_EFFORT }),
+                }),
+            },
+            AgentLimits::default(),
+        )
+    }
+
     fn lease_duration(&self) -> Duration {
         Duration::from_secs(self.lease_seconds.max(1))
     }
@@ -155,6 +218,22 @@ impl MemoryConfig {
             .max(1)
             .saturating_mul(attempts.min(12));
         time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
+    }
+}
+
+/// Resolved memory agents used by the background scheduler.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryAgentSet {
+    /// Diary agent.
+    pub(crate) diary: SystemAgentConfig,
+    /// Profile compaction agent.
+    pub(crate) compact: SystemAgentConfig,
+}
+
+impl MemoryAgentSet {
+    /// Iterate all configured memory agents.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SystemAgentConfig> {
+        [&self.diary, &self.compact].into_iter()
     }
 }
 
@@ -747,26 +826,40 @@ pub struct MemoryRuntime<S, L, M> {
     llms: L,
     media_store: M,
     config: MemoryConfig,
+    agents: MemoryAgentSet,
 }
 
 impl<S, L, M> MemoryRuntime<S, L, M> {
     /// Construct a memory runtime.
-    pub fn new(storage: S, llms: L, media_store: M, config: MemoryConfig) -> Self {
+    pub(crate) fn new(
+        storage: S,
+        llms: L,
+        media_store: M,
+        config: MemoryConfig,
+        agents: MemoryAgentSet,
+    ) -> Self {
         Self {
             storage,
             llms,
             media_store,
             config,
+            agents,
         }
     }
 }
 
-fn memory_job_span(job: &UserMemoryJob, target_user_name: Option<&str>) -> tracing::Span {
+fn memory_job_span(
+    job: &UserMemoryJob,
+    agent: &SystemAgentConfig,
+    target_user_name: Option<&str>,
+) -> tracing::Span {
     let span = tracing::info_span!(
         "memory.job",
         job = %job.id,
         kind = ?job.kind,
-        memory_agent = memory_job_agent(job.kind),
+        memory_agent = %agent.name,
+        provider = %agent.provider,
+        model = %agent.model.id,
         memory_key = %job.memory_key,
         message_provider = %job.key.platform,
         scope_key = %job.key.scope_key,
@@ -786,13 +879,6 @@ fn memory_job_span(job: &UserMemoryJob, target_user_name: Option<&str>) -> traci
     span
 }
 
-fn memory_job_agent(kind: MemoryJobKind) -> &'static str {
-    match kind {
-        MemoryJobKind::Diary => MEMORY_DIARY_AGENT,
-        MemoryJobKind::Compact => MEMORY_COMPACT_AGENT,
-    }
-}
-
 impl<S, L, M> MemoryRuntime<S, L, M>
 where
     S: BotStorage + Clone + Send + Sync + 'static,
@@ -809,7 +895,12 @@ where
         self.config.diary_backfill_window_seconds()?;
         self.config.diary_interval_seconds()?;
         tracing::info!(
-            provider = %self.config.provider,
+            diary_agent = %self.agents.diary.name,
+            diary_provider = %self.agents.diary.provider,
+            diary_model = %self.agents.diary.model.id,
+            compact_agent = %self.agents.compact.name,
+            compact_provider = %self.agents.compact.provider,
+            compact_model = %self.agents.compact.model.id,
             poll_interval_seconds = self.config.poll_interval_seconds,
             diary_backfill_window = %self.config.diary_backfill_window,
             diary_interval = %self.config.diary_interval,
@@ -835,6 +926,13 @@ where
         }
         tracing::info!("memory runtime stopped");
         Ok(())
+    }
+
+    fn agent_config(&self, kind: MemoryJobKind) -> &SystemAgentConfig {
+        match kind {
+            MemoryJobKind::Diary => &self.agents.diary,
+            MemoryJobKind::Compact => &self.agents.compact,
+        }
     }
 
     async fn run_tick(&self) -> Result<(), MemoryError> {
@@ -901,7 +999,8 @@ where
                 running.spawn(async move {
                     let memory_key = job.memory_key.clone();
                     let target_user_name = runtime.load_memory_job_user_name(&job).await;
-                    let span = memory_job_span(&job, target_user_name.as_deref());
+                    let agent = runtime.agent_config(job.kind);
+                    let span = memory_job_span(&job, agent, target_user_name.as_deref());
                     let result = runtime.run_job_with_completion(job).instrument(span).await;
                     (memory_key, result)
                 });
@@ -1009,13 +1108,8 @@ where
             .map_err(|error| MemoryError::Storage(error.to_string()))?;
         let transcript =
             diary_transcript(&job.key, document.as_ref(), &turns, &self.media_store).await;
-        let output = self
-            .run_memory_model(
-                DIARY_PROMPT,
-                transcript,
-                self.config.max_diary_output_tokens.max(1),
-            )
-            .await?;
+        let agent_config = self.agent_config(MemoryJobKind::Diary).clone();
+        let output = self.run_memory_model(&agent_config, transcript).await?;
         self.storage
             .save_user_memory_diary_entry(NewUserMemoryDiaryEntry {
                 key: job.key.clone(),
@@ -1023,8 +1117,8 @@ where
                 window_end,
                 source_turn_ids: turns.iter().map(|turn| turn.turn_id).collect(),
                 markdown: output.text,
-                agent_name: MEMORY_DIARY_AGENT.to_string(),
-                llm_provider: self.config.provider.clone(),
+                agent_name: agent_config.name.clone(),
+                llm_provider: agent_config.provider.clone(),
                 llm_model: output.model_id,
                 usage: output.usage,
             })
@@ -1065,12 +1159,9 @@ where
         }
 
         let input = compact_input(&job.key, document.as_ref(), &events, &diaries);
+        let agent_config = self.agent_config(MemoryJobKind::Compact).clone();
         let output = self
-            .run_memory_model(
-                COMPACTOR_PROMPT,
-                Transcript::from_user_text(input),
-                self.config.max_profile_output_tokens.max(1),
-            )
+            .run_memory_model(&agent_config, Transcript::from_user_text(input))
             .await?;
         let MemoryModelOutput {
             text: markdown,
@@ -1113,8 +1204,8 @@ where
                 source_diary_entry_ids: diaries.iter().map(|entry| entry.id).collect(),
                 source_event_cutoff,
                 source_diary_cutoff,
-                agent_name: MEMORY_COMPACT_AGENT.to_string(),
-                llm_provider: self.config.provider.clone(),
+                agent_name: agent_config.name.clone(),
+                llm_provider: agent_config.provider.clone(),
                 llm_model,
                 usage,
             })
@@ -1125,32 +1216,18 @@ where
 
     async fn run_memory_model(
         &self,
-        instructions: &'static str,
+        agent_config: &SystemAgentConfig,
         transcript: Transcript,
-        max_output_tokens: u32,
     ) -> Result<MemoryModelOutput, MemoryError> {
-        let agent = AgentSpec::new(instructions)
-            .with_limits(AgentLimits::default())
-            .into_agent(Model {
-                backend: RoutedLlmBackend::new(self.llms.clone(), self.config.provider.clone()),
-                spec: ModelSpec {
-                    id: ModelId::new(MEMORY_MODEL_ID),
-                    server_tools: BTreeSet::new(),
-                    sampling: SamplingOptions {
-                        max_output_tokens: Some(max_output_tokens),
-                        temperature: Some(0.2),
-                        top_p: Some(0.9),
-                    },
-                    provider_options: Some(ProviderOptions {
-                        value: json!({ "reasoning_effort": MEMORY_REASONING_EFFORT }),
-                    }),
-                },
-            });
+        let agent = agent_config.spec.clone().into_agent(Model {
+            backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
+            spec: agent_config.model.clone(),
+        });
         let run = agent
             .run(transcript)
             .await
             .map_err(|error| MemoryError::Model(error.to_string()))?;
-        memory_model_output(run)
+        memory_model_output(run, &agent_config.model.id)
     }
 }
 
@@ -1161,11 +1238,14 @@ struct MemoryModelOutput {
     usage: Vec<UsageRecord>,
 }
 
-fn memory_model_output(run: AgentRun) -> Result<MemoryModelOutput, MemoryError> {
+fn memory_model_output(
+    run: AgentRun,
+    fallback_model_id: &ModelId,
+) -> Result<MemoryModelOutput, MemoryError> {
     let usage = run.all_usage();
     let model_id = run
         .last_model_id
-        .unwrap_or_else(|| ModelId::new(MEMORY_MODEL_ID));
+        .unwrap_or_else(|| fallback_model_id.clone());
     match run.outcome {
         AgentOutcome::Completed { answer } => {
             let text = answer.text.trim().to_string();
@@ -1468,8 +1548,11 @@ pub enum MemoryError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use chudbot_api::{
-        ConversationId, ExternalId, PlatformName, UserMemoryEvent, UserMemoryEventKind, UserProfile,
+        AgentLimits, ConversationId, ExternalId, ModelSpec, PlatformName, SamplingOptions,
+        UserMemoryEvent, UserMemoryEventKind, UserProfile,
     };
     use test_case::test_case;
     use time::macros::datetime;
@@ -1507,6 +1590,69 @@ mod tests {
             MemoryConfig::default().diary_interval_seconds().unwrap(),
             24 * 60 * 60
         );
+    }
+
+    #[test]
+    fn memory_agent_providers_use_named_agents_with_default_fallbacks() {
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            MEMORY_DIARY_AGENT.to_string(),
+            test_agent_config("openai", "gpt-5.5"),
+        );
+
+        let providers = MemoryConfig::default()
+            .resolved_agent_providers(&agents, AgentLimits { max_iterations: 4 });
+
+        assert_eq!(
+            providers,
+            vec![
+                (MEMORY_DIARY_AGENT.to_string(), ProviderName::new("openai")),
+                (MEMORY_COMPACT_AGENT.to_string(), ProviderName::new("grok")),
+            ]
+        );
+    }
+
+    #[test]
+    fn memory_config_rejects_removed_model_fields() {
+        for field in [
+            "provider",
+            "max_diary_output_tokens",
+            "max_profile_output_tokens",
+        ] {
+            let mut value = json!({ "enabled": true });
+            value
+                .as_object_mut()
+                .expect("object")
+                .insert(field.to_string(), json!("stale"));
+            let error = serde_json::from_value::<MemoryConfig>(value).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{field}`"))
+            );
+        }
+    }
+
+    fn test_agent_config(provider: &str, model: &str) -> AgentConfig {
+        AgentConfig {
+            provider: ProviderName::new(provider),
+            system_prompt: "configured prompt".to_string(),
+            model: ModelSpec {
+                id: ModelId::new(model),
+                server_tools: BTreeSet::new(),
+                sampling: SamplingOptions::default(),
+                provider_options: None,
+            },
+            server_tools: None,
+            client_tools: None,
+            limits: None,
+            image_generation: None,
+            video_generation: None,
+            audio_transcription: None,
+            memory: false,
+            subagents: BTreeMap::new(),
+        }
     }
 
     #[test]

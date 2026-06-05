@@ -57,8 +57,9 @@ public_base_url = "http://localhost:1860"
 # memory tools when this is enabled. Memory profiles are returned by the lookup
 # tool, not injected into ordinary turn context.
 enabled = true
-# LLM provider registry key used by background diary/compaction jobs.
-provider = "grok"
+# Background memory workers use the normal [bot.agents.memory_diary] and
+# [bot.agents.memory_compact] configs below. If either is omitted, the runtime
+# synthesizes the built-in default for that missing agent.
 poll_interval_seconds = 60
 # Pending memory events and diary entries are rolled into the compact profile only
 # when the user's last compaction is at least this old and no diary job/window is
@@ -76,8 +77,6 @@ lease_seconds = 300
 max_jobs_per_tick = 4
 max_concurrent_jobs = 4
 max_transcript_turns_per_diary_job = 40
-max_diary_output_tokens = 1024
-max_profile_output_tokens = 2048
 retry_backoff_seconds = 300
 max_job_attempts = 5
 
@@ -181,8 +180,10 @@ kind = "xai"
 api_key = "xai-..."
 # base_url = "https://api.x.ai/v1"
 
-# Agents are prompt + provider + model + tool exposure. The name after
-# [bot.agents.<name>] is the runtime selection key used by /chudbot-agent.
+# Agents are prompt + provider + model + tool exposure. User-facing agents can
+# be selected with /chudbot-agent. The reserved system agent names
+# memory_diary, memory_compact, tos_preflight, and conversation_title are picked
+# up by internal jobs and are hidden from /chudbot-agent selection.
 
 [bot.agents.default]
 provider = "grok"
@@ -234,6 +235,87 @@ provider = "grok_audio"
 # Chudbot thread/reply. This is also sent as an xAI STT keyterm bias. Omit this
 # to ignore standalone no-text audio.
 wake_word = "Chudbot"
+
+[bot.agents.memory_diary]
+provider = "grok"
+system_prompt = """
+You write concise user-memory diary entries for Chudbot. Read the bounded transcript slice and optional current memory profile. Extract only stable, useful observations about the subject user. Include uncertainty when evidence is weak. Prefer factual bullets over prose. Consider relationships, preferences and dislikes, projects, work, hobbies, recurring topics, server lore, running jokes, good-natured roast material, corrections, stale facts, and visually meaningful image evidence. Do not invent facts.
+"""
+limits = { max_iterations = 8 }
+
+[bot.agents.memory_diary.model]
+id = "grok-4.3"
+
+[bot.agents.memory_diary.model.sampling]
+max_output_tokens = 1024
+temperature = 0.2
+top_p = 0.9
+
+[bot.agents.memory_diary.model.provider_options]
+value = { reasoning_effort = "high" }
+
+[bot.agents.memory_compact]
+provider = "grok"
+system_prompt = """
+You maintain a compact Markdown memory profile for one Chudbot user in one server/workspace. Produce a complete replacement profile, not a diff. Use explicit memory events, diary entries, corrections, and forget requests. Keep the profile short, normally 1-3 KB. Remove or rewrite forgotten and stale facts. Preserve useful uncertainty. Output Markdown only.
+"""
+limits = { max_iterations = 8 }
+
+[bot.agents.memory_compact.model]
+id = "grok-4.3"
+
+[bot.agents.memory_compact.model.sampling]
+max_output_tokens = 2048
+temperature = 0.2
+top_p = 0.9
+
+[bot.agents.memory_compact.model.provider_options]
+value = { reasoning_effort = "high" }
+
+[bot.agents.tos_preflight]
+provider = "grok"
+system_prompt = """
+You are a TOS compliance classifier for a private friends-only Discord server. Each message you classify is prefixed with the sender's display name as `[name]: `. The DEFAULT IS ALLOW. Only REFUSE the narrowly listed categories below.
+
+REFUSE these:
+- CSAM or any sexualization of minors
+- Doxxing: sharing someone's non-public personal info with apparent intent to harm
+- Credible, specific threats of violence against a real, identifiable person
+- Coordinated incitement to suicide or self-harm directed at a specific person
+- Illegal arrangements: drug or weapon sales, human trafficking, exploitation rings
+- Malware, phishing payloads, or coordinated large-scale spam campaigns
+
+ALLOW EVERYTHING ELSE, including profanity, insults, dark humor, political opinions, criticism of public figures, news/current-events questions, and edgy art requests that do not involve minors.
+
+When in any doubt, ALLOW.
+
+Respond with EXACTLY one token: ALLOW or REFUSE. No punctuation. No explanation.
+"""
+limits = { max_iterations = 8 }
+
+[bot.agents.tos_preflight.model]
+id = "grok-4.3"
+
+[bot.agents.tos_preflight.model.sampling]
+max_output_tokens = 8
+temperature = 0.0
+
+[bot.agents.conversation_title]
+provider = "grok"
+system_prompt = """
+You write very short conversation titles. Output ONLY a title for the conversation below: five words or fewer, no quotes, no period, no leading 'Re:' or 'Conversation about'. Just the title text.
+"""
+limits = { max_iterations = 8 }
+
+[bot.agents.conversation_title.model]
+id = "grok-4.3"
+
+[bot.agents.conversation_title.model.sampling]
+max_output_tokens = 96
+temperature = 0.3
+
+[bot.agents.conversation_title.model.provider_options]
+value = { reasoning_effort = "high" }
 
 [bot.agents.research]
 provider = "openai"

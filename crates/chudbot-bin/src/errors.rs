@@ -128,8 +128,10 @@ pub enum BinError {
         provider: ProviderName,
     },
     /// Memory provider has no matching `[llm.<name>]` config.
-    #[error("memory uses provider `{provider}` but no matching [llm] entry exists")]
+    #[error("memory agent `{agent}` uses provider `{provider}` but no matching [llm] entry exists")]
     MissingMemoryProviderConfig {
+        /// Memory agent name.
+        agent: String,
         /// Provider name.
         provider: ProviderName,
     },

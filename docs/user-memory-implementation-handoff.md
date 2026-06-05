@@ -33,7 +33,7 @@ chudbot-bot/src/lib.rs
   -> mod memory;
 
 chudbot-bot/src/memory.rs
-  -> owns tools, scheduler, pipeline, prompts, and model specs
+  -> owns tools, scheduler, pipeline, and built-in fallback prompts/model specs
 
 chudbot-api
   -> owns any storage contracts/types that chudbot-storage-sqlx must implement
@@ -51,7 +51,8 @@ chudbot-bin
 - Memory client tools exposed to agents.
 - In-process scheduler and worker loop.
 - Diary and profile compaction pipeline.
-- Code-defined memory prompts and memory model specs.
+- Built-in fallback memory prompts and model specs used only when the matching
+  named agent config is omitted.
 
 Keep `crates/chudbot-bot/src/lib.rs` as a thin integration surface. It should
 declare the module, parse/pass config, attach memory tools, inject memory
@@ -96,7 +97,6 @@ Example:
 ```toml
 [memory]
 enabled = true
-provider = "grok"
 poll_interval_seconds = 60
 # Roll pending source changes into profiles at most this often per user.
 compaction_interval = "24h"
@@ -108,19 +108,33 @@ max_concurrent_jobs = 4
 
 [bot.agents.default]
 memory = true
+
+[bot.agents.memory_diary]
+provider = "grok"
+system_prompt = "..."
+
+[bot.agents.memory_diary.model]
+id = "grok-4.3"
+
+[bot.agents.memory_diary.model.sampling]
+max_output_tokens = 1024
+
+[bot.agents.memory_compact]
+provider = "grok"
+system_prompt = "..."
+
+[bot.agents.memory_compact.model]
+id = "grok-4.3"
+
+[bot.agents.memory_compact.model.sampling]
+max_output_tokens = 2048
 ```
 
-`memory.provider` is the configured LLM provider registry key, not the provider
-kind. In the current example config, the likely value is `grok`, backed by
-`kind = "xai"`.
-
-Keep memory prompts and model specs in code inside `chudbot-bot::memory`:
-
-- Provider service: from `[memory].provider`.
-- Model id: `grok-4.3`.
-- Provider options: `reasoning_effort = "medium"`.
-- Sampling: conservative defaults, with bounded output tokens.
-- Client tools for memory pipeline agents: none in the first pass.
+Background memory jobs use the normal agent configs named `memory_diary` and
+`memory_compact`. If either agent is omitted, `chudbot-bot` synthesizes the
+previous built-in default for that missing agent. Do not keep provider, prompt,
+model id, provider option, sampling, or output-token settings under `[memory]`;
+those belong on the named agents.
 
 `compaction_interval` should be a human-readable duration string. Support at
 least `s`, `m`, `h`, and `d` suffixes so deployments can use values like

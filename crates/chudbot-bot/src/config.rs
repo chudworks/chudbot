@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chudbot_api::{
-    AgentLimits, ExternalId, ModelId, ModelSpec, PlatformName, ProviderName, ToolName, UserRef,
+    AgentLimits, AgentSpec, ExternalId, ModelId, ModelSpec, PlatformName, ProviderName, ToolName,
+    UserRef,
 };
 use serde::{Deserialize, Serialize};
 
@@ -362,6 +363,54 @@ pub struct AgentConfig {
     /// Subagents exposed as named client-side tools.
     #[serde(default)]
     pub subagents: BTreeMap<ToolName, SubagentBinding>,
+}
+
+impl AgentConfig {
+    pub(crate) fn agent_spec(&self, default_limits: AgentLimits) -> AgentSpec {
+        let mut spec = AgentSpec::new(self.system_prompt.clone())
+            .with_limits(self.limits.unwrap_or(default_limits));
+        spec.server_tools = self.server_tools.clone();
+        spec.client_tools = self.client_tools.clone();
+        spec
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SystemAgentConfig {
+    pub(crate) name: String,
+    pub(crate) provider: ProviderName,
+    pub(crate) spec: AgentSpec,
+    pub(crate) model: ModelSpec,
+}
+
+impl SystemAgentConfig {
+    pub(crate) fn from_agent_config(
+        name: String,
+        agent: &AgentConfig,
+        default_limits: AgentLimits,
+    ) -> Self {
+        Self {
+            name,
+            provider: agent.provider.clone(),
+            spec: agent.agent_spec(default_limits),
+            model: agent.model.clone(),
+        }
+    }
+
+    pub(crate) fn from_parts(
+        name: impl Into<String>,
+        provider: ProviderName,
+        system_prompt: impl Into<String>,
+        model: ModelSpec,
+        limits: AgentLimits,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            provider,
+            spec: AgentSpec::new(system_prompt).with_limits(limits),
+            model,
+        }
+    }
 }
 
 /// Binding from an agent to a media-generation provider and default model.
