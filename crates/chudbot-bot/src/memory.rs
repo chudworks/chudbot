@@ -6,13 +6,13 @@ use std::time::Duration;
 use chudbot_api::{
     AgentLimits, AgentOutcome, AgentRun, AgentSpec, BotStorage, ClientTool, ClientToolCall,
     ClientToolOutput, ClientToolResultContent, ClientToolSpec, ContentBlock, ConversationId,
-    MediaCategory, MediaStore, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
+    ExternalId, MediaCategory, MediaStore, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
     MemoryTurnWindow, Model, ModelId, ModelSpec, NewUserMemoryDiaryEntry,
     NewUserMemoryDocumentRevision, NewUserMemoryEvent, ProviderName, ProviderOptions,
     SamplingOptions, ToolInputSchema, Transcript, TranscriptTurn, TurnId, TurnRole, UsageRecord,
     UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
     UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
-    UserRef,
+    UserProfile, UserRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -291,6 +291,24 @@ fn memory_scope_id(scope_key: &str) -> &str {
 
 fn memory_guild_id(scope_key: &str) -> Option<&str> {
     scope_key.strip_prefix("guild:")
+}
+
+fn memory_user_ref(key: &UserMemoryKey) -> UserRef {
+    UserRef {
+        platform: key.platform.clone(),
+        guild_id: memory_guild_id(&key.scope_key).map(ExternalId::new),
+        user_id: ExternalId::new(key.user_key.clone()),
+    }
+}
+
+fn memory_profile_display_name(profile: &UserProfile, user_key: &str) -> Option<String> {
+    let name = profile
+        .display_name
+        .as_deref()
+        .or(profile.name.as_deref())
+        .unwrap_or(profile.username.as_str())
+        .trim();
+    (!name.is_empty() && name != user_key).then(|| name.to_string())
 }
 
 /// Runtime client tool kind.
@@ -743,11 +761,12 @@ impl<S, L, M> MemoryRuntime<S, L, M> {
     }
 }
 
-fn memory_job_span(job: &UserMemoryJob) -> tracing::Span {
+fn memory_job_span(job: &UserMemoryJob, target_user_name: Option<&str>) -> tracing::Span {
     let span = tracing::info_span!(
         "memory.job",
         job = %job.id,
         kind = ?job.kind,
+        memory_agent = memory_job_agent(job.kind),
         memory_key = %job.memory_key,
         message_provider = %job.key.platform,
         scope_key = %job.key.scope_key,
@@ -755,12 +774,23 @@ fn memory_job_span(job: &UserMemoryJob) -> tracing::Span {
         guild_id = tracing::field::Empty,
         user_id = %job.key.user_key,
         target_user_id = %job.key.user_key,
+        target_user_name = tracing::field::Empty,
         attempts = job.attempts,
     );
     if let Some(guild_id) = memory_guild_id(&job.key.scope_key) {
         span.record("guild_id", tracing::field::display(guild_id));
     }
+    if let Some(name) = target_user_name {
+        span.record("target_user_name", tracing::field::display(name));
+    }
     span
+}
+
+fn memory_job_agent(kind: MemoryJobKind) -> &'static str {
+    match kind {
+        MemoryJobKind::Diary => MEMORY_DIARY_AGENT,
+        MemoryJobKind::Compact => MEMORY_COMPACT_AGENT,
+    }
 }
 
 impl<S, L, M> MemoryRuntime<S, L, M>
@@ -867,16 +897,14 @@ where
                 };
                 let job = pending.remove(index).expect("pending index exists");
                 active_keys.insert(job.memory_key.clone());
-                let span = memory_job_span(&job);
                 let runtime = (*self).clone();
-                running.spawn(
-                    async move {
-                        let memory_key = job.memory_key.clone();
-                        let result = runtime.run_job_with_completion(job).await;
-                        (memory_key, result)
-                    }
-                    .instrument(span),
-                );
+                running.spawn(async move {
+                    let memory_key = job.memory_key.clone();
+                    let target_user_name = runtime.load_memory_job_user_name(&job).await;
+                    let span = memory_job_span(&job, target_user_name.as_deref());
+                    let result = runtime.run_job_with_completion(job).instrument(span).await;
+                    (memory_key, result)
+                });
             }
 
             let Some(result) = running.join_next().await else {
@@ -895,6 +923,28 @@ where
             }
         }
         Ok(())
+    }
+
+    async fn load_memory_job_user_name(&self, job: &UserMemoryJob) -> Option<String> {
+        let user = memory_user_ref(&job.key);
+        let profiles = match self.storage.load_user_profiles(vec![user]).await {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                tracing::warn!(
+                    job = %job.id,
+                    memory_key = %job.memory_key,
+                    message_provider = %job.key.platform,
+                    scope_key = %job.key.scope_key,
+                    target_user_id = %job.key.user_key,
+                    error = %error,
+                    "failed to load memory subject profile for tracing"
+                );
+                return None;
+            }
+        };
+        profiles
+            .first()
+            .and_then(|profile| memory_profile_display_name(&profile.profile, &job.key.user_key))
     }
 
     async fn run_job_with_completion(&self, job: UserMemoryJob) -> Result<(), MemoryError> {
@@ -961,8 +1011,6 @@ where
             diary_transcript(&job.key, document.as_ref(), &turns, &self.media_store).await;
         let output = self
             .run_memory_model(
-                MEMORY_DIARY_AGENT,
-                &job.key,
                 DIARY_PROMPT,
                 transcript,
                 self.config.max_diary_output_tokens.max(1),
@@ -1019,8 +1067,6 @@ where
         let input = compact_input(&job.key, document.as_ref(), &events, &diaries);
         let output = self
             .run_memory_model(
-                MEMORY_COMPACT_AGENT,
-                &job.key,
                 COMPACTOR_PROMPT,
                 Transcript::from_user_text(input),
                 self.config.max_profile_output_tokens.max(1),
@@ -1077,42 +1123,12 @@ where
         Ok(())
     }
 
-    #[tracing::instrument(
-        name = "memory.model_run",
-        skip_all,
-        fields(
-            memory_agent = tracing::field::Empty,
-            message_provider = %key.platform,
-            scope_key = tracing::field::Empty,
-            scope_id = tracing::field::Empty,
-            guild_id = tracing::field::Empty,
-            user_id = tracing::field::Empty,
-            target_user_id = tracing::field::Empty,
-            provider = %self.config.provider,
-            model = MEMORY_MODEL_ID,
-            max_output_tokens,
-        )
-    )]
     async fn run_memory_model(
         &self,
-        agent_name: &'static str,
-        key: &UserMemoryKey,
         instructions: &'static str,
         transcript: Transcript,
         max_output_tokens: u32,
     ) -> Result<MemoryModelOutput, MemoryError> {
-        let span = tracing::Span::current();
-        span.record("memory_agent", agent_name);
-        span.record("user_id", tracing::field::display(&key.user_key));
-        span.record("target_user_id", tracing::field::display(&key.user_key));
-        span.record("scope_key", tracing::field::display(&key.scope_key));
-        span.record(
-            "scope_id",
-            tracing::field::display(memory_scope_id(&key.scope_key)),
-        );
-        if let Some(guild_id) = memory_guild_id(&key.scope_key) {
-            span.record("guild_id", tracing::field::display(guild_id));
-        }
         let agent = AgentSpec::new(instructions)
             .with_limits(AgentLimits::default())
             .into_agent(Model {
@@ -1453,7 +1469,7 @@ pub enum MemoryError {
 #[cfg(test)]
 mod tests {
     use chudbot_api::{
-        ConversationId, ExternalId, PlatformName, UserMemoryEvent, UserMemoryEventKind,
+        ConversationId, ExternalId, PlatformName, UserMemoryEvent, UserMemoryEventKind, UserProfile,
     };
     use test_case::test_case;
     use time::macros::datetime;
@@ -1505,6 +1521,61 @@ mod tests {
         assert_eq!(key.scope_key, "guild:guild-1");
         assert_eq!(key.user_key, "user-1");
         assert_eq!(key.memory_key(), "discord:guild:guild-1:user-1");
+    }
+
+    #[test]
+    fn memory_user_ref_extracts_guild_scope() {
+        let user = memory_user_ref(&UserMemoryKey {
+            platform: PlatformName::new("discord"),
+            scope_key: "guild:guild-1".to_string(),
+            user_key: "user-1".to_string(),
+        });
+
+        assert_eq!(user.platform.as_str(), "discord");
+        assert_eq!(
+            user.guild_id.as_ref().map(ExternalId::as_str),
+            Some("guild-1")
+        );
+        assert_eq!(user.user_id.as_str(), "user-1");
+    }
+
+    #[test]
+    fn memory_profile_display_name_prefers_readable_names() {
+        let profile = UserProfile {
+            id: UserRef {
+                platform: PlatformName::new("discord"),
+                guild_id: Some(ExternalId::new("guild-1")),
+                user_id: ExternalId::new("user-1"),
+            },
+            username: "alice_global".to_string(),
+            name: Some("Alice Global".to_string()),
+            display_name: Some("Alice Guild".to_string()),
+            avatar_url: None,
+            is_bot: false,
+        };
+
+        assert_eq!(
+            memory_profile_display_name(&profile, "user-1").as_deref(),
+            Some("Alice Guild")
+        );
+    }
+
+    #[test]
+    fn memory_profile_display_name_omits_id_fallback() {
+        let profile = UserProfile {
+            id: UserRef {
+                platform: PlatformName::new("discord"),
+                guild_id: Some(ExternalId::new("guild-1")),
+                user_id: ExternalId::new("user-1"),
+            },
+            username: "user-1".to_string(),
+            name: None,
+            display_name: None,
+            avatar_url: None,
+            is_bot: false,
+        };
+
+        assert_eq!(memory_profile_display_name(&profile, "user-1"), None);
     }
 
     #[test]
