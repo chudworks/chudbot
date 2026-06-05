@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use chudbot_api::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ChannelRef, ContextItem, Conversation,
     ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
-    CountSuccessfulVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, MediaUri,
+    CountActiveVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, MediaUri,
     MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, MessageLink,
     MessageRef, ModelId, NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision,
     NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName, ResolveAgent, RetryTurn,
@@ -1427,9 +1427,9 @@ impl BotStorage for SqlxStorage {
         Ok(())
     }
 
-    async fn count_successful_video_generations(
+    async fn count_active_video_generations(
         &self,
-        input: CountSuccessfulVideoGenerations,
+        input: CountActiveVideoGenerations,
     ) -> Result<u64, Self::Error> {
         let interval_seconds = i64::try_from(input.interval_seconds).unwrap_or(i64::MAX);
         let scope = input
@@ -1445,10 +1445,20 @@ impl BotStorage for SqlxStorage {
                     ($2::text IS NULL AND t.user_message_channel NOT LIKE 'guild:%') \
                     OR ($2::text IS NOT NULL AND t.user_message_channel LIKE $2 || ':%') \
                 ) \
-                AND v.status = 'done' \
-                AND v.output_uri IS NOT NULL \
-                AND v.completed_at IS NOT NULL \
-                AND v.completed_at >= now() - ($3::double precision * interval '1 second')",
+                AND ( \
+                    v.status = 'pending' \
+                    OR ( \
+                        v.status = 'done' \
+                        AND v.output_uri IS NOT NULL \
+                        AND v.completed_at IS NOT NULL \
+                    ) \
+                ) \
+                AND ( \
+                    CASE \
+                        WHEN v.status = 'pending' THEN v.submitted_at \
+                        ELSE v.completed_at \
+                    END \
+                ) >= now() - ($3::double precision * interval '1 second')",
         )
         .bind(input.platform.as_str())
         .bind(scope.as_deref())

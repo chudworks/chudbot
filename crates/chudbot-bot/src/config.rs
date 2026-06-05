@@ -195,7 +195,7 @@ pub(crate) fn video_generation_tool_description(binding: &GenerationBinding) -> 
     );
     if let Some(limit) = &binding.rate_limit {
         description.push_str(&format!(
-            "\n\nThis tool is limited to {} successful video generation{} per {} for each non-bypassed platform scope.",
+            "\n\nThis tool is limited to {} active video generation{} per {} for each non-bypassed platform scope.",
             limit.limit,
             if limit.limit == 1 { "" } else { "s" },
             limit.interval
@@ -371,16 +371,16 @@ pub struct GenerationBinding {
     pub provider: ProviderName,
     /// Provider-specific image/video model id or tier.
     pub model: ModelId,
-    /// Optional successful-video rate limit for this video-generation binding.
+    /// Optional active-video rate limit for this video-generation binding.
     #[serde(default)]
     pub rate_limit: Option<VideoGenerationRateLimit>,
 }
 
-/// Successful-video rate limit for a video-generation binding.
+/// Active-video rate limit for a video-generation binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VideoGenerationRateLimit {
-    /// Maximum successful video generations per interval.
+    /// Maximum pending plus successful video generations per interval.
     pub limit: u32,
     /// Rolling interval, e.g. `4h`, `30m`, or `1d`.
     #[serde(default = "default_video_generation_rate_limit_interval")]

@@ -38,7 +38,7 @@ use chudbot_api::{
     ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult,
     ClientToolResultContent, ClientToolSpec, ClientToolTrace, ContentBlock, Conversation,
     ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
-    ConversationStop, CountSuccessfulVideoGenerations, CreateMedia, CreateVideoJob, EventSink,
+    ConversationStop, CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink,
     ExternalId, FetchMessages, FinishTurn, ImageGeneratorTool, LiveEvent, MediaCategory, MediaRef,
     MediaStore, MediaUri, MessageLink, MessageRef, Model, ModelId, ModelSpec, ModelStep,
     OpenConversation, OutgoingAttachment, PlatformCommand, PlatformCommandDefinition,
@@ -49,10 +49,11 @@ use chudbot_api::{
     SamplingOptions, SaveTurnInput, SendMessage, StoredVideoJob, Subagent, ThreadRequest,
     ToolInputSchema, ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset,
     TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef,
-    VideoGenerator, VideoJobStatus, VideoRequest,
+    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::Serialize;
 use thiserror::Error;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -127,6 +128,7 @@ pub struct BotRuntime<P, S, M, L, I, V, A, E> {
     events: E,
     background: TaskTracker,
     turn_cancellations: TurnCancellations,
+    video_rate_limit_locks: VideoRateLimitLocks,
     download_http: reqwest::Client,
     config: BotConfig,
     memory_config: memory::MemoryConfig,
@@ -258,6 +260,7 @@ impl<P, S, M, L, I, V, A, E> BotRuntime<P, S, M, L, I, V, A, E> {
             events: parts.events,
             background: TaskTracker::new(),
             turn_cancellations: TurnCancellations::default(),
+            video_rate_limit_locks: VideoRateLimitLocks::default(),
             download_http: reqwest::Client::new(),
             config,
             memory_config: parts.memory,
@@ -1525,6 +1528,7 @@ where
                     ),
                     self.media_store.clone(),
                     self.storage.clone(),
+                    self.video_rate_limit_locks.clone(),
                     turn_id,
                     turn_user.clone(),
                     binding.provider.clone(),
@@ -3479,7 +3483,7 @@ where
             ));
             if let Some(limit) = &binding.rate_limit {
                 out.push_str(&format!(
-                    "- Each non-bypassed platform scope is limited to {} successful video generation{} per {}.\n",
+                    "- Each non-bypassed platform scope is limited to {} active video generation{} per {}.\n",
                     limit.limit,
                     if limit.limit == 1 { "" } else { "s" },
                     limit.interval
@@ -4081,9 +4085,9 @@ trait PersistentVideoStorage: Clone + Send + Sync {
         input: UpdateVideoJob,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    fn count_successful_video_generations(
+    fn count_active_video_generations(
         &self,
-        input: CountSuccessfulVideoGenerations,
+        input: CountActiveVideoGenerations,
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 }
 
@@ -4107,11 +4111,47 @@ where
         BotStorage::update_video_job(self, input)
     }
 
-    fn count_successful_video_generations(
+    fn count_active_video_generations(
         &self,
-        input: CountSuccessfulVideoGenerations,
+        input: CountActiveVideoGenerations,
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
-        BotStorage::count_successful_video_generations(self, input)
+        BotStorage::count_active_video_generations(self, input)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct VideoRateLimitLockKey {
+    platform: PlatformName,
+    scope_id: Option<ExternalId>,
+}
+
+impl VideoRateLimitLockKey {
+    fn from_user(user: &UserRef) -> Self {
+        Self {
+            platform: user.platform.clone(),
+            scope_id: user.guild_id.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct VideoRateLimitLocks {
+    inner: Arc<Mutex<BTreeMap<VideoRateLimitLockKey, Arc<AsyncMutex<()>>>>>,
+}
+
+impl VideoRateLimitLocks {
+    async fn lock(&self, user: &UserRef) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .inner
+                .lock()
+                .expect("video rate limit lock map mutex poisoned");
+            locks
+                .entry(VideoRateLimitLockKey::from_user(user))
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
     }
 }
 
@@ -4120,6 +4160,7 @@ struct PersistentVideoGeneratorTool<G, M, S> {
     generator: G,
     media_store: M,
     storage: S,
+    rate_limit_locks: VideoRateLimitLocks,
     turn_id: TurnId,
     turn_user: UserRef,
     provider: ProviderName,
@@ -4134,6 +4175,7 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
         generator: G,
         media_store: M,
         storage: S,
+        rate_limit_locks: VideoRateLimitLocks,
         turn_id: TurnId,
         turn_user: UserRef,
         provider: ProviderName,
@@ -4143,6 +4185,7 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
             generator,
             media_store,
             storage,
+            rate_limit_locks,
             turn_id,
             turn_user,
             provider,
@@ -4157,6 +4200,69 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
     fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
+    }
+
+    async fn enforce_video_rate_limit(
+        &self,
+        rate_limit: &VideoGenerationRateLimit,
+    ) -> Result<(), BotToolError>
+    where
+        S: PersistentVideoStorage,
+    {
+        let interval_seconds = rate_limit
+            .interval_seconds()
+            .map_err(BotToolError::InvalidInput)?;
+        let used = self
+            .storage
+            .count_active_video_generations(CountActiveVideoGenerations {
+                platform: self.turn_user.platform.clone(),
+                scope_id: self.turn_user.guild_id.clone(),
+                interval_seconds,
+            })
+            .await
+            .map_err(|error| BotToolError::Storage(error.to_string()))?;
+        if used >= u64::from(rate_limit.limit) {
+            tracing::warn!(
+                used,
+                limit = rate_limit.limit,
+                interval = %rate_limit.interval,
+                "video generation rate limit exceeded"
+            );
+            return Err(BotToolError::RateLimit(format!(
+                "video generation rate limit exceeded for this platform scope: {} active video generation{} per {}",
+                rate_limit.limit,
+                if rate_limit.limit == 1 { "" } else { "s" },
+                rate_limit.interval
+            )));
+        }
+        Ok(())
+    }
+
+    async fn submit_and_persist_video_job(
+        &self,
+        request: VideoRequest,
+        prompt: String,
+    ) -> Result<VideoJobId, BotToolError>
+    where
+        G: VideoGenerator,
+        S: PersistentVideoStorage,
+    {
+        let job_id = self
+            .generator
+            .submit_video(request)
+            .await
+            .map_err(|error| BotToolError::Generator(error.to_string()))?;
+        self.storage
+            .create_video_job(CreateVideoJob {
+                turn_id: self.turn_id,
+                provider: self.provider.clone(),
+                provider_job_id: job_id.as_str().to_string(),
+                prompt,
+            })
+            .await
+            .map_err(|error| BotToolError::Storage(error.to_string()))?;
+        tracing::info!(job = %job_id, "video job submitted and persisted");
+        Ok(job_id)
     }
 }
 
@@ -4187,53 +4293,17 @@ where
         )
     )]
     async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
-        if let Some(rate_limit) = &self.rate_limit
-            && !rate_limit.bypasses(&self.turn_user)
-        {
-            let interval_seconds = rate_limit
-                .interval_seconds()
-                .map_err(BotToolError::InvalidInput)?;
-            let used = self
-                .storage
-                .count_successful_video_generations(CountSuccessfulVideoGenerations {
-                    platform: self.turn_user.platform.clone(),
-                    scope_id: self.turn_user.guild_id.clone(),
-                    interval_seconds,
-                })
-                .await
-                .map_err(|error| BotToolError::Storage(error.to_string()))?;
-            if used >= u64::from(rate_limit.limit) {
-                tracing::warn!(
-                    used,
-                    limit = rate_limit.limit,
-                    interval = %rate_limit.interval,
-                    "video generation rate limit exceeded"
-                );
-                return Err(BotToolError::RateLimit(format!(
-                    "video generation rate limit exceeded for this platform scope: {} successful video generation{} per {}",
-                    rate_limit.limit,
-                    if rate_limit.limit == 1 { "" } else { "s" },
-                    rate_limit.interval
-                )));
-            }
-        }
         let request = video_request_from_tool_input(&self.media_store, call.input).await?;
         let prompt = request.prompt.clone();
-        let job_id = self
-            .generator
-            .submit_video(request)
-            .await
-            .map_err(|error| BotToolError::Generator(error.to_string()))?;
-        self.storage
-            .create_video_job(CreateVideoJob {
-                turn_id: self.turn_id,
-                provider: self.provider.clone(),
-                provider_job_id: job_id.as_str().to_string(),
-                prompt,
-            })
-            .await
-            .map_err(|error| BotToolError::Storage(error.to_string()))?;
-        tracing::info!(job = %job_id, "video job submitted and persisted");
+        let job_id = if let Some(rate_limit) = &self.rate_limit
+            && !rate_limit.bypasses(&self.turn_user)
+        {
+            let _guard = self.rate_limit_locks.lock(&self.turn_user).await;
+            self.enforce_video_rate_limit(rate_limit).await?;
+            self.submit_and_persist_video_job(request, prompt).await?
+        } else {
+            self.submit_and_persist_video_job(request, prompt).await?
+        };
 
         for poll in 0..self.max_polls {
             match self
@@ -6295,7 +6365,7 @@ fn is_memory_context_item(item: &chudbot_api::ContextItem) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use chudbot_api::{
@@ -6422,6 +6492,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct CountingVideoGenerator {
         submits: Arc<AtomicUsize>,
+        submit_delay: Duration,
     }
 
     impl VideoGenerator for CountingVideoGenerator {
@@ -6433,8 +6504,11 @@ mod tests {
         }
 
         async fn submit_video(&self, _request: VideoRequest) -> Result<VideoJobId, Self::Error> {
-            self.submits.fetch_add(1, Ordering::SeqCst);
-            Ok(VideoJobId::new("job-1"))
+            let submit = self.submits.fetch_add(1, Ordering::SeqCst) + 1;
+            if !self.submit_delay.is_zero() {
+                tokio::time::sleep(self.submit_delay).await;
+            }
+            Ok(VideoJobId::new(format!("job-{submit}")))
         }
 
         async fn check_video(&self, _job: VideoJobId) -> Result<VideoJobStatus, Self::Error> {
@@ -6452,8 +6526,8 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct VideoRateLimitStorage {
-        count: u64,
-        count_requests: Arc<Mutex<Vec<CountSuccessfulVideoGenerations>>>,
+        count: Arc<AtomicU64>,
+        count_requests: Arc<Mutex<Vec<CountActiveVideoGenerations>>>,
         creates: Arc<AtomicUsize>,
         updates: Arc<AtomicUsize>,
     }
@@ -6461,7 +6535,7 @@ mod tests {
     impl VideoRateLimitStorage {
         fn new(count: u64) -> Self {
             Self {
-                count,
+                count: Arc::new(AtomicU64::new(count)),
                 count_requests: Arc::new(Mutex::new(Vec::new())),
                 creates: Arc::new(AtomicUsize::new(0)),
                 updates: Arc::new(AtomicUsize::new(0)),
@@ -6477,6 +6551,7 @@ mod tests {
             input: CreateVideoJob,
         ) -> Result<StoredVideoJob, Self::Error> {
             self.creates.fetch_add(1, Ordering::SeqCst);
+            self.count.fetch_add(1, Ordering::SeqCst);
             Ok(StoredVideoJob {
                 turn_id: input.turn_id,
                 provider: input.provider,
@@ -6493,12 +6568,12 @@ mod tests {
             Ok(())
         }
 
-        async fn count_successful_video_generations(
+        async fn count_active_video_generations(
             &self,
-            input: CountSuccessfulVideoGenerations,
+            input: CountActiveVideoGenerations,
         ) -> Result<u64, Self::Error> {
             self.count_requests.lock().unwrap().push(input);
-            Ok(self.count)
+            Ok(self.count.load(Ordering::SeqCst))
         }
     }
 
@@ -6513,9 +6588,11 @@ mod tests {
         let tool = PersistentVideoGeneratorTool::new(
             CountingVideoGenerator {
                 submits: submits.clone(),
+                submit_delay: Duration::ZERO,
             },
             NoopMediaStore,
             storage.clone(),
+            VideoRateLimitLocks::default(),
             TurnId::new(),
             user("discord", Some("guild-1"), "user-1"),
             ProviderName::new("grok_video"),
@@ -6536,7 +6613,7 @@ mod tests {
             .expect_err("rate limit should fail the tool call");
 
         assert!(
-            matches!(error, BotToolError::RateLimit(message) if message.contains("2 successful video generations per 4h"))
+            matches!(error, BotToolError::RateLimit(message) if message.contains("2 active video generations per 4h"))
         );
         assert_eq!(submits.load(Ordering::SeqCst), 0);
         assert_eq!(storage.creates.load(Ordering::SeqCst), 0);
@@ -6549,6 +6626,69 @@ mod tests {
             Some("guild-1")
         );
         assert_eq!(requests[0].interval_seconds, 4 * 60 * 60);
+    }
+
+    #[tokio::test]
+    async fn video_rate_limit_counts_pending_jobs_between_parallel_calls() {
+        let submits = Arc::new(AtomicUsize::new(0));
+        let storage = VideoRateLimitStorage::new(0);
+        let rate_limit_locks = VideoRateLimitLocks::default();
+        let rate_limit = Some(VideoGenerationRateLimit {
+            limit: 1,
+            interval: "4h".to_string(),
+            bypass_scopes: Vec::new(),
+        });
+        let generator = CountingVideoGenerator {
+            submits: submits.clone(),
+            submit_delay: Duration::from_millis(50),
+        };
+        let mut first = PersistentVideoGeneratorTool::new(
+            generator.clone(),
+            NoopMediaStore,
+            storage.clone(),
+            rate_limit_locks.clone(),
+            TurnId::new(),
+            user("discord", Some("guild-1"), "user-1"),
+            ProviderName::new("grok_video"),
+            rate_limit.clone(),
+        );
+        first.max_polls = 0;
+        let mut second = PersistentVideoGeneratorTool::new(
+            generator,
+            NoopMediaStore,
+            storage.clone(),
+            rate_limit_locks,
+            TurnId::new(),
+            user("discord", Some("guild-1"), "user-2"),
+            ProviderName::new("grok_video"),
+            rate_limit,
+        );
+        second.max_polls = 0;
+
+        let (first_result, second_result) = tokio::join!(
+            first.call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new("generate_video"),
+                input: json!({ "prompt": "animate this" }),
+            }),
+            second.call(ClientToolCall {
+                id: ToolUseId::new("call-2"),
+                name: ToolName::new("generate_video"),
+                input: json!({ "prompt": "animate that" }),
+            })
+        );
+
+        let results = [&first_result, &second_result];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(BotToolError::RateLimit(_))))
+                .count(),
+            1
+        );
+        assert_eq!(submits.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.creates.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.count_requests.lock().unwrap().len(), 2);
     }
 
     #[test]

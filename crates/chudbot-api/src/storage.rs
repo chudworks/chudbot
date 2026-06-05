@@ -507,10 +507,10 @@ pub struct UpdateVideoJob {
     pub error: Option<String>,
 }
 
-/// Input for counting successful video generations in a rolling window.
+/// Input for counting video generations that consume a rolling-window quota.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CountSuccessfulVideoGenerations {
-    /// Messaging platform whose successful video generations are counted.
+pub struct CountActiveVideoGenerations {
+    /// Messaging platform whose video generations are counted.
     pub platform: PlatformName,
     /// Platform workspace/server scope id. `None` counts unscoped channels for
     /// the platform.
@@ -1077,11 +1077,11 @@ pub trait BotStorage: Send + Sync {
         input: UpdateVideoJob,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
-    /// Count successful video generations for one platform scope in a rolling
-    /// window.
-    fn count_successful_video_generations(
+    /// Count pending and successful video generations for one platform scope in
+    /// a rolling window.
+    fn count_active_video_generations(
         &self,
-        input: CountSuccessfulVideoGenerations,
+        input: CountActiveVideoGenerations,
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
 
     /// Load the current compact memory profile for one user.

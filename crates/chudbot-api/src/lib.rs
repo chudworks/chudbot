@@ -50,7 +50,7 @@ pub use platform::{
 };
 pub use storage::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ContextItem, Conversation,
-    ConversationLookup, ConversationSnapshot, ConversationStop, CountSuccessfulVideoGenerations,
+    ConversationLookup, ConversationSnapshot, ConversationStop, CountActiveVideoGenerations,
     CreateVideoJob, FinishTurn, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
     MemoryTurnWindow, MessageLink, NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision,
     NewUserMemoryEvent, OpenConversation, PrivacyMode, ResolveAgent, RetryTurn, RuntimeSettings,
