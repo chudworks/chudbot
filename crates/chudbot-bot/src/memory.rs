@@ -21,6 +21,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument;
 
 use crate::{LlmProviderRegistry, RoutedLlmBackend};
 
@@ -282,6 +283,14 @@ fn scope_key(guild_id: Option<&str>) -> String {
     guild_id
         .map(|guild| format!("guild:{guild}"))
         .unwrap_or_else(|| "global".to_string())
+}
+
+fn memory_scope_id(scope_key: &str) -> &str {
+    scope_key.strip_prefix("guild:").unwrap_or(scope_key)
+}
+
+fn memory_guild_id(scope_key: &str) -> Option<&str> {
+    scope_key.strip_prefix("guild:")
 }
 
 /// Runtime client tool kind.
@@ -734,6 +743,26 @@ impl<S, L, M> MemoryRuntime<S, L, M> {
     }
 }
 
+fn memory_job_span(job: &UserMemoryJob) -> tracing::Span {
+    let span = tracing::info_span!(
+        "memory.job",
+        job = %job.id,
+        kind = ?job.kind,
+        memory_key = %job.memory_key,
+        message_provider = %job.key.platform,
+        scope_key = %job.key.scope_key,
+        scope_id = %memory_scope_id(&job.key.scope_key),
+        guild_id = tracing::field::Empty,
+        user_id = %job.key.user_key,
+        target_user_id = %job.key.user_key,
+        attempts = job.attempts,
+    );
+    if let Some(guild_id) = memory_guild_id(&job.key.scope_key) {
+        span.record("guild_id", tracing::field::display(guild_id));
+    }
+    span
+}
+
 impl<S, L, M> MemoryRuntime<S, L, M>
 where
     S: BotStorage + Clone + Send + Sync + 'static,
@@ -838,12 +867,16 @@ where
                 };
                 let job = pending.remove(index).expect("pending index exists");
                 active_keys.insert(job.memory_key.clone());
+                let span = memory_job_span(&job);
                 let runtime = (*self).clone();
-                running.spawn(async move {
-                    let memory_key = job.memory_key.clone();
-                    let result = runtime.run_job_with_completion(job).await;
-                    (memory_key, result)
-                });
+                running.spawn(
+                    async move {
+                        let memory_key = job.memory_key.clone();
+                        let result = runtime.run_job_with_completion(job).await;
+                        (memory_key, result)
+                    }
+                    .instrument(span),
+                );
             }
 
             let Some(result) = running.join_next().await else {
@@ -928,6 +961,8 @@ where
             diary_transcript(&job.key, document.as_ref(), &turns, &self.media_store).await;
         let output = self
             .run_memory_model(
+                MEMORY_DIARY_AGENT,
+                &job.key,
                 DIARY_PROMPT,
                 transcript,
                 self.config.max_diary_output_tokens.max(1),
@@ -984,6 +1019,8 @@ where
         let input = compact_input(&job.key, document.as_ref(), &events, &diaries);
         let output = self
             .run_memory_model(
+                MEMORY_COMPACT_AGENT,
+                &job.key,
                 COMPACTOR_PROMPT,
                 Transcript::from_user_text(input),
                 self.config.max_profile_output_tokens.max(1),
@@ -1040,12 +1077,42 @@ where
         Ok(())
     }
 
+    #[tracing::instrument(
+        name = "memory.model_run",
+        skip_all,
+        fields(
+            memory_agent = tracing::field::Empty,
+            message_provider = %key.platform,
+            scope_key = tracing::field::Empty,
+            scope_id = tracing::field::Empty,
+            guild_id = tracing::field::Empty,
+            user_id = tracing::field::Empty,
+            target_user_id = tracing::field::Empty,
+            provider = %self.config.provider,
+            model = MEMORY_MODEL_ID,
+            max_output_tokens,
+        )
+    )]
     async fn run_memory_model(
         &self,
+        agent_name: &'static str,
+        key: &UserMemoryKey,
         instructions: &'static str,
         transcript: Transcript,
         max_output_tokens: u32,
     ) -> Result<MemoryModelOutput, MemoryError> {
+        let span = tracing::Span::current();
+        span.record("memory_agent", agent_name);
+        span.record("user_id", tracing::field::display(&key.user_key));
+        span.record("target_user_id", tracing::field::display(&key.user_key));
+        span.record("scope_key", tracing::field::display(&key.scope_key));
+        span.record(
+            "scope_id",
+            tracing::field::display(memory_scope_id(&key.scope_key)),
+        );
+        if let Some(guild_id) = memory_guild_id(&key.scope_key) {
+            span.record("guild_id", tracing::field::display(guild_id));
+        }
         let agent = AgentSpec::new(instructions)
             .with_limits(AgentLimits::default())
             .into_agent(Model {
