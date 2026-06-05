@@ -180,14 +180,16 @@ impl MemoryConfig {
         default_limits: AgentLimits,
     ) -> SystemAgentConfig {
         if let Some(agent) = agents.get(default_name) {
-            return SystemAgentConfig::from_agent_config(
+            let resolved = SystemAgentConfig::from_agent_config(
                 default_name.to_string(),
                 agent,
                 default_limits,
             );
+            resolved.log_loaded_from_config();
+            return resolved;
         }
 
-        SystemAgentConfig::from_parts(
+        let resolved = SystemAgentConfig::from_parts(
             default_name,
             default_memory_provider(),
             default_prompt,
@@ -204,7 +206,9 @@ impl MemoryConfig {
                 }),
             },
             AgentLimits::default(),
-        )
+        );
+        resolved.log_using_default();
+        resolved
     }
 
     fn lease_duration(&self) -> Duration {

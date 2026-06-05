@@ -2193,7 +2193,10 @@ where
 
     fn configured_system_agent(&self, name: &str) -> Option<SystemAgentConfig> {
         self.config.agents.get(name).map(|agent| {
-            SystemAgentConfig::from_agent_config(name.to_string(), agent, self.config.limits)
+            let resolved =
+                SystemAgentConfig::from_agent_config(name.to_string(), agent, self.config.limits);
+            resolved.log_loaded_from_config();
+            resolved
         })
     }
 
@@ -2203,7 +2206,7 @@ where
         }
 
         let (_, source) = self.config.agent_or_platform_default(None, platform)?;
-        Ok(SystemAgentConfig::from_parts(
+        let resolved = SystemAgentConfig::from_parts(
             TOS_PREFLIGHT_AGENT,
             source.provider.clone(),
             MODERATION_PROMPT,
@@ -2218,7 +2221,9 @@ where
                 provider_options: None,
             },
             source.limits.unwrap_or(self.config.limits),
-        ))
+        );
+        resolved.log_using_default();
+        Ok(resolved)
     }
 
     fn conversation_title_agent(
@@ -2233,7 +2238,7 @@ where
         let (_, source) = self
             .config
             .agent_or_platform_default(Some(source_agent_name), platform)?;
-        Ok(SystemAgentConfig::from_parts(
+        let resolved = SystemAgentConfig::from_parts(
             CONVERSATION_TITLE_AGENT,
             source.provider.clone(),
             TITLE_SYSTEM_PROMPT,
@@ -2248,7 +2253,9 @@ where
                 provider_options: source.model.provider_options.clone(),
             },
             source.limits.unwrap_or(self.config.limits),
-        ))
+        );
+        resolved.log_using_default();
+        Ok(resolved)
     }
 
     async fn moderation_allows(

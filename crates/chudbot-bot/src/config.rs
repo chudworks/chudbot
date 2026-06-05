@@ -411,6 +411,34 @@ impl SystemAgentConfig {
             model,
         }
     }
+
+    pub(crate) fn log_loaded_from_config(&self) {
+        self.log_effective_config("config", "loaded system agent from config");
+    }
+
+    pub(crate) fn log_using_default(&self) {
+        self.log_effective_config("default", "using default system agent");
+    }
+
+    fn log_effective_config(&self, source: &'static str, message: &'static str) {
+        tracing::debug!(
+            system_agent = %self.name,
+            source,
+            provider = %self.provider,
+            model = %self.model.id,
+            model_server_tools = ?self.model.server_tools,
+            agent_server_tools = ?self.spec.server_tools,
+            agent_client_tools = ?self.spec.client_tools,
+            max_iterations = self.spec.limits.max_iterations,
+            max_output_tokens = ?self.model.sampling.max_output_tokens,
+            temperature = ?self.model.sampling.temperature,
+            top_p = ?self.model.sampling.top_p,
+            provider_options = ?self.model.provider_options.as_ref().map(|options| &options.value),
+            system_prompt_chars = self.spec.system_prompt.chars().count(),
+            system_prompt = %self.spec.system_prompt,
+            "{message}"
+        );
+    }
 }
 
 /// Binding from an agent to a media-generation provider and default model.
