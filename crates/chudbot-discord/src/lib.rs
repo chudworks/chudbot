@@ -4,7 +4,6 @@
 //! snowflakes. It converts gateway events and REST actions into the
 //! platform-neutral contracts from `chudbot-api`.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,6 +19,7 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use twilight_cache_inmemory::{DefaultInMemoryCache, ResourceType};
 use twilight_gateway::{EventTypeFlags, Intents, Shard, ShardId, ShardState, StreamExt};
 use twilight_http::Client as HttpClient;
 use twilight_http::request::channel::reaction::RequestReactionType;
@@ -72,16 +72,10 @@ struct DiscordPlatformInner {
     bot_user: UserProfile,
     bot_user_id: Id<UserMarker>,
     application_id: Id<ApplicationMarker>,
-    name_cache: Mutex<DiscordNameCache>,
+    cache: DefaultInMemoryCache,
     ready_emitted: AtomicBool,
     event_flags: EventTypeFlags,
     shutdown: CancellationToken,
-}
-
-#[derive(Debug, Clone, Default)]
-struct DiscordNameCache {
-    guilds: BTreeMap<String, String>,
-    channels: BTreeMap<String, String>,
 }
 
 impl DiscordPlatform {
@@ -121,6 +115,14 @@ impl DiscordPlatform {
             | EventTypeFlags::GUILD_CREATE
             | EventTypeFlags::REACTION_ADD
             | EventTypeFlags::REACTION_REMOVE;
+        let cache = DefaultInMemoryCache::builder()
+            .resource_types(
+                ResourceType::GUILD
+                    | ResourceType::CHANNEL
+                    | ResourceType::USER
+                    | ResourceType::MEMBER,
+            )
+            .build();
 
         Ok(Self {
             inner: Arc::new(DiscordPlatformInner {
@@ -132,7 +134,7 @@ impl DiscordPlatform {
                 bot_user,
                 bot_user_id: current.id,
                 application_id: application.id,
-                name_cache: Mutex::new(DiscordNameCache::default()),
+                cache,
                 ready_emitted: AtomicBool::new(false),
                 event_flags,
                 shutdown: CancellationToken::new(),
@@ -221,6 +223,7 @@ impl DiscordPlatform {
                 }
             };
             reconnect_delay = GATEWAY_RECONNECT_BASE_DELAY;
+            self.inner.cache.update(&event);
             match event {
                 Event::MessageCreate(message) => {
                     let message = message.0;
@@ -282,7 +285,6 @@ impl DiscordPlatform {
                     tracing::trace!("ignoring non-command discord interaction");
                 }
                 Event::GuildCreate(guild) => {
-                    self.update_name_cache(&guild).await;
                     log_guild_create(&guild);
                 }
                 _ => {}
@@ -311,21 +313,6 @@ impl DiscordPlatform {
 
     async fn platform_message(&self, message: Message) -> PlatformMessage {
         platform_message_with_guild(&self.inner.platform, message, None)
-    }
-
-    async fn update_name_cache(&self, event: &GuildCreate) {
-        let GuildCreate::Available(guild) = event else {
-            return;
-        };
-        let mut cache = self.inner.name_cache.lock().await;
-        cache
-            .guilds
-            .insert(guild.id.to_string(), guild.name.clone());
-        for channel in &guild.channels {
-            if let Some(name) = &channel.name {
-                cache.channels.insert(channel.id.to_string(), name.clone());
-            }
-        }
     }
 }
 
@@ -665,8 +652,11 @@ impl MessagePlatform for DiscordPlatform {
         message: &PlatformMessage,
         relationship: PlatformMessageRelationship,
     ) -> Result<serde_json::Value, Self::Error> {
-        let cache = self.inner.name_cache.lock().await.clone();
-        Ok(discord_message_context_json(message, relationship, &cache))
+        Ok(discord_message_context_json(
+            message,
+            relationship,
+            &self.inner.cache,
+        ))
     }
 
     async fn parent_channel(&self, channel: ChannelRef) -> Result<ChannelRef, Self::Error> {
@@ -783,25 +773,25 @@ fn platform_message_with_guild(
 fn discord_message_context_json(
     message: &PlatformMessage,
     relationship: PlatformMessageRelationship,
-    cache: &DiscordNameCache,
+    cache: &DefaultInMemoryCache,
 ) -> serde_json::Value {
+    let author = cached_user_context(cache, &message.author.id);
+    let guild_name = message
+        .id
+        .guild_id
+        .as_ref()
+        .and_then(|guild| cached_guild_name(cache, guild));
     serde_json::json!({
         "type": "discord_message",
         "relationship": discord_message_relationship(relationship),
         "platform": message.id.platform.as_str(),
         "guild": discord_entity_json(
             message.id.guild_id.as_ref(),
-            message.id
-                .guild_id
-                .as_ref()
-                .and_then(|guild| cache.guilds.get(guild.as_str()).map(String::as_str)),
+            guild_name.as_deref(),
         ),
         "channel": {
             "id": message.id.channel_id.as_str(),
-            "name": cache
-                .channels
-                .get(message.id.channel_id.as_str())
-                .map(String::as_str),
+            "name": cached_channel_name(cache, &message.id.channel_id),
         },
         "message": {
             "id": message.id.message_id.as_str(),
@@ -810,8 +800,12 @@ fn discord_message_context_json(
         "author": {
             "id": message.author.id.user_id.as_str(),
             "username": message.author.username.as_str(),
-            "global_name": message.author.name.as_deref(),
-            "guild_display_name": message.author.display_name.as_deref(),
+            "global_name": message.author.name.as_deref().or(author.global_name.as_deref()),
+            "guild_display_name": message
+                .author
+                .display_name
+                .as_deref()
+                .or(author.guild_display_name.as_deref()),
             "is_bot": message.author.is_bot,
         },
         "mentioned_users": message.mentions.iter().map(|mention| {
@@ -820,13 +814,20 @@ fn discord_message_context_json(
                     && profile.id.guild_id == mention.guild_id
                     && profile.id.user_id == mention.user_id
             });
+            let cached = cached_user_context(cache, mention);
             serde_json::json!({
                 "id": mention.user_id.as_str(),
                 "mention": format!("<@{}>", mention.user_id.as_str()),
-                "username": profile.map(|profile| profile.username.as_str()),
-                "global_name": profile.and_then(|profile| profile.name.as_deref()),
-                "guild_display_name": profile.and_then(|profile| profile.display_name.as_deref()),
-                "is_bot": profile.map(|profile| profile.is_bot),
+                "username": profile
+                    .map(|profile| profile.username.as_str())
+                    .or(cached.username.as_deref()),
+                "global_name": profile
+                    .and_then(|profile| profile.name.as_deref())
+                    .or(cached.global_name.as_deref()),
+                "guild_display_name": profile
+                    .and_then(|profile| profile.display_name.as_deref())
+                    .or(cached.guild_display_name.as_deref()),
+                "is_bot": profile.map(|profile| profile.is_bot).or(cached.is_bot),
             })
         }).collect::<Vec<_>>(),
         "content": message.content.as_str(),
@@ -842,6 +843,51 @@ fn discord_message_context_json(
             })
         }).collect::<Vec<_>>(),
     })
+}
+
+#[derive(Debug, Default)]
+struct CachedUserContext {
+    username: Option<String>,
+    global_name: Option<String>,
+    guild_display_name: Option<String>,
+    is_bot: Option<bool>,
+}
+
+fn cached_guild_name(cache: &DefaultInMemoryCache, guild: &ExternalId) -> Option<String> {
+    let guild = parse_guild_id(guild).ok()?;
+    cache.guild(guild).map(|guild| guild.name().to_string())
+}
+
+fn cached_channel_name(cache: &DefaultInMemoryCache, channel: &ExternalId) -> Option<String> {
+    let channel = parse_channel_id(channel).ok()?;
+    cache
+        .channel(channel)
+        .and_then(|channel| channel.name.as_deref().map(str::to_string))
+}
+
+fn cached_user_context(cache: &DefaultInMemoryCache, user: &UserRef) -> CachedUserContext {
+    let user_id = parse_user_id(&user.user_id).ok();
+    let guild_id = user
+        .guild_id
+        .as_ref()
+        .and_then(|guild| parse_guild_id(guild).ok());
+    let mut context = CachedUserContext::default();
+
+    if let (Some(guild_id), Some(user_id)) = (guild_id, user_id)
+        && let Some(member) = cache.member(guild_id, user_id)
+    {
+        context.guild_display_name = member.nick().map(str::to_string);
+    }
+
+    if let Some(user_id) = user_id
+        && let Some(user) = cache.user(user_id)
+    {
+        context.username = Some(user.name.clone());
+        context.global_name.clone_from(&user.global_name);
+        context.is_bot = Some(user.bot);
+    }
+
+    context
 }
 
 fn discord_message_relationship(relationship: PlatformMessageRelationship) -> &'static str {
@@ -1518,6 +1564,10 @@ fn parse_guild_id(id: &ExternalId) -> Result<Id<GuildMarker>, DiscordError> {
     parse_id("guild", id)
 }
 
+fn parse_user_id(id: &ExternalId) -> Result<Id<UserMarker>, DiscordError> {
+    parse_id("user", id)
+}
+
 fn parse_interaction_id(id: &ExternalId) -> Result<Id<InteractionMarker>, DiscordError> {
     parse_id("interaction", id)
 }
@@ -1563,13 +1613,15 @@ mod tests {
         PlatformMessageRelationship, PlatformName, ReactionKind, UserProfile, UserRef,
     };
     use time::OffsetDateTime;
+    use twilight_cache_inmemory::{DefaultInMemoryCache, ResourceType};
     use twilight_model::channel::message::{
         EmojiReactionType, MessageReference, MessageReferenceType,
     };
+    use twilight_model::gateway::payload::incoming::{ChannelUpdate, GuildCreate};
     use twilight_model::id::Id;
 
     use super::{
-        DISCORD_MESSAGE_LIMIT, DiscordError, DiscordNameCache, GATEWAY_RECONNECT_MAX_DELAY,
+        DISCORD_MESSAGE_LIMIT, DiscordError, GATEWAY_RECONNECT_MAX_DELAY,
         discord_message_context_json, message_ref_from_reference, next_reconnect_delay,
         parse_channel_id, reaction_kind, split_discord_content,
     };
@@ -1710,13 +1762,7 @@ mod tests {
         let platform = PlatformName::new("discord");
         let guild = ExternalId::new("222");
         let channel = ExternalId::new("111");
-        let mut cache = DiscordNameCache::default();
-        cache
-            .guilds
-            .insert(guild.as_str().to_string(), "Test Guild".to_string());
-        cache
-            .channels
-            .insert(channel.as_str().to_string(), "general".to_string());
+        let cache = discord_context_test_cache();
         let message = PlatformMessage {
             id: MessageRef {
                 platform: platform.clone(),
@@ -1793,6 +1839,45 @@ mod tests {
             value["mentioned_users"][0]["guild_display_name"].as_str(),
             Some("Troll")
         );
+    }
+
+    fn discord_context_test_cache() -> DefaultInMemoryCache {
+        let cache = DefaultInMemoryCache::builder()
+            .resource_types(
+                ResourceType::GUILD
+                    | ResourceType::CHANNEL
+                    | ResourceType::USER
+                    | ResourceType::MEMBER,
+            )
+            .build();
+        let guild: GuildCreate = serde_json::from_value(serde_json::json!({
+            "id": "222",
+            "afk_timeout": 900,
+            "default_message_notifications": 1,
+            "explicit_content_filter": 0,
+            "features": [],
+            "mfa_level": 0,
+            "name": "Test Guild",
+            "nsfw_level": 0,
+            "owner_id": "444",
+            "preferred_locale": "en-US",
+            "premium_progress_bar_enabled": false,
+            "roles": [],
+            "system_channel_flags": 0,
+            "verification_level": 0
+        }))
+        .expect("minimal guild create payload should deserialize");
+        let channel: ChannelUpdate = serde_json::from_value(serde_json::json!({
+            "id": "111",
+            "guild_id": "222",
+            "type": 0,
+            "name": "general"
+        }))
+        .expect("minimal channel update payload should deserialize");
+
+        cache.update(&guild);
+        cache.update(&channel);
+        cache
     }
 
     #[test]

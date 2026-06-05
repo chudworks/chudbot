@@ -16,6 +16,9 @@ tracing.workspace = true
 [dependencies.twilight-gateway]
 version = "0.17"
 
+[dependencies.twilight-cache-inmemory]
+version = "0.17"
+
 [dependencies.twilight-http]
 version = "0.17"
 
