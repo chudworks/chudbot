@@ -33,23 +33,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chudbot_api::{
-    Agent, AgentBuilder, AgentOutcome, AgentSelection, AgentSpec, AttachmentRef, AudioTranscriber,
-    AudioTranscription, AudioTranscriptionRequest, BeginTurn, BotStorage, ChannelLink, ChannelRef,
-    ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,
-    ClientToolSpec, ClientToolTrace, ContentBlock, Conversation, ConversationEventKind,
-    ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
-    CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink, ExternalId, FetchMessages,
-    FinishTurn, ImageGeneratorTool, LiveEvent, MediaCategory, MediaRef, MediaStore, MediaUri,
-    MessageLink, MessageRef, Model, ModelId, ModelSpec, ModelStep, OpenConversation,
-    OutgoingAttachment, PlatformCommand, PlatformCommandDefinition, PlatformCommandInput,
-    PlatformCommandOption, PlatformCommandOptionChoice, PlatformCommandOptionKind,
-    PlatformCommandResponse, PlatformCommandValue, PlatformEvent, PlatformMessage,
-    PlatformMessageReference, PlatformMessageRelationship, PlatformName, PlatformReaction,
-    PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions,
-    SaveTurnInput, SendMessage, StoredVideoJob, Subagent, ThreadRequest, ToolInputSchema, ToolName,
-    ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole,
-    TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator,
-    VideoJobId, VideoJobStatus, VideoRequest,
+    Agent, AgentBuilder, AgentLimits, AgentOutcome, AgentSelection, AgentSpec, AttachmentRef,
+    AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, BeginTurn, BotStorage,
+    ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult,
+    ClientToolResultContent, ClientToolSpec, ClientToolTrace, ContentBlock, Conversation,
+    ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
+    ConversationStop, CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink,
+    ExternalId, FetchMessages, FinishTurn, ImageGeneratorTool, LiveEvent, MediaCategory, MediaRef,
+    MediaStore, MediaUri, MessageLink, MessageRef, Model, ModelId, ModelSpec, ModelStep,
+    OpenConversation, OutgoingAttachment, PlatformCommand, PlatformCommandDefinition,
+    PlatformCommandInput, PlatformCommandOption, PlatformCommandOptionChoice,
+    PlatformCommandOptionKind, PlatformCommandResponse, PlatformCommandValue, PlatformEvent,
+    PlatformMessage, PlatformMessageReference, PlatformMessageRelationship, PlatformName,
+    PlatformReaction, PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings,
+    SamplingOptions, SaveTurnInput, SendMessage, StoredVideoJob, Subagent, ThreadRequest,
+    ToolInputSchema, ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset,
+    TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef,
+    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -134,6 +134,7 @@ pub struct BotRuntime<P, S, M, L, I, V, A, E> {
     download_http: reqwest::Client,
     config: BotConfig,
     memory_config: memory::MemoryConfig,
+    system_agents: RuntimeSystemAgents,
 }
 
 /// Runtime service implementations supplied by the binary crate.
@@ -157,6 +158,205 @@ pub struct BotRuntimeParts<P, S, M, L, I, V, A, E> {
     pub events: E,
     /// User-memory runtime configuration.
     pub memory: memory::MemoryConfig,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeSystemAgents {
+    tos_preflight: TosPreflightSystemAgents,
+    conversation_title: ConversationTitleSystemAgents,
+}
+
+impl RuntimeSystemAgents {
+    fn from_config(config: &BotConfig) -> Self {
+        Self {
+            tos_preflight: TosPreflightSystemAgents::from_config(config),
+            conversation_title: ConversationTitleSystemAgents::from_config(config),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TosPreflightSystemAgents {
+    configured: Option<SystemAgentConfig>,
+    platform_defaults: BTreeMap<PlatformName, SystemAgentConfig>,
+    default: Option<SystemAgentConfig>,
+}
+
+impl TosPreflightSystemAgents {
+    fn from_config(config: &BotConfig) -> Self {
+        if let Some(configured) = configured_system_agent(config, TOS_PREFLIGHT_AGENT) {
+            return Self {
+                configured: Some(configured),
+                platform_defaults: BTreeMap::new(),
+                default: None,
+            };
+        }
+
+        let default = config.agents.get(&config.default_agent).map(|source| {
+            let resolved = default_tos_preflight_agent(source, config.limits);
+            resolved.log_using_default_inherited(&config.default_agent, None);
+            resolved
+        });
+        let mut platform_defaults = BTreeMap::new();
+        for (platform, binding) in &config.platforms {
+            if binding.agent == config.default_agent {
+                continue;
+            }
+            let Some(source) = config.agents.get(&binding.agent) else {
+                tracing::warn!(
+                    system_agent = TOS_PREFLIGHT_AGENT,
+                    platform = %platform,
+                    inherited_agent = %binding.agent,
+                    "platform default agent is missing while resolving system agent"
+                );
+                continue;
+            };
+            let resolved = default_tos_preflight_agent(source, config.limits);
+            resolved.log_using_default_inherited(&binding.agent, Some(platform));
+            platform_defaults.insert(platform.clone(), resolved);
+        }
+
+        Self {
+            configured: None,
+            platform_defaults,
+            default,
+        }
+    }
+
+    fn get(
+        &self,
+        platform: &PlatformName,
+        fallback_agent: &str,
+    ) -> Result<&SystemAgentConfig, BotError> {
+        if let Some(configured) = &self.configured {
+            return Ok(configured);
+        }
+        self.platform_defaults
+            .get(platform)
+            .or(self.default.as_ref())
+            .ok_or_else(|| BotError::MissingAgent {
+                name: fallback_agent.to_string(),
+            })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ConversationTitleSystemAgents {
+    configured: Option<SystemAgentConfig>,
+    agent_defaults: BTreeMap<String, SystemAgentConfig>,
+    platform_defaults: BTreeMap<PlatformName, SystemAgentConfig>,
+    default: Option<SystemAgentConfig>,
+}
+
+impl ConversationTitleSystemAgents {
+    fn from_config(config: &BotConfig) -> Self {
+        if let Some(configured) = configured_system_agent(config, CONVERSATION_TITLE_AGENT) {
+            return Self {
+                configured: Some(configured),
+                agent_defaults: BTreeMap::new(),
+                platform_defaults: BTreeMap::new(),
+                default: None,
+            };
+        }
+
+        let mut agent_defaults = BTreeMap::new();
+        for (agent_name, source) in &config.agents {
+            let resolved = default_conversation_title_agent(source, config.limits);
+            resolved.log_using_default_inherited(agent_name, None);
+            agent_defaults.insert(agent_name.clone(), resolved);
+        }
+        let default = agent_defaults.get(&config.default_agent).cloned();
+        let mut platform_defaults = BTreeMap::new();
+        for (platform, binding) in &config.platforms {
+            let Some(resolved) = agent_defaults.get(&binding.agent) else {
+                tracing::warn!(
+                    system_agent = CONVERSATION_TITLE_AGENT,
+                    platform = %platform,
+                    inherited_agent = %binding.agent,
+                    "platform default agent is missing while resolving system agent"
+                );
+                continue;
+            };
+            platform_defaults.insert(platform.clone(), resolved.clone());
+        }
+
+        Self {
+            configured: None,
+            agent_defaults,
+            platform_defaults,
+            default,
+        }
+    }
+
+    fn get(
+        &self,
+        source_agent_name: &str,
+        platform: &PlatformName,
+        fallback_agent: &str,
+    ) -> Result<&SystemAgentConfig, BotError> {
+        if let Some(configured) = &self.configured {
+            return Ok(configured);
+        }
+        self.agent_defaults
+            .get(source_agent_name)
+            .or_else(|| self.platform_defaults.get(platform))
+            .or(self.default.as_ref())
+            .ok_or_else(|| BotError::MissingAgent {
+                name: fallback_agent.to_string(),
+            })
+    }
+}
+
+fn configured_system_agent(config: &BotConfig, name: &str) -> Option<SystemAgentConfig> {
+    config.agents.get(name).map(|agent| {
+        let resolved = SystemAgentConfig::from_agent_config(name.to_string(), agent, config.limits);
+        resolved.log_loaded_from_config();
+        resolved
+    })
+}
+
+fn default_tos_preflight_agent(
+    source: &AgentConfig,
+    default_limits: AgentLimits,
+) -> SystemAgentConfig {
+    SystemAgentConfig::from_parts(
+        TOS_PREFLIGHT_AGENT,
+        source.provider.clone(),
+        MODERATION_PROMPT,
+        ModelSpec {
+            id: source.model.id.clone(),
+            server_tools: Default::default(),
+            sampling: SamplingOptions {
+                max_output_tokens: Some(8),
+                temperature: Some(0.0),
+                top_p: None,
+            },
+            provider_options: None,
+        },
+        source.limits.unwrap_or(default_limits),
+    )
+}
+
+fn default_conversation_title_agent(
+    source: &AgentConfig,
+    default_limits: AgentLimits,
+) -> SystemAgentConfig {
+    SystemAgentConfig::from_parts(
+        CONVERSATION_TITLE_AGENT,
+        source.provider.clone(),
+        TITLE_SYSTEM_PROMPT,
+        ModelSpec {
+            id: source.model.id.clone(),
+            server_tools: Default::default(),
+            sampling: SamplingOptions {
+                max_output_tokens: Some(TITLE_MAX_TOKENS),
+                temperature: Some(0.3),
+                top_p: None,
+            },
+            provider_options: source.model.provider_options.clone(),
+        },
+        source.limits.unwrap_or(default_limits),
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -251,6 +451,7 @@ impl<P, S, M, L, I, V, A, E> BotRuntime<P, S, M, L, I, V, A, E> {
             default_agent = %config.default_agent,
             "constructing bot runtime"
         );
+        let system_agents = RuntimeSystemAgents::from_config(&config);
         Self {
             platforms: parts.platforms,
             storage: parts.storage,
@@ -266,6 +467,7 @@ impl<P, S, M, L, I, V, A, E> BotRuntime<P, S, M, L, I, V, A, E> {
             download_http: reqwest::Client::new(),
             config,
             memory_config: parts.memory,
+            system_agents,
         }
     }
 
@@ -2191,71 +2393,22 @@ where
         }
     }
 
-    fn configured_system_agent(&self, name: &str) -> Option<SystemAgentConfig> {
-        self.config.agents.get(name).map(|agent| {
-            let resolved =
-                SystemAgentConfig::from_agent_config(name.to_string(), agent, self.config.limits);
-            resolved.log_loaded_from_config();
-            resolved
-        })
-    }
-
-    fn tos_preflight_agent(&self, platform: &PlatformName) -> Result<SystemAgentConfig, BotError> {
-        if let Some(agent) = self.configured_system_agent(TOS_PREFLIGHT_AGENT) {
-            return Ok(agent);
-        }
-
-        let (_, source) = self.config.agent_or_platform_default(None, platform)?;
-        let resolved = SystemAgentConfig::from_parts(
-            TOS_PREFLIGHT_AGENT,
-            source.provider.clone(),
-            MODERATION_PROMPT,
-            ModelSpec {
-                id: source.model.id.clone(),
-                server_tools: Default::default(),
-                sampling: SamplingOptions {
-                    max_output_tokens: Some(8),
-                    temperature: Some(0.0),
-                    top_p: None,
-                },
-                provider_options: None,
-            },
-            source.limits.unwrap_or(self.config.limits),
-        );
-        resolved.log_using_default();
-        Ok(resolved)
+    fn tos_preflight_agent(&self, platform: &PlatformName) -> Result<&SystemAgentConfig, BotError> {
+        self.system_agents
+            .tos_preflight
+            .get(platform, &self.config.default_agent)
     }
 
     fn conversation_title_agent(
         &self,
         source_agent_name: &str,
         platform: &PlatformName,
-    ) -> Result<SystemAgentConfig, BotError> {
-        if let Some(agent) = self.configured_system_agent(CONVERSATION_TITLE_AGENT) {
-            return Ok(agent);
-        }
-
-        let (_, source) = self
-            .config
-            .agent_or_platform_default(Some(source_agent_name), platform)?;
-        let resolved = SystemAgentConfig::from_parts(
-            CONVERSATION_TITLE_AGENT,
-            source.provider.clone(),
-            TITLE_SYSTEM_PROMPT,
-            ModelSpec {
-                id: source.model.id.clone(),
-                server_tools: Default::default(),
-                sampling: SamplingOptions {
-                    max_output_tokens: Some(TITLE_MAX_TOKENS),
-                    temperature: Some(0.3),
-                    top_p: None,
-                },
-                provider_options: source.model.provider_options.clone(),
-            },
-            source.limits.unwrap_or(self.config.limits),
-        );
-        resolved.log_using_default();
-        Ok(resolved)
+    ) -> Result<&SystemAgentConfig, BotError> {
+        self.system_agents.conversation_title.get(
+            source_agent_name,
+            platform,
+            &self.config.default_agent,
+        )
     }
 
     async fn moderation_allows(
@@ -6417,6 +6570,7 @@ fn is_memory_context_item(item: &chudbot_api::ContextItem) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -6514,6 +6668,51 @@ mod tests {
                 }),
                 usage: Vec::new(),
             },
+        }
+    }
+
+    fn test_model_spec(model: &str) -> ModelSpec {
+        ModelSpec {
+            id: ModelId::new(model),
+            server_tools: Default::default(),
+            sampling: SamplingOptions::default(),
+            provider_options: None,
+        }
+    }
+
+    fn test_agent_config(provider: &str, model: &str) -> AgentConfig {
+        AgentConfig {
+            provider: ProviderName::new(provider),
+            system_prompt: "test prompt".to_string(),
+            model: test_model_spec(model),
+            server_tools: None,
+            client_tools: None,
+            limits: None,
+            image_generation: None,
+            video_generation: None,
+            audio_transcription: None,
+            memory: false,
+            subagents: BTreeMap::new(),
+        }
+    }
+
+    fn test_bot_config() -> BotConfig {
+        let mut agents = BTreeMap::new();
+        agents.insert(
+            "assistant".to_string(),
+            test_agent_config("default_provider", "default_model"),
+        );
+        BotConfig {
+            web_base_url: "http://localhost:3000".to_string(),
+            default_agent: "assistant".to_string(),
+            agents,
+            admins: Vec::new(),
+            platforms: BTreeMap::new(),
+            extra_system_prompt: None,
+            version: String::new(),
+            limits: AgentLimits::default(),
+            thread_threshold_chars: DEFAULT_THREAD_THRESHOLD_CHARS,
+            thread_threshold_lines: DEFAULT_THREAD_THRESHOLD_LINES,
         }
     }
 
@@ -6779,6 +6978,85 @@ mod tests {
                 .expect_err("zero limit should be rejected");
 
         assert!(error.to_string().contains("must be greater than zero"));
+    }
+
+    #[test]
+    fn configured_system_agents_override_inherited_defaults() {
+        let mut config = test_bot_config();
+        config.agents.insert(
+            TOS_PREFLIGHT_AGENT.to_string(),
+            test_agent_config("tos_provider", "tos_model"),
+        );
+        config.agents.insert(
+            CONVERSATION_TITLE_AGENT.to_string(),
+            test_agent_config("title_provider", "title_model"),
+        );
+
+        let system_agents = RuntimeSystemAgents::from_config(&config);
+        let platform = PlatformName::new("discord");
+        let tos = system_agents
+            .tos_preflight
+            .get(&platform, &config.default_agent)
+            .expect("configured tos agent");
+        let title = system_agents
+            .conversation_title
+            .get("assistant", &platform, &config.default_agent)
+            .expect("configured title agent");
+
+        assert_eq!(tos.provider, ProviderName::new("tos_provider"));
+        assert_eq!(tos.model.id, ModelId::new("tos_model"));
+        assert_eq!(title.provider, ProviderName::new("title_provider"));
+        assert_eq!(title.model.id, ModelId::new("title_model"));
+        assert!(system_agents.tos_preflight.platform_defaults.is_empty());
+        assert!(system_agents.conversation_title.agent_defaults.is_empty());
+    }
+
+    #[test]
+    fn default_system_agents_preserve_active_agent_inheritance() {
+        let mut config = test_bot_config();
+        config.agents.insert(
+            "research".to_string(),
+            test_agent_config("research_provider", "research_model"),
+        );
+        config.platforms.insert(
+            PlatformName::new("discord"),
+            PlatformBinding {
+                agent: "research".to_string(),
+            },
+        );
+
+        let system_agents = RuntimeSystemAgents::from_config(&config);
+        let discord = PlatformName::new("discord");
+        let slack = PlatformName::new("slack");
+        let tos_discord = system_agents
+            .tos_preflight
+            .get(&discord, &config.default_agent)
+            .expect("platform inherited tos agent");
+        let tos_slack = system_agents
+            .tos_preflight
+            .get(&slack, &config.default_agent)
+            .expect("global inherited tos agent");
+        let title_source_agent = system_agents
+            .conversation_title
+            .get("assistant", &discord, &config.default_agent)
+            .expect("source inherited title agent");
+        let title_platform_fallback = system_agents
+            .conversation_title
+            .get("missing", &discord, &config.default_agent)
+            .expect("platform inherited title agent");
+
+        assert_eq!(tos_discord.provider, ProviderName::new("research_provider"));
+        assert_eq!(tos_discord.model.id, ModelId::new("research_model"));
+        assert_eq!(tos_slack.provider, ProviderName::new("default_provider"));
+        assert_eq!(tos_slack.model.id, ModelId::new("default_model"));
+        assert_eq!(
+            title_source_agent.provider,
+            ProviderName::new("default_provider")
+        );
+        assert_eq!(
+            title_platform_fallback.provider,
+            ProviderName::new("research_provider")
+        );
     }
 
     #[test]

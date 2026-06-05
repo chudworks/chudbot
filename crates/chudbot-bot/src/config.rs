@@ -420,6 +420,32 @@ impl SystemAgentConfig {
         self.log_effective_config("default", "using default system agent");
     }
 
+    pub(crate) fn log_using_default_inherited(
+        &self,
+        inherited_agent: &str,
+        inherited_platform: Option<&PlatformName>,
+    ) {
+        tracing::debug!(
+            system_agent = %self.name,
+            source = "default",
+            inherited_agent,
+            inherited_platform = ?inherited_platform,
+            provider = %self.provider,
+            model = %self.model.id,
+            model_server_tools = ?self.model.server_tools,
+            agent_server_tools = ?self.spec.server_tools,
+            agent_client_tools = ?self.spec.client_tools,
+            max_iterations = self.spec.limits.max_iterations,
+            max_output_tokens = ?self.model.sampling.max_output_tokens,
+            temperature = ?self.model.sampling.temperature,
+            top_p = ?self.model.sampling.top_p,
+            provider_options = ?self.model.provider_options.as_ref().map(|options| &options.value),
+            system_prompt_chars = self.spec.system_prompt.chars().count(),
+            system_prompt = %self.spec.system_prompt,
+            "using default system agent inherited from agent"
+        );
+    }
+
     fn log_effective_config(&self, source: &'static str, message: &'static str) {
         tracing::debug!(
             system_agent = %self.name,
