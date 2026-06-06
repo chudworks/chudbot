@@ -75,6 +75,14 @@ const ERROR_REACTION: &str = "❌";
 const RETRY_REACTION: &str = "🔄";
 const STOP_REACTION: &str = "🛑";
 const REFUSED_REACTION: &str = "❓";
+const RESERVED_TOOL_REACTIONS: &[&str] = &[
+    WORKING_REACTION,
+    SUCCESS_REACTION,
+    ERROR_REACTION,
+    RETRY_REACTION,
+    STOP_REACTION,
+    REFUSED_REACTION,
+];
 const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 // Discord's default per-file upload limit is 10 MiB; larger generated media is
@@ -4998,6 +5006,9 @@ enum BotToolError {
 fn reaction_emoji_from_tool_input(input: &serde_json::Value) -> Result<String, BotToolError> {
     let emoji = tool_required_string(input, "emoji")?;
     validate_reaction_emoji(&emoji)?;
+    if is_reserved_tool_reaction(&emoji) {
+        return Err(reserved_reaction_emoji());
+    }
     Ok(emoji)
 }
 
@@ -5082,6 +5093,16 @@ fn invalid_reaction_emoji() -> BotToolError {
         "`emoji` must be exactly one standard Unicode emoji; text, shortcodes, custom emoji, and multiple emoji are not allowed"
             .to_string(),
     )
+}
+
+fn reserved_reaction_emoji() -> BotToolError {
+    BotToolError::InvalidInput(
+        "`emoji` is reserved for Chudbot system status/control reactions".to_string(),
+    )
+}
+
+fn is_reserved_tool_reaction(emoji: &str) -> bool {
+    RESERVED_TOOL_REACTIONS.contains(&emoji)
 }
 
 fn is_keycap_emoji(emoji: &str) -> bool {
@@ -7166,6 +7187,21 @@ mod tests {
         assert!(matches!(error, BotToolError::InvalidInput(_)));
     }
 
+    #[test_case("👀" ; "working")]
+    #[test_case("✅" ; "success")]
+    #[test_case("❌" ; "error")]
+    #[test_case("🔄" ; "retry")]
+    #[test_case("🛑" ; "stop")]
+    #[test_case("❓" ; "refused")]
+    fn reaction_tool_input_rejects_reserved_system_reactions(input: &str) {
+        let error = reaction_emoji_from_tool_input(&json!({ "emoji": input }))
+            .expect_err("reserved reaction should be rejected");
+
+        assert!(
+            matches!(error, BotToolError::InvalidInput(message) if message.contains("reserved"))
+        );
+    }
+
     #[tokio::test]
     async fn add_reaction_tool_reacts_to_current_user_message() {
         let platform = ReactionRecordingPlatform::default();
@@ -7214,6 +7250,29 @@ mod tests {
             .expect_err("text should be rejected");
 
         assert!(matches!(error, BotToolError::InvalidInput(_)));
+        assert!(platform.reactions.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_reaction_tool_rejects_reserved_reaction_without_platform_call() {
+        let platform = ReactionRecordingPlatform::default();
+        let tool = AddReactionTool {
+            platforms: platform.clone(),
+            message: message_ref("user-message-1"),
+        };
+
+        let error = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(ADD_REACTION_TOOL),
+                input: json!({ "emoji": "✅" }),
+            })
+            .await
+            .expect_err("reserved reaction should be rejected");
+
+        assert!(
+            matches!(error, BotToolError::InvalidInput(message) if message.contains("reserved"))
+        );
         assert!(platform.reactions.lock().unwrap().is_empty());
     }
 
