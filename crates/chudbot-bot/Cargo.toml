@@ -14,6 +14,7 @@ time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+unicode-properties.workspace = true
 
 [dev-dependencies]
 test-case.workspace = true

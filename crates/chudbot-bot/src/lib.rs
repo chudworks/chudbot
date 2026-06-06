@@ -57,12 +57,18 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+use unicode_properties::UnicodeEmoji;
+use unicode_properties::emoji::{
+    is_emoji_presentation_selector, is_regional_indicator, is_tag_character,
+    is_text_presentation_selector, is_zwj,
+};
 
 const FETCH_MESSAGES_TOOL: &str = "fetch_messages";
 const GENERATE_IMAGE_TOOL: &str = "generate_image";
 const GENERATE_VIDEO_TOOL: &str = "generate_video";
 const TRANSCRIBE_AUDIO_TOOL: &str = "transcribe_audio";
 const POST_STATUS_TOOL: &str = "post_status_message";
+const ADD_REACTION_TOOL: &str = "add_reaction";
 const WORKING_REACTION: &str = "👀";
 const SUCCESS_REACTION: &str = "✅";
 const ERROR_REACTION: &str = "❌";
@@ -83,6 +89,7 @@ const CONVERSATION_TITLE_AGENT: &str = "conversation_title";
 const DEFAULT_THREAD_THRESHOLD_CHARS: usize = 1500;
 const DEFAULT_THREAD_THRESHOLD_LINES: usize = 20;
 const THREAD_REPLY_WRAP_WIDTH: usize = 80;
+const MAX_REACTION_EMOJI_SCALARS: usize = 32;
 const MODEL_TRANSCRIPT_IMAGE_MIME_TYPES: &[&str] = &[
     "image/jpeg",
     "image/jpg",
@@ -1685,6 +1692,14 @@ where
                     reply_to: reply_to.clone(),
                     conversation_id,
                     turn_id,
+                },
+            });
+            tracing::debug!(tool = ADD_REACTION_TOOL, "attaching runtime tool");
+            tools.push(RuntimeTool::Reaction {
+                name: ToolName::new(ADD_REACTION_TOOL),
+                tool: AddReactionTool {
+                    platforms: self.platforms.clone(),
+                    message: reply_to.clone(),
                 },
             });
         }
@@ -3701,6 +3716,7 @@ where
         }
         out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, file:// URIs, filenames, or markdown media links in user-facing text.\n");
         out.push_str("- Slow work (video generation, subagent calls, research) SHOULD be narrated with calls to the post_status_message tool.\n");
+        out.push_str("- A subtle Unicode emoji reaction can be added to the user's current message with add_reaction when a compact nonverbal acknowledgement, mood, or topic cue is helpful; use it sparingly and never instead of answering.\n");
         if include_memory {
             out.push_str(memory::prompt_guidance());
         }
@@ -4106,6 +4122,10 @@ where
         name: ToolName,
         tool: PostStatusTool<P, S>,
     },
+    Reaction {
+        name: ToolName,
+        tool: AddReactionTool<P>,
+    },
     Image {
         name: ToolName,
         tool: ImageGeneratorTool<RoutedImageGenerator<I>, M>,
@@ -4142,6 +4162,7 @@ where
         match self {
             Self::Fetch { name, tool } => spec.with_tool(name, tool),
             Self::Status { name, tool } => spec.with_tool(name, tool),
+            Self::Reaction { name, tool } => spec.with_tool(name, tool),
             Self::Image { name, tool } => spec.with_tool(name, tool),
             Self::Video { name, tool } => spec.with_tool(name, tool),
             Self::Audio { name, tool } => spec.with_tool(name, tool),
@@ -4154,6 +4175,7 @@ where
         match self {
             Self::Fetch { name, tool } => builder.with_tool(name, tool),
             Self::Status { name, tool } => builder.with_tool(name, tool),
+            Self::Reaction { name, tool } => builder.with_tool(name, tool),
             Self::Image { name, tool } => builder.with_tool(name, tool),
             Self::Video { name, tool } => builder.with_tool(name, tool),
             Self::Audio { name, tool } => builder.with_tool(name, tool),
@@ -4879,6 +4901,84 @@ where
     }
 }
 
+#[derive(Debug, Clone)]
+struct AddReactionTool<P> {
+    platforms: P,
+    message: MessageRef,
+}
+
+impl<P> ClientTool for AddReactionTool<P>
+where
+    P: MessagePlatformRegistry + Clone,
+{
+    type Error = BotToolError;
+
+    fn spec(&self) -> ClientToolSpec {
+        ClientToolSpec {
+            description: concat!(
+                "Add one standard Unicode emoji reaction to the user message that started ",
+                "this turn. Use this sparingly for compact nonverbal signals: quick ",
+                "acknowledgement, warmth, topic-fit emphasis, or lightweight progress that ",
+                "would be noisy as text. Do not use it to replace the final answer or the ",
+                "automatic completion/error reaction. Pass exactly one Unicode emoji ",
+                "glyph/sequence such as 👍, 🏊, 🔎, 🎉, or ❤️; never pass words, ",
+                "shortcodes like :smile:, custom emoji syntax, markdown, or multiple emoji."
+            )
+            .to_string(),
+            input_schema: ToolInputSchema::new(serde_json::json!({
+                "type": "object",
+                "required": ["emoji"],
+                "properties": {
+                    "emoji": {
+                        "type": "string",
+                        "description": "Exactly one standard Unicode emoji reaction. Do not include text, Discord :shortcodes:, custom emoji markup, markdown, or multiple emoji.",
+                        "minLength": 1,
+                        "maxLength": 64
+                    }
+                },
+                "additionalProperties": false
+            })),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "tool.add_reaction",
+        skip_all,
+        fields(
+            tool_call = %call.id,
+            platform = %self.message.platform,
+            channel = %self.message.channel_id,
+            message = %self.message.message_id,
+        )
+    )]
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+        let emoji = reaction_emoji_from_tool_input(&call.input)?;
+        tracing::debug!(emoji = %emoji, "adding reaction to current user message");
+        self.platforms
+            .add_reaction(
+                self.message.clone(),
+                ReactionKind::Unicode {
+                    name: emoji.clone(),
+                },
+            )
+            .await
+            .map_err(|error| BotToolError::Platform(error.to_string()))?;
+        tracing::info!(emoji = %emoji, "added reaction to current user message");
+        let value = serde_json::json!({
+            "message": self.message,
+            "emoji": emoji,
+        });
+        Ok(ClientToolOutput {
+            result: ClientToolResultContent::Json {
+                value: value.clone(),
+            },
+            is_error: false,
+            trace_response: value,
+            usage: Vec::new(),
+        })
+    }
+}
+
 #[derive(Debug, Error)]
 enum BotToolError {
     #[error("invalid input: {0}")]
@@ -4893,6 +4993,116 @@ enum BotToolError {
     Generator(String),
     #[error("media error: {0}")]
     Media(String),
+}
+
+fn reaction_emoji_from_tool_input(input: &serde_json::Value) -> Result<String, BotToolError> {
+    let emoji = tool_required_string(input, "emoji")?;
+    validate_reaction_emoji(&emoji)?;
+    Ok(emoji)
+}
+
+fn validate_reaction_emoji(emoji: &str) -> Result<(), BotToolError> {
+    if is_keycap_emoji(emoji) {
+        return Ok(());
+    }
+
+    let mut has_emoji_char = false;
+    let mut non_component_base_count = 0usize;
+    let mut regional_indicator_count = 0usize;
+    let mut scalar_count = 0usize;
+    let mut saw_zwj = false;
+    let mut previous_can_join = false;
+    let mut previous_was_zwj = false;
+
+    for ch in emoji.chars() {
+        scalar_count += 1;
+        if scalar_count > MAX_REACTION_EMOJI_SCALARS
+            || ch.is_control()
+            || ch.is_whitespace()
+            || is_text_presentation_selector(ch)
+            || is_keycap_base(ch)
+        {
+            return Err(invalid_reaction_emoji());
+        }
+
+        if is_zwj(ch) {
+            if !previous_can_join {
+                return Err(invalid_reaction_emoji());
+            }
+            saw_zwj = true;
+            previous_can_join = false;
+            previous_was_zwj = true;
+            continue;
+        }
+
+        if is_emoji_presentation_selector(ch) || is_tag_character(ch) {
+            if !has_emoji_char || previous_was_zwj {
+                return Err(invalid_reaction_emoji());
+            }
+            previous_was_zwj = false;
+            continue;
+        }
+
+        if !ch.is_emoji_char_or_emoji_component() {
+            return Err(invalid_reaction_emoji());
+        }
+
+        if ch.is_emoji_char() {
+            has_emoji_char = true;
+            previous_can_join = true;
+            if is_regional_indicator(ch) {
+                regional_indicator_count += 1;
+            } else if !ch.is_emoji_component() {
+                non_component_base_count += 1;
+            }
+        }
+        previous_was_zwj = false;
+    }
+
+    if scalar_count == 0 || !has_emoji_char || previous_was_zwj {
+        return Err(invalid_reaction_emoji());
+    }
+
+    if regional_indicator_count > 0 {
+        if regional_indicator_count == 2 && non_component_base_count == 0 && !saw_zwj {
+            return Ok(());
+        }
+        return Err(invalid_reaction_emoji());
+    }
+
+    if non_component_base_count == 0 || (non_component_base_count > 1 && !saw_zwj) {
+        return Err(invalid_reaction_emoji());
+    }
+
+    Ok(())
+}
+
+fn invalid_reaction_emoji() -> BotToolError {
+    BotToolError::InvalidInput(
+        "`emoji` must be exactly one standard Unicode emoji; text, shortcodes, custom emoji, and multiple emoji are not allowed"
+            .to_string(),
+    )
+}
+
+fn is_keycap_emoji(emoji: &str) -> bool {
+    let mut chars = emoji.chars();
+    let Some(base) = chars.next() else {
+        return false;
+    };
+    if !is_keycap_base(base) {
+        return false;
+    }
+    match chars.next() {
+        Some('\u{20E3}') => chars.next().is_none(),
+        Some(ch) if is_emoji_presentation_selector(ch) => {
+            matches!(chars.next(), Some('\u{20E3}')) && chars.next().is_none()
+        }
+        _ => false,
+    }
+}
+
+fn is_keycap_base(ch: char) -> bool {
+    ch.is_ascii_digit() || matches!(ch, '#' | '*')
 }
 
 async fn video_request_from_tool_input<M>(
@@ -6576,7 +6786,8 @@ mod tests {
 
     use chudbot_api::{
         BoxedMediaRef, CreateMedia, ExternalId, LoadedMedia, MediaError, MediaFuture,
-        MediaMetadata, MediaRef, MediaStore, MediaUri, PlatformName, PublicMediaUrl, VideoJobId,
+        MediaMetadata, MediaRef, MediaStore, MediaUri, PlatformName, PostedMessage, PublicMediaUrl,
+        VideoJobId,
     };
     use serde_json::json;
     use test_case::test_case;
@@ -6588,6 +6799,104 @@ mod tests {
             user_id: ExternalId::new(id),
         }
     }
+
+    fn message_ref(id: &str) -> MessageRef {
+        MessageRef {
+            platform: PlatformName::new("discord"),
+            guild_id: Some(ExternalId::new("guild-1")),
+            channel_id: ExternalId::new("channel-1"),
+            message_id: ExternalId::new(id),
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct ReactionRecordingPlatform {
+        reactions: Arc<Mutex<Vec<(MessageRef, ReactionKind)>>>,
+    }
+
+    impl MessagePlatformRegistry for ReactionRecordingPlatform {
+        type Error = TestPlatformError;
+
+        async fn bot_user(&self, _platform: &PlatformName) -> Result<UserProfile, Self::Error> {
+            Err(TestPlatformError("unexpected bot_user".to_string()))
+        }
+
+        async fn register_commands(
+            &self,
+            _commands: Vec<PlatformCommandDefinition>,
+        ) -> Result<(), Self::Error> {
+            Err(TestPlatformError(
+                "unexpected register_commands".to_string(),
+            ))
+        }
+
+        async fn next_event(&self) -> Result<PlatformEvent, Self::Error> {
+            Err(TestPlatformError("unexpected next_event".to_string()))
+        }
+
+        async fn respond_to_command(
+            &self,
+            _response: PlatformCommandResponse,
+        ) -> Result<(), Self::Error> {
+            Err(TestPlatformError(
+                "unexpected respond_to_command".to_string(),
+            ))
+        }
+
+        async fn send_message(&self, _request: SendMessage) -> Result<PostedMessage, Self::Error> {
+            Err(TestPlatformError("unexpected send_message".to_string()))
+        }
+
+        async fn delete_message(&self, _message: MessageRef) -> Result<(), Self::Error> {
+            Err(TestPlatformError("unexpected delete_message".to_string()))
+        }
+
+        async fn add_reaction(
+            &self,
+            message: MessageRef,
+            reaction: ReactionKind,
+        ) -> Result<(), Self::Error> {
+            self.reactions.lock().unwrap().push((message, reaction));
+            Ok(())
+        }
+
+        async fn remove_own_reaction(
+            &self,
+            _message: MessageRef,
+            _reaction: ReactionKind,
+        ) -> Result<(), Self::Error> {
+            Err(TestPlatformError(
+                "unexpected remove_own_reaction".to_string(),
+            ))
+        }
+
+        async fn typing(&self, _channel: ChannelRef) -> Result<(), Self::Error> {
+            Err(TestPlatformError("unexpected typing".to_string()))
+        }
+
+        async fn fetch_messages(
+            &self,
+            _request: FetchMessages,
+        ) -> Result<Vec<PlatformMessage>, Self::Error> {
+            Err(TestPlatformError("unexpected fetch_messages".to_string()))
+        }
+
+        async fn message_context(
+            &self,
+            _message: &PlatformMessage,
+            _relationship: PlatformMessageRelationship,
+        ) -> Result<serde_json::Value, Self::Error> {
+            Err(TestPlatformError("unexpected message_context".to_string()))
+        }
+
+        async fn parent_channel(&self, channel: ChannelRef) -> Result<ChannelRef, Self::Error> {
+            Ok(channel)
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("{0}")]
+    struct TestPlatformError(String);
 
     fn generated_image_trace(uri: &str, public_url: &str) -> ToolTrace {
         let tool_use_id = chudbot_api::ToolUseId::new("call-1");
@@ -6831,6 +7140,82 @@ mod tests {
     #[derive(Debug, thiserror::Error)]
     #[error("test storage error")]
     struct TestVideoStorageError;
+
+    #[test_case("👍" ; "thumbs up")]
+    #[test_case("🏊🏾" ; "skin tone sequence")]
+    #[test_case("❤️" ; "emoji presentation selector")]
+    #[test_case("🇺🇸" ; "regional indicator flag")]
+    #[test_case("1️⃣" ; "keycap")]
+    #[test_case("👨‍👩‍👧‍👦" ; "zwj family")]
+    #[test_case("🏳️‍🌈" ; "zwj flag")]
+    fn reaction_emoji_validation_accepts_single_unicode_emoji(input: &str) {
+        validate_reaction_emoji(input).expect("emoji should be accepted");
+    }
+
+    #[test_case("done" ; "plain text")]
+    #[test_case(":smile:" ; "discord shortcode")]
+    #[test_case("<:party:123>" ; "custom emoji markup")]
+    #[test_case("👍 ok" ; "emoji plus text")]
+    #[test_case("👍🎉" ; "multiple standalone emoji")]
+    #[test_case("1" ; "bare digit")]
+    #[test_case("🏾" ; "modifier alone")]
+    #[test_case("👍 " ; "trailing whitespace")]
+    fn reaction_emoji_validation_rejects_non_emoji_input(input: &str) {
+        let error = validate_reaction_emoji(input).expect_err("non-emoji input should be rejected");
+
+        assert!(matches!(error, BotToolError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn add_reaction_tool_reacts_to_current_user_message() {
+        let platform = ReactionRecordingPlatform::default();
+        let target = message_ref("user-message-1");
+        let tool = AddReactionTool {
+            platforms: platform.clone(),
+            message: target.clone(),
+        };
+
+        let output = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(ADD_REACTION_TOOL),
+                input: json!({ "emoji": "🏊" }),
+            })
+            .await
+            .expect("reaction tool should succeed");
+
+        assert!(!output.is_error);
+        let reactions = platform.reactions.lock().unwrap();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].0, target);
+        assert_eq!(
+            reactions[0].1,
+            ReactionKind::Unicode {
+                name: "🏊".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn add_reaction_tool_rejects_text_without_platform_call() {
+        let platform = ReactionRecordingPlatform::default();
+        let tool = AddReactionTool {
+            platforms: platform.clone(),
+            message: message_ref("user-message-1"),
+        };
+
+        let error = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(ADD_REACTION_TOOL),
+                input: json!({ "emoji": "done" }),
+            })
+            .await
+            .expect_err("text should be rejected");
+
+        assert!(matches!(error, BotToolError::InvalidInput(_)));
+        assert!(platform.reactions.lock().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn video_rate_limit_fails_before_provider_submit() {

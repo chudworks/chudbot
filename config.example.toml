@@ -194,7 +194,7 @@ would materially improve the answer.
 """
 # Optional agent-level allowlists. Omit for the full runtime-provided surface.
 # server_tools = ["web_search", "x_search"]
-# client_tools = ["fetch_messages", "generate_image", "generate_video", "transcribe_audio", "post_status_message", "lookup_user_memory", "remember_user_memory", "forget_user_memory"]
+# client_tools = ["fetch_messages", "generate_image", "generate_video", "transcribe_audio", "post_status_message", "add_reaction", "lookup_user_memory", "remember_user_memory", "forget_user_memory"]
 memory = true
 limits = { max_iterations = 8 }
 
@@ -324,7 +324,7 @@ You are a careful research assistant. Ground claims with current search when
 available, separate facts from judgment, and keep the final answer concise.
 """
 server_tools = ["web_search"]
-client_tools = ["fetch_messages", "post_status_message"]
+client_tools = ["fetch_messages", "post_status_message", "add_reaction"]
 
 [bot.agents.research.model]
 id = "gpt-5.5"
@@ -347,7 +347,7 @@ You are a concise assistant. Prefer clear, factual answers and ask for missing
 context only when it is necessary.
 """
 server_tools = ["web_search"]
-client_tools = ["fetch_messages", "post_status_message"]
+client_tools = ["fetch_messages", "post_status_message", "add_reaction"]
 limits = { max_iterations = 6 }
 
 [bot.agents.claude.model]
@@ -368,7 +368,7 @@ description = "Ask a focused research subagent to gather facts and return a conc
 # [bot.agents.local]
 # provider = "local_compat"
 # system_prompt = "You are a helpful local model running behind an OpenAI-compatible API."
-# client_tools = ["fetch_messages", "post_status_message"]
+# client_tools = ["fetch_messages", "post_status_message", "add_reaction"]
 # [bot.agents.local.model]
 # id = "qwen3"
 # [bot.agents.local.model.provider_options]
