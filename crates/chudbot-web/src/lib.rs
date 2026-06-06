@@ -3,7 +3,7 @@
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::{Path as FsPath, PathBuf};
+use std::path::{Component, Path as FsPath, PathBuf};
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Request};
@@ -14,6 +14,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use bytes::Bytes;
 use chudbot_api::{
     BotStorage, ClientToolCall, ClientToolResult, ClientToolResultContent, ContextItem,
     Conversation, ConversationId, ConversationLookup, EventSink, GroundingMetadata, LiveEvent,
@@ -22,12 +23,11 @@ use chudbot_api::{
 };
 use futures::{Stream, StreamExt};
 use http_body::Body as _;
+use moka::future::Cache;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
-use tower::ServiceBuilder;
-use tower_http::services::ServeDir;
 use tower_http::set_header::SetResponseHeaderLayer;
 use uuid::Uuid;
 
@@ -35,6 +35,7 @@ const SSE_KEEPALIVE: Duration = Duration::from_secs(30);
 const CACHE_IMMUTABLE: &str = "public, max-age=31536000, immutable";
 const CACHE_NO_CACHE: &str = "no-cache, must-revalidate";
 const CACHE_NO_STORE: &str = "no-store";
+const FRONTEND_STATIC_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const X_ROBOTS_TAG: &str = "noindex, nofollow, noarchive, nosnippet";
 const UA_MAX_LEN: usize = 48;
 const ROBOTS_TXT: &str = "\
@@ -148,6 +149,7 @@ pub struct WebState<S, M> {
     media_store: M,
     events: EventBus,
     config: WebConfig,
+    static_files: StaticFileCache,
     shutdown: CancellationToken,
 }
 
@@ -165,6 +167,7 @@ impl<S, M> WebState<S, M> {
             media_store,
             events,
             config,
+            static_files: StaticFileCache::new(),
             shutdown: CancellationToken::new(),
         }
     }
@@ -177,6 +180,38 @@ impl<S, M> WebState<S, M> {
     fn with_shutdown_token(mut self, shutdown: CancellationToken) -> Self {
         self.shutdown = shutdown;
         self
+    }
+}
+
+#[derive(Clone)]
+struct StaticFileCache {
+    files: Cache<PathBuf, Bytes>,
+}
+
+impl StaticFileCache {
+    fn new() -> Self {
+        let files = Cache::builder()
+            .name("frontend-static-files")
+            .weigher(|_path, bytes: &Bytes| static_file_weight(bytes))
+            .max_capacity(FRONTEND_STATIC_CACHE_MAX_BYTES)
+            .build();
+        Self { files }
+    }
+
+    async fn load(&self, path: PathBuf) -> Option<Bytes> {
+        let load_path = path.clone();
+        self.files
+            .optionally_get_with(path, read_static_file(load_path))
+            .await
+    }
+}
+
+impl std::fmt::Debug for StaticFileCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticFileCache")
+            .field("entry_count", &self.files.entry_count())
+            .field("weighted_size", &self.files.weighted_size())
+            .finish()
     }
 }
 
@@ -298,9 +333,6 @@ where
         "building web router"
     );
     let trust_forwarded_for = state.config.trust_forwarded_for;
-    let assets = ServiceBuilder::new()
-        .layer(cache_layer(CACHE_IMMUTABLE))
-        .service(ServeDir::new(state.config.frontend_dir.join("assets")));
     let api = Router::new()
         .route("/api/config", get(get_config::<S, M>))
         .route("/api/conversations/{id}", get(get_conversation::<S, M>))
@@ -318,7 +350,8 @@ where
         .route("/images/{name}", get(get_image::<S, M>))
         .route("/favicon.ico", get(get_favicon::<S, M>))
         .route("/robots.txt", get(get_robots))
-        .nest_service("/assets", assets)
+        .route("/assets", get(frontend_assets_root))
+        .route("/assets/{*path}", get(get_frontend_asset::<S, M>))
         .fallback(spa_index::<S, M>)
         .layer(x_robots_layer())
         .layer(middleware::from_fn(block_crawlers))
@@ -712,6 +745,27 @@ where
     stream
 }
 
+async fn frontend_assets_root() -> Response {
+    StatusCode::NOT_FOUND.into_response()
+}
+
+#[tracing::instrument(name = "web.get_frontend_asset", skip_all, fields(path = %path))]
+async fn get_frontend_asset<S, M>(
+    State(state): State<WebState<S, M>>,
+    Path(path): Path<String>,
+) -> Response
+where
+    S: Clone + Send + Sync + 'static,
+    M: Clone + Send + Sync + 'static,
+{
+    let Some(relative_path) = static_relative_path(&path) else {
+        tracing::debug!("invalid frontend asset path");
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let path = state.config.frontend_dir.join("assets").join(relative_path);
+    serve_cached_static_file(&state.static_files, path, CACHE_IMMUTABLE).await
+}
+
 #[tracing::instrument(name = "web.get_favicon", skip_all)]
 async fn get_favicon<S, M>(State(state): State<WebState<S, M>>) -> Response
 where
@@ -775,6 +829,59 @@ async fn get_robots() -> Response {
 
 fn cache_layer(value: &'static str) -> SetResponseHeaderLayer<HeaderValue> {
     SetResponseHeaderLayer::overriding(header::CACHE_CONTROL, HeaderValue::from_static(value))
+}
+
+async fn serve_cached_static_file(
+    cache: &StaticFileCache,
+    path: PathBuf,
+    cache_control: &'static str,
+) -> Response {
+    match cache.load(path.clone()).await {
+        Some(bytes) => static_file_response(&path, bytes, cache_control),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn read_static_file(path: PathBuf) -> Option<Bytes> {
+    tokio::fs::read(path).await.ok().map(Bytes::from)
+}
+
+fn static_file_response(path: &FsPath, bytes: Bytes, cache_control: &'static str) -> Response {
+    let mut response = (StatusCode::OK, bytes).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, content_type_for_path(path));
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(cache_control),
+    );
+    response
+}
+
+fn static_relative_path(path: &str) -> Option<PathBuf> {
+    if path.is_empty() || path.contains('\\') {
+        return None;
+    }
+    let mut relative_path = PathBuf::new();
+    for component in FsPath::new(path).components() {
+        match component {
+            Component::Normal(segment) => relative_path.push(segment),
+            Component::CurDir => {}
+            _ => return None,
+        }
+    }
+    (!relative_path.as_os_str().is_empty()).then_some(relative_path)
+}
+
+fn content_type_for_path(path: &FsPath) -> HeaderValue {
+    mime_guess::from_path(path)
+        .first_raw()
+        .map(HeaderValue::from_static)
+        .unwrap_or_else(|| HeaderValue::from_static("application/octet-stream"))
+}
+
+fn static_file_weight(bytes: &Bytes) -> u32 {
+    bytes.len().try_into().unwrap_or(u32::MAX)
 }
 
 fn x_robots_layer() -> SetResponseHeaderLayer<HeaderValue> {
@@ -1002,7 +1109,7 @@ where
     S: Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
 {
-    render_spa(&state.config.frontend_dir, uri.path()).await
+    render_spa(&state.static_files, &state.config.frontend_dir, uri.path()).await
 }
 
 #[tracing::instrument(
@@ -1010,37 +1117,34 @@ where
     skip_all,
     fields(frontend_dir = %frontend_dir.display(), request_path = %request_path)
 )]
-async fn render_spa(frontend_dir: &FsPath, request_path: &str) -> Response {
+async fn render_spa(
+    static_files: &StaticFileCache,
+    frontend_dir: &FsPath,
+    request_path: &str,
+) -> Response {
     let last_segment = request_path.rsplit('/').next().unwrap_or("");
     if last_segment.contains('.') {
         tracing::debug!("asset-looking SPA fallback path not found");
         return (StatusCode::NOT_FOUND, "not found").into_response();
     }
-    let index = frontend_dir.join("index.html");
-    match tokio::fs::read(index).await {
-        Ok(bytes) => {
+    let index_path = frontend_dir.join("index.html");
+    let index = if cache_spa_index() {
+        static_files.load(index_path.clone()).await
+    } else {
+        read_static_file(index_path.clone()).await
+    };
+    match index {
+        Some(bytes) => {
             tracing::debug!(bytes = bytes.len(), "serving SPA index");
-            (
-                StatusCode::OK,
-                [
-                    (
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static("text/html; charset=utf-8"),
-                    ),
-                    (
-                        header::CACHE_CONTROL,
-                        HeaderValue::from_static(CACHE_NO_CACHE),
-                    ),
-                ],
-                bytes,
-            )
-                .into_response()
-        }
-        Err(error) => {
-            tracing::warn!(
-                error = %error,
-                "SPA index is missing or unreadable"
+            let mut response = static_file_response(&index_path, bytes, CACHE_NO_CACHE);
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/html; charset=utf-8"),
             );
+            response
+        }
+        None => {
+            tracing::warn!("SPA index is missing or unreadable");
             (
                 StatusCode::NOT_FOUND,
                 "frontend not built (index.html missing)",
@@ -1050,10 +1154,14 @@ async fn render_spa(frontend_dir: &FsPath, request_path: &str) -> Response {
     }
 }
 
+fn cache_spa_index() -> bool {
+    !cfg!(debug_assertions)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
+    use axum::body::{Body, to_bytes};
     use chudbot_api::{ClientToolTrace, ToolName, ToolUseId};
     use serde_json::json;
 
@@ -1061,6 +1169,20 @@ mod tests {
         let mut req = Request::builder().body(Body::empty()).unwrap();
         req.extensions_mut().insert(ConnectInfo(peer));
         req
+    }
+
+    async fn temp_dir() -> PathBuf {
+        let path = std::env::temp_dir().join(format!("chudbot-web-{}", Uuid::new_v4()));
+        tokio::fs::create_dir_all(&path)
+            .await
+            .expect("create temp dir");
+        path
+    }
+
+    async fn response_bytes(response: Response) -> Bytes {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read response body")
     }
 
     fn client_trace_view(
@@ -1081,6 +1203,65 @@ mod tests {
             trace_response,
             usage: Vec::new(),
         })
+    }
+
+    #[test]
+    fn static_relative_path_rejects_unsafe_paths() {
+        assert!(static_relative_path("../app.js").is_none());
+        assert!(static_relative_path("nested/../../app.js").is_none());
+        assert!(static_relative_path("nested\\app.js").is_none());
+        assert!(static_relative_path("").is_none());
+        assert_eq!(
+            static_relative_path("./assets/app.js"),
+            Some(PathBuf::from("assets").join("app.js"))
+        );
+    }
+
+    #[tokio::test]
+    async fn static_file_cache_reuses_loaded_asset_bytes() {
+        let dir = temp_dir().await;
+        let path = dir.join("app.123abc.js");
+        tokio::fs::write(&path, "first")
+            .await
+            .expect("write first asset");
+
+        let cache = StaticFileCache::new();
+        let first = cache.load(path.clone()).await.expect("load first asset");
+        tokio::fs::write(&path, "second")
+            .await
+            .expect("write second asset");
+        let second = cache.load(path.clone()).await.expect("load cached asset");
+
+        assert_eq!(&first[..], b"first");
+        assert_eq!(&second[..], b"first");
+
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove temp dir");
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    async fn render_spa_reads_index_from_disk_in_debug_builds() {
+        let dir = temp_dir().await;
+        let path = dir.join("index.html");
+        tokio::fs::write(&path, "first")
+            .await
+            .expect("write first index");
+
+        let cache = StaticFileCache::new();
+        let first = render_spa(&cache, &dir, "/c/test").await;
+        tokio::fs::write(&path, "second")
+            .await
+            .expect("write second index");
+        let second = render_spa(&cache, &dir, "/c/test").await;
+
+        assert_eq!(&response_bytes(first).await[..], b"first");
+        assert_eq!(&response_bytes(second).await[..], b"second");
+
+        tokio::fs::remove_dir_all(dir)
+            .await
+            .expect("remove temp dir");
     }
 
     #[test]
