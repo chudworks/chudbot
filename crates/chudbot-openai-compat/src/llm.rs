@@ -124,43 +124,32 @@ async fn to_chat_messages(
             TurnRole::User => "user",
         };
 
-        let mut text = String::new();
-        let mut media_urls = Vec::new();
-        let mut tool_calls = Vec::new();
-        let mut tool_results = Vec::new();
-        for block in &turn.blocks {
-            match block {
-                ContentBlock::Text { text: t } => text.push_str(t),
-                ContentBlock::Media { media } => {
-                    if turn.role == TurnRole::User {
-                        media_urls.push(media_url_or_data(media.as_ref()).await?);
-                    } else {
+        if turn.role == TurnRole::Assistant {
+            let mut text = String::new();
+            let mut tool_calls = Vec::new();
+            for block in &turn.blocks {
+                match block {
+                    ContentBlock::Text { text: t } => text.push_str(t),
+                    ContentBlock::Media { media } => {
                         tracing::debug!(
                             uri = %media.uri(),
                             "skipping assistant media for OpenAI-compatible chat history"
                         );
                     }
-                }
-                ContentBlock::ClientToolCall(call) => {
-                    if turn.role == TurnRole::Assistant {
+                    ContentBlock::ClientToolCall(call) => {
                         tool_calls.push(chat_tool_call(call));
                     }
-                }
-                ContentBlock::ClientToolResult(result) => {
-                    tool_results.push(chat_tool_result(result));
-                }
-                ContentBlock::Continuation(continuation) => {
-                    if &continuation.provider == provider {
-                        tracing::debug!(
-                            provider = %provider,
-                            "OpenAI-compatible provider continuations are not replayed"
-                        );
+                    ContentBlock::ClientToolResult(_) => {}
+                    ContentBlock::Continuation(continuation) => {
+                        if &continuation.provider == provider {
+                            tracing::debug!(
+                                provider = %provider,
+                                "OpenAI-compatible provider continuations are not replayed"
+                            );
+                        }
                     }
                 }
             }
-        }
-
-        if turn.role == TurnRole::Assistant {
             if !text.is_empty() || !tool_calls.is_empty() {
                 let content = if tool_calls.is_empty() || !text.is_empty() {
                     Value::String(text)
@@ -175,27 +164,64 @@ async fn to_chat_messages(
                 }
                 messages.push(Value::Object(message));
             }
-        } else if !text.is_empty() || !media_urls.is_empty() {
-            if media_urls.is_empty() {
-                messages.push(json!({ "role": role, "content": text }));
-            } else {
-                let mut parts = Vec::with_capacity(media_urls.len() + 1);
-                if !text.is_empty() {
-                    parts.push(json!({ "type": "text", "text": text }));
+        } else {
+            let mut text = String::new();
+            let mut media_urls = Vec::new();
+            for block in &turn.blocks {
+                match block {
+                    ContentBlock::Text { text: t } => text.push_str(t),
+                    ContentBlock::Media { media } => {
+                        media_urls.push(media_url_or_data(media.as_ref()).await?);
+                    }
+                    ContentBlock::ClientToolCall(_) => {}
+                    ContentBlock::ClientToolResult(result) => {
+                        push_chat_user_message(&mut messages, &mut text, &mut media_urls);
+                        messages.push(chat_tool_result(result));
+                    }
+                    ContentBlock::Continuation(continuation) => {
+                        if &continuation.provider == provider {
+                            tracing::debug!(
+                                provider = %provider,
+                                "OpenAI-compatible provider continuations are not replayed"
+                            );
+                        }
+                    }
                 }
-                for url in media_urls {
-                    parts.push(json!({
-                        "type": "image_url",
-                        "image_url": { "url": url },
-                    }));
-                }
-                messages.push(json!({ "role": role, "content": parts }));
             }
+            push_chat_user_message(&mut messages, &mut text, &mut media_urls);
         }
-        messages.extend(tool_results);
     }
 
     Ok(messages)
+}
+
+fn push_chat_user_message(
+    messages: &mut Vec<Value>,
+    text: &mut String,
+    media_urls: &mut Vec<String>,
+) {
+    if text.is_empty() && media_urls.is_empty() {
+        return;
+    }
+    if media_urls.is_empty() {
+        messages.push(json!({ "role": "user", "content": text.as_str() }));
+        text.clear();
+        return;
+    }
+
+    let mut parts = Vec::with_capacity(media_urls.len() + 1);
+    if !text.is_empty() {
+        parts.push(json!({ "type": "text", "text": text.as_str() }));
+    }
+    for url in media_urls.iter() {
+        parts.push(json!({
+            "type": "image_url",
+            "image_url": { "url": url },
+        }));
+    }
+    messages.push(json!({ "role": "user", "content": parts }));
+    text.clear();
+    media_urls.clear();
 }
 
 async fn media_url_or_data(media: &dyn MediaRef) -> Result<String, OpenAiCompatError> {

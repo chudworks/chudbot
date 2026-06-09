@@ -544,6 +544,7 @@ where
             result: ClientToolResultContent::Json {
                 value: value.clone(),
             },
+            media: Vec::new(),
             is_error: false,
             trace_response: value,
             usage: Vec::new(),
@@ -581,6 +582,7 @@ where
         };
         Ok(ClientToolOutput {
             result: ClientToolResultContent::Text { text },
+            media: Vec::new(),
             is_error: false,
             trace_response: memory_event_trace(&event),
             usage: Vec::new(),
@@ -628,6 +630,7 @@ where
         };
         Ok(ClientToolOutput {
             result: ClientToolResultContent::Text { text },
+            media: Vec::new(),
             is_error: false,
             trace_response: memory_event_trace(&event),
             usage: Vec::new(),

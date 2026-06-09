@@ -5,6 +5,7 @@ use std::future::Future;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ProviderName, ToolName, ToolUseId};
+use crate::media::BoxedMediaRef;
 use crate::usage::UsageRecord;
 
 /// One client-side tool.
@@ -188,6 +189,13 @@ pub enum ToolTrace {
 pub struct ClientToolOutput {
     /// Result sent back to the model.
     pub result: ClientToolResultContent,
+    /// Additional media made visible to the next model step.
+    ///
+    /// This is intentionally not persisted in tool traces. The tool's JSON/text
+    /// result remains the auditable protocol output, while these handles let
+    /// tools such as `read` expose a stored image as native model media.
+    #[serde(skip)]
+    pub media: Vec<BoxedMediaRef>,
     /// Whether the tool result should be marked as an error when it is
     /// furnished back to the model.
     pub is_error: bool,

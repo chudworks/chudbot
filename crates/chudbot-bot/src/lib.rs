@@ -68,6 +68,10 @@ const FETCH_MESSAGES_TOOL: &str = "fetch_messages";
 const GENERATE_IMAGE_TOOL: &str = "generate_image";
 const GENERATE_VIDEO_TOOL: &str = "generate_video";
 const TRANSCRIBE_AUDIO_TOOL: &str = "transcribe_audio";
+const READ_ASSET_TOOL: &str = "read";
+const STAT_ASSET_TOOL: &str = "stat";
+const PUBLIC_URL_ASSET_TOOL: &str = "public_url";
+const ATTACH_ASSET_TOOL: &str = "attach";
 const POST_STATUS_TOOL: &str = "post_status_message";
 const ADD_REACTION_TOOL: &str = "add_reaction";
 const WORKING_REACTION: &str = "👀";
@@ -1800,6 +1804,27 @@ where
                 )),
             });
         }
+
+        tracing::debug!(tool = READ_ASSET_TOOL, "attaching media access tool");
+        tools.push(RuntimeTool::Asset {
+            name: ToolName::new(READ_ASSET_TOOL),
+            tool: MediaAccessTool::new(self.media_store.clone(), MediaAccessKind::Read),
+        });
+        tracing::debug!(tool = STAT_ASSET_TOOL, "attaching media access tool");
+        tools.push(RuntimeTool::Asset {
+            name: ToolName::new(STAT_ASSET_TOOL),
+            tool: MediaAccessTool::new(self.media_store.clone(), MediaAccessKind::Stat),
+        });
+        tracing::debug!(tool = PUBLIC_URL_ASSET_TOOL, "attaching media access tool");
+        tools.push(RuntimeTool::Asset {
+            name: ToolName::new(PUBLIC_URL_ASSET_TOOL),
+            tool: MediaAccessTool::new(self.media_store.clone(), MediaAccessKind::PublicUrl),
+        });
+        tracing::debug!(tool = ATTACH_ASSET_TOOL, "attaching media access tool");
+        tools.push(RuntimeTool::Asset {
+            name: ToolName::new(ATTACH_ASSET_TOOL),
+            tool: MediaAccessTool::new(self.media_store.clone(), MediaAccessKind::Attach),
+        });
 
         for (tool_name, binding) in &agent_config.subagents {
             let (subagent_name, subagent_config) = self
@@ -3734,6 +3759,7 @@ where
         if include_memory {
             out.push_str("- User memory is available through lookup_user_memory, remember_user_memory, and forget_user_memory.\n");
         }
+        out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, visually inspected with read, and explicitly attached to the final platform reply with attach. read and attach only accept verified stored image assets, never return file bytes, and reject videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths. attach deduplicates with generated media already queued for the final reply.\n");
         out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, file:// URIs, filenames, or markdown media links in user-facing text.\n");
         out.push_str("- Slow work (video generation, subagent calls, research) SHOULD be narrated with calls to the post_status_message tool.\n");
         out.push_str("- A subtle Unicode emoji reaction can be added to the user's current message with add_reaction when a compact nonverbal acknowledgement, mood, or topic cue is helpful; use it sparingly and never instead of answering.\n");
@@ -4158,6 +4184,10 @@ where
         name: ToolName,
         tool: AudioTranscriptionTool<RoutedAudioTranscriber<A>, M>,
     },
+    Asset {
+        name: ToolName,
+        tool: MediaAccessTool<M>,
+    },
     Memory {
         name: ToolName,
         tool: memory::MemoryClientTool<S>,
@@ -4186,6 +4216,7 @@ where
             Self::Image { name, tool } => spec.with_tool(name, tool),
             Self::Video { name, tool } => spec.with_tool(name, tool),
             Self::Audio { name, tool } => spec.with_tool(name, tool),
+            Self::Asset { name, tool } => spec.with_tool(name, tool),
             Self::Memory { name, tool } => spec.with_tool(name, tool),
             Self::Subagent { name, tool } => spec.with_tool(name, tool),
         }
@@ -4199,8 +4230,255 @@ where
             Self::Image { name, tool } => builder.with_tool(name, tool),
             Self::Video { name, tool } => builder.with_tool(name, tool),
             Self::Audio { name, tool } => builder.with_tool(name, tool),
+            Self::Asset { name, tool } => builder.with_tool(name, tool),
             Self::Memory { name, tool } => builder.with_tool(name, tool),
             Self::Subagent { name, tool } => builder.with_tool(name, tool),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct MediaAccessTool<M> {
+    media_store: M,
+    kind: MediaAccessKind,
+}
+
+impl<M> MediaAccessTool<M> {
+    fn new(media_store: M, kind: MediaAccessKind) -> Self {
+        Self { media_store, kind }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MediaAccessKind {
+    Read,
+    Stat,
+    PublicUrl,
+    Attach,
+}
+
+impl MediaAccessKind {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Read => {
+                "Read a stored Chudbot image asset by file:// URI. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, and arbitrary filesystem paths are rejected. The tool returns metadata and makes the image visible to the next model step, but never returns raw bytes."
+            }
+            Self::Stat => {
+                "Validate a stored Chudbot media URI and return whether it exists with MIME type and size metadata. This only checks media storage; it does not read or return file bytes."
+            }
+            Self::PublicUrl => {
+                "Resolve a supported stored Chudbot media URI to its configured public URL when one is available. Images, videos, audio, and avatars are supported; unknown/non-media MIME types are rejected. This only returns metadata and a URL; it does not read or return file bytes."
+            }
+            Self::Attach => {
+                "Attach an existing stored Chudbot image asset to the final platform reply. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, public URLs, and arbitrary filesystem paths are rejected. The tool queues the image for final delivery and never returns raw bytes."
+            }
+        }
+    }
+}
+
+impl<M> ClientTool for MediaAccessTool<M>
+where
+    M: MediaStore,
+{
+    type Error = BotToolError;
+
+    fn spec(&self) -> ClientToolSpec {
+        ClientToolSpec {
+            description: self.kind.description().to_string(),
+            input_schema: asset_uri_tool_schema(),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "tool.media_access",
+        skip_all,
+        fields(tool_call = %call.id, kind = ?self.kind)
+    )]
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+        let uri = media_uri_from_tool_input(&call.input)?;
+        match self.kind {
+            MediaAccessKind::Read => self.read(uri).await,
+            MediaAccessKind::Stat => Ok(self.stat(uri).await),
+            MediaAccessKind::PublicUrl => Ok(self.public_url(uri).await),
+            MediaAccessKind::Attach => self.attach(uri).await,
+        }
+    }
+}
+
+impl<M> MediaAccessTool<M>
+where
+    M: MediaStore,
+{
+    async fn read(&self, uri: MediaUri) -> Result<ClientToolOutput, BotToolError> {
+        let media = self
+            .media_store
+            .media_from_uri(&uri)
+            .await
+            .map_err(|error| BotToolError::Media(error.to_string()))?;
+        if !model_transcript_supports_media(media.as_ref()) {
+            tracing::warn!(
+                uri = %media.uri(),
+                category = ?media.category(),
+                mime_type = %media.mime_type(),
+                "read rejected unsupported media asset"
+            );
+            return Err(BotToolError::InvalidInput(format!(
+                "`read` only supports stored image assets with supported image MIME types; `{}` resolved as category `{:?}` with MIME type `{}`",
+                media.uri(),
+                media.category(),
+                media.mime_type()
+            )));
+        }
+
+        let value = media_access_metadata_json(
+            media.as_ref(),
+            serde_json::json!({
+                "exists": true,
+                "visible_to_model": true,
+                "content": {
+                    "kind": "image",
+                    "delivery": "attached_to_next_model_step",
+                    "bytes_returned": false
+                }
+            }),
+        );
+        tracing::info!(
+            uri = %media.uri(),
+            mime_type = %media.mime_type(),
+            size_bytes = media.size_bytes(),
+            "read exposed stored image asset to model"
+        );
+        Ok(ClientToolOutput {
+            result: ClientToolResultContent::Json {
+                value: value.clone(),
+            },
+            media: vec![media],
+            is_error: false,
+            trace_response: value,
+            usage: Vec::new(),
+        })
+    }
+
+    async fn attach(&self, uri: MediaUri) -> Result<ClientToolOutput, BotToolError> {
+        let media = self
+            .media_store
+            .media_from_uri(&uri)
+            .await
+            .map_err(|error| BotToolError::Media(error.to_string()))?;
+        if !attach_supports_media(media.as_ref()) {
+            tracing::warn!(
+                uri = %media.uri(),
+                category = ?media.category(),
+                mime_type = %media.mime_type(),
+                "attach rejected unsupported media asset"
+            );
+            return Err(BotToolError::InvalidInput(format!(
+                "`attach` only supports stored image assets; `{}` resolved as category `{:?}` with MIME type `{}`",
+                media.uri(),
+                media.category(),
+                media.mime_type()
+            )));
+        }
+
+        let value = media_access_metadata_json(
+            media.as_ref(),
+            serde_json::json!({
+                "exists": true,
+                "attached": true,
+                "delivery": {
+                    "platform_reply": "The image will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown image links in user-facing text.",
+                    "deduplication": "If this URI is already queued by generated media or another attach call, it will only be sent once."
+                }
+            }),
+        );
+        tracing::info!(
+            uri = %media.uri(),
+            mime_type = %media.mime_type(),
+            size_bytes = media.size_bytes(),
+            "queued stored image asset for final reply attachment"
+        );
+        Ok(ClientToolOutput {
+            result: ClientToolResultContent::Json {
+                value: value.clone(),
+            },
+            media: Vec::new(),
+            is_error: false,
+            trace_response: value,
+            usage: Vec::new(),
+        })
+    }
+
+    async fn stat(&self, uri: MediaUri) -> ClientToolOutput {
+        let value = match self.media_store.media_from_uri(&uri).await {
+            Ok(media) => media_access_metadata_json(
+                media.as_ref(),
+                serde_json::json!({
+                    "exists": true,
+                }),
+            ),
+            Err(error) => serde_json::json!({
+                "uri": uri.as_str(),
+                "exists": false,
+                "error": error.to_string(),
+            }),
+        };
+        ClientToolOutput {
+            result: ClientToolResultContent::Json {
+                value: value.clone(),
+            },
+            media: Vec::new(),
+            is_error: false,
+            trace_response: value,
+            usage: Vec::new(),
+        }
+    }
+
+    async fn public_url(&self, uri: MediaUri) -> ClientToolOutput {
+        let value = match self.media_store.media_from_uri(&uri).await {
+            Ok(media) if !public_url_supports_media(media.as_ref()) => media_access_metadata_json(
+                media.as_ref(),
+                serde_json::json!({
+                    "exists": true,
+                    "available": false,
+                    "public_url": null,
+                    "error": "unsupported media type for public_url",
+                }),
+            ),
+            Ok(media) => match media.public_url().await {
+                Ok(public_url) => media_access_metadata_json(
+                    media.as_ref(),
+                    serde_json::json!({
+                        "exists": true,
+                        "available": true,
+                        "public_url": public_url.as_str(),
+                    }),
+                ),
+                Err(error) => media_access_metadata_json(
+                    media.as_ref(),
+                    serde_json::json!({
+                        "exists": true,
+                        "available": false,
+                        "public_url": null,
+                        "error": error.to_string(),
+                    }),
+                ),
+            },
+            Err(error) => serde_json::json!({
+                "uri": uri.as_str(),
+                "exists": false,
+                "available": false,
+                "public_url": null,
+                "error": error.to_string(),
+            }),
+        };
+        ClientToolOutput {
+            result: ClientToolResultContent::Json {
+                value: value.clone(),
+            },
+            media: Vec::new(),
+            is_error: false,
+            trace_response: value,
+            usage: Vec::new(),
         }
     }
 }
@@ -4298,6 +4576,7 @@ where
             result: ClientToolResultContent::Json {
                 value: result.clone(),
             },
+            media: Vec::new(),
             is_error: false,
             trace_response,
             usage: transcription.usage,
@@ -4599,6 +4878,7 @@ where
                         result: ClientToolResultContent::Json {
                             value: result.clone(),
                         },
+                        media: Vec::new(),
                         is_error: false,
                         trace_response,
                         usage: meta.usage,
@@ -4769,6 +5049,7 @@ where
             result: ClientToolResultContent::Json {
                 value: value.clone(),
             },
+            media: Vec::new(),
             is_error: false,
             trace_response: value,
             usage: Vec::new(),
@@ -4914,6 +5195,7 @@ where
             result: ClientToolResultContent::Json {
                 value: value.clone(),
             },
+            media: Vec::new(),
             is_error: false,
             trace_response: value,
             usage: Vec::new(),
@@ -4992,6 +5274,7 @@ where
             result: ClientToolResultContent::Json {
                 value: value.clone(),
             },
+            media: Vec::new(),
             is_error: false,
             trace_response: value,
             usage: Vec::new(),
@@ -5328,6 +5611,49 @@ fn audio_transcription_model_result_json(transcription: &AudioTranscription) -> 
     })
 }
 
+fn media_uri_from_tool_input(input: &serde_json::Value) -> Result<MediaUri, BotToolError> {
+    let uri = tool_required_string(input, "uri")?;
+    if !uri.starts_with("file://") {
+        return Err(BotToolError::InvalidInput(
+            "`uri` must be a stored file:// media URI".to_string(),
+        ));
+    }
+    Ok(MediaUri::new(uri))
+}
+
+fn media_access_metadata_json(
+    media: &dyn chudbot_api::MediaRef,
+    extra: serde_json::Value,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "uri": media.uri().as_str(),
+        "category": media.category(),
+        "name": media.name(),
+        "mime_type": media.mime_type(),
+        "size_bytes": media.size_bytes(),
+    });
+    if let (Some(value), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+        for (key, extra_value) in extra {
+            value.insert(key.clone(), extra_value.clone());
+        }
+    }
+    value
+}
+
+fn asset_uri_tool_schema() -> ToolInputSchema {
+    ToolInputSchema::new(serde_json::json!({
+        "type": "object",
+        "required": ["uri"],
+        "properties": {
+            "uri": {
+                "type": "string",
+                "description": "A stored Chudbot file:// media URI such as file://images/abc.jpg, file://videos/abc.mp4, file://audio/abc.ogg, or file://avatars/abc.png. Do not pass local filesystem paths or public URLs."
+            }
+        },
+        "additionalProperties": false
+    }))
+}
+
 fn audio_transcription_tool_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",
@@ -5508,12 +5834,12 @@ fn append_generated_media_public_urls(mut text: String, public_urls: &[String]) 
         text.push_str("\n\n");
     }
     if public_urls.len() == 1 {
-        text.push_str("Generated media: ");
+        text.push_str("Attached media: ");
         text.push_str(&public_urls[0]);
         return text;
     }
 
-    text.push_str("Generated media:\n");
+    text.push_str("Attached media:\n");
     for public_url in public_urls {
         text.push_str("- ");
         text.push_str(public_url);
@@ -5532,6 +5858,9 @@ fn media_uris_from_tool_traces(trace: &[ToolTrace]) -> Vec<MediaUri> {
             continue;
         };
         if trace.result.is_error {
+            continue;
+        }
+        if !tool_trace_delivers_reply_media(trace.call.name.as_str()) {
             continue;
         }
         let Some(uri) = trace
@@ -5562,12 +5891,22 @@ fn generated_media_reply_refs(trace: &[ToolTrace]) -> Vec<String> {
         if trace.result.is_error {
             continue;
         }
+        if !tool_trace_delivers_reply_media(trace.call.name.as_str()) {
+            continue;
+        }
         collect_generated_media_reply_refs(&trace.trace_response, &mut out);
         if let ClientToolResultContent::Json { value } = &trace.result.content {
             collect_generated_media_reply_refs(value, &mut out);
         }
     }
     out
+}
+
+fn tool_trace_delivers_reply_media(name: &str) -> bool {
+    matches!(
+        name,
+        GENERATE_IMAGE_TOOL | GENERATE_VIDEO_TOOL | ATTACH_ASSET_TOOL
+    )
 }
 
 fn collect_generated_media_reply_refs(value: &serde_json::Value, out: &mut Vec<String>) {
@@ -6047,6 +6386,34 @@ fn model_transcript_supports_image_mime_type(mime_type: &str) -> bool {
     MODEL_TRANSCRIPT_IMAGE_MIME_TYPES
         .iter()
         .any(|supported| mime_type.eq_ignore_ascii_case(supported))
+}
+
+fn public_url_supports_media(media: &dyn chudbot_api::MediaRef) -> bool {
+    let mime_type = media
+        .mime_type()
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match media.category() {
+        MediaCategory::Image | MediaCategory::Avatar => mime_type.starts_with("image/"),
+        MediaCategory::Video => mime_type.starts_with("video/"),
+        MediaCategory::Audio => mime_type.starts_with("audio/"),
+        MediaCategory::Other(_) => false,
+    }
+}
+
+fn attach_supports_media(media: &dyn chudbot_api::MediaRef) -> bool {
+    matches!(media.category(), MediaCategory::Image)
+        && media
+            .mime_type()
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("image/")
 }
 
 fn inject_audio_attachment_refs(
@@ -7128,6 +7495,42 @@ mod tests {
         }
     }
 
+    fn attach_trace(uri: &str) -> ToolTrace {
+        let tool_use_id = chudbot_api::ToolUseId::new("call-attach");
+        ToolTrace::Client {
+            trace: chudbot_api::ClientToolTrace {
+                call: ClientToolCall {
+                    id: tool_use_id.clone(),
+                    name: ToolName::new(ATTACH_ASSET_TOOL),
+                    input: json!({ "uri": uri }),
+                },
+                result: chudbot_api::ClientToolResult {
+                    tool_use_id,
+                    content: ClientToolResultContent::Json {
+                        value: json!({
+                            "uri": uri,
+                            "category": "image",
+                            "name": "generated.jpg",
+                            "mime_type": "image/jpeg",
+                            "size_bytes": 42,
+                            "attached": true,
+                        }),
+                    },
+                    is_error: false,
+                },
+                trace_response: json!({
+                    "uri": uri,
+                    "category": "image",
+                    "name": "generated.jpg",
+                    "mime_type": "image/jpeg",
+                    "size_bytes": 42,
+                    "attached": true,
+                }),
+                usage: Vec::new(),
+            },
+        }
+    }
+
     fn test_model_spec(model: &str) -> ModelSpec {
         ModelSpec {
             id: ModelId::new(model),
@@ -7806,7 +8209,7 @@ mod tests {
 
         assert_eq!(
             reply,
-            "Done.\n\nGenerated media: https://chud.example/videos/generated.mp4"
+            "Done.\n\nAttached media: https://chud.example/videos/generated.mp4"
         );
     }
 
@@ -7910,6 +8313,24 @@ mod tests {
     }
 
     impl ReplyMediaRef {
+        fn image(uri: &str, public_url: &str) -> Self {
+            Self::image_with_mime(uri, "image/jpeg", public_url)
+        }
+
+        fn image_with_mime(uri: &str, mime_type: &str, public_url: &str) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "generated.jpg".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: mime_type.to_string(),
+                    size_bytes: 42,
+                },
+                bytes: Vec::new(),
+                public_url: Some(PublicMediaUrl::new(public_url)),
+            }
+        }
+
         fn video(uri: &str, size_bytes: u64, public_url: &str) -> Self {
             Self {
                 metadata: MediaMetadata {
@@ -7952,6 +8373,231 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[tokio::test]
+    async fn read_asset_exposes_supported_image_without_returning_bytes() {
+        let uri = "file://images/generated.jpg";
+        let store = ReplyMediaStore::new(ReplyMediaRef::image(
+            uri,
+            "https://chud.example/images/generated.jpg",
+        ));
+        let tool = MediaAccessTool::new(store, MediaAccessKind::Read);
+
+        let output = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(READ_ASSET_TOOL),
+                input: json!({ "uri": uri }),
+            })
+            .await
+            .expect("stored image should be readable");
+
+        assert!(!output.is_error);
+        assert_eq!(output.media.len(), 1);
+        let ClientToolResultContent::Json { value } = &output.result else {
+            panic!("expected json result");
+        };
+        assert_eq!(value["uri"], uri);
+        assert_eq!(value["visible_to_model"], true);
+        assert_eq!(value["content"]["bytes_returned"], false);
+        assert!(value.get("bytes").is_none());
+        assert!(value.get("base64").is_none());
+        assert!(value.get("data_url").is_none());
+    }
+
+    #[tokio::test]
+    async fn read_asset_does_not_queue_final_reply_attachment() {
+        let uri = "file://images/generated.jpg";
+        let store = ReplyMediaStore::new(ReplyMediaRef::image(
+            uri,
+            "https://chud.example/images/generated.jpg",
+        ));
+        let tool = MediaAccessTool::new(store.clone(), MediaAccessKind::Read);
+        let call = ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new(READ_ASSET_TOOL),
+            input: json!({ "uri": uri }),
+        };
+        let output = tool
+            .call(call.clone())
+            .await
+            .expect("stored image should be readable");
+        let result = chudbot_api::ClientToolResult {
+            tool_use_id: call.id.clone(),
+            content: output.result,
+            is_error: output.is_error,
+        };
+        let trace = ToolTrace::Client {
+            trace: chudbot_api::ClientToolTrace {
+                call,
+                result,
+                trace_response: output.trace_response,
+                usage: output.usage,
+            },
+        };
+
+        let media = generated_reply_media(&store, &[trace]).await;
+
+        assert!(media.attachments.is_empty());
+        assert!(media.public_urls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn read_asset_rejects_video_without_loading_bytes() {
+        let uri = "file://videos/generated.mp4";
+        let store = ReplyMediaStore::new(ReplyMediaRef::video(
+            uri,
+            42,
+            "https://chud.example/videos/generated.mp4",
+        ));
+        let tool = MediaAccessTool::new(store, MediaAccessKind::Read);
+
+        let error = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(READ_ASSET_TOOL),
+                input: json!({ "uri": uri }),
+            })
+            .await
+            .expect_err("videos should not be exposed through read");
+
+        assert!(
+            matches!(error, BotToolError::InvalidInput(message) if message.contains("only supports stored image assets"))
+        );
+    }
+
+    #[tokio::test]
+    async fn read_asset_rejects_unsupported_image_mime_without_returning_public_url() {
+        let uri = "file://images/upload.pdf";
+        let store = ReplyMediaStore::new(ReplyMediaRef::image_with_mime(
+            uri,
+            "application/pdf",
+            "https://chud.example/images/upload.pdf",
+        ));
+        let read = MediaAccessTool::new(store.clone(), MediaAccessKind::Read);
+        let public_url = MediaAccessTool::new(store, MediaAccessKind::PublicUrl);
+
+        let error = read
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(READ_ASSET_TOOL),
+                input: json!({ "uri": uri }),
+            })
+            .await
+            .expect_err("unsupported image MIME should not be exposed through read");
+        assert!(
+            matches!(error, BotToolError::InvalidInput(message) if message.contains("only supports stored image assets"))
+        );
+
+        let output = public_url
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-2"),
+                name: ToolName::new(PUBLIC_URL_ASSET_TOOL),
+                input: json!({ "uri": uri }),
+            })
+            .await
+            .expect("public_url should return an availability payload");
+        let ClientToolResultContent::Json { value } = &output.result else {
+            panic!("expected json result");
+        };
+        assert_eq!(value["exists"], true);
+        assert_eq!(value["available"], false);
+        assert_eq!(value["public_url"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn attach_asset_queues_supported_image_without_returning_bytes() {
+        let uri = "file://images/generated.jpg";
+        let store = ReplyMediaStore::new(ReplyMediaRef::image(
+            uri,
+            "https://chud.example/images/generated.jpg",
+        ));
+        let tool = MediaAccessTool::new(store, MediaAccessKind::Attach);
+
+        let output = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(ATTACH_ASSET_TOOL),
+                input: json!({ "uri": uri }),
+            })
+            .await
+            .expect("stored image should be attachable");
+
+        assert!(!output.is_error);
+        assert!(output.media.is_empty());
+        let ClientToolResultContent::Json { value } = &output.result else {
+            panic!("expected json result");
+        };
+        assert_eq!(value["uri"], uri);
+        assert_eq!(value["attached"], true);
+        assert!(value.get("bytes").is_none());
+        assert!(value.get("base64").is_none());
+        assert!(value.get("data_url").is_none());
+    }
+
+    #[tokio::test]
+    async fn attach_asset_rejects_video() {
+        let uri = "file://videos/generated.mp4";
+        let store = ReplyMediaStore::new(ReplyMediaRef::video(
+            uri,
+            42,
+            "https://chud.example/videos/generated.mp4",
+        ));
+        let tool = MediaAccessTool::new(store, MediaAccessKind::Attach);
+
+        let error = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(ATTACH_ASSET_TOOL),
+                input: json!({ "uri": uri }),
+            })
+            .await
+            .expect_err("videos should not be attachable through attach");
+
+        assert!(
+            matches!(error, BotToolError::InvalidInput(message) if message.contains("only supports stored image assets"))
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_attach_deduplicates_with_automatic_generated_attachment() {
+        let uri = "file://images/generated.jpg";
+        let public_url = "https://chud.example/images/generated.jpg";
+        let store = ReplyMediaStore::new(ReplyMediaRef::image(uri, public_url));
+        let traces = vec![generated_image_trace(uri, public_url), attach_trace(uri)];
+
+        let media = generated_reply_media(&store, &traces).await;
+
+        assert_eq!(media.attachments.len(), 1);
+        assert_eq!(media.attachments[0].filename, "generated.jpg");
+        assert!(media.public_urls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stat_asset_reports_missing_uri_without_error_result() {
+        let store = ReplyMediaStore::new(ReplyMediaRef::image(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        ));
+        let tool = MediaAccessTool::new(store, MediaAccessKind::Stat);
+
+        let output = tool
+            .call(ClientToolCall {
+                id: ToolUseId::new("call-1"),
+                name: ToolName::new(STAT_ASSET_TOOL),
+                input: json!({ "uri": "file://images/missing.jpg" }),
+            })
+            .await
+            .expect("stat should return a pass/fail payload");
+
+        assert!(!output.is_error);
+        assert!(output.media.is_empty());
+        let ClientToolResultContent::Json { value } = &output.result else {
+            panic!("expected json result");
+        };
+        assert_eq!(value["exists"], false);
+        assert_eq!(value["uri"], "file://images/missing.jpg");
     }
 
     #[test_case(MediaCategory::Image, "image/png", true ; "png image")]

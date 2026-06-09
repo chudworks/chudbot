@@ -136,9 +136,9 @@ async fn to_responses_input(
             continue;
         }
 
+        input.extend(echo);
         let mut text = String::new();
         let mut media_urls = Vec::new();
-        let mut deferred = Vec::new();
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text: t } => text.push_str(t),
@@ -147,8 +147,9 @@ async fn to_responses_input(
                 }
                 ContentBlock::Continuation(_) => {}
                 ContentBlock::ClientToolCall(call) => {
+                    push_responses_message(&mut input, role, &mut text, &mut media_urls);
                     let args = serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".into());
-                    deferred.push(json!({
+                    input.push(json!({
                         "type": "function_call",
                         "call_id": call.id.as_str(),
                         "name": call.name.as_str(),
@@ -156,7 +157,8 @@ async fn to_responses_input(
                     }));
                 }
                 ContentBlock::ClientToolResult(result) => {
-                    deferred.push(json!({
+                    push_responses_message(&mut input, role, &mut text, &mut media_urls);
+                    input.push(json!({
                         "type": "function_call_output",
                         "call_id": result.tool_use_id.as_str(),
                         "output": client_tool_result_as_string(result),
@@ -165,24 +167,35 @@ async fn to_responses_input(
             }
         }
 
-        input.extend(echo);
-        if media_urls.is_empty() {
-            if !text.is_empty() {
-                input.push(json!({ "role": role, "content": text }));
-            }
-        } else {
-            let mut content = Vec::with_capacity(media_urls.len() + 1);
-            if !text.is_empty() {
-                content.push(json!({ "type": "input_text", "text": text }));
-            }
-            for url in media_urls {
-                content.push(json!({ "type": "input_image", "image_url": url }));
-            }
-            input.push(json!({ "role": role, "content": content }));
-        }
-        input.extend(deferred);
+        push_responses_message(&mut input, role, &mut text, &mut media_urls);
     }
     Ok(input)
+}
+
+fn push_responses_message(
+    input: &mut Vec<Value>,
+    role: &str,
+    text: &mut String,
+    media_urls: &mut Vec<String>,
+) {
+    if media_urls.is_empty() {
+        if !text.is_empty() {
+            input.push(json!({ "role": role, "content": text.as_str() }));
+            text.clear();
+        }
+        return;
+    }
+
+    let mut content = Vec::with_capacity(media_urls.len() + 1);
+    if !text.is_empty() {
+        content.push(json!({ "type": "input_text", "text": text.as_str() }));
+    }
+    for url in media_urls.iter() {
+        content.push(json!({ "type": "input_image", "image_url": url }));
+    }
+    input.push(json!({ "role": role, "content": content }));
+    text.clear();
+    media_urls.clear();
 }
 
 fn client_tool_result_as_string(result: &ClientToolResult) -> String {

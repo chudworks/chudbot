@@ -207,7 +207,7 @@ would materially improve the answer.
 """
 # Optional agent-level allowlists. Omit for the full runtime-provided surface.
 # server_tools = ["web_search", "x_search"]
-# client_tools = ["fetch_messages", "generate_image", "generate_video", "transcribe_audio", "post_status_message", "add_reaction", "lookup_user_memory", "remember_user_memory", "forget_user_memory"]
+# client_tools = ["fetch_messages", "generate_image", "generate_video", "transcribe_audio", "read", "stat", "public_url", "attach", "post_status_message", "add_reaction", "lookup_user_memory", "remember_user_memory", "forget_user_memory"]
 memory = true
 limits = { max_iterations = 8 }
 

@@ -52,6 +52,7 @@ use twilight_util::builder::command::{
 
 const DEFAULT_PLATFORM_NAME: &str = "discord";
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
+const DISCORD_ATTACHMENT_LIMIT: usize = 10;
 const CODE_FENCE_MIN_WIDTH: usize = 3;
 const GATEWAY_RECONNECT_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 const GATEWAY_RECONNECT_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -517,10 +518,16 @@ impl MessagePlatform for DiscordPlatform {
         }
 
         let chunks = split_discord_content(&request.content);
-        let attachments = http_attachments(&request.attachments);
-        let mut posted = Vec::with_capacity(chunks.len());
+        let attachment_batches = discord_attachment_batches(&request.attachments);
+        let attachment_message_count = attachment_batches.len().saturating_sub(1);
+        let mut posted = Vec::with_capacity(chunks.len() + attachment_message_count);
         for (index, chunk) in chunks.iter().enumerate() {
             let is_last = index + 1 == chunks.len();
+            let attachments = if is_last {
+                attachment_batches.first().map(Vec::as_slice).unwrap_or(&[])
+            } else {
+                &[]
+            };
             let mut builder = self
                 .inner
                 .http
@@ -534,8 +541,8 @@ impl MessagePlatform for DiscordPlatform {
             {
                 builder = builder.reply(reply_to);
             }
-            if is_last && !attachments.is_empty() {
-                builder = builder.attachments(&attachments);
+            if !attachments.is_empty() {
+                builder = builder.attachments(attachments);
             }
             let message = builder.await?.model().await?;
             tracing::trace!(
@@ -543,7 +550,29 @@ impl MessagePlatform for DiscordPlatform {
                 channel = %message.channel_id,
                 chunk = index,
                 chunks = chunks.len(),
+                attachments = attachments.len(),
                 "posted discord message chunk"
+            );
+            posted.push(message_ref_from_ids(
+                &self.inner.platform,
+                request.channel.guild_id.clone(),
+                target_channel,
+                message.id,
+            ));
+        }
+        for (index, attachments) in attachment_batches.iter().enumerate().skip(1) {
+            let mut builder = self.inner.http.create_message(target_channel).content("");
+            if request.suppress_embeds {
+                builder = builder.flags(MessageFlags::SUPPRESS_EMBEDS);
+            }
+            let message = builder.attachments(attachments).await?.model().await?;
+            tracing::trace!(
+                message = %message.id,
+                channel = %message.channel_id,
+                attachment_batch = index,
+                attachment_batches = attachment_batches.len(),
+                attachments = attachments.len(),
+                "posted discord attachment batch"
             );
             posted.push(message_ref_from_ids(
                 &self.inner.platform,
@@ -1281,6 +1310,13 @@ fn http_attachments(attachments: &[OutgoingAttachment]) -> Vec<HttpAttachment> {
         .collect()
 }
 
+fn discord_attachment_batches(attachments: &[OutgoingAttachment]) -> Vec<Vec<HttpAttachment>> {
+    attachments
+        .chunks(DISCORD_ATTACHMENT_LIMIT)
+        .map(http_attachments)
+        .collect()
+}
+
 fn split_discord_content(content: &str) -> Vec<String> {
     if content.is_empty() {
         return vec![String::new()];
@@ -1609,8 +1645,9 @@ mod tests {
     use std::time::Duration;
 
     use chudbot_api::{
-        AttachmentRef, ExternalId, MessageRef, PlatformMessage, PlatformMessageReference,
-        PlatformMessageRelationship, PlatformName, ReactionKind, UserProfile, UserRef,
+        AttachmentRef, ExternalId, MessageRef, OutgoingAttachment, PlatformMessage,
+        PlatformMessageReference, PlatformMessageRelationship, PlatformName, ReactionKind,
+        UserProfile, UserRef,
     };
     use time::OffsetDateTime;
     use twilight_cache_inmemory::{DefaultInMemoryCache, ResourceType};
@@ -1621,9 +1658,9 @@ mod tests {
     use twilight_model::id::Id;
 
     use super::{
-        DISCORD_MESSAGE_LIMIT, DiscordError, GATEWAY_RECONNECT_MAX_DELAY,
-        discord_message_context_json, message_ref_from_reference, next_reconnect_delay,
-        parse_channel_id, reaction_kind, split_discord_content,
+        DISCORD_ATTACHMENT_LIMIT, DISCORD_MESSAGE_LIMIT, DiscordError, GATEWAY_RECONNECT_MAX_DELAY,
+        discord_attachment_batches, discord_message_context_json, message_ref_from_reference,
+        next_reconnect_delay, parse_channel_id, reaction_kind, split_discord_content,
     };
 
     #[test]
@@ -1705,6 +1742,37 @@ mod tests {
     }
 
     #[test]
+    fn discord_attachment_batches_keep_each_message_within_limit() {
+        let attachments = outgoing_attachments(23);
+
+        let batches = discord_attachment_batches(&attachments);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), DISCORD_ATTACHMENT_LIMIT);
+        assert_eq!(batches[1].len(), DISCORD_ATTACHMENT_LIMIT);
+        assert_eq!(batches[2].len(), 3);
+        assert_eq!(batches[0][0].filename, "generated-0.png");
+        assert_eq!(batches[1][0].filename, "generated-10.png");
+        assert_eq!(batches[2][0].filename, "generated-20.png");
+    }
+
+    #[test]
+    fn discord_attachment_batches_reset_attachment_ids_per_message() {
+        let attachments = outgoing_attachments(DISCORD_ATTACHMENT_LIMIT + 1);
+
+        let batches = discord_attachment_batches(&attachments);
+
+        assert_eq!(
+            batches[0]
+                .iter()
+                .map(|attachment| attachment.id)
+                .collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        assert_eq!(batches[1][0].id, 0);
+    }
+
+    #[test]
     fn reaction_kind_converts_unicode_and_custom() {
         let unicode = EmojiReactionType::Unicode {
             name: "🔄".to_string(),
@@ -1728,6 +1796,16 @@ mod tests {
                 name: Some("spin".to_string())
             }
         );
+    }
+
+    fn outgoing_attachments(count: usize) -> Vec<OutgoingAttachment> {
+        (0..count)
+            .map(|index| OutgoingAttachment {
+                filename: format!("generated-{index}.png"),
+                content_type: "image/png".to_string(),
+                bytes: vec![u8::try_from(index).unwrap_or(u8::MAX)],
+            })
+            .collect()
     }
 
     #[test]

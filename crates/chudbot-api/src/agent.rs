@@ -482,8 +482,10 @@ where
                     let tool_results =
                         execute_client_tool_calls(&client_tools, &self.tools, calls).await;
                     let mut result_blocks = Vec::with_capacity(tool_results.len());
-                    for (result, tool_trace) in tool_results {
+                    for (result, tool_trace, media) in tool_results {
                         result_blocks.push(ContentBlock::ClientToolResult(result));
+                        result_blocks
+                            .extend(media.into_iter().map(|media| ContentBlock::Media { media }));
                         trace.push(ToolTrace::Client { trace: tool_trace });
                     }
                     transcript.push(TranscriptTurn {
@@ -595,7 +597,11 @@ async fn execute_client_tool_calls(
     enabled_tools: &BTreeMap<ToolName, ClientToolSpec>,
     tools: &BTreeMap<ToolName, Box<dyn DynClientTool>>,
     calls: Vec<ClientToolCall>,
-) -> Vec<(ClientToolResult, ClientToolTrace)> {
+) -> Vec<(
+    ClientToolResult,
+    ClientToolTrace,
+    Vec<crate::media::BoxedMediaRef>,
+)> {
     tracing::debug!(calls = calls.len(), "executing client tool calls");
     let mut pending = FuturesUnordered::new();
     for (index, call) in calls.into_iter().enumerate() {
@@ -638,6 +644,7 @@ async fn execute_client_tool_calls(
                     result: ClientToolResultContent::Text {
                         text: format!("tool `{}` failed: {error}", call.name),
                     },
+                    media: Vec::new(),
                     is_error: true,
                     trace_response: serde_json::json!({
                         "error": error.to_string(),
@@ -657,13 +664,13 @@ async fn execute_client_tool_calls(
             trace_response: output.trace_response,
             usage: output.usage,
         };
-        completed.push((index, result, tool_trace));
+        completed.push((index, result, tool_trace, output.media));
     }
 
-    completed.sort_by_key(|(index, _, _)| *index);
+    completed.sort_by_key(|(index, _, _, _)| *index);
     let completed = completed
         .into_iter()
-        .map(|(_, result, tool_trace)| (result, tool_trace))
+        .map(|(_, result, tool_trace, media)| (result, tool_trace, media))
         .collect::<Vec<_>>();
     tracing::debug!(completed = completed.len(), "client tool calls finished");
     completed
@@ -798,6 +805,7 @@ where
         };
         ClientToolOutput {
             result,
+            media: Vec::new(),
             is_error,
             trace_response: subagent_trace_response(run),
             usage: run.all_usage(),
@@ -1048,6 +1056,7 @@ mod tests {
             async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
                 Ok(ClientToolOutput {
                     result: ClientToolResultContent::Json { value: call.input },
+                    media: Vec::new(),
                     is_error: false,
                     trace_response: json!({ "ok": true }),
                     usage: Vec::new(),
@@ -1100,6 +1109,7 @@ mod tests {
             async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
                 Ok(ClientToolOutput {
                     result: ClientToolResultContent::Json { value: call.input },
+                    media: Vec::new(),
                     is_error: false,
                     trace_response: json!({ "ok": true }),
                     usage: Vec::new(),
@@ -1147,6 +1157,7 @@ mod tests {
                     result: ClientToolResultContent::Text {
                         text: String::new(),
                     },
+                    media: Vec::new(),
                     is_error: false,
                     trace_response: json!({ "ok": true }),
                     usage: Vec::new(),
@@ -1506,6 +1517,7 @@ mod tests {
                     result: ClientToolResultContent::Text {
                         text: call.id.as_str().to_string(),
                     },
+                    media: Vec::new(),
                     is_error: false,
                     trace_response: json!({ "tool_use_id": call.id.as_str() }),
                     usage: Vec::new(),

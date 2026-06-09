@@ -143,6 +143,7 @@ where
             result: ClientToolResultContent::Json {
                 value: result.clone(),
             },
+            media: Vec::new(),
             is_error: false,
             trace_response,
             usage,
@@ -340,6 +341,7 @@ where
                         result: ClientToolResultContent::Json {
                             value: result.clone(),
                         },
+                        media: Vec::new(),
                         is_error: false,
                         trace_response,
                         usage: meta.usage,
