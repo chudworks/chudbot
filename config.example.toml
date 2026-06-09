@@ -139,6 +139,13 @@ api_key = "xai-..."
 kind = "openai"
 api_key = "sk-..."
 # base_url = "https://api.openai.com/v1"
+# Optional cost-estimation overrides. Values are USD per 1M tokens. Built-in
+# defaults cover common standard-tier OpenAI models, but you can pin/update
+# rates here when pricing, service tier, long-context, or regional rates differ.
+[llm.openai.pricing."gpt-5.5"]
+input_usd_per_million_tokens = 5.00
+cached_input_usd_per_million_tokens = 0.50
+output_usd_per_million_tokens = 30.00
 
 [llm.anthropic]
 kind = "anthropic"
@@ -165,6 +172,12 @@ api_key = "xai-..."
 kind = "openai"
 api_key = "sk-..."
 # base_url = "https://api.openai.com/v1"
+# Optional image-token cost-estimation overrides. GPT image usage reports
+# separate text/image token details when available.
+[image.openai_images.pricing."gpt-image-1"]
+text_input_usd_per_million_tokens = 5.00
+image_input_usd_per_million_tokens = 10.00
+image_output_usd_per_million_tokens = 40.00
 
 # Named video-generation services. xAI is the only implemented v2 video backend.
 

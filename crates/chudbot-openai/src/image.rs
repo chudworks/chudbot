@@ -10,6 +10,7 @@ use chudbot_api::{
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::pricing::{ImagePricingUsage, OpenAiPricing};
 use crate::{OpenAiClient, OpenAiError, decode_response, log_json_request};
 
 const DEFAULT_IMAGE_MODEL: &str = "gpt-image-1";
@@ -75,7 +76,7 @@ impl OpenAiClient {
         let parsed: ImagesResponse = self
             .post_json("/images/generations", &body, "imagegen[openai].generate")
             .await?;
-        image_from_response(parsed, self.provider_name(), model)
+        image_from_response(parsed, self.provider_name(), model, self.pricing())
     }
 
     async fn generate_from_edit(
@@ -134,7 +135,7 @@ impl OpenAiClient {
                 decode_response(resp, self.provider_name(), endpoint).await
             })
             .await?;
-        image_from_response(parsed, self.provider_name(), model)
+        image_from_response(parsed, self.provider_name(), model, self.pricing())
     }
 }
 
@@ -324,6 +325,7 @@ fn image_from_response(
     parsed: ImagesResponse,
     provider: &ProviderName,
     requested_model: &str,
+    pricing: &OpenAiPricing,
 ) -> Result<GeneratedImage, OpenAiError> {
     let model = parsed
         .model
@@ -346,7 +348,12 @@ fn image_from_response(
         .output_format
         .map(|format| static_mime(&format!("image/{format}")).to_string())
         .unwrap_or_else(|| "image/png".to_string());
-    let usage = usage_from_openai_image(provider, Some(model.clone()), parsed.usage.as_ref());
+    let usage = usage_from_openai_image(
+        provider,
+        Some(model.clone()),
+        parsed.usage.as_ref(),
+        pricing,
+    );
     tracing::info!(
         model = %model,
         mime_type = %mime_type,
@@ -441,9 +448,23 @@ fn usage_from_openai_image(
     provider: &ProviderName,
     model: Option<ModelId>,
     usage: Option<&Value>,
+    pricing: &OpenAiPricing,
 ) -> Option<UsageRecord> {
     let raw = usage?.clone();
     let parsed = serde_json::from_value::<ImageUsage>(raw.clone()).ok()?;
+    let cost = pricing.estimate_image_cost(
+        model.as_ref(),
+        ImagePricingUsage {
+            input_tokens: parsed.input_tokens,
+            text_input_tokens: parsed.input_tokens_details.text_tokens,
+            image_input_tokens: parsed.input_tokens_details.image_tokens,
+            cached_text_input_tokens: parsed.input_tokens_details.cached_text_tokens,
+            cached_image_input_tokens: parsed.input_tokens_details.cached_image_tokens,
+            output_tokens: parsed.output_tokens,
+            text_output_tokens: parsed.output_tokens_details.text_tokens,
+            image_output_tokens: parsed.output_tokens_details.image_tokens,
+        },
+    );
     Some(UsageRecord {
         provider: provider.clone(),
         model,
@@ -453,7 +474,7 @@ fn usage_from_openai_image(
         output_tokens: parsed.output_tokens,
         reasoning_tokens: None,
         total_tokens: parsed.total_tokens,
-        cost: None,
+        cost,
         raw: Some(raw),
     })
 }
@@ -489,9 +510,25 @@ struct ImageUsage {
     #[serde(default)]
     input_tokens: Option<u64>,
     #[serde(default)]
+    input_tokens_details: ImageTokenDetails,
+    #[serde(default)]
     output_tokens: Option<u64>,
     #[serde(default)]
+    output_tokens_details: ImageTokenDetails,
+    #[serde(default)]
     total_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct ImageTokenDetails {
+    #[serde(default)]
+    image_tokens: Option<u64>,
+    #[serde(default)]
+    text_tokens: Option<u64>,
+    #[serde(default)]
+    cached_image_tokens: Option<u64>,
+    #[serde(default)]
+    cached_text_tokens: Option<u64>,
 }
 
 #[cfg(test)]
@@ -561,11 +598,40 @@ mod tests {
             "output_tokens": 200,
             "total_tokens": 212,
         });
-        let record =
-            usage_from_openai_image(&provider, Some(ModelId::new("gpt-image-1")), Some(&usage))
-                .unwrap();
+        let record = usage_from_openai_image(
+            &provider,
+            Some(ModelId::new("gpt-image-1")),
+            Some(&usage),
+            &OpenAiPricing::default(),
+        )
+        .unwrap();
         assert_eq!(record.input_tokens, Some(12));
         assert_eq!(record.output_tokens, Some(200));
         assert_eq!(record.total_tokens, Some(212));
+        assert!(record.cost.is_some());
+    }
+
+    #[test]
+    fn estimates_image_usage_cost_from_token_details() {
+        let provider = ProviderName::new("openai");
+        let usage = json!({
+            "input_tokens": 25,
+            "input_tokens_details": { "text_tokens": 10, "image_tokens": 15 },
+            "output_tokens": 100,
+            "output_tokens_details": { "image_tokens": 100 },
+            "total_tokens": 125,
+        });
+        let record = usage_from_openai_image(
+            &provider,
+            Some(ModelId::new("gpt-image-1.5")),
+            Some(&usage),
+            &OpenAiPricing::default(),
+        )
+        .unwrap();
+
+        let cost = record.cost.expect("estimated cost");
+        assert_eq!(cost.unit, "usd_ticks");
+        assert!(cost.estimated);
+        assert_eq!(cost.amount, "33700000");
     }
 }

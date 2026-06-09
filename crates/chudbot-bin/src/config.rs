@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chudbot_api::{PrivacyMode, ProviderName};
+use chudbot_api::{ModelId, PrivacyMode, ProviderName};
 use chudbot_bot::{BotConfig, MemoryConfig};
 use chudbot_web::WebConfig;
 use serde::{Deserialize, Serialize};
@@ -383,6 +383,9 @@ pub enum LlmProviderConfig {
         /// Optional base URL override.
         #[serde(default)]
         base_url: Option<String>,
+        /// Optional per-model text-token pricing overrides.
+        #[serde(default)]
+        pricing: BTreeMap<ModelId, chudbot_openai::OpenAiTokenPricing>,
     },
     /// Anthropic provider placeholder.
     Anthropic {
@@ -415,6 +418,9 @@ pub enum ImageProviderConfig {
         /// Optional base URL override.
         #[serde(default)]
         base_url: Option<String>,
+        /// Optional per-model image-token pricing overrides.
+        #[serde(default)]
+        pricing: BTreeMap<ModelId, chudbot_openai::OpenAiImagePricing>,
     },
     /// xAI image generation provider.
     Xai {

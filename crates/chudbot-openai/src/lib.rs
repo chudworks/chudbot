@@ -2,14 +2,18 @@
 
 mod image;
 mod llm;
+mod pricing;
 
-use chudbot_api::ProviderName;
+use std::collections::BTreeMap;
+
 use chudbot_api::retry::{ClassifyError, ErrorClass, RetryPolicy, with_retry};
+use chudbot_api::{ModelId, ProviderName};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
 pub use llm::OpenAiOptions;
+pub use pricing::{OpenAiImagePricing, OpenAiTokenPricing};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -20,6 +24,7 @@ pub struct OpenAiClient {
     api_key: String,
     base_url: String,
     provider_name: ProviderName,
+    pricing: pricing::OpenAiPricing,
 }
 
 impl OpenAiClient {
@@ -30,12 +35,25 @@ impl OpenAiClient {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             provider_name: ProviderName::new("openai"),
+            pricing: pricing::OpenAiPricing::default(),
         }
     }
 
     /// Override the base URL. Useful for local tests or gateway deployments.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Override or add text-token pricing entries used for cost estimates.
+    pub fn with_token_pricing(mut self, pricing: BTreeMap<ModelId, OpenAiTokenPricing>) -> Self {
+        self.pricing.apply_token_overrides(pricing);
+        self
+    }
+
+    /// Override or add image-token pricing entries used for cost estimates.
+    pub fn with_image_pricing(mut self, pricing: BTreeMap<ModelId, OpenAiImagePricing>) -> Self {
+        self.pricing.apply_image_overrides(pricing);
         self
     }
 
@@ -56,6 +74,10 @@ impl OpenAiClient {
 
     pub(crate) fn provider_name(&self) -> &ProviderName {
         &self.provider_name
+    }
+
+    pub(crate) fn pricing(&self) -> &pricing::OpenAiPricing {
+        &self.pricing
     }
 
     pub(crate) async fn post_json<T>(

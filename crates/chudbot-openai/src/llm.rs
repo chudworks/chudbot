@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::image::media_bytes_or_url;
+use crate::pricing::OpenAiPricing;
 use crate::{OpenAiClient, OpenAiError, json_strip_nulls};
 
 const REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
@@ -61,6 +62,7 @@ impl LlmBackend for OpenAiClient {
             Some(model_id.clone()),
             UsageSubject::ModelStep,
             parsed.usage.as_ref(),
+            self.pricing(),
         );
         log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
 
@@ -366,9 +368,16 @@ fn usage_from_openai(
     model: Option<ModelId>,
     subject: UsageSubject,
     usage: Option<&Value>,
+    pricing: &OpenAiPricing,
 ) -> Option<UsageRecord> {
     let raw = usage?.clone();
     let parsed = serde_json::from_value::<Usage>(raw.clone()).ok()?;
+    let cost = pricing.estimate_token_cost(
+        model.as_ref(),
+        parsed.input_tokens,
+        parsed.input_tokens_details.cached_tokens,
+        parsed.output_tokens,
+    );
     Some(UsageRecord {
         provider: provider.clone(),
         model,
@@ -378,7 +387,7 @@ fn usage_from_openai(
         output_tokens: Some(parsed.output_tokens),
         reasoning_tokens: Some(parsed.output_tokens_details.reasoning_tokens),
         total_tokens: Some(parsed.total_tokens),
-        cost: None,
+        cost,
         raw: Some(raw),
     })
 }
@@ -635,11 +644,37 @@ mod tests {
             Some(ModelId::new("gpt-5")),
             UsageSubject::ModelStep,
             Some(&usage),
+            &OpenAiPricing::default(),
         )
         .unwrap();
         assert_eq!(record.input_tokens, Some(153));
         assert_eq!(record.cached_input_tokens, Some(128));
         assert_eq!(record.reasoning_tokens, Some(303));
         assert_eq!(record.total_tokens, Some(755));
+        assert!(record.cost.is_none());
+    }
+
+    #[test]
+    fn estimates_usage_cost_for_known_openai_model() {
+        let usage = json!({
+            "input_tokens": 100,
+            "input_tokens_details": { "cached_tokens": 40 },
+            "output_tokens": 20,
+            "total_tokens": 120,
+        });
+        let provider = ProviderName::new("openai");
+        let record = usage_from_openai(
+            &provider,
+            Some(ModelId::new("gpt-5.5")),
+            UsageSubject::ModelStep,
+            Some(&usage),
+            &OpenAiPricing::default(),
+        )
+        .unwrap();
+
+        let cost = record.cost.expect("estimated cost");
+        assert_eq!(cost.unit, "usd_ticks");
+        assert!(cost.estimated);
+        assert_eq!(cost.amount, "9200000");
     }
 }

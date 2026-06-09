@@ -131,15 +131,23 @@ impl ConfiguredLlmProviders {
                     );
                     providers.anthropic.insert(name.clone(), client);
                 }
-                LlmProviderConfig::OpenAi { api_key, base_url } => {
+                LlmProviderConfig::OpenAi {
+                    api_key,
+                    base_url,
+                    pricing,
+                } => {
                     let mut client = chudbot_openai::OpenAiClient::new(api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
+                    }
+                    if !pricing.is_empty() {
+                        client = client.with_token_pricing(pricing.clone());
                     }
                     tracing::info!(
                         provider = %name,
                         kind = "openai",
                         base_url_override = base_url.is_some(),
+                        pricing_overrides = pricing.len(),
                         "registered LLM provider"
                     );
                     providers.openai.insert(name.clone(), client);
@@ -267,15 +275,23 @@ impl ConfiguredImageGenerators {
         let mut providers = ConfiguredImageGeneratorsInner::default();
         for (name, provider) in config {
             match provider {
-                ImageProviderConfig::OpenAi { api_key, base_url } => {
+                ImageProviderConfig::OpenAi {
+                    api_key,
+                    base_url,
+                    pricing,
+                } => {
                     let mut client = chudbot_openai::OpenAiClient::new(api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
+                    }
+                    if !pricing.is_empty() {
+                        client = client.with_image_pricing(pricing.clone());
                     }
                     tracing::info!(
                         provider = %name,
                         kind = "openai",
                         base_url_override = base_url.is_some(),
+                        pricing_overrides = pricing.len(),
                         "registered image provider"
                     );
                     providers.openai.insert(name.clone(), client);
