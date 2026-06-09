@@ -37,7 +37,7 @@ impl OpenAiPricing {
         cached_input_tokens: u64,
         output_tokens: u64,
     ) -> Option<CostAmount> {
-        let pricing = self.token.get(model?)?;
+        let pricing = pricing_for_model(&self.token, model?)?;
         let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
         let cached_price = pricing
             .cached_input_usd_per_million_tokens
@@ -57,7 +57,7 @@ impl OpenAiPricing {
         model: Option<&ModelId>,
         usage: ImagePricingUsage,
     ) -> Option<CostAmount> {
-        let pricing = self.image.get(model?)?;
+        let pricing = pricing_for_model(&self.image, model?)?;
         let text_input_tokens = usage.text_input_tokens.unwrap_or_else(|| {
             usage.input_tokens.unwrap_or(0).saturating_sub(
                 usage
@@ -294,6 +294,28 @@ fn cost_from_ticks(ticks: u64) -> Option<CostAmount> {
     })
 }
 
+fn pricing_for_model<'a, T>(pricing: &'a BTreeMap<ModelId, T>, model: &ModelId) -> Option<&'a T> {
+    pricing.get(model).or_else(|| {
+        strip_dated_model_suffix(model.as_str()).and_then(|base| pricing.get(&ModelId::new(base)))
+    })
+}
+
+fn strip_dated_model_suffix(model: &str) -> Option<&str> {
+    const SUFFIX_LEN: usize = "-YYYY-MM-DD".len();
+    let suffix_start = model.len().checked_sub(SUFFIX_LEN)?;
+    if !model.is_char_boundary(suffix_start) {
+        return None;
+    }
+    let suffix = model.as_bytes().get(suffix_start..)?;
+    let dated = suffix[0] == b'-'
+        && suffix[1..5].iter().all(u8::is_ascii_digit)
+        && suffix[5] == b'-'
+        && suffix[6..8].iter().all(u8::is_ascii_digit)
+        && suffix[8] == b'-'
+        && suffix[9..11].iter().all(u8::is_ascii_digit);
+    dated.then_some(&model[..suffix_start])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,6 +353,17 @@ mod tests {
     }
 
     #[test]
+    fn dated_snapshot_models_use_base_model_pricing() {
+        let pricing = OpenAiPricing::default();
+
+        let cost = pricing
+            .estimate_token_cost(Some(&ModelId::new("gpt-5.4-mini-2026-03-17")), 100, 40, 20)
+            .expect("cost estimate");
+
+        assert_eq!(cost.amount, "1380000");
+    }
+
+    #[test]
     fn estimates_image_tokens_by_modality() {
         let pricing = OpenAiPricing::default();
 
@@ -349,5 +382,24 @@ mod tests {
             .expect("cost estimate");
 
         assert_eq!(cost.amount, "342000000");
+    }
+
+    #[test]
+    fn exact_pricing_overrides_snapshot_fallback() {
+        let mut pricing = OpenAiPricing::default();
+        pricing.apply_token_overrides(BTreeMap::from([(
+            ModelId::new("gpt-5.4-mini-2026-03-17"),
+            OpenAiTokenPricing {
+                input_usd_per_million_tokens: 1.00,
+                cached_input_usd_per_million_tokens: Some(0.10),
+                output_usd_per_million_tokens: 2.00,
+            },
+        )]));
+
+        let cost = pricing
+            .estimate_token_cost(Some(&ModelId::new("gpt-5.4-mini-2026-03-17")), 100, 40, 20)
+            .expect("cost estimate");
+
+        assert_eq!(cost.amount, "1040000");
     }
 }
