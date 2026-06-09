@@ -30,6 +30,7 @@ export interface TurnView {
   tool_trace: ToolTrace[];
   replay_assets: TurnAsset[];
   usage: UsageRecord[];
+  reasoning: TurnReasoning;
 }
 
 export interface Turn {
@@ -162,6 +163,30 @@ export interface UsageRecord {
   cached_input_tokens?: number | null;
   cost?: CostAmount | null;
   raw?: unknown;
+}
+
+export interface TurnReasoning {
+  items: ReasoningItem[];
+  usage: ReasoningUsage[];
+}
+
+export interface ReasoningItem {
+  provider: string;
+  model: string | null;
+  id: string | null;
+  status: string | null;
+  summary: ReasoningSummary[];
+}
+
+export interface ReasoningSummary {
+  kind: string | null;
+  text: string;
+}
+
+export interface ReasoningUsage {
+  provider: string;
+  model: string | null;
+  reasoning_tokens: number;
 }
 
 export interface SiteConfig {

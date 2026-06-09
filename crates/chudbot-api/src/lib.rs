@@ -13,6 +13,7 @@ pub mod ids;
 pub mod llm;
 pub mod media;
 pub mod platform;
+pub mod reasoning;
 pub mod retry;
 pub mod storage;
 pub mod tool;
@@ -48,6 +49,7 @@ pub use platform::{
     PlatformMessageReference, PlatformMessageRelationship, PlatformReaction, PlatformReady,
     PostedMessage, ReactionKind, SendMessage, ThreadRequest, UserProfile,
 };
+pub use reasoning::{ReasoningItem, ReasoningSummary, ReasoningUsage, TurnReasoning};
 pub use storage::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ContextItem, Conversation,
     ConversationLookup, ConversationSnapshot, ConversationStop, CountActiveVideoGenerations,

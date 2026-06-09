@@ -48,8 +48,8 @@ export default function UsageSummary({ turns }: Props) {
       <div className="usage-summary__metrics">
         <UsageMetric label="Cost" value={formatCosts(summary.costs)} />
         <UsageMetric label="Total tokens" value={formatMetric(summary.totalTokens)} />
+        <UsageMetric label="Reasoning" value={formatMetric(summary.reasoningTokens)} />
         <UsageMetric label="Cached input" value={formatMetric(summary.cachedTokens)} />
-        <UsageMetric label="Records" value={formatNumber(records.length)} />
       </div>
       <details className="usage-summary__details">
         <summary>Usage by source</summary>

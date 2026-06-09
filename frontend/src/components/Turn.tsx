@@ -1,4 +1,12 @@
-import type { ContextItem, TurnAsset, TurnView, UserMetadata } from '../types';
+import type {
+  ContextItem,
+  ReasoningItem,
+  ReasoningSummary,
+  TurnAsset,
+  TurnReasoning,
+  TurnView,
+  UserMetadata,
+} from '../types';
 import Avatar from './Avatar';
 import RelativeTime from './RelativeTime';
 import ToolCall from './ToolCall';
@@ -9,7 +17,7 @@ interface Props {
 }
 
 export default function Turn({ turnView, users }: Props) {
-  const { turn, system_instructions, context, tool_trace, replay_assets } = turnView;
+  const { turn, system_instructions, context, tool_trace, replay_assets, reasoning } = turnView;
   const user = users[userKey(turn.user)];
   const userLabel = user?.label || turn.user_display_name || 'user';
   const avatarPath = avatarPathFromUri(user?.avatar_media_uri);
@@ -80,6 +88,8 @@ export default function Turn({ turnView, users }: Props) {
 
       <TurnAssets assets={replay_assets} />
 
+      <ReasoningPanel reasoning={reasoning} />
+
       <div className="turn__assistant">
         <h3>Assistant</h3>
         {/* A failed turn shows its error in red AND any partial content
@@ -99,6 +109,88 @@ export default function Turn({ turnView, users }: Props) {
           <em>(no response yet)</em>
         )}
       </div>
+    </section>
+  );
+}
+
+function ReasoningPanel({ reasoning }: { reasoning: TurnReasoning }) {
+  if (reasoning.items.length === 0 && reasoning.usage.length === 0) return null;
+
+  const summaryCount = reasoning.items.reduce(
+    (count, item) => count + item.summary.length,
+    0
+  );
+  const tokens = reasoning.usage.reduce(
+    (count, usage) => count + usage.reasoning_tokens,
+    0
+  );
+  const details = [
+    tokens > 0 ? `${formatNumber(tokens)} tokens` : null,
+    summaryCount > 0
+      ? `${formatNumber(summaryCount)} ${summaryCount === 1 ? 'summary' : 'summaries'}`
+      : null,
+  ].filter(Boolean);
+
+  return (
+    <details className="reasoning">
+      <summary>Reasoning{details.length > 0 ? ` (${details.join(' · ')})` : ''}</summary>
+      {reasoning.usage.length > 0 && (
+        <div className="reasoning__usage">
+          {reasoning.usage.map((usage) => (
+            <span
+              className="reasoning__usage-item"
+              key={`${usage.provider}:${usage.model ?? ''}`}
+            >
+              <code>{providerModelLabel(usage.provider, usage.model)}</code>
+              {' · '}
+              {formatNumber(usage.reasoning_tokens)} tokens
+            </span>
+          ))}
+        </div>
+      )}
+      {reasoning.items.map((item, index) => (
+        <ReasoningItemView
+          key={item.id ?? `${item.provider}:${item.model ?? ''}:${index}`}
+          item={item}
+        />
+      ))}
+    </details>
+  );
+}
+
+function ReasoningItemView({ item }: { item: ReasoningItem }) {
+  return (
+    <article className="reasoning__item">
+      <header>
+        <code>{providerModelLabel(item.provider, item.model)}</code>
+        {item.status && (
+          <>
+            {' · '}
+            <span>{item.status}</span>
+          </>
+        )}
+        {item.id && (
+          <>
+            {' · '}
+            <span>{item.id}</span>
+          </>
+        )}
+      </header>
+      {item.summary.map((summary, index) => (
+        <ReasoningSummaryView
+          key={`${summary.kind ?? 'summary'}:${index}`}
+          summary={summary}
+        />
+      ))}
+    </article>
+  );
+}
+
+function ReasoningSummaryView({ summary }: { summary: ReasoningSummary }) {
+  return (
+    <section className="reasoning__summary">
+      {summary.kind && <div className="reasoning__summary-kind">{summary.kind}</div>}
+      <pre className="reasoning__summary-text">{summary.text}</pre>
     </section>
   );
 }
@@ -212,4 +304,12 @@ function avatarPathFromUri(uri: string | null | undefined): string | null {
 
 function userKey(user: { platform: string; guild_id: string | null; user_id: string }): string {
   return `${user.platform}:${user.guild_id ?? 'global'}:${user.user_id}`;
+}
+
+function providerModelLabel(provider: string, model: string | null): string {
+  return model ? `${provider}/${model}` : provider;
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat().format(value);
 }

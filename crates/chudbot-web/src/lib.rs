@@ -18,8 +18,8 @@ use bytes::Bytes;
 use chudbot_api::{
     BotStorage, ClientToolCall, ClientToolResult, ClientToolResultContent, ContextItem,
     Conversation, ConversationId, ConversationLookup, EventSink, GroundingMetadata, LiveEvent,
-    MediaCategory, MediaStore, MediaUri, ServerToolUse, ToolTrace, Turn, TurnAsset, TurnSnapshot,
-    UsageRecord, UserRef,
+    MediaCategory, MediaStore, MediaUri, ServerToolUse, ToolTrace, Turn, TurnAsset, TurnReasoning,
+    TurnSnapshot, UsageRecord, UserRef,
 };
 use futures::{Stream, StreamExt};
 use http_body::Body as _;
@@ -472,10 +472,17 @@ pub struct TurnView {
     pub replay_assets: Vec<TurnAsset>,
     /// Usage/cost accumulated by this turn.
     pub usage: Vec<UsageRecord>,
+    /// Viewer-safe reasoning summaries and token counts.
+    pub reasoning: TurnReasoning,
 }
 
 impl From<TurnSnapshot> for TurnView {
     fn from(snapshot: TurnSnapshot) -> Self {
+        let reasoning = TurnReasoning::from_continuation_and_usage(
+            snapshot.turn.continuation.as_ref(),
+            snapshot.turn.model.as_ref(),
+            &snapshot.usage,
+        );
         Self {
             turn: snapshot.turn,
             system_instructions: snapshot.system_instructions,
@@ -487,6 +494,7 @@ impl From<TurnSnapshot> for TurnView {
                 .collect(),
             replay_assets: snapshot.replay_assets,
             usage: snapshot.usage,
+            reasoning,
         }
     }
 }

@@ -176,10 +176,11 @@ impl SqlxStorage {
                     t.user_message_channel, t.user_message, t.user_key, t.user_display_name, \
                     t.user_content, t.assistant_message_provider, t.assistant_message_channel, \
                     t.assistant_message, t.assistant_content, t.status, t.error, \
-                    t.continuation, t.app_version_id, ta.agent_name, ta.llm_provider, ta.llm_model \
+                    COALESCE(ta.continuation, t.continuation) AS continuation, \
+                    t.app_version_id, ta.agent_name, ta.llm_provider, ta.llm_model \
                FROM turns t \
                LEFT JOIN LATERAL ( \
-                    SELECT agent_name, llm_provider, llm_model \
+                    SELECT agent_name, llm_provider, llm_model, continuation \
                       FROM turn_attempts \
                      WHERE turn_id = t.id \
                      ORDER BY attempt_ordinal DESC \

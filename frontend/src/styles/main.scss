@@ -379,6 +379,56 @@ details {
     color: var(--accent);
 }
 
+.reasoning {
+    &__usage {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.45rem;
+        margin: 0.35rem 0 0.55rem;
+    }
+
+    &__usage-item {
+        min-width: 0;
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        background: var(--bg);
+        padding: 0.3rem 0.45rem;
+        color: var(--muted);
+        font-size: 0.8rem;
+        overflow-wrap: anywhere;
+    }
+
+    &__item {
+        margin: 0.5rem 0;
+        padding: 0.5rem 0.75rem;
+        border-left: 3px solid var(--accent);
+        background: var(--bg);
+
+        header {
+            font-size: 0.8rem;
+            color: var(--muted);
+            margin-bottom: 0.35rem;
+            overflow-wrap: anywhere;
+        }
+    }
+
+    &__summary {
+        margin-top: 0.5rem;
+    }
+
+    &__summary-kind {
+        color: var(--muted);
+        font-size: 0.78rem;
+        margin-bottom: 0.25rem;
+    }
+
+    &__summary-text {
+        margin: 0;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+    }
+}
+
 .tools h3,
 .turn-assets h3 {
     font-size: 0.85rem;
