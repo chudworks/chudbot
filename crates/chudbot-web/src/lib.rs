@@ -478,11 +478,8 @@ pub struct TurnView {
 
 impl From<TurnSnapshot> for TurnView {
     fn from(snapshot: TurnSnapshot) -> Self {
-        let reasoning = TurnReasoning::from_continuation_and_usage(
-            snapshot.turn.continuation.as_ref(),
-            snapshot.turn.model.as_ref(),
-            &snapshot.usage,
-        );
+        let reasoning =
+            TurnReasoning::from_model_steps_and_usage(&snapshot.model_steps, &snapshot.usage);
         Self {
             turn: snapshot.turn,
             system_instructions: snapshot.system_instructions,

@@ -10,8 +10,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Instrument;
 
-use crate::ids::{ModelId, ToolName};
+use crate::ids::{ModelId, ProviderName, ToolName};
 use crate::llm::{AssistantStep, LlmBackend, Model, ModelStep, ServerToolSet};
+use crate::storage::{ModelStepKind, ModelStepTrace};
 use crate::tool::{
     ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,
     ClientToolSpec, ClientToolTrace, ToolInputSchema, ToolTrace,
@@ -218,6 +219,8 @@ pub struct AgentRun {
     pub transcript: Transcript,
     /// Tool trace records.
     pub trace: Vec<ToolTrace>,
+    /// Ordered provider model-step traces.
+    pub model_steps: Vec<ModelStepTrace>,
     /// Last model id reported by a provider.
     pub last_model_id: Option<ModelId>,
     /// Final provider continuation to persist for cross-turn replay.
@@ -344,9 +347,11 @@ where
         tracing::info!("starting agent run");
 
         let mut trace = Vec::new();
+        let mut model_steps = Vec::new();
         let mut usage = Vec::new();
         let mut last_model_id = None;
         let mut final_continuation = None;
+        let provider = self.model.backend.backend_name().clone();
 
         for iteration in 0..self.spec.limits.max_iterations {
             tracing::debug!(
@@ -382,6 +387,12 @@ where
 
             match step {
                 ModelStep::Final { step } => {
+                    model_steps.push(model_step_trace(
+                        iteration,
+                        ModelStepKind::Final,
+                        &provider,
+                        &step,
+                    ));
                     tracing::debug!(
                         iteration = iteration + 1,
                         model = %step.model_id,
@@ -413,12 +424,19 @@ where
                         outcome: AgentOutcome::Completed { answer },
                         transcript,
                         trace,
+                        model_steps,
                         last_model_id,
                         final_continuation,
                         usage,
                     });
                 }
                 ModelStep::Continue { step } => {
+                    model_steps.push(model_step_trace(
+                        iteration,
+                        ModelStepKind::Continue,
+                        &provider,
+                        &step,
+                    ));
                     tracing::debug!(
                         iteration = iteration + 1,
                         model = %step.model_id,
@@ -436,6 +454,12 @@ where
                     append_assistant_step(&mut transcript, step);
                 }
                 ModelStep::UseClientTools { step } => {
+                    model_steps.push(model_step_trace(
+                        iteration,
+                        ModelStepKind::ClientTools,
+                        &provider,
+                        &step,
+                    ));
                     tracing::debug!(
                         iteration = iteration + 1,
                         model = %step.model_id,
@@ -489,10 +513,26 @@ where
             },
             transcript,
             trace,
+            model_steps,
             last_model_id,
             final_continuation,
             usage,
         })
+    }
+}
+
+fn model_step_trace(
+    iteration: u32,
+    kind: ModelStepKind,
+    provider: &ProviderName,
+    step: &AssistantStep,
+) -> ModelStepTrace {
+    ModelStepTrace {
+        ordinal: i32::try_from(iteration).unwrap_or(i32::MAX),
+        kind,
+        provider: provider.clone(),
+        model: step.model_id.clone(),
+        continuation: step.continuation.clone(),
     }
 }
 

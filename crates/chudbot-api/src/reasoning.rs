@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::ids::{ModelId, ProviderName};
+use crate::storage::ModelStepTrace;
 use crate::transcript::ProviderContinuation;
 use crate::usage::{UsageRecord, UsageSubject};
 
@@ -23,6 +24,24 @@ pub struct TurnReasoning {
 }
 
 impl TurnReasoning {
+    /// Extract reasoning metadata from ordered provider model steps and usage.
+    pub fn from_model_steps_and_usage(
+        model_steps: &[ModelStepTrace],
+        usage: &[UsageRecord],
+    ) -> Self {
+        let items = model_steps
+            .iter()
+            .filter_map(|step| {
+                step.continuation.as_ref().map(|continuation| {
+                    reasoning_items_from_continuation(continuation, Some(&step.model))
+                })
+            })
+            .flatten()
+            .collect();
+        let usage = reasoning_usage_from_records(usage);
+        Self { items, usage }
+    }
+
     /// Extract reasoning metadata from the stored continuation and usage.
     pub fn from_continuation_and_usage(
         continuation: Option<&ProviderContinuation>,

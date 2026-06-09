@@ -119,10 +119,40 @@ pub struct TurnSnapshot {
     pub context: Vec<ContextItem>,
     /// Tool/server/grounding trace events.
     pub tool_trace: Vec<ToolTrace>,
+    /// Ordered provider model-step traces captured during this attempt.
+    #[serde(default)]
+    pub model_steps: Vec<ModelStepTrace>,
     /// Assets that should be replayed with this turn.
     pub replay_assets: Vec<TurnAsset>,
     /// Usage/cost accumulated by this turn.
     pub usage: Vec<UsageRecord>,
+}
+
+/// Provider model-step trace for replay and audit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelStepTrace {
+    /// Zero-based model step ordinal within the attempt.
+    pub ordinal: i32,
+    /// Why the step ended.
+    pub kind: ModelStepKind,
+    /// Provider that produced the step.
+    pub provider: ProviderName,
+    /// Model id reported by the provider for this step.
+    pub model: ModelId,
+    /// Opaque provider continuation/output to replay later.
+    pub continuation: Option<ProviderContinuation>,
+}
+
+/// Model step terminal kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelStepKind {
+    /// Provider returned final assistant content.
+    Final,
+    /// Provider requested another provider call without client tools.
+    Continue,
+    /// Provider requested client-side tool calls.
+    ClientTools,
 }
 
 /// Turn metadata.
@@ -185,12 +215,6 @@ pub struct Turn {
     /// `None` for turns imported from storage that predate version tracking.
     #[serde(default)]
     pub app_version_id: Option<i32>,
-    /// Provider continuation from the final assistant step.
-    ///
-    /// Replay-only provider plumbing. This may contain encrypted reasoning
-    /// state and must not cross the web API.
-    #[serde(skip)]
-    pub continuation: Option<ProviderContinuation>,
 }
 
 /// Turn status.
@@ -307,8 +331,6 @@ pub enum FinishTurn {
         assistant_content: String,
         /// Posted assistant message.
         assistant_message: MessageRef,
-        /// Provider continuation to replay later.
-        continuation: Option<ProviderContinuation>,
         /// Usage/cost accumulated by this turn.
         usage: Vec<UsageRecord>,
     },
@@ -932,6 +954,13 @@ pub trait BotStorage: Send + Sync {
         trace: ToolTrace,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Append one provider model-step trace for a turn.
+    fn append_model_step_trace(
+        &self,
+        turn_id: TurnId,
+        trace: ModelStepTrace,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Link a platform message to a turn/conversation.
     fn link_message(
         &self,
@@ -1165,61 +1194,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use crate::{ExternalId, PlatformName};
-
-    #[test]
-    fn turn_serialization_omits_provider_continuation() {
-        let platform = PlatformName::new("discord");
-        let channel = ExternalId::new("channel-1");
-        let turn = Turn {
-            id: TurnId(Uuid::nil()),
-            ordinal: 0,
-            history_cutoff: None,
-            response_ordinal: Some(0),
-            created_at: datetime!(2026-06-03 12:00 UTC),
-            user_message_created_at: datetime!(2026-06-03 12:00 UTC),
-            completed_at: Some(datetime!(2026-06-03 12:00 UTC)),
-            user_message: MessageRef {
-                platform: platform.clone(),
-                guild_id: Some(ExternalId::new("guild-1")),
-                channel_id: channel.clone(),
-                message_id: ExternalId::new("user-message-1"),
-            },
-            user: UserRef {
-                platform: platform.clone(),
-                guild_id: Some(ExternalId::new("guild-1")),
-                user_id: ExternalId::new("user-1"),
-            },
-            user_display_name: "Chud".to_string(),
-            user_content: "hi".to_string(),
-            assistant_message: Some(MessageRef {
-                platform,
-                guild_id: Some(ExternalId::new("guild-1")),
-                channel_id: channel,
-                message_id: ExternalId::new("assistant-message-1"),
-            }),
-            assistant_content: Some("hello".to_string()),
-            status: TurnStatus::Completed,
-            error: None,
-            agent_name: Some("grok".to_string()),
-            provider: Some(ProviderName::new("xai")),
-            model: Some(ModelId::new("grok-4.3")),
-            app_version_id: Some(7),
-            continuation: Some(ProviderContinuation {
-                provider: ProviderName::new("xai"),
-                data: serde_json::json!([
-                    { "type": "reasoning", "id": "rs_1", "encrypted_content": "BLOB" },
-                ]),
-            }),
-        };
-
-        let value = serde_json::to_value(turn).unwrap();
-
-        assert!(
-            value.get("continuation").is_none(),
-            "provider continuation leaked into serialized turn"
-        );
-    }
+    use crate::PlatformName;
 
     #[test]
     fn memory_dto_timestamps_serialize_as_rfc3339_strings() {

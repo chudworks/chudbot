@@ -11,13 +11,13 @@ use chudbot_api::{
     ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
     CountActiveVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, MediaUri,
     MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, MessageLink,
-    MessageRef, ModelId, NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision,
-    NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName, ResolveAgent, RetryTurn,
-    RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob, ToolTrace, Turn, TurnAsset,
-    TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob, UsageRecord, UsageSubject,
-    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
-    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
-    UserProfile, UserRef,
+    MessageRef, ModelId, ModelStepKind, ModelStepTrace, NewUserMemoryDiaryEntry,
+    NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName,
+    ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob,
+    ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob,
+    UsageRecord, UsageSubject, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
+    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext,
+    UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserProfile, UserRef,
 };
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -176,11 +176,10 @@ impl SqlxStorage {
                     t.user_message_channel, t.user_message, t.user_key, t.user_display_name, \
                     t.user_content, t.assistant_message_provider, t.assistant_message_channel, \
                     t.assistant_message, t.assistant_content, t.status, t.error, \
-                    COALESCE(ta.continuation, t.continuation) AS continuation, \
                     t.app_version_id, ta.agent_name, ta.llm_provider, ta.llm_model \
                FROM turns t \
                LEFT JOIN LATERAL ( \
-                    SELECT agent_name, llm_provider, llm_model, continuation \
+                    SELECT agent_name, llm_provider, llm_model \
                       FROM turn_attempts \
                      WHERE turn_id = t.id \
                      ORDER BY attempt_ordinal DESC \
@@ -209,6 +208,10 @@ impl SqlxStorage {
                 Some(id) => self.load_tool_trace(id).await?,
                 None => Vec::new(),
             };
+            let model_steps = match attempt_id {
+                Some(id) => self.load_model_steps(id).await?,
+                None => Vec::new(),
+            };
             let replay_assets = self.load_turn_assets(turn_id).await?;
             let usage = self.load_usage_for_turn(turn_id).await?;
             turns.push(TurnSnapshot {
@@ -216,6 +219,7 @@ impl SqlxStorage {
                 system_instructions,
                 context,
                 tool_trace,
+                model_steps,
                 replay_assets,
                 usage,
             });
@@ -288,6 +292,22 @@ impl SqlxStorage {
         rows.into_iter()
             .map(|row| serde_json::from_value(row.get("trace")).map_err(SqlxStorageError::Json))
             .collect()
+    }
+
+    async fn load_model_steps(
+        &self,
+        attempt_id: Uuid,
+    ) -> Result<Vec<ModelStepTrace>, SqlxStorageError> {
+        let rows = sqlx::query(
+            "SELECT ordinal, step_kind, llm_provider, llm_model, continuation \
+               FROM turn_attempt_model_steps \
+              WHERE attempt_id = $1 \
+              ORDER BY ordinal",
+        )
+        .bind(attempt_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(model_step_from_row).collect()
     }
 
     async fn load_turn_assets(&self, turn_id: TurnId) -> Result<Vec<TurnAsset>, SqlxStorageError> {
@@ -433,8 +453,8 @@ impl BotStorage for SqlxStorage {
                        user_message_created_at, completed_at, user_message_provider, \
                        user_message_channel, user_message, user_key, user_display_name, \
                        user_content, assistant_message_provider, assistant_message_channel, \
-                       assistant_message, assistant_content, status, error, continuation, \
-                       app_version_id, NULL::text AS agent_name, NULL::text AS llm_provider, \
+                       assistant_message, assistant_content, status, error, app_version_id, \
+                       NULL::text AS agent_name, NULL::text AS llm_provider, \
                        NULL::text AS llm_model",
         )
         .bind(id.0)
@@ -565,6 +585,38 @@ impl BotStorage for SqlxStorage {
         Ok(())
     }
 
+    async fn append_model_step_trace(
+        &self,
+        turn_id: TurnId,
+        trace: ModelStepTrace,
+    ) -> Result<(), Self::Error> {
+        let attempt_id = self.latest_attempt_id_required(turn_id).await?;
+        sqlx::query(
+            "INSERT INTO turn_attempt_model_steps \
+               (attempt_id, ordinal, step_kind, llm_provider, llm_model, continuation) \
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(attempt_id)
+        .bind(trace.ordinal)
+        .bind(model_step_kind_str(trace.kind))
+        .bind(trace.provider.as_str())
+        .bind(trace.model.as_str())
+        .bind(optional_json(&trace.continuation)?)
+        .execute(&self.pool)
+        .await?;
+        tracing::trace!(
+            turn = %turn_id,
+            attempt = %attempt_id,
+            ordinal = trace.ordinal,
+            kind = model_step_kind_str(trace.kind),
+            provider = %trace.provider,
+            model = %trace.model,
+            has_continuation = trace.continuation.is_some(),
+            "persisted model step trace"
+        );
+        Ok(())
+    }
+
     async fn link_message(&self, link: MessageLink) -> Result<(), Self::Error> {
         let mut tx = self.pool.begin().await?;
         upsert_channel_from_message(&mut tx, &link.message).await?;
@@ -672,7 +724,6 @@ impl BotStorage for SqlxStorage {
                 turn_id,
                 assistant_content,
                 assistant_message,
-                continuation,
                 usage,
             } => {
                 let mut tx = self.pool.begin().await?;
@@ -697,8 +748,7 @@ impl BotStorage for SqlxStorage {
                     "UPDATE turns \
                         SET status = 'completed', completed_at = now(), response_ordinal = $2, \
                             assistant_message_provider = $3, assistant_message_channel = $4, \
-                            assistant_message = $5, assistant_content = $6, error = NULL, \
-                            continuation = $7 \
+                            assistant_message = $5, assistant_content = $6, error = NULL \
                       WHERE id = $1",
                 )
                 .bind(turn_id.0)
@@ -707,7 +757,6 @@ impl BotStorage for SqlxStorage {
                 .bind(channel_key_from_message(&assistant_message))
                 .bind(assistant_message.message_id.as_str())
                 .bind(&assistant_content)
-                .bind(optional_json(&continuation)?)
                 .execute(&mut *tx)
                 .await?;
                 sqlx::query(
@@ -723,7 +772,6 @@ impl BotStorage for SqlxStorage {
                     Some(&assistant_message),
                     Some(&assistant_content),
                     None,
-                    optional_json(&continuation)?,
                 )
                 .await?;
                 insert_usage(
@@ -769,7 +817,6 @@ impl BotStorage for SqlxStorage {
                     assistant_message.as_ref(),
                     assistant_content.as_deref(),
                     Some(&error),
-                    None,
                 )
                 .await?;
                 insert_usage(&mut tx, conversation_id, Some(turn_id), usage).await?;
@@ -789,16 +836,8 @@ impl BotStorage for SqlxStorage {
                 .bind(&reason)
                 .execute(&mut *tx)
                 .await?;
-                update_latest_attempt(
-                    &mut tx,
-                    turn_id,
-                    "cancelled",
-                    None,
-                    None,
-                    Some(&reason),
-                    None,
-                )
-                .await?;
+                update_latest_attempt(&mut tx, turn_id, "cancelled", None, None, Some(&reason))
+                    .await?;
                 insert_usage(&mut tx, conversation_id, Some(turn_id), usage).await?;
                 tx.commit().await?;
             }
@@ -2250,6 +2289,9 @@ pub enum SqlxStorageError {
     /// Stored platform reference was malformed.
     #[error("invalid platform reference: {0}")]
     InvalidReference(String),
+    /// Stored model step kind was malformed.
+    #[error("invalid model step kind: {0}")]
+    InvalidModelStepKind(String),
 }
 
 struct ToolTraceFields {
@@ -2645,7 +2687,6 @@ async fn update_latest_attempt(
     assistant_message: Option<&MessageRef>,
     assistant_content: Option<&str>,
     error: Option<&str>,
-    continuation: Option<Value>,
 ) -> Result<(), SqlxStorageError> {
     let attempt_id: Uuid = sqlx::query_scalar(
         "SELECT id FROM turn_attempts WHERE turn_id = $1 ORDER BY attempt_ordinal DESC LIMIT 1",
@@ -2657,7 +2698,7 @@ async fn update_latest_attempt(
         "UPDATE turn_attempts \
             SET status = $2, completed_at = now(), assistant_message_provider = $3, \
                 assistant_message_channel = $4, assistant_message = $5, assistant_content = $6, \
-                error = $7, continuation = $8 \
+                error = $7 \
           WHERE id = $1",
     )
     .bind(attempt_id)
@@ -2667,7 +2708,6 @@ async fn update_latest_attempt(
     .bind(assistant_message.map(|m| m.message_id.as_str()))
     .bind(assistant_content)
     .bind(error)
-    .bind(continuation)
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -2926,10 +2966,6 @@ fn app_version_from_row(row: sqlx::postgres::PgRow) -> AppVersion {
 
 fn turn_from_row(row: &sqlx::postgres::PgRow) -> Result<Turn, SqlxStorageError> {
     let status: String = row.get("status");
-    let continuation = row
-        .get::<Option<Value>, _>("continuation")
-        .map(serde_json::from_value)
-        .transpose()?;
     Ok(Turn {
         id: TurnId(row.get("id")),
         ordinal: row.get("ordinal"),
@@ -2964,6 +3000,20 @@ fn turn_from_row(row: &sqlx::postgres::PgRow) -> Result<Turn, SqlxStorageError> 
             .map(ProviderName::new),
         model: row.get::<Option<String>, _>("llm_model").map(ModelId::new),
         app_version_id: row.get("app_version_id"),
+    })
+}
+
+fn model_step_from_row(row: sqlx::postgres::PgRow) -> Result<ModelStepTrace, SqlxStorageError> {
+    let kind: String = row.get("step_kind");
+    let continuation = row
+        .get::<Option<Value>, _>("continuation")
+        .map(serde_json::from_value)
+        .transpose()?;
+    Ok(ModelStepTrace {
+        ordinal: row.get("ordinal"),
+        kind: model_step_kind_from_str(&kind)?,
+        provider: ProviderName::new(row.get::<String, _>("llm_provider")),
+        model: ModelId::new(row.get::<String, _>("llm_model")),
         continuation,
     })
 }
@@ -2974,6 +3024,23 @@ fn status_from_str(status: &str) -> TurnStatus {
         "failed" => TurnStatus::Failed,
         "cancelled" => TurnStatus::Cancelled,
         _ => TurnStatus::Pending,
+    }
+}
+
+fn model_step_kind_from_str(kind: &str) -> Result<ModelStepKind, SqlxStorageError> {
+    match kind {
+        "final" => Ok(ModelStepKind::Final),
+        "continue" => Ok(ModelStepKind::Continue),
+        "client_tools" => Ok(ModelStepKind::ClientTools),
+        other => Err(SqlxStorageError::InvalidModelStepKind(other.to_string())),
+    }
+}
+
+fn model_step_kind_str(kind: ModelStepKind) -> &'static str {
+    match kind {
+        ModelStepKind::Final => "final",
+        ModelStepKind::Continue => "continue",
+        ModelStepKind::ClientTools => "client_tools",
     }
 }
 

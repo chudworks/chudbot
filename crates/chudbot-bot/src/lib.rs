@@ -27,7 +27,7 @@ pub(crate) use config::{
     image_generation_tool_description, video_generation_tool_description,
 };
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -41,15 +41,16 @@ use chudbot_api::{
     ConversationStop, CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink,
     ExternalId, FetchMessages, FinishTurn, ImageGeneratorTool, LiveEvent, MediaCategory, MediaRef,
     MediaStore, MediaUri, MessageLink, MessageRef, Model, ModelId, ModelSpec, ModelStep,
-    OpenConversation, OutgoingAttachment, PlatformCommand, PlatformCommandDefinition,
-    PlatformCommandInput, PlatformCommandOption, PlatformCommandOptionChoice,
-    PlatformCommandOptionKind, PlatformCommandResponse, PlatformCommandValue, PlatformEvent,
-    PlatformMessage, PlatformMessageReference, PlatformMessageRelationship, PlatformName,
-    PlatformReaction, PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings,
-    SamplingOptions, SaveTurnInput, SendMessage, StoredVideoJob, Subagent, ThreadRequest,
-    ToolInputSchema, ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset,
-    TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageRecord, UserProfile, UserRef,
-    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    ModelStepKind, ModelStepTrace, OpenConversation, OutgoingAttachment, PlatformCommand,
+    PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
+    PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
+    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
+    PlatformMessageRelationship, PlatformName, PlatformReaction, PrivacyMode, ProviderName,
+    ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput, SendMessage,
+    StoredVideoJob, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, ToolUseId,
+    Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob,
+    UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator, VideoJobId, VideoJobStatus,
+    VideoRequest,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -1407,12 +1408,20 @@ where
         drop(cancel_guard);
         tracing::debug!(
             outcome = agent_outcome_kind(&run.outcome),
+            model_steps = run.model_steps.len(),
             trace_events = run.trace.len(),
             usage_records = run.all_usage().len(),
             last_model = ?run.last_model_id,
             has_continuation = run.final_continuation.is_some(),
             "agent run completed"
         );
+
+        for step in run.model_steps.iter().cloned() {
+            self.storage
+                .append_model_step_trace(execution.turn.id, step)
+                .await
+                .map_err(storage_error)?;
+        }
 
         for (ordinal, trace) in run.trace.iter().cloned().enumerate() {
             let trace_kind = tool_trace_kind(&trace);
@@ -1529,7 +1538,6 @@ where
                         turn_id: execution.turn.id,
                         assistant_content: content,
                         assistant_message: posted.id,
-                        continuation: run.final_continuation.clone(),
                         usage: execution.usage_with_preflight(run.all_usage()),
                     })
                     .await
@@ -3585,16 +3593,21 @@ where
                 "added prior user turn to transcript"
             );
             transcript.push(user_turn);
-            append_client_tool_replay(&mut transcript, &turn.tool_trace);
+            let replayed_from_model_steps = append_model_step_replay(
+                &mut transcript,
+                &turn.model_steps,
+                &turn.tool_trace,
+                turn.turn.assistant_content.as_deref(),
+            );
 
-            if let Some(answer) = &turn.turn.assistant_content {
-                let mut blocks = Vec::new();
-                if let Some(continuation) = &turn.turn.continuation {
-                    blocks.push(ContentBlock::Continuation(continuation.clone()));
-                }
-                blocks.push(ContentBlock::Text {
+            if !replayed_from_model_steps {
+                append_client_tool_replay(&mut transcript, &turn.tool_trace);
+            }
+
+            if !replayed_from_model_steps && let Some(answer) = &turn.turn.assistant_content {
+                let blocks = vec![ContentBlock::Text {
                     text: answer.clone(),
-                });
+                }];
                 transcript.push(TranscriptTurn {
                     role: TurnRole::Assistant,
                     blocks,
@@ -3605,7 +3618,6 @@ where
                 });
                 tracing::trace!(
                     turn = %turn.turn.id,
-                    has_continuation = turn.turn.continuation.is_some(),
                     "added prior assistant turn to transcript"
                 );
             }
@@ -5658,6 +5670,121 @@ fn push_unique_string(out: &mut Vec<String>, value: &str) {
         return;
     }
     out.push(value.to_string());
+}
+
+fn append_model_step_replay(
+    transcript: &mut Transcript,
+    model_steps: &[ModelStepTrace],
+    traces: &[ToolTrace],
+    assistant_content: Option<&str>,
+) -> bool {
+    if model_steps.is_empty() {
+        return false;
+    }
+
+    let client_results = client_tool_results_by_id(traces);
+    let mut consumed_results = BTreeSet::new();
+    for (index, step) in model_steps.iter().enumerate() {
+        let is_final_step = index + 1 == model_steps.len();
+        let mut assistant_blocks = Vec::new();
+        if let Some(continuation) = &step.continuation {
+            assistant_blocks.push(ContentBlock::Continuation(continuation.clone()));
+        }
+        if is_final_step
+            && let Some(answer) = assistant_content
+            && !answer.is_empty()
+        {
+            assistant_blocks.push(ContentBlock::Text {
+                text: answer.to_string(),
+            });
+        }
+        if !assistant_blocks.is_empty() {
+            transcript.push(TranscriptTurn {
+                role: TurnRole::Assistant,
+                blocks: assistant_blocks,
+                metadata: serde_json::Value::Null,
+            });
+        }
+
+        let call_ids = step
+            .continuation
+            .as_ref()
+            .map(provider_client_tool_call_ids)
+            .unwrap_or_default();
+        let mut result_blocks = Vec::new();
+        for call_id in call_ids {
+            if consumed_results.contains(&call_id) {
+                continue;
+            }
+            if let Some(result) = client_results.get(&call_id) {
+                consumed_results.insert(call_id);
+                result_blocks.push(ContentBlock::ClientToolResult(result.clone()));
+            }
+        }
+
+        if step.kind == ModelStepKind::ClientTools
+            && step.continuation.is_none()
+            && result_blocks.is_empty()
+        {
+            for (call_id, result) in &client_results {
+                if consumed_results.insert(call_id.clone()) {
+                    result_blocks.push(ContentBlock::ClientToolResult(result.clone()));
+                }
+            }
+        }
+
+        if !result_blocks.is_empty() {
+            transcript.push(TranscriptTurn {
+                role: TurnRole::User,
+                blocks: result_blocks,
+                metadata: serde_json::Value::Null,
+            });
+        }
+    }
+
+    true
+}
+
+fn client_tool_results_by_id(traces: &[ToolTrace]) -> BTreeMap<String, ClientToolResult> {
+    let mut results = BTreeMap::new();
+    for trace in traces {
+        let ToolTrace::Client { trace } = trace else {
+            continue;
+        };
+        results.insert(
+            trace.result.tool_use_id.as_str().to_string(),
+            trace.result.clone(),
+        );
+    }
+    results
+}
+
+fn provider_client_tool_call_ids(continuation: &chudbot_api::ProviderContinuation) -> Vec<String> {
+    let mut ids = Vec::new();
+    collect_provider_client_tool_call_ids(&continuation.data, &mut ids);
+    ids
+}
+
+fn collect_provider_client_tool_call_ids(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_provider_client_tool_call_ids(item, out);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if object.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
+                && let Some(id) = object
+                    .get("call_id")
+                    .or_else(|| object.get("id"))
+                    .and_then(serde_json::Value::as_str)
+                && !out.iter().any(|seen| seen == id)
+            {
+                out.push(id.to_string());
+            }
+        }
+        _ => {}
+    }
 }
 
 fn strip_generated_media_refs(text: &str, refs: &[String]) -> String {
@@ -8067,6 +8194,83 @@ mod tests {
             panic!("expected json result");
         };
         assert_eq!(value["uri"], "file://images/generated.jpg");
+    }
+
+    #[test]
+    fn model_step_replay_uses_provider_continuations_and_matching_tool_results() {
+        let trace = generated_image_trace(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        );
+        let provider = ProviderName::new("xai");
+        let model_steps = vec![
+            ModelStepTrace {
+                ordinal: 0,
+                kind: ModelStepKind::ClientTools,
+                provider: provider.clone(),
+                model: ModelId::new("grok-4.3"),
+                continuation: Some(chudbot_api::ProviderContinuation {
+                    provider: provider.clone(),
+                    data: json!([
+                        {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "encrypted_content": "BLOB_1",
+                            "summary": [{ "type": "summary_text", "text": "Need an image." }]
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "call-1",
+                            "name": "generate_image",
+                            "arguments": "{\"prompt\":\"a worm\"}"
+                        }
+                    ]),
+                }),
+            },
+            ModelStepTrace {
+                ordinal: 1,
+                kind: ModelStepKind::Final,
+                provider: provider.clone(),
+                model: ModelId::new("grok-4.3"),
+                continuation: Some(chudbot_api::ProviderContinuation {
+                    provider,
+                    data: json!([
+                        { "type": "reasoning", "id": "rs_2", "encrypted_content": "BLOB_2" },
+                        {
+                            "type": "message",
+                            "id": "msg_2",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "Done." }]
+                        }
+                    ]),
+                }),
+            },
+        ];
+        let mut transcript = Transcript::new();
+
+        let replayed =
+            append_model_step_replay(&mut transcript, &model_steps, &[trace], Some("Done."));
+
+        assert!(replayed);
+        assert_eq!(transcript.turns.len(), 3);
+        assert_eq!(transcript.turns[0].role, TurnRole::Assistant);
+        assert_eq!(transcript.turns[1].role, TurnRole::User);
+        assert_eq!(transcript.turns[2].role, TurnRole::Assistant);
+        assert!(matches!(
+            transcript.turns[0].blocks.as_slice(),
+            [ContentBlock::Continuation(_)]
+        ));
+        let [ContentBlock::ClientToolResult(result)] = transcript.turns[1].blocks.as_slice() else {
+            panic!("expected matching client tool result");
+        };
+        assert_eq!(result.tool_use_id.as_str(), "call-1");
+        assert!(matches!(
+            transcript.turns[2].blocks.as_slice(),
+            [
+                ContentBlock::Continuation(_),
+                ContentBlock::Text { text }
+            ] if text == "Done."
+        ));
     }
 
     #[test]
