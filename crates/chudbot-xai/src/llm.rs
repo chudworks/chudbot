@@ -33,11 +33,13 @@ impl LlmBackend for XaiClient {
             .reasoning_effort
             .as_ref()
             .map(|effort| json!({ "effort": effort }));
+        let has_tools = !tools.is_empty();
 
         let body = json_strip_nulls(json!({
             "model": request.model.as_str(),
             "input": input,
-            "tools": (!tools.is_empty()).then_some(tools),
+            "tools": has_tools.then_some(tools),
+            "parallel_tool_calls": has_tools.then_some(true),
             "max_output_tokens": request.sampling.max_output_tokens,
             "temperature": request.sampling.temperature,
             "top_p": request.sampling.top_p,

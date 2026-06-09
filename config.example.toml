@@ -334,7 +334,7 @@ server_tools = ["web_search"]
 max_output_tokens = 4096
 
 [bot.agents.research.model.provider_options]
-value = { reasoning_effort = "medium" }
+value = { reasoning_effort = "medium", reasoning_summary = "auto", text_verbosity = "low" }
 
 [bot.agents.research.image_generation]
 provider = "openai_images"

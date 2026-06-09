@@ -29,20 +29,21 @@ impl LlmBackend for OpenAiClient {
         let input = to_responses_input(&request.transcript, self).await?;
         let tools = build_responses_tools(&request.client_tools, &request.server_tools);
         let options = OpenAiOptions::from_request(&request);
-        let reasoning = options
-            .reasoning_effort
-            .as_ref()
-            .map(|effort| json!({ "effort": effort }));
+        let reasoning = build_reasoning_options(&options);
+        let text = build_text_options(&options);
         let sampling = model_supports_sampling(request.model.as_str());
+        let has_tools = !tools.is_empty();
 
         let body = json_strip_nulls(json!({
             "model": request.model.as_str(),
             "input": input,
-            "tools": (!tools.is_empty()).then_some(tools),
+            "tools": has_tools.then_some(tools),
+            "parallel_tool_calls": has_tools.then_some(true),
             "max_output_tokens": request.sampling.max_output_tokens,
             "temperature": sampling.then_some(request.sampling.temperature).flatten(),
             "top_p": sampling.then_some(request.sampling.top_p).flatten(),
             "reasoning": reasoning,
+            "text": text,
             "prompt_cache_key": request.transcript.id,
             "include": REASONING_INCLUDE,
             "store": false,
@@ -105,7 +106,7 @@ async fn to_responses_input(
     if let Some(instructions) = &transcript.instructions
         && !instructions.is_empty()
     {
-        input.push(json!({ "role": "system", "content": instructions }));
+        input.push(json!({ "role": "developer", "content": instructions }));
     }
 
     for message in &transcript.turns {
@@ -217,6 +218,27 @@ fn build_responses_tools(
         tools.push(json!({ "type": "web_search" }));
     }
     tools
+}
+
+fn build_reasoning_options(options: &OpenAiOptions) -> Option<Value> {
+    let value = json_strip_nulls(json!({
+        "effort": options.reasoning_effort.as_deref(),
+        "summary": options.reasoning_summary.as_deref(),
+    }));
+    match &value {
+        Value::Object(map) if map.is_empty() => None,
+        _ => Some(value),
+    }
+}
+
+fn build_text_options(options: &OpenAiOptions) -> Option<Value> {
+    let value = json_strip_nulls(json!({
+        "verbosity": options.text_verbosity.as_deref(),
+    }));
+    match &value {
+        Value::Object(map) if map.is_empty() => None,
+        _ => Some(value),
+    }
 }
 
 fn walk_output(
@@ -363,9 +385,15 @@ fn usage_from_openai(
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OpenAiOptions {
-    /// Reasoning effort: `minimal`, `low`, `medium`, or `high`.
+    /// Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Reasoning summary detail: `auto`, `concise`, or `detailed`.
+    #[serde(default)]
+    pub reasoning_summary: Option<String>,
+    /// Text verbosity: `low`, `medium`, or `high`.
+    #[serde(default)]
+    pub text_verbosity: Option<String>,
 }
 
 impl OpenAiOptions {
@@ -499,15 +527,50 @@ mod tests {
             server_tools: ServerToolSet::new(),
             sampling: chudbot_api::SamplingOptions::default(),
             provider_options: Some(ProviderOptions {
-                value: json!({ "reasoning_effort": "high" }),
+                value: json!({
+                    "reasoning_effort": "high",
+                    "reasoning_summary": "auto",
+                    "text_verbosity": "low",
+                }),
             }),
         };
-        assert_eq!(
-            OpenAiOptions::from_request(&request)
-                .reasoning_effort
-                .as_deref(),
-            Some("high")
-        );
+        let options = OpenAiOptions::from_request(&request);
+        assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(options.reasoning_summary.as_deref(), Some("auto"));
+        assert_eq!(options.text_verbosity.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn builds_reasoning_options_with_summary() {
+        let options = OpenAiOptions {
+            reasoning_effort: Some("medium".to_string()),
+            reasoning_summary: Some("auto".to_string()),
+            text_verbosity: None,
+        };
+        let reasoning = build_reasoning_options(&options).unwrap();
+        assert_eq!(reasoning, json!({ "effort": "medium", "summary": "auto" }));
+    }
+
+    #[test]
+    fn builds_text_options_with_verbosity() {
+        let options = OpenAiOptions {
+            text_verbosity: Some("low".to_string()),
+            ..OpenAiOptions::default()
+        };
+        let text = build_text_options(&options).unwrap();
+        assert_eq!(text, json!({ "verbosity": "low" }));
+    }
+
+    #[test]
+    fn omits_text_options_when_empty() {
+        let options = OpenAiOptions::default();
+        assert!(build_text_options(&options).is_none());
+    }
+
+    #[test]
+    fn omits_reasoning_options_when_empty() {
+        let options = OpenAiOptions::default();
+        assert!(build_reasoning_options(&options).is_none());
     }
 
     #[test]
@@ -542,6 +605,19 @@ mod tests {
         assert_eq!(input[1]["encrypted_content"], "BLOB");
         assert_eq!(input[2]["type"], "message");
         assert_eq!(input[2]["id"], "msg_1");
+    }
+
+    #[test]
+    fn sends_transcript_instructions_as_developer_message() {
+        let client = OpenAiClient::new("key");
+        let mut transcript = Transcript::new();
+        transcript.instructions = Some("Follow the application rules.".to_string());
+        transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
+
+        let input = futures::executor::block_on(to_responses_input(&transcript, &client)).unwrap();
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"], "Follow the application rules.");
+        assert_eq!(input[1]["role"], "user");
     }
 
     #[test]

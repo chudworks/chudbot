@@ -13,6 +13,7 @@ use thiserror::Error;
 pub use llm::XaiOptions;
 
 const DEFAULT_BASE_URL: &str = "https://api.x.ai/v1";
+const X_GROK_CONV_ID_HEADER: &str = "x-grok-conv-id";
 
 /// xAI API client.
 #[derive(Debug, Clone)]
@@ -83,15 +84,20 @@ impl XaiClient {
         T: for<'de> Deserialize<'de>,
     {
         let url = format!("{}{}", self.base_url, endpoint);
+        let grok_conv_id = prompt_cache_key_header_value(body).map(str::to_string);
         log_json_request(&self.provider_name, endpoint, body);
         tracing::debug!(
             provider = %self.provider_name,
             endpoint = %endpoint,
             base_url = %self.base_url,
+            x_grok_conv_id = grok_conv_id.is_some(),
             "sending xAI JSON request"
         );
         with_retry(policy, label, || {
-            let request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
+            let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
+            if let Some(grok_conv_id) = &grok_conv_id {
+                request = request.header(X_GROK_CONV_ID_HEADER, grok_conv_id);
+            }
             async move {
                 let resp = request.send().await.map_err(|e| {
                     tracing::warn!(
@@ -148,6 +154,12 @@ impl XaiClient {
         })
         .await
     }
+}
+
+fn prompt_cache_key_header_value(body: &Value) -> Option<&str> {
+    body.get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn json_strip_nulls(mut value: Value) -> Value {
@@ -316,6 +328,29 @@ fn looks_like_base64(text: &str) -> bool {
             b.is_ascii_alphanumeric()
                 || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::prompt_cache_key_header_value;
+
+    #[test]
+    fn prompt_cache_key_header_value_uses_non_empty_request_key() {
+        let body = json!({ "prompt_cache_key": "conv-123" });
+
+        assert_eq!(prompt_cache_key_header_value(&body), Some("conv-123"));
+    }
+
+    #[test]
+    fn prompt_cache_key_header_value_ignores_missing_or_empty_key() {
+        assert_eq!(prompt_cache_key_header_value(&json!({})), None);
+        assert_eq!(
+            prompt_cache_key_header_value(&json!({ "prompt_cache_key": "" })),
+            None
+        );
+    }
 }
 
 /// xAI provider error.
