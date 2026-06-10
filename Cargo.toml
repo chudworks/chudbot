@@ -6,6 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 authors = ["Chud"]
+license = "AGPL-3.0-or-later"
 
 [workspace.dependencies]
 thiserror = "2"
