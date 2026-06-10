@@ -290,18 +290,30 @@ pub struct WebRuntimeConfig {
     /// Optional favicon served at /favicon.ico.
     #[serde(default)]
     pub favicon_path: Option<PathBuf>,
+    /// Public origin used for absolute URLs in link-preview metadata. Falls
+    /// back to `[bot].web_base_url` when omitted.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
+    /// Optional link-preview thumbnail served at /og-image.
+    #[serde(default)]
+    pub og_image_path: Option<PathBuf>,
     /// Whether access logs trust proxy-provided client IP headers.
     #[serde(default = "default_trust_forwarded_for")]
     pub trust_forwarded_for: bool,
 }
 
 impl WebRuntimeConfig {
-    pub(crate) fn viewer_config(&self) -> WebConfig {
+    pub(crate) fn viewer_config(&self, fallback_public_base_url: &str) -> WebConfig {
         WebConfig {
             title_prefix: self.title_prefix.clone(),
             version: VERSION.to_string(),
             frontend_dir: self.frontend_dir.clone(),
             favicon_path: self.favicon_path.clone(),
+            public_base_url: self
+                .public_base_url
+                .clone()
+                .or_else(|| Some(fallback_public_base_url.to_string())),
+            og_image_path: self.og_image_path.clone(),
             trust_forwarded_for: self.trust_forwarded_for,
         }
     }

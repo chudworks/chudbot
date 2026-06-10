@@ -20,7 +20,7 @@ Workspace crates:
 - `chudbot-discord`: Twilight platform implementation. No Twilight types leak
   into `chudbot-api`.
 - `chudbot-web`: Axum JSON API, SSE, media routes, static SPA serving, crawler
-  controls, and viewer config.
+  controls, link-preview (OpenGraph) injection, and viewer config.
 - `chudbot-storage-sqlx`: Postgres `BotStorage` implementation and embedded
   migrations.
 - `chudbot-asset-local`: local filesystem `MediaStore`.

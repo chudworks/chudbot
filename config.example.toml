@@ -35,6 +35,13 @@ frontend_dir = "frontend-build"
 # Optional favicon. Keep it outside frontend_dir because deploys replace that
 # directory. Uncomment after setting a real path.
 # favicon_path = "/Users/chud/Documents/chudbot/chudbot.ico"
+# Public origin used for the absolute URLs in link-preview (OpenGraph) tags on
+# /c/<id> pages, which give pasted trace links a proper embed in Discord.
+# Falls back to [bot].web_base_url when omitted.
+# public_base_url = "https://chudbot.example.com"
+# Optional square icon (png/jpg/webp) shown as the link-preview thumbnail,
+# served at /og-image. Keep it outside frontend_dir like the favicon.
+# og_image_path = "/Users/chud/Documents/chudbot/chudbot.png"
 # Whether access logs trust Cloudflare/proxy headers for client IPs. Defaults
 # to true, which matches the Cloudflare tunnel deploy. Set false for direct
 # public exposure without a trusted proxy in front.

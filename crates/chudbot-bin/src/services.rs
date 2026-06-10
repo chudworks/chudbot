@@ -81,7 +81,7 @@ impl ServicePlan {
             audio,
             media_store,
             events: EventBus::new(256),
-            web: config.web.viewer_config(),
+            web: config.web.viewer_config(&config.bot.web_base_url),
         })
     }
 }
