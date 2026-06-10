@@ -66,4 +66,7 @@ pub use tool::{
     ClientToolSpec, ClientToolTrace, GroundingMetadata, ServerToolUse, ToolInputSchema, ToolTrace,
 };
 pub use transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptTurn, TurnRole};
-pub use usage::{CostAmount, UsageRecord, UsageSubject};
+pub use usage::{
+    CostAmount, UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord,
+    UsageSubject,
+};

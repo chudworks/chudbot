@@ -49,11 +49,12 @@ use chudbot_api::{
     ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput, SendMessage,
     StoredVideoJob, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, ToolUseId,
     Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob,
-    UrlMediaRef, UsageRecord, UserProfile, UserRef, VideoGenerator, VideoJobId, VideoJobStatus,
-    VideoRequest,
+    UrlMediaRef, UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord,
+    UserProfile, UserRef, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::Serialize;
 use thiserror::Error;
+use time::OffsetDateTime;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use tokio::task::{JoinError, JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
@@ -74,6 +75,7 @@ const PUBLIC_URL_ASSET_TOOL: &str = "public_url";
 const ATTACH_ASSET_TOOL: &str = "attach";
 const POST_STATUS_TOOL: &str = "post_status_message";
 const ADD_REACTION_TOOL: &str = "add_reaction";
+const USAGE_REPORT_TOOL: &str = "usage_report";
 const WORKING_REACTION: &str = "👀";
 const SUCCESS_REACTION: &str = "✅";
 const ERROR_REACTION: &str = "❌";
@@ -1720,6 +1722,14 @@ where
                 tool: AddReactionTool {
                     platforms: self.platforms.clone(),
                     message: reply_to.clone(),
+                },
+            });
+            tracing::debug!(tool = USAGE_REPORT_TOOL, "attaching runtime tool");
+            tools.push(RuntimeTool::UsageReport {
+                name: ToolName::new(USAGE_REPORT_TOOL),
+                tool: UsageReportTool {
+                    storage: self.storage.clone(),
+                    channel: channel_from_message(reply_to),
                 },
             });
         }
@@ -4172,6 +4182,10 @@ where
         name: ToolName,
         tool: AddReactionTool<P>,
     },
+    UsageReport {
+        name: ToolName,
+        tool: UsageReportTool<S>,
+    },
     Image {
         name: ToolName,
         tool: ImageGeneratorTool<RoutedImageGenerator<I>, M>,
@@ -4213,6 +4227,7 @@ where
             Self::Fetch { name, tool } => spec.with_tool(name, tool),
             Self::Status { name, tool } => spec.with_tool(name, tool),
             Self::Reaction { name, tool } => spec.with_tool(name, tool),
+            Self::UsageReport { name, tool } => spec.with_tool(name, tool),
             Self::Image { name, tool } => spec.with_tool(name, tool),
             Self::Video { name, tool } => spec.with_tool(name, tool),
             Self::Audio { name, tool } => spec.with_tool(name, tool),
@@ -4227,6 +4242,7 @@ where
             Self::Fetch { name, tool } => builder.with_tool(name, tool),
             Self::Status { name, tool } => builder.with_tool(name, tool),
             Self::Reaction { name, tool } => builder.with_tool(name, tool),
+            Self::UsageReport { name, tool } => builder.with_tool(name, tool),
             Self::Image { name, tool } => builder.with_tool(name, tool),
             Self::Video { name, tool } => builder.with_tool(name, tool),
             Self::Audio { name, tool } => builder.with_tool(name, tool),
@@ -5280,6 +5296,267 @@ where
             usage: Vec::new(),
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct UsageReportTool<S> {
+    storage: S,
+    channel: ChannelRef,
+}
+
+impl<S> ClientTool for UsageReportTool<S>
+where
+    S: BotStorage + Clone,
+{
+    type Error = BotToolError;
+
+    fn spec(&self) -> ClientToolSpec {
+        ClientToolSpec {
+            description: concat!(
+                "Report this bot's stored model/tool/media usage and its cost in USD. ",
+                "Defaults to the current server's lifetime total; group rows per server, ",
+                "channel, user, agent, provider, model, or usage kind to answer questions ",
+                "like \"how much has this channel or user cost?\". Background memory-job ",
+                "usage is included and grouped under the `memory` pseudo-channel."
+            )
+            .to_string(),
+            input_schema: ToolInputSchema::new(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "group_by": {
+                        "type": "string",
+                        "enum": ["total", "guild", "channel", "user", "agent", "provider", "model", "kind"],
+                        "default": "total",
+                        "description": "Aggregation dimension for the report rows. `guild` buckets guild-less usage under `direct`; `kind` splits by usage subject such as `model_step` or `image_generation`."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["guild", "channel", "global"],
+                        "default": "guild",
+                        "description": "guild = the current server (or this direct-message channel outside a server), channel = the current channel or thread only, global = every server and DM this bot serves."
+                    },
+                    "days": {
+                        "type": "number",
+                        "exclusiveMinimum": 0,
+                        "description": "Look-back window in days; fractions allowed. Omit for lifetime totals."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "default": 10,
+                        "description": "Maximum number of report rows, costliest first."
+                    }
+                },
+                "additionalProperties": false
+            })),
+        }
+    }
+
+    #[tracing::instrument(
+        name = "tool.usage_report",
+        skip_all,
+        fields(
+            tool_call = %call.id,
+            platform = %self.channel.platform,
+            channel = %self.channel.channel_id,
+        )
+    )]
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+        let request = usage_report_request(&call.input, &self.channel, OffsetDateTime::now_utc())?;
+        let mut groups = self
+            .storage
+            .usage_cost_report(request.query.clone())
+            .await
+            .map_err(|error| BotToolError::Storage(error.to_string()))?;
+        let truncated = groups.len() > request.limit as usize;
+        groups.truncate(request.limit as usize);
+        let total = if request.query.group_by == UsageCostGrouping::Total {
+            groups.first().cloned()
+        } else {
+            self.storage
+                .usage_cost_report(UsageCostQuery {
+                    group_by: UsageCostGrouping::Total,
+                    limit: 1,
+                    ..request.query.clone()
+                })
+                .await
+                .map_err(|error| BotToolError::Storage(error.to_string()))?
+                .into_iter()
+                .next()
+        };
+        tracing::info!(
+            group_by = ?request.query.group_by,
+            groups = groups.len(),
+            truncated,
+            "built usage cost report"
+        );
+        let value = usage_report_value(&request, total.as_ref(), &groups, truncated);
+        Ok(ClientToolOutput {
+            result: ClientToolResultContent::Json {
+                value: value.clone(),
+            },
+            media: Vec::new(),
+            is_error: false,
+            trace_response: value,
+            usage: Vec::new(),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct UsageReportRequest {
+    query: UsageCostQuery,
+    days: Option<f64>,
+    limit: u32,
+}
+
+fn usage_report_request(
+    input: &serde_json::Value,
+    channel: &ChannelRef,
+    now: OffsetDateTime,
+) -> Result<UsageReportRequest, BotToolError> {
+    let group_by = match tool_optional_string(input, "group_by")?
+        .as_deref()
+        .unwrap_or("total")
+    {
+        "total" => UsageCostGrouping::Total,
+        "guild" => UsageCostGrouping::Guild,
+        "channel" => UsageCostGrouping::Channel,
+        "user" => UsageCostGrouping::User,
+        "agent" => UsageCostGrouping::Agent,
+        "provider" => UsageCostGrouping::Provider,
+        "model" => UsageCostGrouping::Model,
+        "kind" => UsageCostGrouping::Kind,
+        other => {
+            return Err(BotToolError::InvalidInput(format!(
+                "unknown `group_by` value `{other}`"
+            )));
+        }
+    };
+    let scope = match tool_optional_string(input, "scope")?
+        .as_deref()
+        .unwrap_or("guild")
+    {
+        "guild" => match &channel.guild_id {
+            Some(guild_id) => UsageCostScope::Guild {
+                guild_id: guild_id.as_str().to_string(),
+            },
+            None => current_channel_scope(channel),
+        },
+        "channel" => current_channel_scope(channel),
+        "global" => UsageCostScope::All,
+        other => {
+            return Err(BotToolError::InvalidInput(format!(
+                "unknown `scope` value `{other}`"
+            )));
+        }
+    };
+    let days = match input.get("days") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let days = value
+                .as_f64()
+                .filter(|days| days.is_finite() && *days > 0.0);
+            Some(days.ok_or_else(|| {
+                BotToolError::InvalidInput("`days` must be a positive number".to_string())
+            })?)
+        }
+    };
+    let since = days.map(|days| now - time::Duration::seconds_f64(days * 86_400.0));
+    let limit = match input.get("limit") {
+        None | Some(serde_json::Value::Null) => 10,
+        Some(value) => {
+            let limit = value
+                .as_u64()
+                .filter(|limit| (1..=50).contains(limit))
+                .ok_or_else(|| {
+                    BotToolError::InvalidInput(
+                        "`limit` must be an integer between 1 and 50".to_string(),
+                    )
+                })?;
+            u32::try_from(limit).expect("limit fits u32 after range check")
+        }
+    };
+    Ok(UsageReportRequest {
+        query: UsageCostQuery {
+            platform: channel.platform.clone(),
+            scope,
+            since,
+            group_by,
+            // Fetch one extra row to detect truncation.
+            limit: limit + 1,
+        },
+        days,
+        limit,
+    })
+}
+
+fn current_channel_scope(channel: &ChannelRef) -> UsageCostScope {
+    UsageCostScope::Channel {
+        guild_id: channel
+            .guild_id
+            .as_ref()
+            .map(|guild_id| guild_id.as_str().to_string()),
+        channel_id: channel.channel_id.as_str().to_string(),
+    }
+}
+
+fn usage_report_value(
+    request: &UsageReportRequest,
+    total: Option<&UsageCostRow>,
+    groups: &[UsageCostRow],
+    truncated: bool,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "group_by": request.query.group_by,
+        "scope": request.query.scope,
+        "window_days": request.days,
+        "since": request.query.since.and_then(|since| {
+            since.format(&time::format_description::well_known::Rfc3339).ok()
+        }),
+        "total": total.map(|row| usage_cost_row_value(request.query.group_by, row)),
+    });
+    if request.query.group_by != UsageCostGrouping::Total {
+        value["groups"] = groups
+            .iter()
+            .map(|row| usage_cost_row_value(request.query.group_by, row))
+            .collect();
+        value["truncated"] = serde_json::Value::Bool(truncated);
+    }
+    value
+}
+
+fn usage_cost_row_value(group_by: UsageCostGrouping, row: &UsageCostRow) -> serde_json::Value {
+    let mut value = serde_json::to_value(row).unwrap_or_default();
+    if let Some(mention) = usage_cost_row_mention(group_by, row) {
+        value["mention"] = serde_json::Value::String(mention);
+    }
+    value
+}
+
+/// Platform mention markup the model can paste into a reply so ids render as
+/// user/channel names.
+fn usage_cost_row_mention(group_by: UsageCostGrouping, row: &UsageCostRow) -> Option<String> {
+    let key = row.key.as_deref()?;
+    match group_by {
+        UsageCostGrouping::User => Some(format!("<@{key}>")),
+        UsageCostGrouping::Channel => {
+            channel_id_from_channel_key(key).map(|channel_id| format!("<#{channel_id}>"))
+        }
+        _ => None,
+    }
+}
+
+/// Extract the platform channel id from a storage channel key
+/// (`guild:<g>:channel:<c>` or `channel:<c>`).
+fn channel_id_from_channel_key(key: &str) -> Option<&str> {
+    if let Some(rest) = key.strip_prefix("guild:") {
+        return rest
+            .split_once(":channel:")
+            .map(|(_, channel_id)| channel_id);
+    }
+    key.strip_prefix("channel:")
 }
 
 #[derive(Debug, Error)]
@@ -7322,6 +7599,188 @@ mod tests {
             channel_id: ExternalId::new("channel-1"),
             message_id: ExternalId::new(id),
         }
+    }
+
+    fn channel_ref(guild: Option<&str>) -> ChannelRef {
+        ChannelRef {
+            platform: PlatformName::new("discord"),
+            guild_id: guild.map(ExternalId::new),
+            channel_id: ExternalId::new("channel-1"),
+        }
+    }
+
+    fn usage_cost_row(key: Option<&str>) -> UsageCostRow {
+        UsageCostRow {
+            key: key.map(str::to_string),
+            label: None,
+            records: 3,
+            conversations: 2,
+            turns: 2,
+            input_tokens: 100,
+            cached_input_tokens: 10,
+            output_tokens: 50,
+            reasoning_tokens: 5,
+            total_tokens: 165,
+            cost_usd: Some("0.0123".to_string()),
+            cost_estimated: false,
+            unpriced_records: 0,
+        }
+    }
+
+    #[test]
+    fn usage_report_request_defaults_to_guild_lifetime_total() {
+        let request = usage_report_request(
+            &json!({}),
+            &channel_ref(Some("guild-1")),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("default input parses");
+        assert_eq!(request.query.group_by, UsageCostGrouping::Total);
+        assert_eq!(
+            request.query.scope,
+            UsageCostScope::Guild {
+                guild_id: "guild-1".to_string()
+            }
+        );
+        assert!(request.query.since.is_none());
+        assert_eq!(request.days, None);
+        assert_eq!(request.limit, 10);
+        assert_eq!(request.query.limit, 11);
+        assert_eq!(request.query.platform, PlatformName::new("discord"));
+    }
+
+    #[test]
+    fn usage_report_request_guild_scope_falls_back_to_dm_channel() {
+        let request =
+            usage_report_request(&json!({}), &channel_ref(None), OffsetDateTime::UNIX_EPOCH)
+                .expect("dm input parses");
+        assert_eq!(
+            request.query.scope,
+            UsageCostScope::Channel {
+                guild_id: None,
+                channel_id: "channel-1".to_string()
+            }
+        );
+    }
+
+    #[test_case(json!({"scope": "channel"}), UsageCostScope::Channel {
+        guild_id: Some("guild-1".to_string()),
+        channel_id: "channel-1".to_string(),
+    } ; "channel scope keeps guild")]
+    #[test_case(json!({"scope": "global"}), UsageCostScope::All ; "global scope")]
+    fn usage_report_request_maps_scopes(input: serde_json::Value, expected: UsageCostScope) {
+        let request = usage_report_request(
+            &input,
+            &channel_ref(Some("guild-1")),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("scope parses");
+        assert_eq!(request.query.scope, expected);
+    }
+
+    #[test_case("guild", UsageCostGrouping::Guild ; "guild grouping")]
+    #[test_case("channel", UsageCostGrouping::Channel ; "channel grouping")]
+    #[test_case("user", UsageCostGrouping::User ; "user grouping")]
+    #[test_case("agent", UsageCostGrouping::Agent ; "agent grouping")]
+    #[test_case("provider", UsageCostGrouping::Provider ; "provider grouping")]
+    #[test_case("model", UsageCostGrouping::Model ; "model grouping")]
+    #[test_case("kind", UsageCostGrouping::Kind ; "kind grouping")]
+    fn usage_report_request_maps_groupings(name: &str, expected: UsageCostGrouping) {
+        let request = usage_report_request(
+            &json!({ "group_by": name }),
+            &channel_ref(Some("guild-1")),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("grouping parses");
+        assert_eq!(request.query.group_by, expected);
+    }
+
+    #[test]
+    fn usage_report_request_window_days_sets_since() {
+        let now = OffsetDateTime::UNIX_EPOCH + time::Duration::days(400);
+        let request =
+            usage_report_request(&json!({"days": 1.5}), &channel_ref(Some("guild-1")), now)
+                .expect("days parses");
+        assert_eq!(request.days, Some(1.5));
+        assert_eq!(
+            request.query.since,
+            Some(now - time::Duration::seconds_f64(1.5 * 86_400.0))
+        );
+    }
+
+    #[test_case(json!({"group_by": "vibes"}) ; "unknown grouping")]
+    #[test_case(json!({"scope": "universe"}) ; "unknown scope")]
+    #[test_case(json!({"days": 0}) ; "zero days")]
+    #[test_case(json!({"days": -3}) ; "negative days")]
+    #[test_case(json!({"days": "week"}) ; "non numeric days")]
+    #[test_case(json!({"limit": 0}) ; "limit below range")]
+    #[test_case(json!({"limit": 51}) ; "limit above range")]
+    fn usage_report_request_rejects_invalid_input(input: serde_json::Value) {
+        let result = usage_report_request(
+            &input,
+            &channel_ref(Some("guild-1")),
+            OffsetDateTime::UNIX_EPOCH,
+        );
+        assert!(matches!(result, Err(BotToolError::InvalidInput(_))));
+    }
+
+    #[test_case("guild:g-1:channel:c-9", Some("c-9") ; "guild channel key")]
+    #[test_case("channel:c-9", Some("c-9") ; "dm channel key")]
+    #[test_case("memory", None ; "memory sentinel")]
+    fn channel_id_from_channel_key_extracts_id(key: &str, expected: Option<&str>) {
+        assert_eq!(channel_id_from_channel_key(key), expected);
+    }
+
+    #[test_case(UsageCostGrouping::User, Some("u-1"), Some("<@u-1>") ; "user mention")]
+    #[test_case(
+        UsageCostGrouping::Channel,
+        Some("guild:g-1:channel:c-1"),
+        Some("<#c-1>") ; "channel mention"
+    )]
+    #[test_case(UsageCostGrouping::Channel, Some("memory"), None ; "memory has no mention")]
+    #[test_case(UsageCostGrouping::Guild, Some("g-1"), None ; "guild has no mention")]
+    #[test_case(UsageCostGrouping::User, None, None ; "missing key has no mention")]
+    fn usage_cost_row_mention_decorates_rows(
+        group_by: UsageCostGrouping,
+        key: Option<&str>,
+        expected: Option<&str>,
+    ) {
+        let row = usage_cost_row(key);
+        assert_eq!(
+            usage_cost_row_mention(group_by, &row),
+            expected.map(str::to_string)
+        );
+    }
+
+    #[test]
+    fn usage_report_value_includes_groups_only_when_grouped() {
+        let grouped = usage_report_request(
+            &json!({"group_by": "user", "days": 1.0}),
+            &channel_ref(Some("guild-1")),
+            OffsetDateTime::UNIX_EPOCH + time::Duration::days(400),
+        )
+        .expect("request parses");
+        let total_row = usage_cost_row(None);
+        let group_row = usage_cost_row(Some("u-1"));
+        let value = usage_report_value(&grouped, Some(&total_row), &[group_row], true);
+        assert_eq!(value["group_by"], "user");
+        assert_eq!(value["scope"]["kind"], "guild");
+        assert_eq!(value["window_days"], 1.0);
+        assert!(value["since"].is_string());
+        assert_eq!(value["total"]["cost_usd"], "0.0123");
+        assert_eq!(value["groups"][0]["mention"], "<@u-1>");
+        assert_eq!(value["truncated"], true);
+
+        let total = usage_report_request(
+            &json!({}),
+            &channel_ref(Some("guild-1")),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .expect("request parses");
+        let value = usage_report_value(&total, Some(&total_row), &[], false);
+        assert!(value["since"].is_null());
+        assert!(value.get("groups").is_none());
+        assert!(value.get("truncated").is_none());
     }
 
     #[derive(Debug, Clone, Default)]

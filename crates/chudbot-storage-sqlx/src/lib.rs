@@ -15,9 +15,10 @@ use chudbot_api::{
     NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName,
     ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob,
     ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob,
-    UsageRecord, UsageSubject, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
-    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext,
-    UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserProfile, UserRef,
+    UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UsageSubject,
+    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
+    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
+    UserProfile, UserRef,
 };
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -1506,6 +1507,35 @@ impl BotStorage for SqlxStorage {
         .fetch_one(&self.pool)
         .await?;
         Ok(u64::try_from(count).unwrap_or(0))
+    }
+
+    async fn usage_cost_report(
+        &self,
+        query: UsageCostQuery,
+    ) -> Result<Vec<UsageCostRow>, Self::Error> {
+        let (guild, channel) = match &query.scope {
+            UsageCostScope::All => (None, None),
+            UsageCostScope::Guild { guild_id } => (Some(guild_id.clone()), None),
+            UsageCostScope::Channel {
+                guild_id,
+                channel_id,
+            } => (
+                None,
+                Some(selection_channel_key(guild_id.as_deref(), channel_id)),
+            ),
+        };
+        let limit = i64::from(query.limit.max(1));
+        // Safe to assert: the SQL is assembled from compile-time fragments
+        // only; all caller data is bound as parameters.
+        let rows = sqlx::query(sqlx::AssertSqlSafe(usage_cost_report_sql(query.group_by)))
+            .bind(query.platform.as_str())
+            .bind(guild)
+            .bind(channel)
+            .bind(query.since)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(usage_cost_row_from_row).collect())
     }
 
     async fn load_user_memory_document(
@@ -3172,6 +3202,151 @@ fn media_parts(uri: &str) -> (&'static str, String, &'static str) {
     ("other", uri.to_string(), "application/octet-stream")
 }
 
+/// Common row shape for turn usage and background memory-job usage.
+///
+/// `chan` is the storage channel key (`guild:<g>:channel:<c>` or
+/// `channel:<c>`); memory rows use the `memory` sentinel so channel-scoped
+/// queries exclude them while guild/user groupings still attribute them.
+const USAGE_COST_SOURCE_SQL: &str = "\
+    SELECT c.message_provider AS message_provider, \
+           CASE WHEN COALESCE(t.user_message_channel, c.channel) LIKE 'guild:%:channel:%' \
+                THEN split_part(COALESCE(t.user_message_channel, c.channel), ':', 2) \
+           END AS guild_key, \
+           COALESCE(t.user_message_channel, c.channel) AS chan, \
+           COALESCE(t.user_key, c.created_by_user_key) AS user_key, \
+           COALESCE(a.agent_name, c.agent_name) AS agent_name, \
+           u.provider AS provider, \
+           u.model AS model, \
+           COALESCE(u.subject_kind || ':' || u.subject_name, u.subject_kind) AS subject, \
+           u.input_tokens AS input_tokens, \
+           u.cached_tokens AS cached_tokens, \
+           u.output_tokens AS output_tokens, \
+           u.reasoning_tokens AS reasoning_tokens, \
+           u.total_tokens AS total_tokens, \
+           u.cost_amount AS cost_amount, \
+           u.cost_unit AS cost_unit, \
+           u.cost_estimated AS cost_estimated, \
+           u.conversation_id AS conversation_id, \
+           u.turn_id AS turn_id, \
+           u.created_at AS created_at \
+      FROM usage_records u \
+      JOIN conversations c ON c.id = u.conversation_id \
+      LEFT JOIN turns t ON t.id = u.turn_id \
+      LEFT JOIN turn_attempts a ON a.id = u.attempt_id \
+    UNION ALL \
+    SELECT m.message_provider, \
+           CASE WHEN m.scope_key LIKE 'guild:%' THEN substr(m.scope_key, 7) END, \
+           'memory', \
+           m.subject_user_key, \
+           m.agent_name, \
+           rec.value ->> 'provider', \
+           rec.value ->> 'model', \
+           m.subject, \
+           (rec.value ->> 'input_tokens')::bigint, \
+           (rec.value ->> 'cached_input_tokens')::bigint, \
+           (rec.value ->> 'output_tokens')::bigint, \
+           (rec.value ->> 'reasoning_tokens')::bigint, \
+           (rec.value ->> 'total_tokens')::bigint, \
+           rec.value -> 'cost' ->> 'amount', \
+           rec.value -> 'cost' ->> 'unit', \
+           (rec.value -> 'cost' ->> 'estimated')::boolean, \
+           NULL::uuid, \
+           NULL::uuid, \
+           m.created_at \
+      FROM ( \
+           SELECT de.message_provider, de.scope_key, de.subject_user_key, de.agent_name, \
+                  de.usage, de.created_at, 'memory_diary' AS subject \
+             FROM user_memory_diary_entries de \
+           UNION ALL \
+           SELECT dv.message_provider, dv.scope_key, dv.subject_user_key, dv.agent_name, \
+                  dv.usage, dv.created_at, 'memory_compact' \
+             FROM user_memory_document_versions dv \
+           ) m \
+      CROSS JOIN LATERAL jsonb_array_elements(m.usage) rec(value)";
+
+fn usage_cost_report_sql(group_by: UsageCostGrouping) -> String {
+    const GROUPED: &str = "GROUP BY 1 ORDER BY cost_usd_numeric DESC NULLS LAST, records DESC";
+    let (key, label, label_join, group_order) = match group_by {
+        UsageCostGrouping::Total => ("NULL::text", "MAX(NULL::text)", "", ""),
+        UsageCostGrouping::Guild => (
+            "COALESCE(src.guild_key, 'direct')",
+            "MAX(NULL::text)",
+            "",
+            GROUPED,
+        ),
+        UsageCostGrouping::Channel => ("src.chan", "MAX(NULL::text)", "", GROUPED),
+        UsageCostGrouping::User => (
+            "src.user_key",
+            "MAX(COALESCE(pu.display_name, pu.username))",
+            "LEFT JOIN platform_users pu \
+               ON pu.message_provider = src.message_provider AND pu.user_key = src.user_key ",
+            GROUPED,
+        ),
+        UsageCostGrouping::Agent => ("src.agent_name", "MAX(NULL::text)", "", GROUPED),
+        UsageCostGrouping::Provider => ("src.provider", "MAX(NULL::text)", "", GROUPED),
+        UsageCostGrouping::Model => (
+            "COALESCE(src.provider || '/' || src.model, src.provider)",
+            "MAX(NULL::text)",
+            "",
+            GROUPED,
+        ),
+        UsageCostGrouping::Kind => ("src.subject", "MAX(NULL::text)", "", GROUPED),
+    };
+    format!(
+        "SELECT {key} AS key, \
+                {label} AS label, \
+                COUNT(*) AS records, \
+                COUNT(DISTINCT src.conversation_id) AS conversations, \
+                COUNT(DISTINCT src.turn_id) AS turns, \
+                COALESCE(SUM(src.input_tokens), 0)::bigint AS input_tokens, \
+                COALESCE(SUM(src.cached_tokens), 0)::bigint AS cached_tokens, \
+                COALESCE(SUM(src.output_tokens), 0)::bigint AS output_tokens, \
+                COALESCE(SUM(src.reasoning_tokens), 0)::bigint AS reasoning_tokens, \
+                COALESCE(SUM(src.total_tokens), 0)::bigint AS total_tokens, \
+                SUM(CASE src.cost_unit \
+                    WHEN 'usd_ticks' THEN src.cost_amount::numeric / 10000000000::numeric \
+                    WHEN 'usd' THEN src.cost_amount::numeric \
+                END) AS cost_usd_numeric, \
+                trim_scale(round(SUM(CASE src.cost_unit \
+                    WHEN 'usd_ticks' THEN src.cost_amount::numeric / 10000000000::numeric \
+                    WHEN 'usd' THEN src.cost_amount::numeric \
+                END), 6))::text AS cost_usd, \
+                COALESCE(BOOL_OR(src.cost_estimated) \
+                    FILTER (WHERE src.cost_unit IN ('usd', 'usd_ticks')), false) AS cost_estimated, \
+                COUNT(*) FILTER (WHERE src.cost_amount IS NULL OR src.cost_unit IS NULL \
+                    OR src.cost_unit NOT IN ('usd', 'usd_ticks')) AS unpriced_records \
+           FROM ({USAGE_COST_SOURCE_SQL}) src \
+           {label_join}\
+          WHERE src.message_provider = $1 \
+            AND ($2::text IS NULL OR src.guild_key = $2) \
+            AND ($3::text IS NULL OR src.chan = $3) \
+            AND ($4::timestamptz IS NULL OR src.created_at >= $4) \
+          {group_order} \
+          LIMIT $5"
+    )
+}
+
+fn usage_cost_row_from_row(row: sqlx::postgres::PgRow) -> UsageCostRow {
+    fn non_negative(value: i64) -> u64 {
+        u64::try_from(value).unwrap_or(0)
+    }
+    UsageCostRow {
+        key: row.get("key"),
+        label: row.get("label"),
+        records: non_negative(row.get("records")),
+        conversations: non_negative(row.get("conversations")),
+        turns: non_negative(row.get("turns")),
+        input_tokens: non_negative(row.get("input_tokens")),
+        cached_input_tokens: non_negative(row.get("cached_tokens")),
+        output_tokens: non_negative(row.get("output_tokens")),
+        reasoning_tokens: non_negative(row.get("reasoning_tokens")),
+        total_tokens: non_negative(row.get("total_tokens")),
+        cost_usd: row.get("cost_usd"),
+        cost_estimated: row.get("cost_estimated"),
+        unpriced_records: non_negative(row.get("unpriced_records")),
+    }
+}
+
 fn usage_subject(subject: &UsageSubject) -> (&'static str, Option<String>) {
     match subject {
         UsageSubject::ModelStep => ("model_step", None),
@@ -3194,8 +3369,63 @@ fn display_name_for_user(user: &UserProfile) -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use test_case::test_case;
 
     use super::*;
+
+    #[test_case(UsageCostGrouping::Total, "NULL::text AS key" ; "total key is null")]
+    #[test_case(UsageCostGrouping::Guild, "COALESCE(src.guild_key, 'direct') AS key" ; "guild key")]
+    #[test_case(UsageCostGrouping::Channel, "src.chan AS key" ; "channel key")]
+    #[test_case(UsageCostGrouping::User, "src.user_key AS key" ; "user key")]
+    #[test_case(UsageCostGrouping::Agent, "src.agent_name AS key" ; "agent key")]
+    #[test_case(UsageCostGrouping::Provider, "src.provider AS key" ; "provider key")]
+    #[test_case(
+        UsageCostGrouping::Model,
+        "COALESCE(src.provider || '/' || src.model, src.provider) AS key" ; "model key"
+    )]
+    #[test_case(UsageCostGrouping::Kind, "src.subject AS key" ; "kind key")]
+    fn usage_cost_report_sql_selects_group_key(group_by: UsageCostGrouping, key_expr: &str) {
+        let sql = usage_cost_report_sql(group_by);
+        assert!(sql.starts_with(&format!("SELECT {key_expr}")), "{sql}");
+    }
+
+    #[test_case(UsageCostGrouping::Total, false ; "total is ungrouped")]
+    #[test_case(UsageCostGrouping::Guild, true ; "guild is grouped")]
+    #[test_case(UsageCostGrouping::User, true ; "user is grouped")]
+    fn usage_cost_report_sql_groups_when_keyed(group_by: UsageCostGrouping, grouped: bool) {
+        let sql = usage_cost_report_sql(group_by);
+        assert_eq!(sql.contains("GROUP BY 1"), grouped, "{sql}");
+        assert_eq!(
+            sql.contains("ORDER BY cost_usd_numeric DESC"),
+            grouped,
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn usage_cost_report_sql_joins_user_labels_only_for_user_grouping() {
+        let user_sql = usage_cost_report_sql(UsageCostGrouping::User);
+        assert!(
+            user_sql.contains("LEFT JOIN platform_users pu"),
+            "{user_sql}"
+        );
+        let guild_sql = usage_cost_report_sql(UsageCostGrouping::Guild);
+        assert!(!guild_sql.contains("platform_users"), "{guild_sql}");
+    }
+
+    #[test]
+    fn usage_cost_report_sql_binds_all_filters() {
+        let sql = usage_cost_report_sql(UsageCostGrouping::Total);
+        for filter in [
+            "src.message_provider = $1",
+            "$2::text IS NULL OR src.guild_key = $2",
+            "$3::text IS NULL OR src.chan = $3",
+            "$4::timestamptz IS NULL OR src.created_at >= $4",
+            "LIMIT $5",
+        ] {
+            assert!(sql.contains(filter), "missing `{filter}` in {sql}");
+        }
+    }
 
     #[test]
     fn tool_trace_media_asset_finds_nested_client_result_uri() {

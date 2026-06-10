@@ -18,7 +18,7 @@ use crate::media::MediaUri;
 use crate::platform::UserProfile;
 use crate::tool::ToolTrace;
 use crate::transcript::{ProviderContinuation, Transcript};
-use crate::usage::UsageRecord;
+use crate::usage::{UsageCostQuery, UsageCostRow, UsageRecord};
 
 /// Privacy mode for context gathering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1112,6 +1112,13 @@ pub trait BotStorage: Send + Sync {
         &self,
         input: CountActiveVideoGenerations,
     ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+
+    /// Aggregate stored usage/cost records — turn usage plus background
+    /// memory-job usage — for reporting, costliest groups first.
+    fn usage_cost_report(
+        &self,
+        query: UsageCostQuery,
+    ) -> impl Future<Output = Result<Vec<UsageCostRow>, Self::Error>> + Send;
 
     /// Load the current compact memory profile for one user.
     fn load_user_memory_document(
