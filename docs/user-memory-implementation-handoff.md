@@ -621,9 +621,9 @@ Suggested profile headings:
 Initial policy:
 
 - Enqueue diary jobs for the next complete `diary_interval` source window after
-  the user's last diary entry. Ignore completed turns older than
-  `now - diary_backfill_window` so first enablement on an existing database does
-  not summarize full historical chat.
+  the user's last diary entry or terminal diary job. Ignore completed turns older
+  than `now - diary_backfill_window` so first enablement on an existing database
+  does not summarize full historical chat.
 - Do not create a diary job for every new turn. If the next pending diary window
   starts at `T`, wait until `T + diary_interval <= now`, then summarize
   `[T, T + diary_interval)`.
@@ -648,6 +648,8 @@ Compaction should be resilient and idempotent:
   possible.
 - Re-running an expired job should not duplicate active jobs or corrupt the
   current memory document.
+- A diary job that exhausts its retry attempts should advance the diary window
+  cursor, so one bad source window is skipped instead of recreated forever.
 - Revision increments and current-document replacement should happen in one SQL
   transaction.
 - Mark the job complete only after the durable memory rows have been written.

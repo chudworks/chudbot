@@ -85,6 +85,8 @@ max_jobs_per_tick = 4
 max_concurrent_jobs = 4
 max_transcript_turns_per_diary_job = 40
 retry_backoff_seconds = 300
+# When a diary job exhausts this limit, that source window is skipped by future
+# scheduling so one bad window cannot be retried forever.
 max_job_attempts = 5
 
 [bot]

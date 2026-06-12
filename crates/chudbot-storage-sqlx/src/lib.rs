@@ -1754,6 +1754,43 @@ impl BotStorage for SqlxStorage {
         let mut inserted = 0u64;
         let diary_window_seconds =
             i64::try_from(schedule.diary_window_seconds.max(1)).unwrap_or(i64::MAX);
+        sqlx::query(
+            "UPDATE user_memory_jobs active_jobs \
+                SET status = 'failed', completed_at = COALESCE(completed_at, $1), \
+                    leased_by = NULL, leased_until = NULL, \
+                    error = COALESCE(error, 'diary window already reached terminal state') \
+              WHERE active_jobs.kind = 'diary' \
+                AND (active_jobs.status = 'pending' \
+                     OR (active_jobs.status = 'running' AND active_jobs.leased_until < $1)) \
+                AND active_jobs.window_start IS NOT NULL \
+                AND active_jobs.window_end IS NOT NULL \
+                AND ( \
+                     EXISTS ( \
+                         SELECT 1 \
+                           FROM user_memory_diary_entries diary_entry \
+                          WHERE diary_entry.message_provider = active_jobs.message_provider \
+                            AND diary_entry.scope_key = active_jobs.scope_key \
+                            AND diary_entry.subject_user_key = active_jobs.subject_user_key \
+                            AND diary_entry.window_start = active_jobs.window_start \
+                            AND diary_entry.window_end = active_jobs.window_end \
+                     ) \
+                     OR EXISTS ( \
+                         SELECT 1 \
+                           FROM user_memory_jobs terminal_jobs \
+                          WHERE terminal_jobs.kind = 'diary' \
+                            AND terminal_jobs.status IN ('completed', 'failed') \
+                            AND terminal_jobs.id <> active_jobs.id \
+                            AND terminal_jobs.message_provider = active_jobs.message_provider \
+                            AND terminal_jobs.scope_key = active_jobs.scope_key \
+                            AND terminal_jobs.subject_user_key = active_jobs.subject_user_key \
+                            AND terminal_jobs.window_start = active_jobs.window_start \
+                            AND terminal_jobs.window_end = active_jobs.window_end \
+                     ) \
+                )",
+        )
+        .bind(schedule.now)
+        .execute(&self.pool)
+        .await?;
         let diary_rows = sqlx::query(
             "SELECT diary_windows.message_provider, diary_windows.scope_key, \
                     diary_windows.subject_user_key, diary_windows.window_start, \
@@ -1786,7 +1823,18 @@ impl BotStorage for SqlxStorage {
                              LEFT JOIN ( \
                                   SELECT message_provider, scope_key, subject_user_key, \
                                          MAX(window_end) AS window_end \
-                                    FROM user_memory_diary_entries \
+                                    FROM ( \
+                                         SELECT message_provider, scope_key, subject_user_key, \
+                                                window_end \
+                                           FROM user_memory_diary_entries \
+                                          UNION ALL \
+                                         SELECT message_provider, scope_key, subject_user_key, \
+                                                window_end \
+                                           FROM user_memory_jobs \
+                                          WHERE kind = 'diary' \
+                                            AND status IN ('completed', 'failed') \
+                                            AND window_end IS NOT NULL \
+                                    ) processed_diary_windows \
                                    GROUP BY message_provider, scope_key, subject_user_key \
                              ) latest_diary \
                                ON latest_diary.message_provider = t.user_message_provider \
@@ -1917,7 +1965,18 @@ impl BotStorage for SqlxStorage {
                                     LEFT JOIN ( \
                                          SELECT message_provider, scope_key, subject_user_key, \
                                                 MAX(window_end) AS window_end \
-                                           FROM user_memory_diary_entries \
+                                           FROM ( \
+                                                SELECT message_provider, scope_key, subject_user_key, \
+                                                       window_end \
+                                                  FROM user_memory_diary_entries \
+                                                 UNION ALL \
+                                                SELECT message_provider, scope_key, subject_user_key, \
+                                                       window_end \
+                                                  FROM user_memory_jobs \
+                                                 WHERE kind = 'diary' \
+                                                   AND status IN ('completed', 'failed') \
+                                                   AND window_end IS NOT NULL \
+                                           ) processed_diary_windows \
                                           GROUP BY message_provider, scope_key, subject_user_key \
                                     ) latest_diary \
                                       ON latest_diary.message_provider = t.user_message_provider \
