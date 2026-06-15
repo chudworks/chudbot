@@ -343,6 +343,7 @@ dependencies = [
  "chudbot-asset-local",
  "chudbot-bot",
  "chudbot-discord",
+ "chudbot-gemini",
  "chudbot-openai",
  "chudbot-openai-compat",
  "chudbot-storage-sqlx",
@@ -394,6 +395,20 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "twilight-util",
+]
+
+[[package]]
+name = "chudbot-gemini"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chudbot-api",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

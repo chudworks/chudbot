@@ -171,6 +171,11 @@ input_usd_per_million_tokens = 3.00
 # cache_read_usd_per_million_tokens = 0.30
 output_usd_per_million_tokens = 15.00
 
+[llm.gemini]
+kind = "gemini"
+api_key = "AIza..."
+# base_url = "https://generativelanguage.googleapis.com/v1beta"
+
 # OpenAI-compatible Chat Completions provider for local/model-gateway hosts.
 # vLLM defaults to http://127.0.0.1:8000/v1 and needs
 # `--enable-auto-tool-choice --tool-call-parser <parser>` for automatic client
@@ -198,12 +203,22 @@ text_input_usd_per_million_tokens = 5.00
 image_input_usd_per_million_tokens = 10.00
 image_output_usd_per_million_tokens = 40.00
 
-# Named video-generation services. xAI is the only implemented v2 video backend.
+[image.gemini_images]
+kind = "gemini"
+api_key = "AIza..."
+# base_url = "https://generativelanguage.googleapis.com/v1beta"
+
+# Named video-generation services.
 
 [video.grok_video]
 kind = "xai"
 api_key = "xai-..."
 # base_url = "https://api.x.ai/v1"
+
+[video.gemini_video]
+kind = "gemini"
+api_key = "AIza..."
+# base_url = "https://generativelanguage.googleapis.com/v1beta"
 
 # Named audio transcription services. xAI uses the Grok Speech-to-Text endpoint.
 
@@ -405,3 +420,25 @@ description = "Ask a focused research subagent to gather facts and return a conc
 # id = "qwen3"
 # [bot.agents.local.model.provider_options]
 # value = { parallel_tool_calls = false, extra_body = { top_k = 40, min_p = 0.05 } }
+
+# Example Gemini agent with Nano Banana image generation and Veo video
+# generation.
+# [bot.agents.gemini]
+# provider = "gemini"
+# system_prompt = "You are a helpful assistant using Google's Gemini API."
+# server_tools = ["web_search"]
+# client_tools = ["fetch_messages", "generate_image", "generate_video", "post_status_message", "add_reaction", "usage_report"]
+# [bot.agents.gemini.model]
+# id = "gemini-3.5-flash"
+# server_tools = ["web_search"]
+# [bot.agents.gemini.model.sampling]
+# max_output_tokens = 4096
+# temperature = 0.7
+# [bot.agents.gemini.model.provider_options]
+# value = { thinking_level = "low" }
+# [bot.agents.gemini.image_generation]
+# provider = "gemini_images"
+# model = "gemini-3.1-flash-image"
+# [bot.agents.gemini.video_generation]
+# provider = "gemini_video"
+# model = "veo-3.1-generate-preview"

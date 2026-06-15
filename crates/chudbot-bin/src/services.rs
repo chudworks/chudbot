@@ -95,6 +95,7 @@ pub struct ConfiguredLlmProviders {
 #[derive(Debug, Default)]
 struct ConfiguredLlmProvidersInner {
     anthropic: BTreeMap<ProviderName, chudbot_anthropic::AnthropicClient>,
+    gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
     openai: BTreeMap<ProviderName, chudbot_openai::OpenAiClient>,
     openai_compat: BTreeMap<ProviderName, chudbot_openai_compat::OpenAiCompatClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
@@ -174,6 +175,19 @@ impl ConfiguredLlmProviders {
                     );
                     providers.openai_compat.insert(name.clone(), client);
                 }
+                LlmProviderConfig::Gemini { api_key, base_url } => {
+                    let mut client = chudbot_gemini::GeminiClient::new(api_key.clone());
+                    if let Some(base_url) = base_url {
+                        client = client.with_base_url(base_url.clone());
+                    }
+                    tracing::info!(
+                        provider = %name,
+                        kind = "gemini",
+                        base_url_override = base_url.is_some(),
+                        "registered LLM provider"
+                    );
+                    providers.gemini.insert(name.clone(), client);
+                }
                 LlmProviderConfig::Xai { api_key, base_url } => {
                     let mut client = chudbot_xai::XaiClient::new(api_key.clone());
                     if let Some(base_url) = base_url {
@@ -196,6 +210,7 @@ impl ConfiguredLlmProviders {
 
     pub(crate) fn configured_count(&self) -> usize {
         self.inner.anthropic.len()
+            + self.inner.gemini.len()
             + self.inner.openai.len()
             + self.inner.openai_compat.len()
             + self.inner.xai.len()
@@ -207,6 +222,7 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
 
     fn contains_provider(&self, provider: &ProviderName) -> bool {
         let contains = self.inner.anthropic.contains_key(provider)
+            || self.inner.gemini.contains_key(provider)
             || self.inner.openai.contains_key(provider)
             || self.inner.openai_compat.contains_key(provider)
             || self.inner.xai.contains_key(provider);
@@ -242,6 +258,12 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
                 .await
                 .map_err(ConfiguredLlmError::OpenAiCompat);
         }
+        if let Some(client) = self.inner.gemini.get(provider) {
+            tracing::debug!(kind = "gemini", "dispatching model step");
+            return LlmBackend::step(client, request)
+                .await
+                .map_err(ConfiguredLlmError::Gemini);
+        }
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching model step");
             return LlmBackend::step(client, request)
@@ -261,6 +283,7 @@ pub struct ConfiguredImageGenerators {
 
 #[derive(Debug, Default)]
 struct ConfiguredImageGeneratorsInner {
+    gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
     openai: BTreeMap<ProviderName, chudbot_openai::OpenAiClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
 }
@@ -317,6 +340,19 @@ impl ConfiguredImageGenerators {
                     );
                     providers.xai.insert(name.clone(), client);
                 }
+                ImageProviderConfig::Gemini { api_key, base_url } => {
+                    let mut client = chudbot_gemini::GeminiClient::new(api_key.clone());
+                    if let Some(base_url) = base_url {
+                        client = client.with_base_url(base_url.clone());
+                    }
+                    tracing::info!(
+                        provider = %name,
+                        kind = "gemini",
+                        base_url_override = base_url.is_some(),
+                        "registered image provider"
+                    );
+                    providers.gemini.insert(name.clone(), client);
+                }
             }
         }
         Self {
@@ -325,7 +361,7 @@ impl ConfiguredImageGenerators {
     }
 
     pub(crate) fn configured_count(&self) -> usize {
-        self.inner.openai.len() + self.inner.xai.len()
+        self.inner.gemini.len() + self.inner.openai.len() + self.inner.xai.len()
     }
 }
 
@@ -333,8 +369,9 @@ impl ImageGeneratorRegistry for ConfiguredImageGenerators {
     type Error = ConfiguredImageError;
 
     fn contains_generator(&self, provider: &ProviderName) -> bool {
-        let contains =
-            self.inner.openai.contains_key(provider) || self.inner.xai.contains_key(provider);
+        let contains = self.inner.gemini.contains_key(provider)
+            || self.inner.openai.contains_key(provider)
+            || self.inner.xai.contains_key(provider);
         tracing::trace!(provider = %provider, contains, "checking image provider registry");
         contains
     }
@@ -355,6 +392,12 @@ impl ImageGeneratorRegistry for ConfiguredImageGenerators {
                 .await
                 .map_err(ConfiguredImageError::OpenAi);
         }
+        if let Some(client) = self.inner.gemini.get(provider) {
+            tracing::debug!(kind = "gemini", "dispatching image generation");
+            return ImageGenerator::generate_image(client, request)
+                .await
+                .map_err(ConfiguredImageError::Gemini);
+        }
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching image generation");
             return ImageGenerator::generate_image(client, request)
@@ -374,6 +417,7 @@ pub struct ConfiguredVideoGenerators {
 
 #[derive(Debug, Default)]
 struct ConfiguredVideoGeneratorsInner {
+    gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
 }
 
@@ -408,6 +452,19 @@ impl ConfiguredVideoGenerators {
                     );
                     providers.xai.insert(name.clone(), client);
                 }
+                VideoProviderConfig::Gemini { api_key, base_url } => {
+                    let mut client = chudbot_gemini::GeminiClient::new(api_key.clone());
+                    if let Some(base_url) = base_url {
+                        client = client.with_base_url(base_url.clone());
+                    }
+                    tracing::info!(
+                        provider = %name,
+                        kind = "gemini",
+                        base_url_override = base_url.is_some(),
+                        "registered video provider"
+                    );
+                    providers.gemini.insert(name.clone(), client);
+                }
             }
         }
         Self {
@@ -416,7 +473,7 @@ impl ConfiguredVideoGenerators {
     }
 
     pub(crate) fn configured_count(&self) -> usize {
-        self.inner.xai.len()
+        self.inner.gemini.len() + self.inner.xai.len()
     }
 }
 
@@ -424,7 +481,8 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
     type Error = ConfiguredVideoError;
 
     fn contains_generator(&self, provider: &ProviderName) -> bool {
-        let contains = self.inner.xai.contains_key(provider);
+        let contains =
+            self.inner.gemini.contains_key(provider) || self.inner.xai.contains_key(provider);
         tracing::trace!(provider = %provider, contains, "checking video provider registry");
         contains
     }
@@ -445,6 +503,12 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
                 .await
                 .map_err(ConfiguredVideoError::Xai);
         }
+        if let Some(client) = self.inner.gemini.get(provider) {
+            tracing::debug!(kind = "gemini", "dispatching video submit");
+            return VideoGenerator::submit_video(client, request)
+                .await
+                .map_err(ConfiguredVideoError::Gemini);
+        }
         tracing::warn!("requested video provider is missing from registry");
         Err(ConfiguredVideoError::Missing(provider.clone()))
     }
@@ -460,6 +524,11 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
                 .await
                 .map_err(ConfiguredVideoError::Xai);
         }
+        if let Some(client) = self.inner.gemini.get(provider) {
+            return VideoGenerator::check_video(client, job)
+                .await
+                .map_err(ConfiguredVideoError::Gemini);
+        }
         tracing::warn!("requested video provider is missing from registry");
         Err(ConfiguredVideoError::Missing(provider.clone()))
     }
@@ -474,6 +543,11 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
             return VideoGenerator::download_video(client, url)
                 .await
                 .map_err(ConfiguredVideoError::Xai);
+        }
+        if let Some(client) = self.inner.gemini.get(provider) {
+            return VideoGenerator::download_video(client, url)
+                .await
+                .map_err(ConfiguredVideoError::Gemini);
         }
         tracing::warn!("requested video provider is missing from registry");
         Err(ConfiguredVideoError::Missing(provider.clone()))

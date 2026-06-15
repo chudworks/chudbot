@@ -15,6 +15,9 @@ pub enum ConfiguredLlmError {
     /// Anthropic request failed.
     #[error(transparent)]
     Anthropic(#[from] chudbot_anthropic::AnthropicError),
+    /// Gemini request failed.
+    #[error(transparent)]
+    Gemini(#[from] chudbot_gemini::GeminiError),
     /// OpenAI request failed.
     #[error(transparent)]
     OpenAi(#[from] chudbot_openai::OpenAiError),
@@ -32,6 +35,9 @@ pub enum ConfiguredImageError {
     /// Provider was referenced but not implemented/configured.
     #[error("image provider `{0}` is not available in the 2.0 runtime")]
     Missing(ProviderName),
+    /// Gemini image generation failed.
+    #[error(transparent)]
+    Gemini(#[from] chudbot_gemini::GeminiError),
     /// OpenAI image generation failed.
     #[error(transparent)]
     OpenAi(#[from] chudbot_openai::OpenAiError),
@@ -46,6 +52,9 @@ pub enum ConfiguredVideoError {
     /// Provider was referenced but not implemented/configured.
     #[error("video provider `{0}` is not available in the 2.0 runtime")]
     Missing(ProviderName),
+    /// Gemini video generation failed.
+    #[error(transparent)]
+    Gemini(#[from] chudbot_gemini::GeminiError),
     /// xAI video generation failed.
     #[error(transparent)]
     Xai(#[from] chudbot_xai::XaiError),

@@ -419,6 +419,14 @@ pub enum LlmProviderConfig {
         #[serde(default)]
         api_key: Option<String>,
     },
+    /// Google Gemini API provider.
+    Gemini {
+        /// API key.
+        api_key: String,
+        /// Optional base URL override.
+        #[serde(default)]
+        base_url: Option<String>,
+    },
 }
 
 /// Named image-generation provider config.
@@ -445,6 +453,14 @@ pub enum ImageProviderConfig {
         #[serde(default)]
         base_url: Option<String>,
     },
+    /// Google Gemini API image generation provider.
+    Gemini {
+        /// API key.
+        api_key: String,
+        /// Optional base URL override.
+        #[serde(default)]
+        base_url: Option<String>,
+    },
 }
 
 /// Named video-generation provider config.
@@ -453,6 +469,14 @@ pub enum ImageProviderConfig {
 pub enum VideoProviderConfig {
     /// xAI video generation provider.
     Xai {
+        /// API key.
+        api_key: String,
+        /// Optional base URL override.
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+    /// Google Gemini API Veo video generation provider.
+    Gemini {
         /// API key.
         api_key: String,
         /// Optional base URL override.

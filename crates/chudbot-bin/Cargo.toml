@@ -15,6 +15,7 @@ chudbot-anthropic = { path = "../chudbot-anthropic" }
 chudbot-asset-local = { path = "../chudbot-asset-local" }
 chudbot-bot = { path = "../chudbot-bot" }
 chudbot-discord = { path = "../chudbot-discord" }
+chudbot-gemini = { path = "../chudbot-gemini" }
 chudbot-openai = { path = "../chudbot-openai" }
 chudbot-openai-compat = { path = "../chudbot-openai-compat" }
 chudbot-storage-sqlx = { path = "../chudbot-storage-sqlx" }
