@@ -399,13 +399,16 @@ pub enum LlmProviderConfig {
         #[serde(default)]
         pricing: BTreeMap<ModelId, chudbot_openai::OpenAiTokenPricing>,
     },
-    /// Anthropic provider placeholder.
+    /// Anthropic provider.
     Anthropic {
         /// API key.
         api_key: String,
         /// Optional base URL override.
         #[serde(default)]
         base_url: Option<String>,
+        /// Optional per-model text-token pricing overrides.
+        #[serde(default)]
+        pricing: BTreeMap<ModelId, chudbot_anthropic::AnthropicTokenPricing>,
     },
     /// OpenAI-compatible provider placeholder.
     #[serde(rename = "openai_compat")]

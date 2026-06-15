@@ -8,12 +8,13 @@ use base64::engine::general_purpose::STANDARD as B64;
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
     ContentBlock, GroundingMetadata, LlmBackend, MediaRef, ModelId, ModelStep, ModelStepRequest,
-    ProviderName, ServerToolSet, ServerToolUse, ToolName, ToolUseId, Transcript, TurnRole,
-    UsageRecord, UsageSubject,
+    ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName, ToolUseId,
+    Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::pricing::{AnthropicPricing, AnthropicTokenUsage};
 use crate::{AnthropicClient, AnthropicError};
 
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
@@ -61,11 +62,13 @@ impl LlmBackend for AnthropicClient {
             Some(model_id.clone()),
             UsageSubject::ModelStep,
             parsed.usage.as_ref(),
+            self.pricing(),
         );
         log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
 
         let (text, client_tool_calls, server_tool_uses, grounding) =
             walk_blocks(&parsed.content, self.provider_name());
+        let continuation = continuation_from_content(self.provider_name(), &parsed.content);
 
         let mut content = Vec::new();
         if !text.is_empty() {
@@ -78,15 +81,14 @@ impl LlmBackend for AnthropicClient {
             server_tool_uses,
             grounding,
             model_id,
-            continuation: None,
+            continuation,
             usage: usage.into_iter().collect(),
         };
 
-        if !step.client_tool_calls.is_empty() {
-            Ok(ModelStep::UseClientTools { step })
-        } else {
-            Ok(ModelStep::Final { step })
-        }
+        Ok(model_step_from_assistant_step(
+            step,
+            parsed.stop_reason.as_deref(),
+        ))
     }
 }
 
@@ -113,7 +115,13 @@ async fn to_anthropic_messages(
             TurnRole::User => "user",
         };
 
-        let mut content = Vec::new();
+        let mut content = provider_continuation_content(turn, provider);
+
+        if !content.is_empty() {
+            messages.push(json!({ "role": role, "content": content }));
+            continue;
+        }
+
         for block in &turn.blocks {
             match block {
                 ContentBlock::Text { text } if !text.is_empty() => {
@@ -141,7 +149,7 @@ async fn to_anthropic_messages(
                     if &continuation.provider == provider {
                         tracing::debug!(
                             provider = %provider,
-                            "anthropic provider continuation is not replayed by this implementation",
+                            "skipping empty Anthropic provider continuation",
                         );
                     }
                 }
@@ -154,6 +162,24 @@ async fn to_anthropic_messages(
     }
 
     Ok((system, messages))
+}
+
+fn provider_continuation_content(
+    turn: &chudbot_api::TranscriptTurn,
+    provider: &ProviderName,
+) -> Vec<Value> {
+    let mut content = Vec::new();
+    for block in &turn.blocks {
+        if let ContentBlock::Continuation(continuation) = block
+            && &continuation.provider == provider
+        {
+            match &continuation.data {
+                Value::Array(items) => content.extend(items.iter().cloned()),
+                other => content.push(other.clone()),
+            }
+        }
+    }
+    content
 }
 
 async fn media_source(media: &dyn MediaRef) -> Result<Value, AnthropicError> {
@@ -313,6 +339,26 @@ fn walk_blocks(
     (text, client_uses, server_uses, grounding)
 }
 
+fn continuation_from_content(
+    provider: &ProviderName,
+    content: &[Value],
+) -> Option<ProviderContinuation> {
+    (!content.is_empty()).then_some(ProviderContinuation {
+        provider: provider.clone(),
+        data: Value::Array(content.to_vec()),
+    })
+}
+
+fn model_step_from_assistant_step(step: AssistantStep, stop_reason: Option<&str>) -> ModelStep {
+    if !step.client_tool_calls.is_empty() {
+        ModelStep::UseClientTools { step }
+    } else if stop_reason == Some("pause_turn") || step.content.is_empty() {
+        ModelStep::Continue { step }
+    } else {
+        ModelStep::Final { step }
+    }
+}
+
 fn server_tool_use_from_pair(
     provider: &ProviderName,
     request: Value,
@@ -397,11 +443,28 @@ fn usage_from_anthropic(
     model: Option<ModelId>,
     subject: UsageSubject,
     usage: Option<&Value>,
+    pricing: &AnthropicPricing,
 ) -> Option<UsageRecord> {
     let raw = usage?.clone();
     let parsed = serde_json::from_value::<Usage>(raw.clone()).ok()?;
-    let input_tokens =
-        parsed.input_tokens + parsed.cache_creation_input_tokens + parsed.cache_read_input_tokens;
+    let cache_creation_5m_input_tokens = parsed.cache_creation_5m_input_tokens();
+    let cache_creation_1h_input_tokens = parsed.cache_creation_1h_input_tokens();
+    let cache_creation_input_tokens = parsed.cache_creation_input_tokens();
+    let input_tokens = parsed
+        .input_tokens
+        .saturating_add(cache_creation_input_tokens)
+        .saturating_add(parsed.cache_read_input_tokens);
+    let cost = pricing.estimate_token_cost(
+        model.as_ref(),
+        AnthropicTokenUsage {
+            input_tokens: parsed.input_tokens,
+            cache_creation_5m_input_tokens,
+            cache_creation_1h_input_tokens,
+            cache_read_input_tokens: parsed.cache_read_input_tokens,
+            output_tokens: parsed.output_tokens,
+            inference_geo: parsed.inference_geo.as_deref(),
+        },
+    );
     Some(UsageRecord {
         provider: provider.clone(),
         model,
@@ -411,7 +474,7 @@ fn usage_from_anthropic(
         output_tokens: Some(parsed.output_tokens),
         reasoning_tokens: None,
         total_tokens: Some(input_tokens + parsed.output_tokens),
-        cost: None,
+        cost,
         raw: Some(raw),
     })
 }
@@ -452,6 +515,8 @@ struct AnthropicResponse {
     #[serde(default)]
     model: Option<String>,
     #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
     usage: Option<Value>,
 }
 
@@ -462,17 +527,132 @@ struct Usage {
     #[serde(default)]
     cache_creation_input_tokens: u64,
     #[serde(default)]
+    cache_creation: CacheCreationUsage,
+    #[serde(default)]
     cache_read_input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    #[serde(default)]
+    inference_geo: Option<String>,
+}
+
+impl Usage {
+    fn cache_creation_input_tokens(&self) -> u64 {
+        self.cache_creation_input_tokens
+            .max(self.cache_creation.total_input_tokens())
+    }
+
+    fn cache_creation_5m_input_tokens(&self) -> u64 {
+        if self.cache_creation.total_input_tokens() == 0 {
+            self.cache_creation_input_tokens
+        } else {
+            self.cache_creation.ephemeral_5m_input_tokens
+        }
+    }
+
+    fn cache_creation_1h_input_tokens(&self) -> u64 {
+        self.cache_creation.ephemeral_1h_input_tokens
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct CacheCreationUsage {
+    #[serde(default)]
+    ephemeral_5m_input_tokens: u64,
+    #[serde(default)]
+    ephemeral_1h_input_tokens: u64,
+}
+
+impl CacheCreationUsage {
+    fn total_input_tokens(&self) -> u64 {
+        self.ephemeral_5m_input_tokens
+            .saturating_add(self.ephemeral_1h_input_tokens)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use chudbot_api::{ClientToolResult, ClientToolResultContent, ProviderName, ToolUseId};
+    use chudbot_api::{
+        ClientToolResult, ClientToolResultContent, ProviderName, ToolUseId, TranscriptTurn,
+        TurnRole,
+    };
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn builds_anthropic_web_search_tool_only() {
+        let mut server_tools = ServerToolSet::new();
+        server_tools.insert("web_search".to_string());
+        server_tools.insert("x_search".to_string());
+
+        let tools = build_messages_tools(&BTreeMap::new(), &server_tools);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], WEB_SEARCH_TOOL_TYPE);
+        assert_eq!(tools[0]["name"], WEB_SEARCH_TOOL_NAME);
+        assert_eq!(tools[0]["max_uses"], 5);
+    }
+
+    #[test]
+    fn replays_anthropic_continuation_content_as_is() {
+        let provider = ProviderName::new("anthropic");
+        let raw_content = json!([
+            {"type": "text", "text": "Searching."},
+            {
+                "type": "server_tool_use",
+                "id": "srvtoolu_1",
+                "name": "web_search",
+                "input": {"query": "latest rust release"}
+            },
+            {
+                "type": "web_search_tool_result",
+                "tool_use_id": "srvtoolu_1",
+                "content": [{"type": "web_search_result", "url": "https://example.com"}]
+            }
+        ]);
+        let turn = TranscriptTurn {
+            role: TurnRole::Assistant,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "Searching.".to_string(),
+                },
+                ContentBlock::Continuation(ProviderContinuation {
+                    provider: provider.clone(),
+                    data: raw_content.clone(),
+                }),
+            ],
+            metadata: Value::Null,
+        };
+
+        assert_eq!(
+            provider_continuation_content(&turn, &provider),
+            raw_content.as_array().unwrap().clone()
+        );
+    }
+
+    #[test]
+    fn pause_turn_continues_even_with_text_content() {
+        let step = AssistantStep {
+            content: vec![ContentBlock::Text {
+                text: "I'll search for that.".to_string(),
+            }],
+            client_tool_calls: Vec::new(),
+            server_tool_uses: Vec::new(),
+            grounding: Vec::new(),
+            model_id: ModelId::new("claude-sonnet-4-6"),
+            continuation: continuation_from_content(
+                &ProviderName::new("anthropic"),
+                &[json!({"type": "text", "text": "I'll search for that."})],
+            ),
+            usage: Vec::new(),
+        };
+
+        assert!(matches!(
+            model_step_from_assistant_step(step, Some("pause_turn")),
+            ModelStep::Continue { .. }
+        ));
+    }
 
     #[test]
     fn pairs_server_tool_use_with_web_search_result() {
@@ -561,5 +741,64 @@ mod tests {
         assert_eq!(block["tool_use_id"], "toolu_1");
         assert_eq!(block["content"], "{\"ok\":true}");
         assert!(block.get("is_error").is_none());
+    }
+
+    #[test]
+    fn usage_estimates_cost_with_prompt_cache_details() {
+        let usage = json!({
+            "input_tokens": 100,
+            "cache_creation_input_tokens": 20,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 12,
+                "ephemeral_1h_input_tokens": 8
+            },
+            "cache_read_input_tokens": 40,
+            "output_tokens": 10,
+            "inference_geo": "global"
+        });
+        let provider = ProviderName::new("anthropic");
+
+        let record = usage_from_anthropic(
+            &provider,
+            Some(ModelId::new("claude-sonnet-4-6")),
+            UsageSubject::ModelStep,
+            Some(&usage),
+            &AnthropicPricing::default(),
+        )
+        .expect("usage record");
+
+        assert_eq!(record.input_tokens, Some(160));
+        assert_eq!(record.cached_input_tokens, Some(40));
+        assert_eq!(record.output_tokens, Some(10));
+        assert_eq!(record.total_tokens, Some(170));
+        let cost = record.cost.expect("estimated cost");
+        assert_eq!(cost.unit, "usd_ticks");
+        assert!(cost.estimated);
+        assert_eq!(cost.amount, "5550001");
+    }
+
+    #[test]
+    fn usage_treats_flat_cache_creation_as_5m_when_details_are_absent() {
+        let usage = json!({
+            "input_tokens": 100,
+            "cache_creation_input_tokens": 20,
+            "cache_read_input_tokens": 40,
+            "output_tokens": 10,
+        });
+        let provider = ProviderName::new("anthropic");
+
+        let record = usage_from_anthropic(
+            &provider,
+            Some(ModelId::new("claude-sonnet-4-6")),
+            UsageSubject::ModelStep,
+            Some(&usage),
+            &AnthropicPricing::default(),
+        )
+        .expect("usage record");
+
+        assert_eq!(record.input_tokens, Some(160));
+        assert_eq!(record.cached_input_tokens, Some(40));
+        assert_eq!(record.total_tokens, Some(170));
+        assert_eq!(record.cost.expect("estimated cost").amount, "5370001");
     }
 }

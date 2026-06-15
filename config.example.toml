@@ -160,6 +160,16 @@ output_usd_per_million_tokens = 30.00
 kind = "anthropic"
 api_key = "sk-ant-..."
 # base_url = "https://api.anthropic.com/v1"
+# Optional cost-estimation overrides. Values are USD per 1M tokens. Built-in
+# defaults cover standard/global Claude API pricing for current Claude models.
+# Cache rates default to Anthropic's documented multipliers when omitted:
+# 5m writes = 1.25x input, 1h writes = 2x input, reads = 0.1x input.
+[llm.anthropic.pricing."claude-sonnet-4-6"]
+input_usd_per_million_tokens = 3.00
+# cache_creation_5m_usd_per_million_tokens = 3.75
+# cache_creation_1h_usd_per_million_tokens = 6.00
+# cache_read_usd_per_million_tokens = 0.30
+output_usd_per_million_tokens = 15.00
 
 # OpenAI-compatible Chat Completions provider for local/model-gateway hosts.
 # vLLM defaults to http://127.0.0.1:8000/v1 and needs

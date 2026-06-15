@@ -1,14 +1,18 @@
 //! Anthropic provider crate for the chudbot 2.0 API.
 
 mod llm;
+mod pricing;
 
-use chudbot_api::ProviderName;
+use std::collections::BTreeMap;
+
 use chudbot_api::retry::{ClassifyError, ErrorClass, RetryPolicy, with_retry};
+use chudbot_api::{ModelId, ProviderName};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
 pub use llm::AnthropicOptions;
+pub use pricing::AnthropicTokenPricing;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const API_VERSION: &str = "2023-06-01";
@@ -20,6 +24,7 @@ pub struct AnthropicClient {
     api_key: String,
     base_url: String,
     provider_name: ProviderName,
+    pricing: pricing::AnthropicPricing,
 }
 
 impl AnthropicClient {
@@ -30,12 +35,19 @@ impl AnthropicClient {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             provider_name: ProviderName::new("anthropic"),
+            pricing: pricing::AnthropicPricing::default(),
         }
     }
 
     /// Override the base URL. Useful for local tests.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Override or add text-token pricing entries used for cost estimates.
+    pub fn with_token_pricing(mut self, pricing: BTreeMap<ModelId, AnthropicTokenPricing>) -> Self {
+        self.pricing.apply_token_overrides(pricing);
         self
     }
 
@@ -56,6 +68,10 @@ impl AnthropicClient {
 
     pub(crate) fn provider_name(&self) -> &ProviderName {
         &self.provider_name
+    }
+
+    pub(crate) fn pricing(&self) -> &pricing::AnthropicPricing {
+        &self.pricing
     }
 
     pub(crate) async fn post_json<T>(
