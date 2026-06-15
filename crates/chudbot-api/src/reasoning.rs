@@ -120,11 +120,13 @@ fn reasoning_item_from_value(
     let item_type = object.get("type").and_then(Value::as_str);
     let summary = match item_type {
         Some("reasoning") => reasoning_summaries_from_value(object.get("summary")),
-        Some("thinking") => object
-            .get("thinking")
-            .and_then(Value::as_str)
-            .map(|text| vec![summary_text(Some("thinking"), text)])
-            .unwrap_or_default(),
+        Some("thinking") => anthropic_thinking_summaries(object),
+        Some("redacted_thinking") => {
+            vec![summary_text(
+                Some("redacted_thinking"),
+                "Thinking content redacted by provider.",
+            )]
+        }
         _ => Vec::new(),
     };
     let summary: Vec<_> = summary
@@ -145,6 +147,23 @@ fn reasoning_item_from_value(
             .map(str::to_string),
         summary,
     })
+}
+
+fn anthropic_thinking_summaries(object: &serde_json::Map<String, Value>) -> Vec<ReasoningSummary> {
+    if let Some(text) = object.get("thinking").and_then(Value::as_str)
+        && !text.trim().is_empty()
+    {
+        return vec![summary_text(Some("thinking"), text)];
+    }
+
+    if object.contains_key("signature") {
+        return vec![summary_text(
+            Some("thinking_omitted"),
+            "Thinking content omitted by provider.",
+        )];
+    }
+
+    Vec::new()
 }
 
 fn reasoning_summaries_from_value(value: Option<&Value>) -> Vec<ReasoningSummary> {
@@ -299,6 +318,46 @@ mod tests {
         assert_eq!(
             reasoning.items[0].summary[0].text,
             "Considered the tradeoffs."
+        );
+    }
+
+    #[test]
+    fn extracts_anthropic_omitted_and_redacted_thinking_markers() {
+        let provider = ProviderName::new("anthropic");
+        let continuation = ProviderContinuation {
+            provider: provider.clone(),
+            data: json!([
+                {
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": "OPAQUE"
+                },
+                {
+                    "type": "redacted_thinking",
+                    "data": "OPAQUE"
+                }
+            ]),
+        };
+
+        let reasoning = TurnReasoning::from_continuation_and_usage(Some(&continuation), None, &[]);
+
+        assert_eq!(reasoning.items.len(), 2);
+        assert_eq!(reasoning.items[0].provider, provider);
+        assert_eq!(
+            reasoning.items[0].summary[0].kind.as_deref(),
+            Some("thinking_omitted")
+        );
+        assert_eq!(
+            reasoning.items[0].summary[0].text,
+            "Thinking content omitted by provider."
+        );
+        assert_eq!(
+            reasoning.items[1].summary[0].kind.as_deref(),
+            Some("redacted_thinking")
+        );
+        assert_eq!(
+            reasoning.items[1].summary[0].text,
+            "Thinking content redacted by provider."
         );
     }
 }

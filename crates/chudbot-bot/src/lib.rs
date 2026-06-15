@@ -6389,11 +6389,15 @@ fn collect_provider_client_tool_call_ids(value: &serde_json::Value, out: &mut Ve
             }
         }
         serde_json::Value::Object(object) => {
-            if object.get("type").and_then(serde_json::Value::as_str) == Some("function_call")
-                && let Some(id) = object
+            let id = match object.get("type").and_then(serde_json::Value::as_str) {
+                Some("function_call") => object
                     .get("call_id")
                     .or_else(|| object.get("id"))
-                    .and_then(serde_json::Value::as_str)
+                    .and_then(serde_json::Value::as_str),
+                Some("tool_use") => object.get("id").and_then(serde_json::Value::as_str),
+                _ => None,
+            };
+            if let Some(id) = id
                 && !out.iter().any(|seen| seen == id)
             {
                 out.push(id.to_string());
@@ -9375,6 +9379,60 @@ mod tests {
                 ContentBlock::Continuation(_),
                 ContentBlock::Text { text }
             ] if text == "Done."
+        ));
+    }
+
+    #[test]
+    fn model_step_replay_matches_anthropic_tool_use_results() {
+        let trace = generated_image_trace(
+            "file://images/generated.jpg",
+            "https://chud.example/images/generated.jpg",
+        );
+        let provider = ProviderName::new("anthropic");
+        let model_steps = vec![
+            ModelStepTrace {
+                ordinal: 0,
+                kind: ModelStepKind::ClientTools,
+                provider: provider.clone(),
+                model: ModelId::new("claude-haiku-4-5"),
+                continuation: Some(chudbot_api::ProviderContinuation {
+                    provider: provider.clone(),
+                    data: json!([
+                        { "type": "text", "text": "Need an image." },
+                        {
+                            "type": "tool_use",
+                            "id": "call-1",
+                            "name": "generate_image",
+                            "input": { "prompt": "a worm" }
+                        }
+                    ]),
+                }),
+            },
+            ModelStepTrace {
+                ordinal: 1,
+                kind: ModelStepKind::Final,
+                provider,
+                model: ModelId::new("claude-haiku-4-5"),
+                continuation: None,
+            },
+        ];
+        let mut transcript = Transcript::new();
+
+        let replayed =
+            append_model_step_replay(&mut transcript, &model_steps, &[trace], Some("Done."));
+
+        assert!(replayed);
+        assert_eq!(transcript.turns.len(), 3);
+        assert_eq!(transcript.turns[0].role, TurnRole::Assistant);
+        assert_eq!(transcript.turns[1].role, TurnRole::User);
+        assert_eq!(transcript.turns[2].role, TurnRole::Assistant);
+        let [ContentBlock::ClientToolResult(result)] = transcript.turns[1].blocks.as_slice() else {
+            panic!("expected matching Anthropic client tool result");
+        };
+        assert_eq!(result.tool_use_id.as_str(), "call-1");
+        assert!(matches!(
+            transcript.turns[2].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "Done."
         ));
     }
 

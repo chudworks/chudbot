@@ -404,6 +404,8 @@ server_tools = ["web_search"]
 [bot.agents.claude.model.sampling]
 max_output_tokens = 4096
 temperature = 0.4
+# [bot.agents.claude.model.provider_options]
+# value = { effort = "medium", thinking = { type = "adaptive", display = "summarized" } }
 
 # Subagents expose another configured agent as a client-side tool to the parent
 # model. The target agent must exist in [bot.agents].

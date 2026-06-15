@@ -35,6 +35,7 @@ impl LlmBackend for AnthropicClient {
         mark_last_block_ephemeral(&mut messages);
 
         let tools = build_messages_tools(&request.client_tools, &request.server_tools);
+        let options = AnthropicOptions::from_request(&request);
         let body = serde_json::to_value(AnthropicRequest {
             model: request.model.as_str(),
             max_tokens: request
@@ -46,6 +47,8 @@ impl LlmBackend for AnthropicClient {
             tools: &tools,
             temperature: request.sampling.temperature,
             top_p: request.sampling.top_p,
+            thinking: options.thinking.as_ref(),
+            effort: options.effort.as_deref(),
         })
         .map_err(|e| AnthropicError::Decode(e.to_string()))?;
 
@@ -481,7 +484,24 @@ fn usage_from_anthropic(
 
 /// Anthropic-specific per-request knobs.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
-pub struct AnthropicOptions {}
+pub struct AnthropicOptions {
+    /// Anthropic Messages `thinking` block, e.g. `{ type = "adaptive" }`.
+    #[serde(default)]
+    pub thinking: Option<Value>,
+    /// Anthropic effort level: `low`, `medium`, `high`, `max`, or model-specific values.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+impl AnthropicOptions {
+    fn from_request(request: &ModelStepRequest) -> Self {
+        request
+            .provider_options
+            .as_ref()
+            .and_then(|options| serde_json::from_value(options.value.clone()).ok())
+            .unwrap_or_default()
+    }
+}
 
 #[derive(Serialize)]
 struct AnthropicRequest<'a> {
@@ -496,6 +516,10 @@ struct AnthropicRequest<'a> {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<&'a str>,
 }
 
 fn mark_last_block_ephemeral(messages: &mut [Value]) {
@@ -741,6 +765,29 @@ mod tests {
         assert_eq!(block["tool_use_id"], "toolu_1");
         assert_eq!(block["content"], "{\"ok\":true}");
         assert!(block.get("is_error").is_none());
+    }
+
+    #[test]
+    fn request_body_includes_anthropic_thinking_and_effort_options() {
+        let messages = vec![json!({"role": "user", "content": [{"type": "text", "text": "hi"}]})];
+        let tools = Vec::new();
+        let thinking = json!({"type": "adaptive", "display": "summarized"});
+
+        let body = serde_json::to_value(AnthropicRequest {
+            model: "claude-sonnet-4-6",
+            max_tokens: 4096,
+            messages: &messages,
+            system: None,
+            tools: &tools,
+            temperature: None,
+            top_p: None,
+            thinking: Some(&thinking),
+            effort: Some("medium"),
+        })
+        .expect("serialize request");
+
+        assert_eq!(body["thinking"], thinking);
+        assert_eq!(body["effort"], "medium");
     }
 
     #[test]

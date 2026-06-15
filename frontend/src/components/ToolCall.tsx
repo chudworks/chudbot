@@ -80,13 +80,26 @@ function traceView(trace: ToolTrace): TraceView {
       };
     case 'grounding':
       return {
-        name: `${trace.metadata.provider}/grounding`,
+        name: groundingName(trace.metadata.provider, trace.metadata.raw),
         requestLabel: 'Metadata',
         request: { provider: trace.metadata.provider },
         responseLabel: 'Raw payload',
         response: trace.metadata.raw,
       };
   }
+}
+
+function groundingName(provider: string, raw: unknown): string {
+  return `${provider}/${isCitationMetadata(raw) ? 'citations' : 'grounding'}`;
+}
+
+function isCitationMetadata(raw: unknown): boolean {
+  const values = Array.isArray(raw) ? raw : [raw];
+  return values.some((value) => {
+    if (!value || typeof value !== 'object') return false;
+    const type = (value as { type?: unknown }).type;
+    return typeof type === 'string' && type.endsWith('_location');
+  });
 }
 
 function resultContentValue(content: ClientToolResultContent): unknown {
