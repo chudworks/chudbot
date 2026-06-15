@@ -194,19 +194,19 @@ async fn media_source(media: &dyn MediaRef) -> Result<Value, AnthropicError> {
         )));
     }
 
-    match media.public_url().await {
-        Ok(url) => Ok(json!({
-            "type": "url",
-            "url": url.as_str(),
+    match media.load().await {
+        Ok(loaded) => Ok(json!({
+            "type": "base64",
+            "media_type": loaded.media.mime_type(),
+            "data": B64.encode(&loaded.bytes),
         })),
-        Err(public_error) => match media.load().await {
-            Ok(loaded) => Ok(json!({
-                "type": "base64",
-                "media_type": loaded.media.mime_type(),
-                "data": B64.encode(&loaded.bytes),
+        Err(load_error) => match media.public_url().await {
+            Ok(url) => Ok(json!({
+                "type": "url",
+                "url": url.as_str(),
             })),
-            Err(load_error) => Err(AnthropicError::Reference(format!(
-                "media `{}` has no public URL ({public_error}) and could not be loaded ({load_error})",
+            Err(public_error) => Err(AnthropicError::Reference(format!(
+                "media `{}` could not be loaded ({load_error}) and has no public URL ({public_error})",
                 media.uri()
             ))),
         },
@@ -597,12 +597,57 @@ impl CacheCreationUsage {
 #[cfg(test)]
 mod tests {
     use chudbot_api::{
-        ClientToolResult, ClientToolResultContent, ProviderName, ToolUseId, TranscriptTurn,
-        TurnRole,
+        ClientToolResult, ClientToolResultContent, LoadedMedia, MediaCategory, MediaFuture,
+        MediaMetadata, MediaRef, MediaUri, ProviderName, PublicMediaUrl, ToolUseId, TranscriptTurn,
+        TurnRole, UrlMediaRef,
     };
     use serde_json::json;
 
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct LoadablePublicMediaRef {
+        metadata: MediaMetadata,
+        public_url: PublicMediaUrl,
+        bytes: Vec<u8>,
+    }
+
+    impl LoadablePublicMediaRef {
+        fn new(uri: &str, public_url: &str, mime_type: &str, bytes: Vec<u8>) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "stored-image.png".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: mime_type.to_string(),
+                    size_bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                },
+                public_url: PublicMediaUrl::new(public_url),
+                bytes,
+            }
+        }
+    }
+
+    impl MediaRef for LoadablePublicMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> chudbot_api::BoxedMediaRef {
+            Box::new(self.clone())
+        }
+
+        fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
+            let public_url = self.public_url.clone();
+            Box::pin(async move { Ok(public_url) })
+        }
+
+        fn load(&self) -> MediaFuture<'_, LoadedMedia> {
+            let media = self.clone_box();
+            let bytes = self.bytes.clone();
+            Box::pin(async move { Ok(LoadedMedia { media, bytes }) })
+        }
+    }
 
     #[test]
     fn builds_anthropic_web_search_tool_only() {
@@ -748,6 +793,37 @@ mod tests {
         assert_eq!(last[1]["cache_control"], json!({ "type": "ephemeral" }));
         assert!(last[0].get("cache_control").is_none());
         assert!(messages[0]["content"][0].get("cache_control").is_none());
+    }
+
+    #[tokio::test]
+    async fn loadable_media_is_inlined_instead_of_sent_as_url() {
+        let media = LoadablePublicMediaRef::new(
+            "file://images/stored.png",
+            "https://chud.example/media/images/stored.png",
+            "image/png",
+            b"image bytes".to_vec(),
+        );
+
+        let source = media_source(&media).await.expect("media source");
+
+        assert_eq!(source["type"], "base64");
+        assert_eq!(source["media_type"], "image/png");
+        assert_eq!(source["data"], "aW1hZ2UgYnl0ZXM=");
+        assert!(source.get("url").is_none());
+    }
+
+    #[tokio::test]
+    async fn url_only_media_still_uses_url_source() {
+        let media = UrlMediaRef::new(
+            MediaCategory::Image,
+            "https://example.com/image.png",
+            "image/png",
+        );
+
+        let source = media_source(&media).await.expect("media source");
+
+        assert_eq!(source["type"], "url");
+        assert_eq!(source["url"], "https://example.com/image.png");
     }
 
     #[test]
