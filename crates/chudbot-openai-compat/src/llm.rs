@@ -7,8 +7,8 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
-    ContentBlock, LlmBackend, MediaRef, ModelId, ModelStep, ModelStepRequest, ProviderName,
-    ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    ContentBlock, LlmBackend, MediaRef, ModelId, ModelStep, ModelStepRequest, ProviderContinuation,
+    ProviderName, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -83,6 +83,10 @@ impl LlmBackend for OpenAiCompatClient {
             &choice.message.tool_calls,
             choice.message.function_call.as_ref(),
         );
+        let continuation = continuation_from_reasoning_content(
+            self.provider_name(),
+            choice.message.reasoning_content.as_deref(),
+        );
 
         let mut content = Vec::new();
         if !text.is_empty() {
@@ -95,7 +99,7 @@ impl LlmBackend for OpenAiCompatClient {
             server_tool_uses: Vec::new(),
             grounding: Vec::new(),
             model_id,
-            continuation: None,
+            continuation,
             usage: usage.into_iter().collect(),
         };
 
@@ -450,6 +454,26 @@ fn merge_extra_body(body: &mut Value, extra_body: BTreeMap<String, Value>) {
     map.extend(extra_body);
 }
 
+fn continuation_from_reasoning_content(
+    provider: &ProviderName,
+    reasoning_content: Option<&str>,
+) -> Option<ProviderContinuation> {
+    let text = reasoning_content?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(ProviderContinuation {
+        provider: provider.clone(),
+        data: json!({
+            "type": "reasoning",
+            "summary": [{
+                "type": "reasoning_content",
+                "text": text,
+            }],
+        }),
+    })
+}
+
 #[derive(Deserialize)]
 struct ChatResponse {
     #[serde(default)]
@@ -469,6 +493,8 @@ struct Choice {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<Value>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     #[serde(default)]
     tool_calls: Vec<ToolCall>,
     #[serde(default)]
@@ -671,7 +697,11 @@ mod tests {
         let body = json!({
             "model": "local-model",
             "choices": [{
-                "message": { "role": "assistant", "content": "the answer" },
+                "message": {
+                    "role": "assistant",
+                    "content": "the answer",
+                    "reasoning_content": "thought through it",
+                },
                 "finish_reason": "stop",
             }],
             "usage": { "prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15 },
@@ -684,7 +714,31 @@ mod tests {
             content_to_text(choice.message.content.as_ref()).as_str(),
             "the answer"
         );
+        assert_eq!(
+            choice.message.reasoning_content.as_deref(),
+            Some("thought through it")
+        );
         assert!(choice.message.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn reasoning_content_becomes_viewer_continuation() {
+        let provider = ProviderName::new("openai_compat");
+        let continuation =
+            continuation_from_reasoning_content(&provider, Some("  considered the prompt\n  "))
+                .expect("reasoning continuation");
+
+        assert_eq!(continuation.provider, provider);
+        assert_eq!(continuation.data["type"], "reasoning");
+        assert_eq!(
+            continuation.data["summary"][0],
+            json!({
+                "type": "reasoning_content",
+                "text": "considered the prompt"
+            })
+        );
+        assert!(continuation_from_reasoning_content(&provider, Some("  ")).is_none());
+        assert!(continuation_from_reasoning_content(&provider, None).is_none());
     }
 
     #[test]
