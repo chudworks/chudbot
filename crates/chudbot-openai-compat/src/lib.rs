@@ -12,6 +12,7 @@ use chudbot_api::ProviderName;
 use chudbot_api::retry::{ClassifyError, ErrorClass, RetryPolicy, with_retry};
 use serde::Deserialize;
 use serde_json::Value;
+use std::error::Error as StdError;
 use thiserror::Error;
 
 pub use llm::OpenAiCompatOptions;
@@ -77,19 +78,24 @@ impl OpenAiCompatClient {
             "sending OpenAI-compatible JSON request"
         );
         with_retry(RetryPolicy::default(), label, || {
-            let mut request = self.http.post(&url).json(body);
+            let request_url = url.clone();
+            let mut request = self.http.post(&request_url).json(body);
             if let Some(api_key) = &self.api_key {
                 request = request.bearer_auth(api_key);
             }
             async move {
                 let resp = request.send().await.map_err(|e| {
+                    let error_chain = format_error_chain(&e);
                     tracing::warn!(
                         provider = %self.provider_name,
                         endpoint = %endpoint,
+                        url = %request_url,
                         error = %e,
+                        error_chain = %error_chain,
+                        error_debug = ?e,
                         "OpenAI-compatible request transport error"
                     );
-                    OpenAiCompatError::Transport(e.to_string())
+                    OpenAiCompatError::Transport(error_chain)
                 })?;
                 tracing::debug!(
                     provider = %self.provider_name,
@@ -169,6 +175,17 @@ fn truncate_body(mut body: String, max: usize) -> String {
     body
 }
 
+fn format_error_chain(error: &dyn StdError) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        message.push_str(": ");
+        message.push_str(&error.to_string());
+        source = error.source();
+    }
+    message
+}
+
 /// OpenAI-compatible provider error.
 #[derive(Debug, Error)]
 pub enum OpenAiCompatError {
@@ -207,6 +224,14 @@ impl ClassifyError for OpenAiCompatError {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Error)]
+    #[error("outer")]
+    struct OuterError(#[source] InnerError);
+
+    #[derive(Debug, Error)]
+    #[error("inner")]
+    struct InnerError;
+
     #[test]
     fn joins_endpoint_url_with_or_without_slashes() {
         assert_eq!(
@@ -217,5 +242,10 @@ mod tests {
             endpoint_url("http://127.0.0.1:8000/v1/", "chat/completions"),
             "http://127.0.0.1:8000/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn formats_error_source_chain() {
+        assert_eq!(format_error_chain(&OuterError(InnerError)), "outer: inner");
     }
 }
