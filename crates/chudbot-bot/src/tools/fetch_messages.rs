@@ -37,26 +37,26 @@ where
     pub(crate) fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: "Fetch recent messages from the current channel for context.".to_string(),
-            input_schema: ToolInputSchema::new(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "channel_id": {
-                        "type": "string",
-                        "description": "Optional platform channel id. Defaults to the current channel."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "default": 20
-                    },
-                    "before_message_id": {
-                        "type": "string",
-                        "description": "Optional platform message id to page before."
-                    }
-                },
-                "additionalProperties": false
-            })),
+            input_schema: ToolInputSchema::object([
+                ToolInputField::optional(
+                    "channel_id",
+                    ToolInputValueSchema::string().description(
+                        "Optional platform channel id. Defaults to the current channel.",
+                    ),
+                ),
+                ToolInputField::optional(
+                    "limit",
+                    ToolInputValueSchema::integer()
+                        .minimum(1)
+                        .maximum(100)
+                        .default(20),
+                ),
+                ToolInputField::optional(
+                    "before_message_id",
+                    ToolInputValueSchema::string()
+                        .description("Optional platform message id to page before."),
+                ),
+            ]),
         }
     }
 

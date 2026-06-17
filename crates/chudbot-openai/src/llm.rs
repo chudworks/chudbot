@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
     ContentBlock, GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep,
-    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName,
-    ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
+    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -335,13 +335,17 @@ fn build_responses_tools(
             "type": "function",
             "name": name.as_str(),
             "description": tool.description,
-            "parameters": tool.input_schema.as_json_schema(),
+            "parameters": openai_tool_parameters(&tool.input_schema),
         }));
     }
     if server_tools.contains("web_search") {
         tools.push(json!({ "type": "web_search" }));
     }
     tools
+}
+
+fn openai_tool_parameters(input_schema: &ToolInputSchema) -> Value {
+    serde_json::to_value(input_schema).expect("tool input schema serializes")
 }
 
 /// Build the OpenAI `reasoning` option object, omitting it when unset.
@@ -593,7 +597,9 @@ struct TokenDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chudbot_api::{ProviderOptions, ToolInputSchema, TranscriptTurn};
+    use chudbot_api::{
+        ProviderOptions, ToolInputField, ToolInputSchema, ToolInputValueSchema, TranscriptTurn,
+    };
 
     #[test]
     fn reasoning_models_reject_sampling_knobs() {
@@ -623,14 +629,30 @@ mod tests {
             ToolName::new("fetch_messages"),
             ClientToolSpec {
                 description: "Fetch context.".to_string(),
-                input_schema: ToolInputSchema::empty_object(),
+                input_schema: ToolInputSchema::object([ToolInputField::required(
+                    "query",
+                    ToolInputValueSchema::string().description("Search query."),
+                )]),
             },
         );
         let tools = build_responses_tools(&client_tools, &ServerToolSet::new());
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["name"], "fetch_messages");
-        assert_eq!(tools[0]["parameters"]["type"], "object");
+        assert_eq!(
+            tools[0]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]

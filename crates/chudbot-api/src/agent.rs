@@ -874,7 +874,7 @@ mod tests {
     fn test_tool_spec(description: impl Into<String>) -> ClientToolSpec {
         ClientToolSpec {
             description: description.into(),
-            input_schema: ToolInputSchema::new(json!({ "type": "object" })),
+            input_schema: ToolInputSchema::default(),
         }
     }
 

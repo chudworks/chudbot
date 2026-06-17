@@ -511,40 +511,31 @@ pub(crate) fn media_tool_model_result_json(
 /// The schema is deliberately stricter than many provider APIs: it rejects
 /// unknown fields and caps requested duration before provider routing.
 pub(crate) fn video_tool_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "required": ["prompt"],
-        "properties": {
-            "prompt": {
-                "type": "string",
-                "description": "The video prompt."
-            },
-            "image": {
-                "type": "string",
-                "description": "Optional media URI or public URL for an image to animate. Use file:// media URIs from prior tool results; do not invent local filesystem paths."
-            },
-            "image_url": {
-                "type": "string",
-                "description": "Alias for image."
-            },
-            "duration_seconds": {
-                "type": "integer",
-                "minimum": 1,
-                "maximum": 15
-            },
-            "aspect_ratio": {
-                "type": "string",
-                "description": "Optional provider-specific aspect ratio."
-            },
-            "resolution": {
-                "type": "string",
-                "description": "Optional provider-specific resolution or quality tier."
-            },
-            "model": {
-                "type": "string",
-                "description": "Optional provider-specific model id."
-            }
-        },
-        "additionalProperties": false
-    }))
+    ToolInputSchema::object([
+        ToolInputField::required(
+            "prompt",
+            ToolInputValueSchema::string().description("The video prompt."),
+        ),
+        ToolInputField::optional(
+            "image",
+            ToolInputValueSchema::string().description("Optional media URI or public URL for an image to animate. Use file:// media URIs from prior tool results; do not invent local filesystem paths."),
+        ),
+        ToolInputField::optional(
+            "duration_seconds",
+            ToolInputValueSchema::integer().minimum(1).maximum(15),
+        ),
+        ToolInputField::optional(
+            "aspect_ratio",
+            ToolInputValueSchema::string().description("Optional provider-specific aspect ratio."),
+        ),
+        ToolInputField::optional(
+            "resolution",
+            ToolInputValueSchema::string()
+                .description("Optional provider-specific resolution or quality tier."),
+        ),
+        ToolInputField::optional(
+            "model",
+            ToolInputValueSchema::string().description("Optional provider-specific model id."),
+        ),
+    ])
 }

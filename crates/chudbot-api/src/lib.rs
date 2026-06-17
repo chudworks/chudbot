@@ -113,7 +113,8 @@ pub use agent::{
 pub use tool::{
     ClientToolCall, ClientToolDefinition, ClientToolExecutor, ClientToolExecutorError,
     ClientToolOutput, ClientToolResult, ClientToolResultContent, ClientToolSpec, ClientToolTrace,
-    GroundingMetadata, NoClientTools, ServerToolUse, ToolInputSchema, ToolTrace,
+    GroundingMetadata, NoClientTools, ServerToolUse, ToolInputField, ToolInputSchema,
+    ToolInputValueSchema, ToolTrace,
 };
 
 // Media combines three related boundaries: stored media references, media store

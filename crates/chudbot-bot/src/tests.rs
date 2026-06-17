@@ -63,6 +63,23 @@ fn usage_cost_row(key: Option<&str>) -> UsageCostRow {
 // Usage report tests cover the JSON tool contract: default scoping, input
 // validation, grouping labels, and response payload shape.
 #[test]
+fn generated_tool_schemas_advertise_canonical_input_fields() {
+    let audio = audio_transcription_tool_schema().json_schema();
+    assert!(audio["properties"].get("audio_uri").is_some());
+    assert!(audio["properties"].get("keyterms").is_some());
+    assert!(audio["properties"].get("audio").is_none());
+    assert!(audio["properties"].get("keyterm").is_none());
+
+    let image = image_tool_schema().json_schema();
+    assert!(image["properties"].get("reference_images").is_some());
+    assert!(image["properties"].get("references").is_none());
+
+    let video = video_tool_schema().json_schema();
+    assert!(video["properties"].get("image").is_some());
+    assert!(video["properties"].get("image_url").is_none());
+}
+
+#[test]
 fn usage_report_request_defaults_to_guild_lifetime_total() {
     let request = usage_report_request(
         &json!({}),
@@ -1024,12 +1041,7 @@ async fn subagent_exposes_spec_and_executes_nested_agent() {
         spec.description,
         "Ask the OpenAI expert for a second opinion."
     );
-    assert!(
-        spec.input_schema
-            .as_json_schema()
-            .get("properties")
-            .is_some()
-    );
+    assert!(spec.input_schema.json_schema().get("properties").is_some());
 
     let output = subagent
         .call(ClientToolCall {

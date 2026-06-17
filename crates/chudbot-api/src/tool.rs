@@ -26,10 +26,12 @@
 //!    the next transcript step.
 //! 5. Persist [`ToolTrace::Client`] records for auditing and replay.
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::ids::{ProviderName, ToolName, ToolUseId};
@@ -49,55 +51,290 @@ pub struct ClientToolSpec {
     pub input_schema: ToolInputSchema,
 }
 
-/// JSON Schema describing a client-side tool's input object.
+/// Provider-neutral contract describing a client-side tool's input object.
 ///
-/// Providers use different envelope field names for this data. OpenAI and xAI
-/// call it `parameters`; Anthropic calls it `input_schema`. The schema document
-/// itself is JSON Schema, so the API crate keeps one provider-neutral wrapper
-/// and lets provider crates place it into their native request shape.
+/// Built-in tools should use the typed object contract instead of constructing
+/// JSON by hand. Provider crates still receive provider-shaped schema values
+/// because OpenAI/xAI/OpenAI-compatible, Anthropic, and Gemini use different
+/// tool envelopes and schema dialects.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(transparent)]
 pub struct ToolInputSchema {
-    /// Provider-neutral JSON Schema document.
-    json_schema: serde_json::Value,
+    #[serde(rename = "type")]
+    schema_type: ToolInputObjectType,
+    /// Object properties keyed by model-visible input name.
+    pub properties: BTreeMap<String, ToolInputValueSchema>,
+    /// Required input property names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+    /// Whether undeclared input fields are accepted.
+    #[serde(rename = "additionalProperties")]
+    pub additional_properties: bool,
 }
 
 impl ToolInputSchema {
-    /// Wrap a JSON Schema document.
-    ///
-    /// Callers are responsible for passing a schema valid for the target
-    /// provider. This type preserves the document without normalizing provider
-    /// extensions or schema draft details.
-    pub fn new(json_schema: serde_json::Value) -> Self {
-        Self { json_schema }
+    /// Build a strict object input contract.
+    pub fn object(fields: impl IntoIterator<Item = ToolInputField>) -> Self {
+        let mut properties = BTreeMap::new();
+        let mut required = Vec::new();
+        for field in fields {
+            if field.required {
+                required.push(field.name.clone());
+            }
+            properties.insert(field.name, field.schema);
+        }
+        Self {
+            schema_type: ToolInputObjectType::Object,
+            properties,
+            required,
+            additional_properties: false,
+        }
     }
 
     /// A strict empty object schema for no-argument tools.
     pub fn empty_object() -> Self {
-        // Keep no-arg tools explicit and strict so providers do not infer that
-        // arbitrary input keys are accepted.
-        Self::new(serde_json::json!({
-            "type": "object",
-            "properties": {},
-            "additionalProperties": false,
-        }))
+        Self::object([])
     }
 
-    /// Borrow the raw JSON Schema document for provider conversion.
-    pub fn as_json_schema(&self) -> &serde_json::Value {
-        &self.json_schema
+    /// Build the provider-neutral JSON Schema representation.
+    pub fn json_schema(&self) -> Value {
+        serde_json::to_value(self).expect("tool input schema serializes")
     }
 
-    /// Consume the wrapper and return the raw JSON Schema document.
-    pub fn into_json_schema(self) -> serde_json::Value {
-        self.json_schema
+    /// Consume the wrapper and return the generic JSON Schema representation.
+    pub fn into_json_schema(self) -> Value {
+        self.json_schema()
     }
 }
 
-impl From<serde_json::Value> for ToolInputSchema {
-    fn from(json_schema: serde_json::Value) -> Self {
-        Self::new(json_schema)
+impl Default for ToolInputSchema {
+    fn default() -> Self {
+        Self::empty_object()
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ToolInputObjectType {
+    Object,
+}
+
+/// One named property in a tool input object.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolInputField {
+    name: String,
+    schema: ToolInputValueSchema,
+    required: bool,
+}
+
+impl ToolInputField {
+    /// Define a required property.
+    pub fn required(name: impl Into<String>, schema: ToolInputValueSchema) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            required: true,
+        }
+    }
+
+    /// Define an optional property.
+    pub fn optional(name: impl Into<String>, schema: ToolInputValueSchema) -> Self {
+        Self {
+            name: name.into(),
+            schema,
+            required: false,
+        }
+    }
+}
+
+/// Provider-neutral schema for one tool input value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolInputValueSchema {
+    #[serde(flatten)]
+    kind: ToolInputValueKind,
+    /// Model-visible field description.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    /// Allowed string values.
+    #[serde(default, rename = "enum", skip_serializing_if = "Vec::is_empty")]
+    enum_values: Vec<String>,
+    /// Default value hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default: Option<Value>,
+    /// Inclusive minimum.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    minimum: Option<Value>,
+    /// Inclusive maximum.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    maximum: Option<Value>,
+    /// Exclusive minimum.
+    #[serde(rename = "exclusiveMinimum", skip_serializing_if = "Option::is_none")]
+    exclusive_minimum: Option<Value>,
+    /// Minimum string length.
+    #[serde(rename = "minLength", skip_serializing_if = "Option::is_none")]
+    min_length: Option<usize>,
+    /// Maximum string length.
+    #[serde(rename = "maxLength", skip_serializing_if = "Option::is_none")]
+    max_length: Option<usize>,
+    /// Minimum array length.
+    #[serde(rename = "minItems", skip_serializing_if = "Option::is_none")]
+    min_items: Option<usize>,
+    /// Maximum array length.
+    #[serde(rename = "maxItems", skip_serializing_if = "Option::is_none")]
+    max_items: Option<usize>,
+}
+
+impl ToolInputValueSchema {
+    /// String value.
+    pub fn string() -> Self {
+        Self::new(ToolInputValueKind::Typed {
+            schema_type: ToolInputValueType::String,
+            items: None,
+        })
+    }
+
+    /// Integer value.
+    pub fn integer() -> Self {
+        Self::new(ToolInputValueKind::Typed {
+            schema_type: ToolInputValueType::Integer,
+            items: None,
+        })
+    }
+
+    /// Number value.
+    pub fn number() -> Self {
+        Self::new(ToolInputValueKind::Typed {
+            schema_type: ToolInputValueType::Number,
+            items: None,
+        })
+    }
+
+    /// Boolean value.
+    pub fn boolean() -> Self {
+        Self::new(ToolInputValueKind::Typed {
+            schema_type: ToolInputValueType::Boolean,
+            items: None,
+        })
+    }
+
+    /// Array value.
+    pub fn array(items: ToolInputValueSchema) -> Self {
+        Self::new(ToolInputValueKind::Typed {
+            schema_type: ToolInputValueType::Array,
+            items: Some(Box::new(items)),
+        })
+    }
+
+    /// Union value emitted as `anyOf` in the provider-neutral JSON Schema.
+    pub fn any_of(schemas: impl IntoIterator<Item = ToolInputValueSchema>) -> Self {
+        Self::new(ToolInputValueKind::AnyOf {
+            any_of: schemas.into_iter().collect(),
+        })
+    }
+
+    /// Add a model-visible description.
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Restrict a string field to a fixed set of values.
+    pub fn enum_values<I, S>(mut self, values: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.enum_values = values.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Add a default value hint.
+    pub fn default(mut self, value: impl Into<Value>) -> Self {
+        self.default = Some(value.into());
+        self
+    }
+
+    /// Add an inclusive minimum.
+    pub fn minimum(mut self, value: impl Into<Value>) -> Self {
+        self.minimum = Some(value.into());
+        self
+    }
+
+    /// Add an inclusive maximum.
+    pub fn maximum(mut self, value: impl Into<Value>) -> Self {
+        self.maximum = Some(value.into());
+        self
+    }
+
+    /// Add an exclusive minimum.
+    pub fn exclusive_minimum(mut self, value: impl Into<Value>) -> Self {
+        self.exclusive_minimum = Some(value.into());
+        self
+    }
+
+    /// Add a minimum string length.
+    pub fn min_length(mut self, value: usize) -> Self {
+        self.min_length = Some(value);
+        self
+    }
+
+    /// Add a maximum string length.
+    pub fn max_length(mut self, value: usize) -> Self {
+        self.max_length = Some(value);
+        self
+    }
+
+    /// Add a minimum array length.
+    pub fn min_items(mut self, value: usize) -> Self {
+        self.min_items = Some(value);
+        self
+    }
+
+    /// Add a maximum array length.
+    pub fn max_items(mut self, value: usize) -> Self {
+        self.max_items = Some(value);
+        self
+    }
+
+    fn new(kind: ToolInputValueKind) -> Self {
+        Self {
+            kind,
+            description: None,
+            enum_values: Vec::new(),
+            default: None,
+            minimum: None,
+            maximum: None,
+            exclusive_minimum: None,
+            min_length: None,
+            max_length: None,
+            min_items: None,
+            max_items: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum ToolInputValueKind {
+    Typed {
+        #[serde(rename = "type")]
+        schema_type: ToolInputValueType,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        items: Option<Box<ToolInputValueSchema>>,
+    },
+    AnyOf {
+        #[serde(rename = "anyOf")]
+        any_of: Vec<ToolInputValueSchema>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ToolInputValueType {
+    String,
+    Integer,
+    Number,
+    Boolean,
+    Array,
 }
 
 /// One named client-side tool exposed by a [`ClientToolExecutor`].
@@ -380,5 +617,99 @@ impl ClientToolExecutor for NoClientTools {
         // With an empty advertised surface, every request is a protocol mismatch
         // that the agent loop can turn into a model-visible tool error.
         Err(ClientToolExecutorError::unknown(call.name))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn default_input_schema_is_empty_object() {
+        let schema = ToolInputSchema::default();
+
+        assert_eq!(schema, ToolInputSchema::empty_object());
+        assert_eq!(
+            schema.json_schema(),
+            json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            })
+        );
+    }
+
+    #[test]
+    fn typed_input_schema_emits_strict_json_schema_object() {
+        let schema = ToolInputSchema::object([
+            ToolInputField::required(
+                "prompt",
+                ToolInputValueSchema::string()
+                    .description("Prompt text.")
+                    .min_length(1),
+            ),
+            ToolInputField::optional(
+                "references",
+                ToolInputValueSchema::array(ToolInputValueSchema::string()).max_items(3),
+            ),
+            ToolInputField::optional(
+                "mode",
+                ToolInputValueSchema::string()
+                    .enum_values(["fast", "quality"])
+                    .default("fast"),
+            ),
+        ]);
+
+        assert_eq!(
+            schema.json_schema(),
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Prompt text.",
+                        "minLength": 1
+                    },
+                    "references": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": 3
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["fast", "quality"],
+                        "default": "fast"
+                    }
+                },
+                "required": ["prompt"],
+                "additionalProperties": false
+            })
+        );
+        let round_trip: ToolInputSchema =
+            serde_json::from_value(schema.json_schema()).expect("schema deserializes");
+        assert_eq!(round_trip, schema);
+    }
+
+    #[test]
+    fn typed_input_schema_supports_unions_without_raw_json() {
+        let schema = ToolInputSchema::object([ToolInputField::optional(
+            "value",
+            ToolInputValueSchema::any_of([
+                ToolInputValueSchema::string(),
+                ToolInputValueSchema::array(ToolInputValueSchema::string()),
+            ]),
+        )]);
+
+        assert_eq!(
+            schema.json_schema()["properties"]["value"],
+            json!({
+                "anyOf": [
+                    { "type": "string" },
+                    { "type": "array", "items": { "type": "string" } }
+                ]
+            })
+        );
     }
 }

@@ -670,17 +670,10 @@ where
 
 /// JSON Schema for all subagent tool inputs.
 fn subagent_input_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "required": ["prompt"],
-        "properties": {
-            "prompt": {
-                "type": "string",
-                "description": "The task or question for the sub-agent."
-            }
-        },
-        "additionalProperties": false
-    }))
+    ToolInputSchema::object([ToolInputField::required(
+        "prompt",
+        ToolInputValueSchema::string().description("The task or question for the sub-agent."),
+    )])
 }
 
 /// Convert the parent tool input into the nested agent's user message.

@@ -15,7 +15,7 @@ use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
     ContentBlock, GroundingMetadata, LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest,
     ModelStep, ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
-    ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -311,7 +311,7 @@ fn build_messages_tools(
         tools.push(json!({
             "name": name.as_str(),
             "description": tool.description.as_str(),
-            "input_schema": tool.input_schema.as_json_schema(),
+            "input_schema": anthropic_tool_input_schema(&tool.input_schema),
         }));
     }
     if server_tools.contains("web_search") {
@@ -324,6 +324,10 @@ fn build_messages_tools(
         }));
     }
     tools
+}
+
+fn anthropic_tool_input_schema(input_schema: &ToolInputSchema) -> Value {
+    serde_json::to_value(input_schema).expect("tool input schema serializes")
 }
 
 /// Split Anthropic response content into the pieces the agent loop consumes.
@@ -695,8 +699,8 @@ impl CacheCreationUsage {
 mod tests {
     use chudbot_api::{
         ClientToolResult, ClientToolResultContent, LoadedMedia, MediaCategory, MediaMetadata,
-        MediaRef, MediaUri, ProviderName, PublicMediaUrl, ToolUseId, TranscriptTurn, TurnRole,
-        UrlMediaRef,
+        MediaRef, MediaUri, ProviderName, PublicMediaUrl, ToolInputField, ToolInputSchema,
+        ToolInputValueSchema, ToolUseId, TranscriptTurn, TurnRole, UrlMediaRef,
     };
     use serde_json::json;
 
@@ -759,6 +763,40 @@ mod tests {
         assert_eq!(tools[0]["type"], WEB_SEARCH_TOOL_TYPE);
         assert_eq!(tools[0]["name"], WEB_SEARCH_TOOL_NAME);
         assert_eq!(tools[0]["max_uses"], 5);
+    }
+
+    #[test]
+    fn builds_anthropic_client_tool_schema() {
+        let mut client_tools = BTreeMap::new();
+        client_tools.insert(
+            ToolName::new("fetch_messages"),
+            ClientToolSpec {
+                description: "Fetch context.".to_string(),
+                input_schema: ToolInputSchema::object([ToolInputField::required(
+                    "query",
+                    ToolInputValueSchema::string().description("Search query."),
+                )]),
+            },
+        );
+
+        let tools = build_messages_tools(&client_tools, &ServerToolSet::new());
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], "fetch_messages");
+        assert_eq!(
+            tools[0]["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]

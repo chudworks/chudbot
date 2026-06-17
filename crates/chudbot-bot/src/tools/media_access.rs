@@ -64,17 +64,12 @@ pub(crate) fn attach_asset_spec() -> ClientToolSpec {
 /// Tool implementations still perform the security checks; the schema exists
 /// to guide model arguments and reject unrelated JSON fields before execution.
 pub(crate) fn asset_uri_tool_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "required": ["uri"],
-        "properties": {
-            "uri": {
-                "type": "string",
-                "description": "A stored Chudbot file:// media URI such as file://images/abc.jpg, file://videos/abc.mp4, file://audio/abc.ogg, or file://avatars/abc.png. Do not pass local filesystem paths or public URLs."
-            }
-        },
-        "additionalProperties": false
-    }))
+    ToolInputSchema::object([ToolInputField::required(
+        "uri",
+        ToolInputValueSchema::string().description(
+            "A stored Chudbot file:// media URI such as file://images/abc.jpg, file://videos/abc.mp4, file://audio/abc.ogg, or file://avatars/abc.png. Do not pass local filesystem paths or public URLs.",
+        ),
+    )])
 }
 
 #[tracing::instrument(

@@ -251,29 +251,25 @@ pub(crate) fn image_tool_schema() -> ToolInputSchema {
         "2-3 references, refer to them in the prompt as <IMAGE_0>, <IMAGE_1>, etc. in this ",
         "array's order."
     );
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "required": ["prompt"],
-        "properties": {
-            "prompt": {
-                "type": "string",
-                "description": prompt_description
-            },
-            "reference_images": {
-                "type": "array",
-                "description": reference_images_description,
-                "maxItems": MAX_REFERENCE_IMAGES,
-                "items": { "type": "string" }
-            },
-            "aspect_ratio": {
-                "type": "string",
-                "description": "Optional provider-specific aspect ratio."
-            },
-            "model": {
-                "type": "string",
-                "description": "Optional provider-specific model id or quality tier."
-            }
-        },
-        "additionalProperties": false
-    }))
+    ToolInputSchema::object([
+        ToolInputField::required(
+            "prompt",
+            ToolInputValueSchema::string().description(prompt_description),
+        ),
+        ToolInputField::optional(
+            "reference_images",
+            ToolInputValueSchema::array(ToolInputValueSchema::string())
+                .description(reference_images_description)
+                .max_items(MAX_REFERENCE_IMAGES),
+        ),
+        ToolInputField::optional(
+            "aspect_ratio",
+            ToolInputValueSchema::string().description("Optional provider-specific aspect ratio."),
+        ),
+        ToolInputField::optional(
+            "model",
+            ToolInputValueSchema::string()
+                .description("Optional provider-specific model id or quality tier."),
+        ),
+    ])
 }

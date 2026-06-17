@@ -194,39 +194,27 @@ pub(crate) fn audio_transcription_model_result_json(
 /// `audio_transcription_request_from_tool_input`; detailed type coercion and
 /// media validation still happen in the request parser.
 pub(crate) fn audio_transcription_tool_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "required": ["audio_uri"],
-        "properties": {
-            "audio_uri": {
-                "type": "string",
-                "description": "A file://audio/... URI from the message JSON audio_attachments or attachment audio_uri field."
-            },
-            "audio": {
-                "type": "string",
-                "description": "Alias for audio_uri."
-            },
-            "language": {
-                "type": "string",
-                "description": "Optional language code such as en, fr, de, or ja for text formatting."
-            },
-            "keyterm": {
-                "oneOf": [
-                    { "type": "string" },
-                    { "type": "array", "items": { "type": "string" } }
-                ],
-                "description": "Optional key term or terms to bias transcription toward."
-            },
-            "keyterms": {
-                "type": "array",
-                "items": { "type": "string" },
-                "description": "Alias for keyterm when passing multiple terms."
-            },
-            "model": {
-                "type": "string",
-                "description": "Optional provider-specific transcription model id."
-            }
-        },
-        "additionalProperties": false
-    }))
+    ToolInputSchema::object([
+        ToolInputField::required(
+            "audio_uri",
+            ToolInputValueSchema::string().description(
+                "A file://audio/... URI from the message JSON audio_attachments or attachment audio_uri field.",
+            ),
+        ),
+        ToolInputField::optional(
+            "language",
+            ToolInputValueSchema::string()
+                .description("Optional language code such as en, fr, de, or ja for text formatting."),
+        ),
+        ToolInputField::optional(
+            "keyterms",
+            ToolInputValueSchema::array(ToolInputValueSchema::string())
+                .description("Optional key terms to bias transcription toward."),
+        ),
+        ToolInputField::optional(
+            "model",
+            ToolInputValueSchema::string()
+                .description("Optional provider-specific transcription model id."),
+        ),
+    ])
 }

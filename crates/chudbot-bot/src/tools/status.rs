@@ -43,17 +43,11 @@ where
     pub(crate) fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: "Post a short interim status reply before slow work.".to_string(),
-            input_schema: ToolInputSchema::new(serde_json::json!({
-                "type": "object",
-                "required": ["text"],
-                "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Short status message to send to the user."
-                    }
-                },
-                "additionalProperties": false
-            })),
+            input_schema: ToolInputSchema::object([ToolInputField::required(
+                "text",
+                ToolInputValueSchema::string()
+                    .description("Short status message to send to the user."),
+            )]),
         }
     }
 

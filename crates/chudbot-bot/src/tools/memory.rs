@@ -338,16 +338,11 @@ where
 /// The only accepted field is optional `target_user_id`; absent input reads the
 /// current author captured in `MemoryToolContext`.
 fn lookup_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "target_user_id": {
-                "type": "string",
-                "description": "Optional platform user id. Defaults to the current author."
-            }
-        },
-        "additionalProperties": false
-    }))
+    ToolInputSchema::object([ToolInputField::optional(
+        "target_user_id",
+        ToolInputValueSchema::string()
+            .description("Optional platform user id. Defaults to the current author."),
+    )])
 }
 
 /// JSON Schema for appending a `remember` event.
@@ -355,30 +350,25 @@ fn lookup_schema() -> ToolInputSchema {
 /// `memory` is required and must be non-empty after trimming. `tags` and
 /// `confidence` are optional metadata that pass through to the event record.
 fn remember_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "target_user_id": {
-                "type": "string",
-                "description": "Optional platform user id. Defaults to the current author."
-            },
-            "memory": {
-                "type": "string",
-                "description": "Stable useful fact to remember."
-            },
-            "tags": {
-                "type": "array",
-                "items": { "type": "string" }
-            },
-            "confidence": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1
-            }
-        },
-        "required": ["memory"],
-        "additionalProperties": false
-    }))
+    ToolInputSchema::object([
+        ToolInputField::optional(
+            "target_user_id",
+            ToolInputValueSchema::string()
+                .description("Optional platform user id. Defaults to the current author."),
+        ),
+        ToolInputField::required(
+            "memory",
+            ToolInputValueSchema::string().description("Stable useful fact to remember."),
+        ),
+        ToolInputField::optional(
+            "tags",
+            ToolInputValueSchema::array(ToolInputValueSchema::string()),
+        ),
+        ToolInputField::optional(
+            "confidence",
+            ToolInputValueSchema::number().minimum(0).maximum(1),
+        ),
+    ])
 }
 
 /// JSON Schema for appending a `forget` event.
@@ -386,24 +376,19 @@ fn remember_schema() -> ToolInputSchema {
 /// `query` names what should stop being used. `reason`, when present, is folded
 /// into the event body as explanatory text for later compaction.
 fn forget_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "target_user_id": {
-                "type": "string",
-                "description": "Optional platform user id. Defaults to the current author."
-            },
-            "query": {
-                "type": "string",
-                "description": "Description of what should be forgotten or no longer used."
-            },
-            "reason": {
-                "type": "string"
-            }
-        },
-        "required": ["query"],
-        "additionalProperties": false
-    }))
+    ToolInputSchema::object([
+        ToolInputField::optional(
+            "target_user_id",
+            ToolInputValueSchema::string()
+                .description("Optional platform user id. Defaults to the current author."),
+        ),
+        ToolInputField::required(
+            "query",
+            ToolInputValueSchema::string()
+                .description("Description of what should be forgotten or no longer used."),
+        ),
+        ToolInputField::optional("reason", ToolInputValueSchema::string()),
+    ])
 }
 
 /// Read a required, trimmed, non-empty string field from provider JSON.

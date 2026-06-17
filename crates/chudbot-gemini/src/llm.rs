@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
     ContentBlock, GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep,
-    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName,
-    ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
+    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -342,7 +342,7 @@ fn build_tools(
                 json!({
                     "name": name.as_str(),
                     "description": tool.description,
-                    "parameters": tool.input_schema.as_json_schema(),
+                    "parameters": gemini_tool_parameters(&tool.input_schema),
                 })
             }).collect::<Vec<_>>(),
         }));
@@ -351,6 +351,10 @@ fn build_tools(
         tools.push(json!({ "googleSearch": {} }));
     }
     tools
+}
+
+fn gemini_tool_parameters(input_schema: &ToolInputSchema) -> Value {
+    serde_json::to_value(input_schema).expect("tool input schema serializes")
 }
 
 /// Requests provider-side server-tool telemetry when Gemini web search is on.
@@ -601,7 +605,9 @@ struct UsageMetadata {
 
 #[cfg(test)]
 mod tests {
-    use chudbot_api::{ProviderName, ServerToolSet};
+    use chudbot_api::{
+        ProviderName, ServerToolSet, ToolInputField, ToolInputSchema, ToolInputValueSchema,
+    };
     use serde_json::json;
 
     use super::*;
@@ -613,7 +619,10 @@ mod tests {
             ToolName::new("fetch_messages"),
             ClientToolSpec {
                 description: "Fetch recent messages".to_string(),
-                input_schema: chudbot_api::ToolInputSchema::empty_object(),
+                input_schema: ToolInputSchema::object([ToolInputField::required(
+                    "query",
+                    ToolInputValueSchema::string().description("Search query."),
+                )]),
             },
         );
         let mut server_tools = ServerToolSet::new();
@@ -625,6 +634,20 @@ mod tests {
         assert_eq!(
             tools[0]["functionDeclarations"][0]["name"],
             "fetch_messages"
+        );
+        assert_eq!(
+            tools[0]["functionDeclarations"][0]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            })
         );
         assert_eq!(tools[1], json!({ "googleSearch": {} }));
         assert_eq!(

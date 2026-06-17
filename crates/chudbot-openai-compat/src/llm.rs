@@ -21,8 +21,8 @@ use base64::engine::general_purpose::STANDARD as B64;
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
     ContentBlock, LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest, ModelStep,
-    ModelStepRequest, ProviderContinuation, ProviderName, ToolName, ToolUseId, Transcript,
-    TurnRole, UsageRecord, UsageSubject,
+    ModelStepRequest, ProviderContinuation, ProviderName, ToolInputSchema, ToolName, ToolUseId,
+    Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -451,11 +451,15 @@ fn build_chat_tools(client_tools: &BTreeMap<ToolName, ClientToolSpec>) -> Vec<Va
                 "function": {
                     "name": name.as_str(),
                     "description": tool.description,
-                    "parameters": tool.input_schema.as_json_schema(),
+                    "parameters": openai_compat_tool_parameters(&tool.input_schema),
                 },
             })
         })
         .collect()
+}
+
+fn openai_compat_tool_parameters(input_schema: &ToolInputSchema) -> Value {
+    serde_json::to_value(input_schema).expect("tool input schema serializes")
 }
 
 fn parse_tool_calls(
@@ -715,7 +719,8 @@ struct TokenDetails {
 mod tests {
     use super::*;
     use chudbot_api::{
-        MediaCategory, ProviderOptions, ServerToolSet, ToolInputSchema, TranscriptTurn, UrlMediaRef,
+        MediaCategory, ProviderOptions, ServerToolSet, ToolInputField, ToolInputSchema,
+        ToolInputValueSchema, TranscriptTurn, UrlMediaRef,
     };
 
     #[test]
@@ -853,7 +858,10 @@ mod tests {
             ToolName::new("fetch_messages"),
             ClientToolSpec {
                 description: "Fetch context.".to_string(),
-                input_schema: ToolInputSchema::empty_object(),
+                input_schema: ToolInputSchema::object([ToolInputField::required(
+                    "query",
+                    ToolInputValueSchema::string().description("Search query."),
+                )]),
             },
         );
 
@@ -862,7 +870,20 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
         assert_eq!(tools[0]["function"]["name"], "fetch_messages");
-        assert_eq!(tools[0]["function"]["parameters"]["type"], "object");
+        assert_eq!(
+            tools[0]["function"]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            })
+        );
     }
 
     #[test]

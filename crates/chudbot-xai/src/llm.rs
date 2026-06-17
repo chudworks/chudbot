@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolSpec, ContentBlock, CostAmount, GroundingMetadata,
     LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest,
-    ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName, ToolUseId,
-    Transcript, TurnRole, UsageRecord, UsageSubject,
+    ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolInputSchema, ToolName,
+    ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -440,7 +440,7 @@ fn build_responses_tools(
             "type": "function",
             "name": name.as_str(),
             "description": tool.description,
-            "parameters": tool.input_schema.as_json_schema(),
+            "parameters": xai_tool_parameters(&tool.input_schema),
         }));
     }
     // Server tools are executed by xAI and reported back as raw *_call output
@@ -452,6 +452,10 @@ fn build_responses_tools(
         tools.push(json!({ "type": "x_search" }));
     }
     tools
+}
+
+fn xai_tool_parameters(input_schema: &ToolInputSchema) -> Value {
+    serde_json::to_value(input_schema).expect("tool input schema serializes")
 }
 
 fn walk_output(
@@ -646,7 +650,9 @@ struct TokenDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chudbot_api::{ProviderOptions, TranscriptTurn};
+    use chudbot_api::{
+        ProviderOptions, ToolInputField, ToolInputSchema, ToolInputValueSchema, TranscriptTurn,
+    };
 
     #[test]
     fn synthesized_role_messages_include_stable_ids() {
@@ -830,6 +836,41 @@ mod tests {
                 .reasoning_effort
                 .as_deref(),
             Some("high")
+        );
+    }
+
+    #[test]
+    fn builds_xai_client_tool_schema() {
+        let mut client_tools = BTreeMap::new();
+        client_tools.insert(
+            ToolName::new("fetch_messages"),
+            ClientToolSpec {
+                description: "Fetch context.".to_string(),
+                input_schema: ToolInputSchema::object([ToolInputField::required(
+                    "query",
+                    ToolInputValueSchema::string().description("Search query."),
+                )]),
+            },
+        );
+
+        let tools = build_responses_tools(&client_tools, &ServerToolSet::new());
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "fetch_messages");
+        assert_eq!(
+            tools[0]["parameters"],
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query."
+                    }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            })
         );
     }
 }

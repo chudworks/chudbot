@@ -31,19 +31,13 @@ where
                 "shortcodes like :smile:, custom emoji syntax, markdown, or multiple emoji."
             )
             .to_string(),
-            input_schema: ToolInputSchema::new(serde_json::json!({
-                "type": "object",
-                "required": ["emoji"],
-                "properties": {
-                    "emoji": {
-                        "type": "string",
-                        "description": "Exactly one standard Unicode emoji reaction. Do not include text, Discord :shortcodes:, custom emoji markup, markdown, or multiple emoji.",
-                        "minLength": 1,
-                        "maxLength": 64
-                    }
-                },
-                "additionalProperties": false
-            })),
+            input_schema: ToolInputSchema::object([ToolInputField::required(
+                "emoji",
+                ToolInputValueSchema::string()
+                    .description("Exactly one standard Unicode emoji reaction. Do not include text, Discord :shortcodes:, custom emoji markup, markdown, or multiple emoji.")
+                    .min_length(1)
+                    .max_length(64),
+            )]),
         }
     }
 

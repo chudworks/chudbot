@@ -47,36 +47,39 @@ where
                 "usage is included and grouped under the `memory` pseudo-channel."
             )
             .to_string(),
-            input_schema: ToolInputSchema::new(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "group_by": {
-                        "type": "string",
-                        "enum": ["total", "guild", "channel", "user", "agent", "provider", "model", "kind"],
-                        "default": "total",
-                        "description": "Aggregation dimension for the report rows. `guild` buckets guild-less usage under `direct`; `kind` splits by usage subject such as `model_step` or `image_generation`."
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["guild", "channel", "global"],
-                        "default": "guild",
-                        "description": "guild = the current server (or this direct-message channel outside a server), channel = the current channel or thread only, global = every server and DM this bot serves."
-                    },
-                    "days": {
-                        "type": "number",
-                        "exclusiveMinimum": 0,
-                        "description": "Look-back window in days; fractions allowed. Omit for lifetime totals."
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 50,
-                        "default": 10,
-                        "description": "Maximum number of report rows, costliest first."
-                    }
-                },
-                "additionalProperties": false
-            })),
+            input_schema: ToolInputSchema::object([
+                ToolInputField::optional(
+                    "group_by",
+                    ToolInputValueSchema::string()
+                        .enum_values([
+                            "total", "guild", "channel", "user", "agent", "provider", "model",
+                            "kind",
+                        ])
+                        .default("total")
+                        .description("Aggregation dimension for the report rows. `guild` buckets guild-less usage under `direct`; `kind` splits by usage subject such as `model_step` or `image_generation`."),
+                ),
+                ToolInputField::optional(
+                    "scope",
+                    ToolInputValueSchema::string()
+                        .enum_values(["guild", "channel", "global"])
+                        .default("guild")
+                        .description("guild = the current server (or this direct-message channel outside a server), channel = the current channel or thread only, global = every server and DM this bot serves."),
+                ),
+                ToolInputField::optional(
+                    "days",
+                    ToolInputValueSchema::number()
+                        .exclusive_minimum(0)
+                        .description("Look-back window in days; fractions allowed. Omit for lifetime totals."),
+                ),
+                ToolInputField::optional(
+                    "limit",
+                    ToolInputValueSchema::integer()
+                        .minimum(1)
+                        .maximum(50)
+                        .default(10)
+                        .description("Maximum number of report rows, costliest first."),
+                ),
+            ]),
         }
     }
 
