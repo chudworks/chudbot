@@ -6,14 +6,6 @@ use super::*;
 #[derive(Debug)]
 pub(crate) struct RuntimeToolError(String);
 
-impl std::fmt::Display for RuntimeToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for RuntimeToolError {}
-
 pub(crate) type RuntimeAgent<R> =
     Agent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
 
@@ -76,16 +68,6 @@ pub(crate) struct RuntimeMemoryFlags {
     pub(crate) forget: bool,
 }
 
-impl RuntimeMemoryFlags {
-    pub(crate) fn all() -> Self {
-        Self {
-            lookup: true,
-            remember: true,
-            forget: true,
-        }
-    }
-}
-
 /// Tool executor for an agent run.
 ///
 /// Tool specs and tool execution are both derived from the same dependencies,
@@ -94,11 +76,167 @@ pub(crate) struct RuntimeToolExecutor<R: BotRuntimeTypes> {
     pub(crate) deps: RuntimeToolDeps<R>,
     pub(crate) context: RuntimeToolContext,
     pub(crate) enabled: RuntimeToolFlags,
-    pub(crate) memory: Option<memory::MemoryToolContext>,
+    pub(crate) memory: Option<MemoryToolContext>,
     pub(crate) image_generation: Option<GenerationBinding>,
     pub(crate) video_generation: Option<GenerationBinding>,
     pub(crate) audio_transcription: Option<TranscriptionBinding>,
     pub(crate) subagents: Vec<RuntimeSubagent<R>>,
+}
+
+impl<R> ClientToolExecutor for RuntimeToolExecutor<R>
+where
+    R: BotRuntimeTypes,
+{
+    type Error = RuntimeToolError;
+
+    async fn execute(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
+        let name = call.name.clone();
+        // Dispatch by stable tool name. Unknown names fall through to subagents,
+        // then to the executor's sentinel unknown-tool error.
+        match name.as_str() {
+            FETCH_MESSAGES_TOOL if self.enabled.fetch_messages => self.fetch_messages(call).await,
+            POST_STATUS_TOOL if self.enabled.post_status => self.post_status(call).await,
+            ADD_REACTION_TOOL if self.enabled.add_reaction => self.add_reaction(call).await,
+            USAGE_REPORT_TOOL if self.enabled.usage_report => self.usage_report(call).await,
+            GENERATE_IMAGE_TOOL if self.image_generation.is_some() => {
+                self.generate_image(call).await
+            }
+            GENERATE_VIDEO_TOOL if self.video_generation.is_some() => {
+                self.generate_video(call).await
+            }
+            TRANSCRIBE_AUDIO_TOOL if self.audio_transcription.is_some() => {
+                self.transcribe_audio(call).await
+            }
+            READ_ASSET_TOOL if self.enabled.media_access.read => self.read_asset(call).await,
+            STAT_ASSET_TOOL if self.enabled.media_access.stat => self.stat_asset(call).await,
+            PUBLIC_URL_ASSET_TOOL if self.enabled.media_access.public_url => {
+                self.public_url_asset(call).await
+            }
+            ATTACH_ASSET_TOOL if self.enabled.media_access.attach => self.attach_asset(call).await,
+            LOOKUP_USER_MEMORY_TOOL if self.enabled.memory.lookup => {
+                self.lookup_user_memory(call).await
+            }
+            REMEMBER_USER_MEMORY_TOOL if self.enabled.memory.remember => {
+                self.remember_user_memory(call).await
+            }
+            FORGET_USER_MEMORY_TOOL if self.enabled.memory.forget => {
+                self.forget_user_memory(call).await
+            }
+            _ => self.execute_subagent_or_unknown(call).await,
+        }
+    }
+
+    fn tools(&self) -> Vec<ClientToolDefinition> {
+        // Keep this list in sync with `execute`: a tool should be advertised only
+        // when the matching dispatch arm is enabled.
+        let mut definitions = Vec::new();
+        if self.enabled.fetch_messages {
+            definitions.push(ClientToolDefinition::new(
+                FETCH_MESSAGES_TOOL,
+                self.fetch_messages_tool().spec(),
+            ));
+        }
+        if self.enabled.post_status {
+            definitions.push(ClientToolDefinition::new(
+                POST_STATUS_TOOL,
+                self.post_status_tool().spec(),
+            ));
+        }
+        if self.enabled.add_reaction {
+            definitions.push(ClientToolDefinition::new(
+                ADD_REACTION_TOOL,
+                self.add_reaction_tool().spec(),
+            ));
+        }
+        if self.enabled.usage_report {
+            definitions.push(ClientToolDefinition::new(
+                USAGE_REPORT_TOOL,
+                self.usage_report_tool().spec(),
+            ));
+        }
+        if let Some(tool) = self.image_generation_tool() {
+            definitions.push(ClientToolDefinition::new(GENERATE_IMAGE_TOOL, tool.spec()));
+        }
+        if let Some(tool) = self.video_generation_tool() {
+            definitions.push(ClientToolDefinition::new(GENERATE_VIDEO_TOOL, tool.spec()));
+        }
+        if let Some(tool) = self.audio_transcription_tool() {
+            definitions.push(ClientToolDefinition::new(
+                TRANSCRIBE_AUDIO_TOOL,
+                tool.spec(),
+            ));
+        }
+        if self.enabled.media_access.read {
+            definitions.push(ClientToolDefinition::new(
+                READ_ASSET_TOOL,
+                read_asset_spec(),
+            ));
+        }
+        if self.enabled.media_access.stat {
+            definitions.push(ClientToolDefinition::new(
+                STAT_ASSET_TOOL,
+                stat_asset_spec(),
+            ));
+        }
+        if self.enabled.media_access.public_url {
+            definitions.push(ClientToolDefinition::new(
+                PUBLIC_URL_ASSET_TOOL,
+                public_url_asset_spec(),
+            ));
+        }
+        if self.enabled.media_access.attach {
+            definitions.push(ClientToolDefinition::new(
+                ATTACH_ASSET_TOOL,
+                attach_asset_spec(),
+            ));
+        }
+        if self.enabled.memory.lookup {
+            definitions.push(ClientToolDefinition::new(
+                LOOKUP_USER_MEMORY_TOOL,
+                lookup_user_memory_spec(),
+            ));
+        }
+        if self.enabled.memory.remember {
+            definitions.push(ClientToolDefinition::new(
+                REMEMBER_USER_MEMORY_TOOL,
+                remember_user_memory_spec(),
+            ));
+        }
+        if self.enabled.memory.forget {
+            definitions.push(ClientToolDefinition::new(
+                FORGET_USER_MEMORY_TOOL,
+                forget_user_memory_spec(),
+            ));
+        }
+        for subagent in &self.subagents {
+            definitions.push(ClientToolDefinition::new(
+                subagent.name.clone(),
+                subagent.tool.spec(),
+            ));
+        }
+        definitions
+    }
+}
+
+impl std::fmt::Display for RuntimeToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RuntimeToolError {}
+
+impl RuntimeMemoryFlags {
+    pub(crate) fn all() -> Self {
+        Self {
+            lookup: true,
+            remember: true,
+            forget: true,
+        }
+    }
 }
 
 impl<R> std::fmt::Debug for RuntimeSubagent<R>
@@ -145,7 +283,7 @@ where
         }
     }
 
-    pub(crate) fn enable_memory(&mut self, context: memory::MemoryToolContext) {
+    pub(crate) fn enable_memory(&mut self, context: MemoryToolContext) {
         self.memory = Some(context);
         self.enabled.memory = RuntimeMemoryFlags::all();
     }
@@ -366,7 +504,7 @@ where
         let Some(context) = &self.memory else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
-        memory::lookup_user_memory(&self.deps.storage, context, call)
+        lookup_user_memory(&self.deps.storage, context, call)
             .await
             .map_err(runtime_tool_execution_error)
     }
@@ -378,7 +516,7 @@ where
         let Some(context) = &self.memory else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
-        memory::remember_user_memory(&self.deps.storage, context, call)
+        remember_user_memory(&self.deps.storage, context, call)
             .await
             .map_err(runtime_tool_execution_error)
     }
@@ -390,7 +528,7 @@ where
         let Some(context) = &self.memory else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
-        memory::forget_user_memory(&self.deps.storage, context, call)
+        forget_user_memory(&self.deps.storage, context, call)
             .await
             .map_err(runtime_tool_execution_error)
     }
@@ -412,144 +550,6 @@ where
             .call(call)
             .await
             .map_err(runtime_tool_execution_error)
-    }
-}
-
-impl<R> ClientToolExecutor for RuntimeToolExecutor<R>
-where
-    R: BotRuntimeTypes,
-{
-    type Error = RuntimeToolError;
-
-    fn tools(&self) -> Vec<ClientToolDefinition> {
-        // Keep this list in sync with `execute`: a tool should be advertised only
-        // when the matching dispatch arm is enabled.
-        let mut definitions = Vec::new();
-        if self.enabled.fetch_messages {
-            definitions.push(ClientToolDefinition::new(
-                FETCH_MESSAGES_TOOL,
-                self.fetch_messages_tool().spec(),
-            ));
-        }
-        if self.enabled.post_status {
-            definitions.push(ClientToolDefinition::new(
-                POST_STATUS_TOOL,
-                self.post_status_tool().spec(),
-            ));
-        }
-        if self.enabled.add_reaction {
-            definitions.push(ClientToolDefinition::new(
-                ADD_REACTION_TOOL,
-                self.add_reaction_tool().spec(),
-            ));
-        }
-        if self.enabled.usage_report {
-            definitions.push(ClientToolDefinition::new(
-                USAGE_REPORT_TOOL,
-                self.usage_report_tool().spec(),
-            ));
-        }
-        if let Some(tool) = self.image_generation_tool() {
-            definitions.push(ClientToolDefinition::new(GENERATE_IMAGE_TOOL, tool.spec()));
-        }
-        if let Some(tool) = self.video_generation_tool() {
-            definitions.push(ClientToolDefinition::new(GENERATE_VIDEO_TOOL, tool.spec()));
-        }
-        if let Some(tool) = self.audio_transcription_tool() {
-            definitions.push(ClientToolDefinition::new(
-                TRANSCRIBE_AUDIO_TOOL,
-                tool.spec(),
-            ));
-        }
-        if self.enabled.media_access.read {
-            definitions.push(ClientToolDefinition::new(
-                READ_ASSET_TOOL,
-                read_asset_spec(),
-            ));
-        }
-        if self.enabled.media_access.stat {
-            definitions.push(ClientToolDefinition::new(
-                STAT_ASSET_TOOL,
-                stat_asset_spec(),
-            ));
-        }
-        if self.enabled.media_access.public_url {
-            definitions.push(ClientToolDefinition::new(
-                PUBLIC_URL_ASSET_TOOL,
-                public_url_asset_spec(),
-            ));
-        }
-        if self.enabled.media_access.attach {
-            definitions.push(ClientToolDefinition::new(
-                ATTACH_ASSET_TOOL,
-                attach_asset_spec(),
-            ));
-        }
-        if self.enabled.memory.lookup {
-            definitions.push(ClientToolDefinition::new(
-                memory::LOOKUP_USER_MEMORY_TOOL,
-                memory::lookup_user_memory_spec(),
-            ));
-        }
-        if self.enabled.memory.remember {
-            definitions.push(ClientToolDefinition::new(
-                memory::REMEMBER_USER_MEMORY_TOOL,
-                memory::remember_user_memory_spec(),
-            ));
-        }
-        if self.enabled.memory.forget {
-            definitions.push(ClientToolDefinition::new(
-                memory::FORGET_USER_MEMORY_TOOL,
-                memory::forget_user_memory_spec(),
-            ));
-        }
-        for subagent in &self.subagents {
-            definitions.push(ClientToolDefinition::new(
-                subagent.name.clone(),
-                subagent.tool.spec(),
-            ));
-        }
-        definitions
-    }
-
-    async fn execute(
-        &self,
-        call: ClientToolCall,
-    ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
-        let name = call.name.clone();
-        // Dispatch by stable tool name. Unknown names fall through to subagents,
-        // then to the executor's sentinel unknown-tool error.
-        match name.as_str() {
-            FETCH_MESSAGES_TOOL if self.enabled.fetch_messages => self.fetch_messages(call).await,
-            POST_STATUS_TOOL if self.enabled.post_status => self.post_status(call).await,
-            ADD_REACTION_TOOL if self.enabled.add_reaction => self.add_reaction(call).await,
-            USAGE_REPORT_TOOL if self.enabled.usage_report => self.usage_report(call).await,
-            GENERATE_IMAGE_TOOL if self.image_generation.is_some() => {
-                self.generate_image(call).await
-            }
-            GENERATE_VIDEO_TOOL if self.video_generation.is_some() => {
-                self.generate_video(call).await
-            }
-            TRANSCRIBE_AUDIO_TOOL if self.audio_transcription.is_some() => {
-                self.transcribe_audio(call).await
-            }
-            READ_ASSET_TOOL if self.enabled.media_access.read => self.read_asset(call).await,
-            STAT_ASSET_TOOL if self.enabled.media_access.stat => self.stat_asset(call).await,
-            PUBLIC_URL_ASSET_TOOL if self.enabled.media_access.public_url => {
-                self.public_url_asset(call).await
-            }
-            ATTACH_ASSET_TOOL if self.enabled.media_access.attach => self.attach_asset(call).await,
-            memory::LOOKUP_USER_MEMORY_TOOL if self.enabled.memory.lookup => {
-                self.lookup_user_memory(call).await
-            }
-            memory::REMEMBER_USER_MEMORY_TOOL if self.enabled.memory.remember => {
-                self.remember_user_memory(call).await
-            }
-            memory::FORGET_USER_MEMORY_TOOL if self.enabled.memory.forget => {
-                self.forget_user_memory(call).await
-            }
-            _ => self.execute_subagent_or_unknown(call).await,
-        }
     }
 }
 

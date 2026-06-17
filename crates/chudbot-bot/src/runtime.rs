@@ -315,6 +315,22 @@ where
         self.events.publish(LiveEvent::UserProfileUpdated { user });
     }
 
+    pub(crate) fn publish_conversation(
+        &self,
+        conversation_id: ConversationId,
+        kind: ConversationEventKind,
+    ) {
+        tracing::trace!(
+            conversation = %conversation_id,
+            event = conversation_event_kind(kind),
+            "publishing conversation event"
+        );
+        self.events.publish(LiveEvent::Conversation {
+            conversation_id,
+            kind,
+        });
+    }
+
     pub(crate) fn is_admin(&self, user: &chudbot_api::UserRef) -> bool {
         self.config.admins.iter().any(|admin| {
             admin.platform == user.platform

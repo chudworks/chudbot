@@ -1,6 +1,7 @@
 //! Unit tests for platform-neutral bot orchestration helpers.
 
 use super::*;
+use crate::config::{append_default_audio_keyterms, audio_transcription_default_keyterms};
 use crate::prelude::*;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};

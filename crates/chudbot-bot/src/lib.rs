@@ -9,6 +9,7 @@
 
 mod action;
 mod agents;
+mod avatars;
 mod commands;
 mod config;
 mod constants;
@@ -41,10 +42,7 @@ pub use runtime::{BotRuntime, BotRuntimeParts, BotRuntimeTypes};
 pub(crate) use action::*;
 pub(crate) use agents::*;
 pub(crate) use commands::*;
-pub(crate) use config::{
-    SystemAgentConfig, append_default_audio_keyterms, audio_transcription_default_keyterms,
-    image_generation_tool_description, video_generation_tool_description,
-};
+pub(crate) use config::SystemAgentConfig;
 pub(crate) use constants::*;
 pub(crate) use error::*;
 pub(crate) use media::*;

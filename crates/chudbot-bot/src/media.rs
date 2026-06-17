@@ -1,5 +1,6 @@
 //! Media attachment ingestion, generated-media delivery, and audio preflight helpers.
 
+use crate::config::audio_transcription_default_keyterms;
 use crate::prelude::*;
 use crate::*;
 
@@ -754,35 +755,4 @@ pub(crate) fn extension_from_filename(filename: &str) -> Option<String> {
                 .to_ascii_lowercase()
         })
         .filter(|extension| !extension.is_empty())
-}
-
-pub(crate) fn avatar_media_name(user: &UserProfile, url: &str) -> String {
-    let tail = url
-        .split('?')
-        .next()
-        .and_then(|url| url.rsplit('/').next())
-        .unwrap_or("avatar.png");
-    let stem = tail.strip_suffix(".png").unwrap_or(tail);
-    let stem = if url.contains("/embed/avatars/") {
-        format!("default{stem}")
-    } else {
-        stem.to_string()
-    };
-    format!(
-        "{}_{}.png",
-        user.id.user_id.as_str(),
-        safe_media_name_part(&stem)
-    )
-}
-
-pub(crate) fn safe_media_name_part(input: &str) -> String {
-    let out = input
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-        .collect::<String>();
-    if out.is_empty() {
-        "avatar".to_string()
-    } else {
-        out
-    }
 }
