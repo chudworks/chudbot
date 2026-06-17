@@ -22,6 +22,7 @@ chudbot-storage-sqlx = { path = "../chudbot-storage-sqlx" }
 chudbot-web = { path = "../chudbot-web" }
 chudbot-xai = { path = "../chudbot-xai" }
 futures.workspace = true
+moka.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "logging", "std"] }
 serde.workspace = true
 serde_json.workspace = true

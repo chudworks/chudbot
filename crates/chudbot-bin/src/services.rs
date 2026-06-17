@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use chudbot_api::{
     AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
@@ -9,6 +10,7 @@ use chudbot_api::{
 };
 use chudbot_asset_local::LocalMediaStore;
 use chudbot_web::{EventBus, WebConfig};
+use moka::future::Cache;
 use serde_json::json;
 
 use crate::config::{
@@ -18,6 +20,8 @@ use crate::config::{
 use crate::errors::{
     BinError, ConfiguredAudioError, ConfiguredImageError, ConfiguredLlmError, ConfiguredVideoError,
 };
+
+const MODEL_INFO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Services that can be built before storage/platform implementations exist.
 #[derive(Debug)]
@@ -100,6 +104,7 @@ struct ConfiguredLlmProvidersInner {
     openai_compat: BTreeMap<ProviderName, chudbot_openai_compat::OpenAiCompatClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
     model_info: BTreeMap<ProviderName, BTreeMap<ModelId, ModelInfo>>,
+    model_info_cache: ModelInfoCache,
 }
 
 impl Default for ConfiguredLlmProviders {
@@ -239,6 +244,45 @@ impl ConfiguredLlmProviders {
             + self.inner.openai_compat.len()
             + self.inner.xai.len()
     }
+
+    async fn fetch_remote_model_info(
+        &self,
+        provider: &ProviderName,
+        request: ModelInfoRequest,
+    ) -> Result<Option<ModelInfo>, ConfiguredLlmError> {
+        if let Some(client) = self.inner.anthropic.get(provider) {
+            tracing::debug!(kind = "anthropic", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::Anthropic);
+        }
+        if let Some(client) = self.inner.openai.get(provider) {
+            tracing::debug!(kind = "openai", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::OpenAi);
+        }
+        if let Some(client) = self.inner.openai_compat.get(provider) {
+            tracing::debug!(kind = "openai_compat", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::OpenAiCompat);
+        }
+        if let Some(client) = self.inner.gemini.get(provider) {
+            tracing::debug!(kind = "gemini", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::Gemini);
+        }
+        if let Some(client) = self.inner.xai.get(provider) {
+            tracing::debug!(kind = "xai", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::Xai);
+        }
+        tracing::warn!("requested provider is missing from registry");
+        Err(ConfiguredLlmError::Missing(provider.clone()))
+    }
 }
 
 impl LlmProviderRegistry for ConfiguredLlmProviders {
@@ -313,38 +357,22 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
             return Ok(Some(info));
         }
 
-        if let Some(client) = self.inner.anthropic.get(provider) {
-            tracing::debug!(kind = "anthropic", "fetching model metadata");
-            return LlmBackend::fetch_model_info(client, request)
-                .await
-                .map_err(ConfiguredLlmError::Anthropic);
+        let cache_key = ModelInfoCacheKey::new(provider, &request);
+        if let Some(info) = self.inner.model_info_cache.get(&cache_key).await {
+            tracing::debug!(
+                cache_hit = true,
+                available = info.is_some(),
+                "using cached model metadata"
+            );
+            return Ok(info);
         }
-        if let Some(client) = self.inner.openai.get(provider) {
-            tracing::debug!(kind = "openai", "fetching model metadata");
-            return LlmBackend::fetch_model_info(client, request)
-                .await
-                .map_err(ConfiguredLlmError::OpenAi);
-        }
-        if let Some(client) = self.inner.openai_compat.get(provider) {
-            tracing::debug!(kind = "openai_compat", "fetching model metadata");
-            return LlmBackend::fetch_model_info(client, request)
-                .await
-                .map_err(ConfiguredLlmError::OpenAiCompat);
-        }
-        if let Some(client) = self.inner.gemini.get(provider) {
-            tracing::debug!(kind = "gemini", "fetching model metadata");
-            return LlmBackend::fetch_model_info(client, request)
-                .await
-                .map_err(ConfiguredLlmError::Gemini);
-        }
-        if let Some(client) = self.inner.xai.get(provider) {
-            tracing::debug!(kind = "xai", "fetching model metadata");
-            return LlmBackend::fetch_model_info(client, request)
-                .await
-                .map_err(ConfiguredLlmError::Xai);
-        }
-        tracing::warn!("requested provider is missing from registry");
-        Err(ConfiguredLlmError::Missing(provider.clone()))
+
+        let info = self.fetch_remote_model_info(provider, request).await?;
+        self.inner
+            .model_info_cache
+            .insert(cache_key, info.clone())
+            .await;
+        Ok(info)
     }
 }
 
@@ -379,6 +407,60 @@ fn configured_model_info_entry(model: &ModelId, info: &LlmModelInfoConfig) -> Op
             "max_output_tokens": info.max_output_tokens,
         })),
     })
+}
+
+struct ModelInfoCache {
+    entries: Cache<ModelInfoCacheKey, Option<ModelInfo>>,
+}
+
+impl ModelInfoCache {
+    async fn get(&self, key: &ModelInfoCacheKey) -> Option<Option<ModelInfo>> {
+        self.entries.get(key).await
+    }
+
+    async fn insert(&self, key: ModelInfoCacheKey, info: Option<ModelInfo>) {
+        self.entries.insert(key, info).await;
+    }
+}
+
+impl Default for ModelInfoCache {
+    fn default() -> Self {
+        Self {
+            entries: Cache::builder()
+                .name("llm-model-info")
+                .time_to_live(MODEL_INFO_CACHE_TTL)
+                .max_capacity(1024)
+                .build(),
+        }
+    }
+}
+
+impl std::fmt::Debug for ModelInfoCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelInfoCache")
+            .field("entry_count", &self.entries.entry_count())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ModelInfoCacheKey {
+    provider: ProviderName,
+    model: ModelId,
+    provider_options: Option<String>,
+}
+
+impl ModelInfoCacheKey {
+    fn new(provider: &ProviderName, request: &ModelInfoRequest) -> Self {
+        Self {
+            provider: provider.clone(),
+            model: request.model.clone(),
+            provider_options: request
+                .provider_options
+                .as_ref()
+                .map(|options| options.value.to_string()),
+        }
+    }
 }
 
 /// Concrete named image-generation provider registry.
@@ -888,6 +970,71 @@ mod tests {
         assert_eq!(info.id, model);
         assert_eq!(info.context_window_tokens, Some(131_072));
         assert_eq!(info.max_output_tokens, Some(8_192));
+    }
+
+    #[tokio::test]
+    async fn model_info_cache_stores_hits_and_misses() {
+        let cache = ModelInfoCache::default();
+        let provider = ProviderName::new("provider");
+        let model = ModelId::new("model");
+        let key = ModelInfoCacheKey::new(
+            &provider,
+            &ModelInfoRequest {
+                model: model.clone(),
+                provider_options: None,
+            },
+        );
+        let info = ModelInfo {
+            id: model.clone(),
+            context_window_tokens: Some(200_000),
+            max_output_tokens: Some(8_192),
+            raw: None,
+        };
+
+        assert!(cache.get(&key).await.is_none());
+        cache.insert(key.clone(), Some(info.clone())).await;
+        let cached = cache
+            .get(&key)
+            .await
+            .expect("cached entry")
+            .expect("cached model info");
+        assert_eq!(cached.id, info.id);
+        assert_eq!(cached.context_window_tokens, info.context_window_tokens);
+        assert_eq!(cached.max_output_tokens, info.max_output_tokens);
+
+        let missing_key = ModelInfoCacheKey::new(
+            &provider,
+            &ModelInfoRequest {
+                model: ModelId::new("missing-model"),
+                provider_options: None,
+            },
+        );
+        cache.insert(missing_key.clone(), None).await;
+        assert!(matches!(cache.get(&missing_key).await, Some(None)));
+    }
+
+    #[test]
+    fn model_info_cache_key_includes_provider_options() {
+        let provider = ProviderName::new("provider");
+        let model = ModelId::new("model");
+        let without_options = ModelInfoCacheKey::new(
+            &provider,
+            &ModelInfoRequest {
+                model: model.clone(),
+                provider_options: None,
+            },
+        );
+        let with_options = ModelInfoCacheKey::new(
+            &provider,
+            &ModelInfoRequest {
+                model,
+                provider_options: Some(chudbot_api::ProviderOptions {
+                    value: json!({ "region": "us-east-1" }),
+                }),
+            },
+        );
+
+        assert_ne!(without_options, with_options);
     }
 
     #[test]

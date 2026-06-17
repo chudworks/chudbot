@@ -352,6 +352,7 @@ dependencies = [
  "chudbot-xai",
  "clap",
  "futures",
+ "moka",
  "rustls",
  "serde",
  "serde_json",
