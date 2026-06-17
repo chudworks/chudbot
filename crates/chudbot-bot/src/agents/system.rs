@@ -43,20 +43,6 @@ impl RuntimeSystemAgents {
     }
 }
 
-/// Load a reserved system agent that was explicitly configured by name.
-///
-/// A configured reserved agent is a hard override for inherited defaults, so
-/// callers should skip building fallback tables when this returns `Some`.
-pub(crate) fn configured_system_agent(config: &BotConfig, name: &str) -> Option<SystemAgentConfig> {
-    config.agents.get(name).map(|agent| {
-        // Reuse the same resolved shape as defaults so logging and runtime
-        // construction see one representation regardless of provenance.
-        let resolved = SystemAgentConfig::from_agent_config(name.to_string(), agent, config.limits);
-        resolved.log_loaded_from_config();
-        resolved
-    })
-}
-
 impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
@@ -78,4 +64,18 @@ where
             NoClientTools,
         )
     }
+}
+
+/// Load a reserved system agent that was explicitly configured by name.
+///
+/// A configured reserved agent is a hard override for inherited defaults, so
+/// callers should skip building fallback tables when this returns `Some`.
+pub(crate) fn configured_system_agent(config: &BotConfig, name: &str) -> Option<SystemAgentConfig> {
+    config.agents.get(name).map(|agent| {
+        // Reuse the same resolved shape as defaults so logging and runtime
+        // construction see one representation regardless of provenance.
+        let resolved = SystemAgentConfig::from_agent_config(name.to_string(), agent, config.limits);
+        resolved.log_loaded_from_config();
+        resolved
+    })
 }

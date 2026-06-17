@@ -65,39 +65,18 @@ impl<S, L, M> MemoryRuntime<S, L, M> {
     }
 }
 
-/// Build the parent tracing span for a claimed memory job.
-///
-/// Provider and agent logs inherit the subject/scope fields from this span, so
-/// nested model spans do not need to repeat the same identifiers.
-fn memory_job_span(
-    job: &UserMemoryJob,
-    agent: &SystemAgentConfig,
-    target_user_name: Option<&str>,
-) -> tracing::Span {
-    let span = tracing::info_span!(
-        "memory.job",
-        job = %job.id,
-        kind = ?job.kind,
-        memory_agent = %agent.name,
-        provider = %agent.provider,
-        model = %agent.model.id,
-        memory_key = %job.memory_key,
-        message_provider = %job.key.platform,
-        scope_key = %job.key.scope_key,
-        scope_id = %memory_scope_id(&job.key.scope_key),
-        guild_id = tracing::field::Empty,
-        user_id = %job.key.user_key,
-        target_user_id = %job.key.user_key,
-        target_user_name = tracing::field::Empty,
-        attempts = job.attempts,
-    );
-    if let Some(guild_id) = memory_guild_id(&job.key.scope_key) {
-        span.record("guild_id", tracing::field::display(guild_id));
-    }
-    if let Some(name) = target_user_name {
-        span.record("target_user_name", tracing::field::display(name));
-    }
-    span
+/// Errors from the memory runtime.
+#[derive(Debug, Error)]
+pub enum MemoryError {
+    /// Configuration is invalid.
+    #[error(transparent)]
+    Config(#[from] MemoryConfigError),
+    /// Storage operation failed.
+    #[error("storage error: {0}")]
+    Storage(String),
+    /// Model operation failed.
+    #[error("model error: {0}")]
+    Model(String),
 }
 
 impl<S, L, M> MemoryRuntime<S, L, M>
@@ -153,13 +132,6 @@ where
         }
         tracing::info!("memory runtime stopped");
         Ok(())
-    }
-
-    fn agent_config(&self, kind: MemoryJobKind) -> &SystemAgentConfig {
-        match kind {
-            MemoryJobKind::Diary => &self.agents.diary,
-            MemoryJobKind::Compact => &self.agents.compact,
-        }
     }
 
     /// Enqueue due work, claim a bounded batch, and run that claimed batch.
@@ -269,30 +241,6 @@ where
             }
         }
         Ok(())
-    }
-
-    /// Best-effort lookup for a readable memory subject label on the outer job
-    /// span.
-    async fn load_memory_job_user_name(&self, job: &UserMemoryJob) -> Option<String> {
-        let user = memory_user_ref(&job.key);
-        let profiles = match self.storage.load_user_profiles(vec![user]).await {
-            Ok(profiles) => profiles,
-            Err(error) => {
-                tracing::warn!(
-                    job = %job.id,
-                    memory_key = %job.memory_key,
-                    message_provider = %job.key.platform,
-                    scope_key = %job.key.scope_key,
-                    target_user_id = %job.key.user_key,
-                    error = %error,
-                    "failed to load memory subject profile for tracing"
-                );
-                return None;
-            }
-        };
-        profiles
-            .first()
-            .and_then(|profile| memory_profile_display_name(&profile.profile, &job.key.user_key))
     }
 
     /// Run one claimed job and persist its completion state.
@@ -510,6 +458,72 @@ where
             .map_err(|error| MemoryError::Model(error.to_string()))?;
         memory_model_output(run, &agent_config.model.id)
     }
+
+    fn agent_config(&self, kind: MemoryJobKind) -> &SystemAgentConfig {
+        match kind {
+            MemoryJobKind::Diary => &self.agents.diary,
+            MemoryJobKind::Compact => &self.agents.compact,
+        }
+    }
+
+    /// Best-effort lookup for a readable memory subject label on the outer job
+    /// span.
+    async fn load_memory_job_user_name(&self, job: &UserMemoryJob) -> Option<String> {
+        let user = memory_user_ref(&job.key);
+        let profiles = match self.storage.load_user_profiles(vec![user]).await {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                tracing::warn!(
+                    job = %job.id,
+                    memory_key = %job.memory_key,
+                    message_provider = %job.key.platform,
+                    scope_key = %job.key.scope_key,
+                    target_user_id = %job.key.user_key,
+                    error = %error,
+                    "failed to load memory subject profile for tracing"
+                );
+                return None;
+            }
+        };
+        profiles
+            .first()
+            .and_then(|profile| memory_profile_display_name(&profile.profile, &job.key.user_key))
+    }
+}
+
+/// Build the parent tracing span for a claimed memory job.
+///
+/// Provider and agent logs inherit the subject/scope fields from this span, so
+/// nested model spans do not need to repeat the same identifiers.
+fn memory_job_span(
+    job: &UserMemoryJob,
+    agent: &SystemAgentConfig,
+    target_user_name: Option<&str>,
+) -> tracing::Span {
+    let span = tracing::info_span!(
+        "memory.job",
+        job = %job.id,
+        kind = ?job.kind,
+        memory_agent = %agent.name,
+        provider = %agent.provider,
+        model = %agent.model.id,
+        memory_key = %job.memory_key,
+        message_provider = %job.key.platform,
+        scope_key = %job.key.scope_key,
+        scope_id = %memory_scope_id(&job.key.scope_key),
+        guild_id = tracing::field::Empty,
+        user_id = %job.key.user_key,
+        target_user_id = %job.key.user_key,
+        target_user_name = tracing::field::Empty,
+        attempts = job.attempts,
+    );
+    if let Some(guild_id) = memory_guild_id(&job.key.scope_key) {
+        span.record("guild_id", tracing::field::display(guild_id));
+    }
+    if let Some(name) = target_user_name {
+        span.record("target_user_name", tracing::field::display(name));
+    }
+    span
 }
 
 /// Text, model identity, and usage extracted from a completed memory-agent run.
@@ -565,18 +579,4 @@ fn memory_model_output(
             "memory model cancelled: {reason}"
         ))),
     }
-}
-
-/// Errors from the memory runtime.
-#[derive(Debug, Error)]
-pub enum MemoryError {
-    /// Configuration is invalid.
-    #[error(transparent)]
-    Config(#[from] MemoryConfigError),
-    /// Storage operation failed.
-    #[error("storage error: {0}")]
-    Storage(String),
-    /// Model operation failed.
-    #[error("model error: {0}")]
-    Model(String),
 }

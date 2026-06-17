@@ -94,63 +94,6 @@ where
     transcript
 }
 
-/// Append supported image payloads after a text breadcrumb for each image.
-async fn append_diary_image_blocks<M>(
-    blocks: &mut Vec<ContentBlock>,
-    turn: &UserMemoryTurn,
-    media_store: &M,
-) where
-    M: MediaStore,
-{
-    for (index, image) in turn.image_context.iter().enumerate() {
-        // The text marker remains useful even when the binary asset is missing
-        // or rejected by the provider-specific media filter below.
-        blocks.push(ContentBlock::Text {
-            text: format!(
-                "Visual content for turn {} image {} (source: {}, uri: {}).",
-                turn.turn_id,
-                index + 1,
-                memory_image_source_label(&image.source),
-                image.image_uri
-            ),
-        });
-        match media_store.media_from_uri(&image.image_uri).await {
-            Ok(media) if memory_diary_supports_media(media.as_ref()) => {
-                blocks.push(ContentBlock::Media { media });
-            }
-            Ok(media) => tracing::debug!(
-                turn = %turn.turn_id,
-                source = %image.source,
-                uri = %media.uri(),
-                category = ?media.category(),
-                mime_type = %media.mime_type(),
-                "skipping unsupported diary image media"
-            ),
-            Err(error) => tracing::warn!(
-                turn = %turn.turn_id,
-                source = %image.source,
-                uri = %image.image_uri,
-                error = %error,
-                "skipping diary image media"
-            ),
-        }
-    }
-}
-
-#[cfg(test)]
-/// Render only text sections for unit tests that do not need media replay.
-pub(super) fn diary_input(
-    key: &UserMemoryKey,
-    document: Option<&UserMemoryDocument>,
-    turns: &[UserMemoryTurn],
-) -> String {
-    let mut out = diary_header_text(key, document);
-    for turn in turns {
-        out.push_str(&diary_turn_text(turn));
-    }
-    out
-}
-
 /// Render the subject ids and current compact memory profile.
 fn diary_header_text(key: &UserMemoryKey, document: Option<&UserMemoryDocument>) -> String {
     let mut out = String::new();
@@ -228,20 +171,6 @@ fn memory_image_source_label(source: &str) -> &str {
     }
 }
 
-/// Return whether this media asset can be replayed as a diary image block.
-fn memory_diary_supports_media(media: &dyn MediaRef) -> bool {
-    matches!(media.category(), MediaCategory::Image)
-        && MEMORY_DIARY_IMAGE_MIME_TYPES
-            .iter()
-            .any(|supported| image_mime_type_eq(media.mime_type(), supported))
-}
-
-/// Compare MIME types while ignoring parameters such as `; charset=binary`.
-fn image_mime_type_eq(actual: &str, expected: &str) -> bool {
-    let actual = actual.split(';').next().unwrap_or("").trim();
-    actual.eq_ignore_ascii_case(expected)
-}
-
 /// Render successful audio transcriptions as model-visible turn context.
 fn append_audio_transcriptions(out: &mut String, transcriptions: &[UserMemoryAudioTranscription]) {
     let mut rendered_any = false;
@@ -282,6 +211,77 @@ fn append_audio_transcriptions(out: &mut String, transcriptions: &[UserMemoryAud
         };
         out.push_str(&format!("- Audio {}{}: {}\n", index + 1, metadata, text));
     }
+}
+
+/// Append supported image payloads after a text breadcrumb for each image.
+async fn append_diary_image_blocks<M>(
+    blocks: &mut Vec<ContentBlock>,
+    turn: &UserMemoryTurn,
+    media_store: &M,
+) where
+    M: MediaStore,
+{
+    for (index, image) in turn.image_context.iter().enumerate() {
+        // The text marker remains useful even when the binary asset is missing
+        // or rejected by the provider-specific media filter below.
+        blocks.push(ContentBlock::Text {
+            text: format!(
+                "Visual content for turn {} image {} (source: {}, uri: {}).",
+                turn.turn_id,
+                index + 1,
+                memory_image_source_label(&image.source),
+                image.image_uri
+            ),
+        });
+        match media_store.media_from_uri(&image.image_uri).await {
+            Ok(media) if memory_diary_supports_media(media.as_ref()) => {
+                blocks.push(ContentBlock::Media { media });
+            }
+            Ok(media) => tracing::debug!(
+                turn = %turn.turn_id,
+                source = %image.source,
+                uri = %media.uri(),
+                category = ?media.category(),
+                mime_type = %media.mime_type(),
+                "skipping unsupported diary image media"
+            ),
+            Err(error) => tracing::warn!(
+                turn = %turn.turn_id,
+                source = %image.source,
+                uri = %image.image_uri,
+                error = %error,
+                "skipping diary image media"
+            ),
+        }
+    }
+}
+
+/// Return whether this media asset can be replayed as a diary image block.
+fn memory_diary_supports_media(media: &dyn MediaRef) -> bool {
+    matches!(media.category(), MediaCategory::Image)
+        && MEMORY_DIARY_IMAGE_MIME_TYPES
+            .iter()
+            .any(|supported| image_mime_type_eq(media.mime_type(), supported))
+}
+
+/// Compare MIME types while ignoring parameters such as `; charset=binary`.
+fn image_mime_type_eq(actual: &str, expected: &str) -> bool {
+    let actual = actual.split(';').next().unwrap_or("").trim();
+    actual.eq_ignore_ascii_case(expected)
+}
+
+#[cfg(test)]
+/// Render only text sections for unit tests that do not need media replay.
+pub(super) fn diary_input(
+    key: &UserMemoryKey,
+    document: Option<&UserMemoryDocument>,
+    turns: &[UserMemoryTurn],
+) -> String {
+    let mut out = diary_header_text(key, document);
+    for turn in turns {
+        out.push_str(&diary_turn_text(turn));
+    }
+    out
 }
 
 #[cfg(test)]

@@ -13,6 +13,81 @@
 use crate::prelude::*;
 use crate::*;
 
+/// Fully prepared state needed to execute one model-backed turn.
+pub(crate) struct TurnExecution {
+    /// Conversation that owns the turn and receives live viewer events.
+    pub(crate) conversation: Conversation,
+    /// Durable turn row that will be driven to one terminal status.
+    pub(crate) turn: Turn,
+    /// Resolved agent name recorded with the turn input and trace span.
+    pub(crate) agent_name: String,
+    /// Agent configuration used to build providers, tools, and model request shape.
+    pub(crate) agent_config: AgentConfig,
+    /// Final system prompt, including any conversation-specific guidance.
+    pub(crate) system_prompt: String,
+    /// Model transcript prepared from stored conversation state and current context.
+    pub(crate) transcript: Transcript,
+    /// Runtime privacy/opt-in settings captured for this turn.
+    pub(crate) settings: RuntimeSettings,
+    /// Platform message that assistant output should reply to.
+    pub(crate) reply_to: MessageRef,
+    /// Whether this turn opened the conversation and should include first-reply behavior.
+    pub(crate) is_new: bool,
+    /// Tool traces produced before agent execution, such as audio transcription preflight.
+    pub(crate) preflight_tool_traces: Vec<ToolTrace>,
+    /// Usage records produced before agent execution.
+    pub(crate) preflight_usage: Vec<UsageRecord>,
+}
+
+impl TurnExecution {
+    /// Return turn usage with preflight usage prepended in execution order.
+    pub(crate) fn usage_with_preflight(&self, mut usage: Vec<UsageRecord>) -> Vec<UsageRecord> {
+        if self.preflight_usage.is_empty() {
+            return usage;
+        }
+        let mut out = self.preflight_usage.clone();
+        out.append(&mut usage);
+        out
+    }
+}
+
+/// Existing conversation found for a new platform message.
+#[derive(Debug, Clone)]
+pub(crate) struct ExistingConversation {
+    /// Loaded conversation snapshot used for continuation and transcript assembly.
+    pub(crate) snapshot: ConversationSnapshot,
+    /// Lookup route that found the snapshot.
+    pub(crate) source: ConversationLookupSource,
+}
+
+/// Where a conversation lookup matched, used for audio wake-up decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConversationLookupSource {
+    /// The message arrived in a channel already linked to a conversation.
+    Channel,
+    /// The message explicitly replied to a message linked to a conversation.
+    ReferencedMessage,
+    /// The current message was already linked to a conversation.
+    Message,
+}
+
+impl ConversationLookupSource {
+    /// Return whether this lookup source should let audio continue a conversation.
+    ///
+    /// Already-linked current messages are treated as idempotent reprocessing,
+    /// not as a fresh audio mention.
+    pub(crate) fn counts_as_audio_mention(self) -> bool {
+        matches!(self, Self::Channel | Self::ReferencedMessage)
+    }
+}
+
+/// Context items prepared for the model transcript and persisted trace.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTurnContext {
+    /// Ordered context entries saved with the turn input.
+    pub(crate) items: Vec<chudbot_api::ContextItem>,
+}
+
 impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
@@ -1689,79 +1764,4 @@ where
         }
         Ok(already_replays)
     }
-}
-
-/// Fully prepared state needed to execute one model-backed turn.
-pub(crate) struct TurnExecution {
-    /// Conversation that owns the turn and receives live viewer events.
-    pub(crate) conversation: Conversation,
-    /// Durable turn row that will be driven to one terminal status.
-    pub(crate) turn: Turn,
-    /// Resolved agent name recorded with the turn input and trace span.
-    pub(crate) agent_name: String,
-    /// Agent configuration used to build providers, tools, and model request shape.
-    pub(crate) agent_config: AgentConfig,
-    /// Final system prompt, including any conversation-specific guidance.
-    pub(crate) system_prompt: String,
-    /// Model transcript prepared from stored conversation state and current context.
-    pub(crate) transcript: Transcript,
-    /// Runtime privacy/opt-in settings captured for this turn.
-    pub(crate) settings: RuntimeSettings,
-    /// Platform message that assistant output should reply to.
-    pub(crate) reply_to: MessageRef,
-    /// Whether this turn opened the conversation and should include first-reply behavior.
-    pub(crate) is_new: bool,
-    /// Tool traces produced before agent execution, such as audio transcription preflight.
-    pub(crate) preflight_tool_traces: Vec<ToolTrace>,
-    /// Usage records produced before agent execution.
-    pub(crate) preflight_usage: Vec<UsageRecord>,
-}
-
-impl TurnExecution {
-    /// Return turn usage with preflight usage prepended in execution order.
-    pub(crate) fn usage_with_preflight(&self, mut usage: Vec<UsageRecord>) -> Vec<UsageRecord> {
-        if self.preflight_usage.is_empty() {
-            return usage;
-        }
-        let mut out = self.preflight_usage.clone();
-        out.append(&mut usage);
-        out
-    }
-}
-
-/// Existing conversation found for a new platform message.
-#[derive(Debug, Clone)]
-pub(crate) struct ExistingConversation {
-    /// Loaded conversation snapshot used for continuation and transcript assembly.
-    pub(crate) snapshot: ConversationSnapshot,
-    /// Lookup route that found the snapshot.
-    pub(crate) source: ConversationLookupSource,
-}
-
-/// Where a conversation lookup matched, used for audio wake-up decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConversationLookupSource {
-    /// The message arrived in a channel already linked to a conversation.
-    Channel,
-    /// The message explicitly replied to a message linked to a conversation.
-    ReferencedMessage,
-    /// The current message was already linked to a conversation.
-    Message,
-}
-
-impl ConversationLookupSource {
-    /// Return whether this lookup source should let audio continue a conversation.
-    ///
-    /// Already-linked current messages are treated as idempotent reprocessing,
-    /// not as a fresh audio mention.
-    pub(crate) fn counts_as_audio_mention(self) -> bool {
-        matches!(self, Self::Channel | Self::ReferencedMessage)
-    }
-}
-
-/// Context items prepared for the model transcript and persisted trace.
-#[derive(Debug, Clone)]
-pub(crate) struct PreparedTurnContext {
-    /// Ordered context entries saved with the turn input.
-    pub(crate) items: Vec<chudbot_api::ContextItem>,
 }

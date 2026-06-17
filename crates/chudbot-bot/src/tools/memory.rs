@@ -79,6 +79,22 @@ impl MemoryToolContext {
     }
 }
 
+/// Errors from memory client tools.
+///
+/// These are execution failures, not successful tool results with
+/// `is_error = true`. `RuntimeToolExecutor` stringifies them through
+/// `runtime_tool_execution_error`, and the agent loop wraps the error text into
+/// the model-facing failed tool result and trace JSON.
+#[derive(Debug, Error)]
+pub(crate) enum MemoryToolError {
+    /// Tool input was invalid.
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    /// Storage operation failed.
+    #[error("storage error: {0}")]
+    Storage(String),
+}
+
 /// Model-facing spec for reading a user's memory state.
 ///
 /// The prompt guidance tells agents to call this before responding to authors
@@ -315,22 +331,6 @@ where
         trace_response: memory_event_trace(&event),
         usage: Vec::new(),
     })
-}
-
-/// Errors from memory client tools.
-///
-/// These are execution failures, not successful tool results with
-/// `is_error = true`. `RuntimeToolExecutor` stringifies them through
-/// `runtime_tool_execution_error`, and the agent loop wraps the error text into
-/// the model-facing failed tool result and trace JSON.
-#[derive(Debug, Error)]
-pub(crate) enum MemoryToolError {
-    /// Tool input was invalid.
-    #[error("invalid input: {0}")]
-    InvalidInput(String),
-    /// Storage operation failed.
-    #[error("storage error: {0}")]
-    Storage(String),
 }
 
 /// JSON Schema for the lookup tool input.

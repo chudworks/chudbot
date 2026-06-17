@@ -60,328 +60,12 @@ pub struct BotConfig {
     pub thread_threshold_lines: usize,
 }
 
-impl BotConfig {
-    /// Validate references and local invariants that can be checked before the
-    /// runtime builds providers, tools, or platform adapters.
-    #[tracing::instrument(
-        name = "bot.config.validate",
-        skip_all,
-        fields(
-            agents = self.agents.len(),
-            admins = self.admins.len(),
-            platforms = self.platforms.len(),
-            default_agent = %self.default_agent,
-        )
-    )]
-    pub fn validate(&self) -> Result<(), BotError> {
-        tracing::debug!("validating bot config");
-
-        // Establish the global fallback first; several later paths assume it
-        // exists when a platform or request does not name a valid agent.
-        if !self.agents.contains_key(&self.default_agent) {
-            tracing::warn!(
-                missing_agent = %self.default_agent,
-                "default agent is not configured"
-            );
-            return Err(BotError::MissingAgent {
-                name: self.default_agent.clone(),
-            });
-        }
-
-        // Platform defaults are optional, but every configured override must
-        // still resolve to one of the named agents in this map.
-        for binding in self.platforms.values() {
-            if !self.agents.contains_key(&binding.agent) {
-                tracing::warn!(
-                    missing_agent = %binding.agent,
-                    "platform binding references missing agent"
-                );
-                return Err(BotError::MissingAgent {
-                    name: binding.agent.clone(),
-                });
-            }
-        }
-
-        // Agent-local bindings are turned into runtime tools. Validate them
-        // here so missing names or malformed media/audio bindings fail before
-        // the bot starts accepting events.
-        for (agent_name, agent) in &self.agents {
-            if let Some(binding) = &agent.image_generation {
-                validate_generation_binding(agent_name, "image_generation", binding)?;
-            }
-            if let Some(binding) = &agent.video_generation {
-                validate_generation_binding(agent_name, "video_generation", binding)?;
-            }
-            if let Some(binding) = &agent.audio_transcription {
-                validate_transcription_binding(agent_name, "audio_transcription", binding)?;
-            }
-            for binding in agent.subagents.values() {
-                if !self.agents.contains_key(&binding.agent) {
-                    tracing::warn!(
-                        agent = %agent_name,
-                        missing_subagent = %binding.agent,
-                        "subagent binding references missing agent"
-                    );
-                    return Err(BotError::MissingSubagent {
-                        agent: agent_name.clone(),
-                        subagent: binding.agent.clone(),
-                    });
-                }
-            }
-        }
-        tracing::info!("bot config validated");
-        Ok(())
-    }
-
-    /// Resolve the agent for an incoming turn.
-    ///
-    /// A valid explicit request wins. Unknown requests are treated like "no
-    /// request" so platform/default routing remains usable when a user-provided
-    /// agent name is stale or unavailable.
-    pub fn agent_or_platform_default(
-        &self,
-        requested: Option<&str>,
-        platform: &PlatformName,
-    ) -> Result<(String, &AgentConfig), BotError> {
-        // Prefer the user or platform command selection only when it names a
-        // configured agent.
-        if let Some(name) = requested
-            && let Some(agent) = self.agents.get(name)
-        {
-            tracing::debug!(
-                requested_agent = %name,
-                platform = %platform,
-                provider = %agent.provider,
-                model = %agent.model.id,
-                "resolved requested agent"
-            );
-            return Ok((name.to_string(), agent));
-        }
-
-        // Then fall back through the platform binding and finally the global
-        // default. `validate` normally guarantees this lookup succeeds.
-        let platform_default = self
-            .platforms
-            .get(platform)
-            .map(|binding| binding.agent.as_str())
-            .unwrap_or(self.default_agent.as_str());
-        let resolved = self
-            .agents
-            .get(platform_default)
-            .map(|agent| (platform_default.to_string(), agent))
-            .ok_or_else(|| BotError::MissingAgent {
-                name: platform_default.to_string(),
-            })?;
-        tracing::debug!(
-            requested_agent = ?requested,
-            platform = %platform,
-            resolved_agent = %resolved.0,
-            provider = %resolved.1.provider,
-            model = %resolved.1.model.id,
-            "resolved platform/default agent"
-        );
-        Ok(resolved)
-    }
-}
-
 fn default_thread_threshold_chars() -> usize {
     DEFAULT_THREAD_THRESHOLD_CHARS
 }
 
 fn default_thread_threshold_lines() -> usize {
     DEFAULT_THREAD_THRESHOLD_LINES
-}
-
-/// Build the model-facing description for an agent's image generation tool.
-///
-/// The text explains the media reference contract because generated and
-/// uploaded images are addressed by internal `file://images/...` URIs, not by
-/// public URLs or guessed filenames.
-pub(crate) fn image_generation_tool_description(
-    provider: &ProviderName,
-    model: &ModelId,
-) -> String {
-    // Keep the reference-image rules in the tool description itself; the model
-    // sees this on every tool call decision, while config docs are not in-band.
-    format!(
-        concat!(
-            "Generate an image with the configured `{}` image provider and `{}` model, ",
-            "save it to media storage, and return its media URI.\n\n",
-            "Use this whenever the user asks for an image, picture, drawing, illustration, ",
-            "infographic, or other visual.\n\n",
-            "To edit, restyle, transform, make a variation of, or combine images already ",
-            "visible in the conversation, pass their exact `file://images/...` URI(s) in ",
-            "`reference_images`. This is the expected path for requests like \"turn this ",
-            "image into...\", \"make the image...\", \"use the previous image\", or ",
-            "\"here's a different version\". User-uploaded images are listed in image ",
-            "attachment reference notes; generated images are listed in prior tool ",
-            "results and generated-media reference notes. Never invent or guess paths. ",
-            "For two or three references, refer to them in the prompt as <IMAGE_0>, ",
-            "<IMAGE_1>, etc. in the same order. If no real URI applies, omit ",
-            "`reference_images` and generate from text alone.\n\n",
-            "Generated media is attached to the final platform reply automatically. ",
-            "Do not paste media URIs, filenames, public URLs, or markdown media links ",
-            "in user-facing text."
-        ),
-        provider, model
-    )
-}
-
-/// Build the model-facing description for an agent's video generation tool.
-pub(crate) fn video_generation_tool_description(binding: &GenerationBinding) -> String {
-    let mut description = format!(
-        "Generate a video with the configured `{}` video provider and `{}` model, save it to media storage, and return its media URI.",
-        binding.provider, binding.model
-    );
-    if let Some(limit) = &binding.rate_limit {
-        // The runtime enforces the limit; this hint helps the model avoid
-        // surprising users with retries that cannot run yet.
-        description.push_str(&format!(
-            "\n\nThis tool is limited to {} active video generation{} per {} for each non-bypassed platform scope.",
-            limit.limit,
-            if limit.limit == 1 { "" } else { "s" },
-            limit.interval
-        ));
-    }
-    description
-}
-
-/// Validate a media generation binding shared by image and video tools.
-///
-/// Image and video bindings intentionally share the same config shape, but only
-/// video generation accepts the optional active-job rate limit.
-pub(crate) fn validate_generation_binding(
-    agent_name: &str,
-    field: &'static str,
-    binding: &GenerationBinding,
-) -> Result<(), BotError> {
-    // Registry lookups happen later, so catch empty registry keys here while the
-    // error can still name the owning agent and config field.
-    if binding.provider.as_str().trim().is_empty() {
-        tracing::warn!(agent = %agent_name, field, "media generation provider is empty");
-        return Err(BotError::InvalidGenerationBinding {
-            agent: agent_name.to_string(),
-            field,
-            message: "provider is empty".to_string(),
-        });
-    }
-    if binding.model.as_str().trim().is_empty() {
-        tracing::warn!(agent = %agent_name, field, "media generation model is empty");
-        return Err(BotError::InvalidGenerationBinding {
-            agent: agent_name.to_string(),
-            field,
-            message: "model is empty".to_string(),
-        });
-    }
-    if let Some(rate_limit) = &binding.rate_limit {
-        // Keep the shared config struct narrow at runtime: image bindings can
-        // deserialize the field for diagnostics, but validation rejects it.
-        if field != "video_generation" {
-            tracing::warn!(agent = %agent_name, field, "rate limit configured on non-video generation binding");
-            return Err(BotError::InvalidGenerationBinding {
-                agent: agent_name.to_string(),
-                field,
-                message: "rate_limit is only supported on video_generation".to_string(),
-            });
-        }
-        validate_video_generation_rate_limit(agent_name, field, rate_limit)?;
-    }
-    Ok(())
-}
-
-/// Validate the video-specific portion of a generation binding.
-fn validate_video_generation_rate_limit(
-    agent_name: &str,
-    field: &'static str,
-    rate_limit: &VideoGenerationRateLimit,
-) -> Result<(), BotError> {
-    // A zero limit would permanently disable the tool while still advertising
-    // it to the model, so fail configuration instead.
-    if rate_limit.limit == 0 {
-        tracing::warn!(agent = %agent_name, field, "video generation rate limit is zero");
-        return Err(BotError::InvalidGenerationBinding {
-            agent: agent_name.to_string(),
-            field,
-            message: "rate_limit.limit must be greater than zero".to_string(),
-        });
-    }
-    if let Err(message) = rate_limit.interval_seconds() {
-        tracing::warn!(
-            agent = %agent_name,
-            field,
-            interval = %rate_limit.interval,
-            "video generation rate limit interval is invalid"
-        );
-        return Err(BotError::InvalidGenerationBinding {
-            agent: agent_name.to_string(),
-            field,
-            message,
-        });
-    }
-
-    // Bypass scopes are matched at runtime against platform and guild/scope id;
-    // empty components would otherwise silently never match.
-    for scope in &rate_limit.bypass_scopes {
-        if scope.platform.as_str().trim().is_empty() {
-            tracing::warn!(agent = %agent_name, field, "video generation rate limit bypass platform is empty");
-            return Err(BotError::InvalidGenerationBinding {
-                agent: agent_name.to_string(),
-                field,
-                message: "rate_limit.bypass_scopes platform must not be empty".to_string(),
-            });
-        }
-        if scope.scope_id.as_str().trim().is_empty() {
-            tracing::warn!(
-                agent = %agent_name,
-                field,
-                platform = %scope.platform,
-                "video generation rate limit bypass scope id is empty"
-            );
-            return Err(BotError::InvalidGenerationBinding {
-                agent: agent_name.to_string(),
-                field,
-                message: "rate_limit.bypass_scopes scope_id must not be empty".to_string(),
-            });
-        }
-    }
-    Ok(())
-}
-
-/// Validate the audio transcription binding that enables the transcription tool.
-fn validate_transcription_binding(
-    agent_name: &str,
-    field: &'static str,
-    binding: &TranscriptionBinding,
-) -> Result<(), BotError> {
-    if binding.provider.as_str().trim().is_empty() {
-        tracing::warn!(agent = %agent_name, field, "audio transcription provider is empty");
-        return Err(BotError::InvalidGenerationBinding {
-            agent: agent_name.to_string(),
-            field,
-            message: "provider is empty".to_string(),
-        });
-    }
-    if let Some(model) = &binding.model
-        && model.as_str().trim().is_empty()
-    {
-        tracing::warn!(agent = %agent_name, field, "audio transcription model is empty");
-        return Err(BotError::InvalidGenerationBinding {
-            agent: agent_name.to_string(),
-            field,
-            message: "model is empty".to_string(),
-        });
-    }
-    if let Some(wake_word) = &binding.wake_word
-        && wake_word.trim().is_empty()
-    {
-        tracing::warn!(agent = %agent_name, field, "audio transcription wake word is empty");
-        return Err(BotError::InvalidGenerationBinding {
-            agent: agent_name.to_string(),
-            field,
-            message: "wake_word is empty".to_string(),
-        });
-    }
-    Ok(())
 }
 
 /// One named agent: prompt, provider/model, tool exposure, and subagents.
@@ -434,6 +118,37 @@ impl AgentConfig {
         spec.client_tools = self.client_tools.clone();
         spec
     }
+}
+
+/// Platform default binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlatformBinding {
+    /// Agent name used for this platform by default.
+    pub agent: String,
+}
+
+/// Runtime controls for the bot event loop.
+#[derive(Debug, Clone, Copy)]
+pub struct BotRunOptions {
+    /// How long graceful shutdown waits for in-flight event tasks.
+    pub drain_timeout: Duration,
+}
+
+impl Default for BotRunOptions {
+    fn default() -> Self {
+        Self {
+            drain_timeout: DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+        }
+    }
+}
+
+/// A tool binding from one agent to another.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentBinding {
+    /// Target agent name.
+    pub agent: String,
+    /// Tool description shown to the parent model.
+    pub description: String,
 }
 
 /// Effective configuration for a reserved system agent.
@@ -659,33 +374,318 @@ pub(crate) fn append_default_audio_keyterms(keyterms: &mut Vec<String>, defaults
     }
 }
 
-/// Platform default binding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PlatformBinding {
-    /// Agent name used for this platform by default.
-    pub agent: String,
-}
+impl BotConfig {
+    /// Validate references and local invariants that can be checked before the
+    /// runtime builds providers, tools, or platform adapters.
+    #[tracing::instrument(
+        name = "bot.config.validate",
+        skip_all,
+        fields(
+            agents = self.agents.len(),
+            admins = self.admins.len(),
+            platforms = self.platforms.len(),
+            default_agent = %self.default_agent,
+        )
+    )]
+    pub fn validate(&self) -> Result<(), BotError> {
+        tracing::debug!("validating bot config");
 
-/// Runtime controls for the bot event loop.
-#[derive(Debug, Clone, Copy)]
-pub struct BotRunOptions {
-    /// How long graceful shutdown waits for in-flight event tasks.
-    pub drain_timeout: Duration,
-}
-
-impl Default for BotRunOptions {
-    fn default() -> Self {
-        Self {
-            drain_timeout: DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+        // Establish the global fallback first; several later paths assume it
+        // exists when a platform or request does not name a valid agent.
+        if !self.agents.contains_key(&self.default_agent) {
+            tracing::warn!(
+                missing_agent = %self.default_agent,
+                "default agent is not configured"
+            );
+            return Err(BotError::MissingAgent {
+                name: self.default_agent.clone(),
+            });
         }
+
+        // Platform defaults are optional, but every configured override must
+        // still resolve to one of the named agents in this map.
+        for binding in self.platforms.values() {
+            if !self.agents.contains_key(&binding.agent) {
+                tracing::warn!(
+                    missing_agent = %binding.agent,
+                    "platform binding references missing agent"
+                );
+                return Err(BotError::MissingAgent {
+                    name: binding.agent.clone(),
+                });
+            }
+        }
+
+        // Agent-local bindings are turned into runtime tools. Validate them
+        // here so missing names or malformed media/audio bindings fail before
+        // the bot starts accepting events.
+        for (agent_name, agent) in &self.agents {
+            if let Some(binding) = &agent.image_generation {
+                validate_generation_binding(agent_name, "image_generation", binding)?;
+            }
+            if let Some(binding) = &agent.video_generation {
+                validate_generation_binding(agent_name, "video_generation", binding)?;
+            }
+            if let Some(binding) = &agent.audio_transcription {
+                validate_transcription_binding(agent_name, "audio_transcription", binding)?;
+            }
+            for binding in agent.subagents.values() {
+                if !self.agents.contains_key(&binding.agent) {
+                    tracing::warn!(
+                        agent = %agent_name,
+                        missing_subagent = %binding.agent,
+                        "subagent binding references missing agent"
+                    );
+                    return Err(BotError::MissingSubagent {
+                        agent: agent_name.clone(),
+                        subagent: binding.agent.clone(),
+                    });
+                }
+            }
+        }
+        tracing::info!("bot config validated");
+        Ok(())
+    }
+
+    /// Resolve the agent for an incoming turn.
+    ///
+    /// A valid explicit request wins. Unknown requests are treated like "no
+    /// request" so platform/default routing remains usable when a user-provided
+    /// agent name is stale or unavailable.
+    pub fn agent_or_platform_default(
+        &self,
+        requested: Option<&str>,
+        platform: &PlatformName,
+    ) -> Result<(String, &AgentConfig), BotError> {
+        // Prefer the user or platform command selection only when it names a
+        // configured agent.
+        if let Some(name) = requested
+            && let Some(agent) = self.agents.get(name)
+        {
+            tracing::debug!(
+                requested_agent = %name,
+                platform = %platform,
+                provider = %agent.provider,
+                model = %agent.model.id,
+                "resolved requested agent"
+            );
+            return Ok((name.to_string(), agent));
+        }
+
+        // Then fall back through the platform binding and finally the global
+        // default. `validate` normally guarantees this lookup succeeds.
+        let platform_default = self
+            .platforms
+            .get(platform)
+            .map(|binding| binding.agent.as_str())
+            .unwrap_or(self.default_agent.as_str());
+        let resolved = self
+            .agents
+            .get(platform_default)
+            .map(|agent| (platform_default.to_string(), agent))
+            .ok_or_else(|| BotError::MissingAgent {
+                name: platform_default.to_string(),
+            })?;
+        tracing::debug!(
+            requested_agent = ?requested,
+            platform = %platform,
+            resolved_agent = %resolved.0,
+            provider = %resolved.1.provider,
+            model = %resolved.1.model.id,
+            "resolved platform/default agent"
+        );
+        Ok(resolved)
     }
 }
 
-/// A tool binding from one agent to another.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubagentBinding {
-    /// Target agent name.
-    pub agent: String,
-    /// Tool description shown to the parent model.
-    pub description: String,
+/// Build the model-facing description for an agent's image generation tool.
+///
+/// The text explains the media reference contract because generated and
+/// uploaded images are addressed by internal `file://images/...` URIs, not by
+/// public URLs or guessed filenames.
+pub(crate) fn image_generation_tool_description(
+    provider: &ProviderName,
+    model: &ModelId,
+) -> String {
+    // Keep the reference-image rules in the tool description itself; the model
+    // sees this on every tool call decision, while config docs are not in-band.
+    format!(
+        concat!(
+            "Generate an image with the configured `{}` image provider and `{}` model, ",
+            "save it to media storage, and return its media URI.\n\n",
+            "Use this whenever the user asks for an image, picture, drawing, illustration, ",
+            "infographic, or other visual.\n\n",
+            "To edit, restyle, transform, make a variation of, or combine images already ",
+            "visible in the conversation, pass their exact `file://images/...` URI(s) in ",
+            "`reference_images`. This is the expected path for requests like \"turn this ",
+            "image into...\", \"make the image...\", \"use the previous image\", or ",
+            "\"here's a different version\". User-uploaded images are listed in image ",
+            "attachment reference notes; generated images are listed in prior tool ",
+            "results and generated-media reference notes. Never invent or guess paths. ",
+            "For two or three references, refer to them in the prompt as <IMAGE_0>, ",
+            "<IMAGE_1>, etc. in the same order. If no real URI applies, omit ",
+            "`reference_images` and generate from text alone.\n\n",
+            "Generated media is attached to the final platform reply automatically. ",
+            "Do not paste media URIs, filenames, public URLs, or markdown media links ",
+            "in user-facing text."
+        ),
+        provider, model
+    )
+}
+
+/// Build the model-facing description for an agent's video generation tool.
+pub(crate) fn video_generation_tool_description(binding: &GenerationBinding) -> String {
+    let mut description = format!(
+        "Generate a video with the configured `{}` video provider and `{}` model, save it to media storage, and return its media URI.",
+        binding.provider, binding.model
+    );
+    if let Some(limit) = &binding.rate_limit {
+        // The runtime enforces the limit; this hint helps the model avoid
+        // surprising users with retries that cannot run yet.
+        description.push_str(&format!(
+            "\n\nThis tool is limited to {} active video generation{} per {} for each non-bypassed platform scope.",
+            limit.limit,
+            if limit.limit == 1 { "" } else { "s" },
+            limit.interval
+        ));
+    }
+    description
+}
+
+/// Validate a media generation binding shared by image and video tools.
+///
+/// Image and video bindings intentionally share the same config shape, but only
+/// video generation accepts the optional active-job rate limit.
+pub(crate) fn validate_generation_binding(
+    agent_name: &str,
+    field: &'static str,
+    binding: &GenerationBinding,
+) -> Result<(), BotError> {
+    // Registry lookups happen later, so catch empty registry keys here while the
+    // error can still name the owning agent and config field.
+    if binding.provider.as_str().trim().is_empty() {
+        tracing::warn!(agent = %agent_name, field, "media generation provider is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "provider is empty".to_string(),
+        });
+    }
+    if binding.model.as_str().trim().is_empty() {
+        tracing::warn!(agent = %agent_name, field, "media generation model is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "model is empty".to_string(),
+        });
+    }
+    if let Some(rate_limit) = &binding.rate_limit {
+        // Keep the shared config struct narrow at runtime: image bindings can
+        // deserialize the field for diagnostics, but validation rejects it.
+        if field != "video_generation" {
+            tracing::warn!(agent = %agent_name, field, "rate limit configured on non-video generation binding");
+            return Err(BotError::InvalidGenerationBinding {
+                agent: agent_name.to_string(),
+                field,
+                message: "rate_limit is only supported on video_generation".to_string(),
+            });
+        }
+        validate_video_generation_rate_limit(agent_name, field, rate_limit)?;
+    }
+    Ok(())
+}
+
+/// Validate the video-specific portion of a generation binding.
+fn validate_video_generation_rate_limit(
+    agent_name: &str,
+    field: &'static str,
+    rate_limit: &VideoGenerationRateLimit,
+) -> Result<(), BotError> {
+    // A zero limit would permanently disable the tool while still advertising
+    // it to the model, so fail configuration instead.
+    if rate_limit.limit == 0 {
+        tracing::warn!(agent = %agent_name, field, "video generation rate limit is zero");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "rate_limit.limit must be greater than zero".to_string(),
+        });
+    }
+    if let Err(message) = rate_limit.interval_seconds() {
+        tracing::warn!(
+            agent = %agent_name,
+            field,
+            interval = %rate_limit.interval,
+            "video generation rate limit interval is invalid"
+        );
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message,
+        });
+    }
+
+    // Bypass scopes are matched at runtime against platform and guild/scope id;
+    // empty components would otherwise silently never match.
+    for scope in &rate_limit.bypass_scopes {
+        if scope.platform.as_str().trim().is_empty() {
+            tracing::warn!(agent = %agent_name, field, "video generation rate limit bypass platform is empty");
+            return Err(BotError::InvalidGenerationBinding {
+                agent: agent_name.to_string(),
+                field,
+                message: "rate_limit.bypass_scopes platform must not be empty".to_string(),
+            });
+        }
+        if scope.scope_id.as_str().trim().is_empty() {
+            tracing::warn!(
+                agent = %agent_name,
+                field,
+                platform = %scope.platform,
+                "video generation rate limit bypass scope id is empty"
+            );
+            return Err(BotError::InvalidGenerationBinding {
+                agent: agent_name.to_string(),
+                field,
+                message: "rate_limit.bypass_scopes scope_id must not be empty".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate the audio transcription binding that enables the transcription tool.
+fn validate_transcription_binding(
+    agent_name: &str,
+    field: &'static str,
+    binding: &TranscriptionBinding,
+) -> Result<(), BotError> {
+    if binding.provider.as_str().trim().is_empty() {
+        tracing::warn!(agent = %agent_name, field, "audio transcription provider is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "provider is empty".to_string(),
+        });
+    }
+    if let Some(model) = &binding.model
+        && model.as_str().trim().is_empty()
+    {
+        tracing::warn!(agent = %agent_name, field, "audio transcription model is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "model is empty".to_string(),
+        });
+    }
+    if let Some(wake_word) = &binding.wake_word
+        && wake_word.trim().is_empty()
+    {
+        tracing::warn!(agent = %agent_name, field, "audio transcription wake word is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "wake_word is empty".to_string(),
+        });
+    }
+    Ok(())
 }

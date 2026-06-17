@@ -16,6 +16,14 @@ use super::*;
 #[derive(Debug)]
 pub(crate) struct RuntimeToolError(String);
 
+impl std::fmt::Display for RuntimeToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RuntimeToolError {}
+
 /// Runtime agent type wired to routed LLM providers and Chudbot client tools.
 pub(crate) type RuntimeAgent<R> =
     Agent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
@@ -30,6 +38,17 @@ pub(crate) struct RuntimeSubagent<R: BotRuntimeTypes> {
     pub(crate) name: ToolName,
     /// Nested agent tool. Boxed so recursive config graphs have a finite size.
     pub(crate) tool: Box<RuntimeSubagentTool<R>>,
+}
+
+impl<R> std::fmt::Debug for RuntimeSubagent<R>
+where
+    R: BotRuntimeTypes,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeSubagent")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Shared runtime services available to all tool calls for one turn.
@@ -111,6 +130,17 @@ pub(crate) struct RuntimeMemoryFlags {
     pub(crate) forget: bool,
 }
 
+impl RuntimeMemoryFlags {
+    /// Enable the full read/write/delete memory surface for a configured agent.
+    pub(crate) fn all() -> Self {
+        Self {
+            lookup: true,
+            remember: true,
+            forget: true,
+        }
+    }
+}
+
 /// Tool executor for an agent run.
 ///
 /// Tool specs and tool execution are both derived from the same dependencies,
@@ -140,6 +170,22 @@ pub(crate) struct RuntimeToolExecutor<R: BotRuntimeTypes> {
     pub(crate) audio_transcription: Option<TranscriptionBinding>,
     /// Configured subagents exposed as additional named client tools.
     pub(crate) subagents: Vec<RuntimeSubagent<R>>,
+}
+
+impl<R> std::fmt::Debug for RuntimeToolExecutor<R>
+where
+    R: BotRuntimeTypes,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeToolExecutor")
+            .field("enabled", &self.enabled)
+            .field("memory", &self.memory.is_some())
+            .field("image_generation", &self.image_generation.is_some())
+            .field("video_generation", &self.video_generation.is_some())
+            .field("audio_transcription", &self.audio_transcription.is_some())
+            .field("subagents", &self.subagents)
+            .finish()
+    }
 }
 
 impl<R> ClientToolExecutor for RuntimeToolExecutor<R>
@@ -278,52 +324,6 @@ where
             ));
         }
         definitions
-    }
-}
-
-impl std::fmt::Display for RuntimeToolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for RuntimeToolError {}
-
-impl RuntimeMemoryFlags {
-    /// Enable the full read/write/delete memory surface for a configured agent.
-    pub(crate) fn all() -> Self {
-        Self {
-            lookup: true,
-            remember: true,
-            forget: true,
-        }
-    }
-}
-
-impl<R> std::fmt::Debug for RuntimeSubagent<R>
-where
-    R: BotRuntimeTypes,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeSubagent")
-            .field("name", &self.name)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<R> std::fmt::Debug for RuntimeToolExecutor<R>
-where
-    R: BotRuntimeTypes,
-{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeToolExecutor")
-            .field("enabled", &self.enabled)
-            .field("memory", &self.memory.is_some())
-            .field("image_generation", &self.image_generation.is_some())
-            .field("video_generation", &self.video_generation.is_some())
-            .field("audio_transcription", &self.audio_transcription.is_some())
-            .field("subagents", &self.subagents)
-            .finish()
     }
 }
 

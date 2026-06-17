@@ -8,113 +8,6 @@
 
 use super::*;
 
-/// Storage operations needed by the video-generation tool.
-///
-/// The trait mirrors the `BotStorage` subset used here so tests can exercise
-/// persistence and rate-limit behavior without depending on the full storage
-/// surface.
-pub(crate) trait PersistentVideoStorage: Clone + Send + Sync {
-    /// Storage backend error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Insert the local row for a provider job after upstream submission.
-    fn create_video_job(
-        &self,
-        input: CreateVideoJob,
-    ) -> impl Future<Output = Result<StoredVideoJob, Self::Error>> + Send;
-
-    /// Record a provider job status transition and optional output URI/error.
-    fn update_video_job(
-        &self,
-        input: UpdateVideoJob,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Count pending plus completed video jobs inside the rolling quota window.
-    fn count_active_video_generations(
-        &self,
-        input: CountActiveVideoGenerations,
-    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
-}
-
-impl<T> PersistentVideoStorage for T
-where
-    T: BotStorage + Clone + Send + Sync,
-{
-    type Error = T::Error;
-
-    fn create_video_job(
-        &self,
-        input: CreateVideoJob,
-    ) -> impl Future<Output = Result<StoredVideoJob, Self::Error>> + Send {
-        BotStorage::create_video_job(self, input)
-    }
-
-    fn update_video_job(
-        &self,
-        input: UpdateVideoJob,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        BotStorage::update_video_job(self, input)
-    }
-
-    fn count_active_video_generations(
-        &self,
-        input: CountActiveVideoGenerations,
-    ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
-        BotStorage::count_active_video_generations(self, input)
-    }
-}
-
-/// Single-node rate-limit lock scope.
-///
-/// Video quotas are scoped to the platform workspace/server when one exists.
-/// Platform-only scopes use `None`, which still serializes all calls on that
-/// platform together.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct VideoRateLimitLockKey {
-    /// Messaging platform that owns the video-generation scope.
-    pub(crate) platform: PlatformName,
-    /// Optional platform workspace/server/guild id.
-    pub(crate) scope_id: Option<ExternalId>,
-}
-
-impl VideoRateLimitLockKey {
-    /// Build the quota key for the user that issued the current turn.
-    pub(crate) fn from_user(user: &UserRef) -> Self {
-        Self {
-            platform: user.platform.clone(),
-            scope_id: user.guild_id.clone(),
-        }
-    }
-}
-
-/// Shared per-scope async locks for video quota checks and submissions.
-///
-/// A video tool value is created per turn, so the lock map must be supplied by
-/// the runtime and cloned into each tool instance. The lock is intentionally
-/// in-process because Chudbot runs as a single node.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct VideoRateLimitLocks {
-    /// Lazily-created async mutexes keyed by platform scope.
-    pub(crate) inner: Arc<Mutex<BTreeMap<VideoRateLimitLockKey, Arc<AsyncMutex<()>>>>>,
-}
-
-impl VideoRateLimitLocks {
-    /// Acquire the async mutex for the caller's platform scope.
-    pub(crate) async fn lock(&self, user: &UserRef) -> OwnedMutexGuard<()> {
-        let lock = {
-            let mut locks = self
-                .inner
-                .lock()
-                .expect("video rate limit lock map mutex poisoned");
-            locks
-                .entry(VideoRateLimitLockKey::from_user(user))
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        lock.lock_owned().await
-    }
-}
-
 /// Runtime client tool for configured video generation.
 ///
 /// `generator` is already routed to the agent's configured provider and default
@@ -178,79 +71,6 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
     pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
-    }
-
-    /// Enforce the configured active-video quota for the current platform scope.
-    ///
-    /// The caller is expected to hold the matching `VideoRateLimitLocks` guard
-    /// unless the user is bypassed. The storage count includes jobs still
-    /// pending plus completed jobs inside the rolling interval.
-    pub(crate) async fn enforce_video_rate_limit(
-        &self,
-        rate_limit: &VideoGenerationRateLimit,
-    ) -> Result<(), BotToolError>
-    where
-        S: PersistentVideoStorage,
-    {
-        let interval_seconds = rate_limit
-            .interval_seconds()
-            .map_err(BotToolError::InvalidInput)?;
-        let used = self
-            .storage
-            .count_active_video_generations(CountActiveVideoGenerations {
-                platform: self.turn_user.platform.clone(),
-                scope_id: self.turn_user.guild_id.clone(),
-                interval_seconds,
-            })
-            .await
-            .map_err(|error| BotToolError::Storage(error.to_string()))?;
-        if used >= u64::from(rate_limit.limit) {
-            tracing::warn!(
-                used,
-                limit = rate_limit.limit,
-                interval = %rate_limit.interval,
-                "video generation rate limit exceeded"
-            );
-            return Err(BotToolError::RateLimit(format!(
-                "video generation rate limit exceeded for this platform scope: {} active video generation{} per {}",
-                rate_limit.limit,
-                if rate_limit.limit == 1 { "" } else { "s" },
-                rate_limit.interval
-            )));
-        }
-        Ok(())
-    }
-
-    /// Submit a provider job and create its local pending row.
-    ///
-    /// In the rate-limited path this runs inside the per-scope critical section
-    /// so another call cannot observe the same active count before this row
-    /// exists.
-    pub(crate) async fn submit_and_persist_video_job(
-        &self,
-        request: VideoRequest,
-        prompt: String,
-    ) -> Result<VideoJobId, BotToolError>
-    where
-        G: VideoGenerator,
-        S: PersistentVideoStorage,
-    {
-        let job_id = self
-            .generator
-            .submit_video(request)
-            .await
-            .map_err(|error| BotToolError::Generator(error.to_string()))?;
-        self.storage
-            .create_video_job(CreateVideoJob {
-                turn_id: self.turn_id,
-                provider: self.provider.clone(),
-                provider_job_id: job_id.as_str().to_string(),
-                prompt,
-            })
-            .await
-            .map_err(|error| BotToolError::Storage(error.to_string()))?;
-        tracing::info!(job = %job_id, "video job submitted and persisted");
-        Ok(job_id)
     }
 }
 
@@ -428,6 +248,188 @@ where
             .await
             .map_err(|error| BotToolError::Storage(error.to_string()))?;
         Err(BotToolError::Generator(message))
+    }
+}
+
+/// Storage operations needed by the video-generation tool.
+///
+/// The trait mirrors the `BotStorage` subset used here so tests can exercise
+/// persistence and rate-limit behavior without depending on the full storage
+/// surface.
+pub(crate) trait PersistentVideoStorage: Clone + Send + Sync {
+    /// Storage backend error type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Insert the local row for a provider job after upstream submission.
+    fn create_video_job(
+        &self,
+        input: CreateVideoJob,
+    ) -> impl Future<Output = Result<StoredVideoJob, Self::Error>> + Send;
+
+    /// Record a provider job status transition and optional output URI/error.
+    fn update_video_job(
+        &self,
+        input: UpdateVideoJob,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Count pending plus completed video jobs inside the rolling quota window.
+    fn count_active_video_generations(
+        &self,
+        input: CountActiveVideoGenerations,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send;
+}
+
+impl<T> PersistentVideoStorage for T
+where
+    T: BotStorage + Clone + Send + Sync,
+{
+    type Error = T::Error;
+
+    fn create_video_job(
+        &self,
+        input: CreateVideoJob,
+    ) -> impl Future<Output = Result<StoredVideoJob, Self::Error>> + Send {
+        BotStorage::create_video_job(self, input)
+    }
+
+    fn update_video_job(
+        &self,
+        input: UpdateVideoJob,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        BotStorage::update_video_job(self, input)
+    }
+
+    fn count_active_video_generations(
+        &self,
+        input: CountActiveVideoGenerations,
+    ) -> impl Future<Output = Result<u64, Self::Error>> + Send {
+        BotStorage::count_active_video_generations(self, input)
+    }
+}
+
+/// Single-node rate-limit lock scope.
+///
+/// Video quotas are scoped to the platform workspace/server when one exists.
+/// Platform-only scopes use `None`, which still serializes all calls on that
+/// platform together.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct VideoRateLimitLockKey {
+    /// Messaging platform that owns the video-generation scope.
+    pub(crate) platform: PlatformName,
+    /// Optional platform workspace/server/guild id.
+    pub(crate) scope_id: Option<ExternalId>,
+}
+
+impl VideoRateLimitLockKey {
+    /// Build the quota key for the user that issued the current turn.
+    pub(crate) fn from_user(user: &UserRef) -> Self {
+        Self {
+            platform: user.platform.clone(),
+            scope_id: user.guild_id.clone(),
+        }
+    }
+}
+
+/// Shared per-scope async locks for video quota checks and submissions.
+///
+/// A video tool value is created per turn, so the lock map must be supplied by
+/// the runtime and cloned into each tool instance. The lock is intentionally
+/// in-process because Chudbot runs as a single node.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct VideoRateLimitLocks {
+    /// Lazily-created async mutexes keyed by platform scope.
+    pub(crate) inner: Arc<Mutex<BTreeMap<VideoRateLimitLockKey, Arc<AsyncMutex<()>>>>>,
+}
+
+impl VideoRateLimitLocks {
+    /// Acquire the async mutex for the caller's platform scope.
+    pub(crate) async fn lock(&self, user: &UserRef) -> OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self
+                .inner
+                .lock()
+                .expect("video rate limit lock map mutex poisoned");
+            locks
+                .entry(VideoRateLimitLockKey::from_user(user))
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+}
+
+impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
+    /// Enforce the configured active-video quota for the current platform scope.
+    ///
+    /// The caller is expected to hold the matching `VideoRateLimitLocks` guard
+    /// unless the user is bypassed. The storage count includes jobs still
+    /// pending plus completed jobs inside the rolling interval.
+    pub(crate) async fn enforce_video_rate_limit(
+        &self,
+        rate_limit: &VideoGenerationRateLimit,
+    ) -> Result<(), BotToolError>
+    where
+        S: PersistentVideoStorage,
+    {
+        let interval_seconds = rate_limit
+            .interval_seconds()
+            .map_err(BotToolError::InvalidInput)?;
+        let used = self
+            .storage
+            .count_active_video_generations(CountActiveVideoGenerations {
+                platform: self.turn_user.platform.clone(),
+                scope_id: self.turn_user.guild_id.clone(),
+                interval_seconds,
+            })
+            .await
+            .map_err(|error| BotToolError::Storage(error.to_string()))?;
+        if used >= u64::from(rate_limit.limit) {
+            tracing::warn!(
+                used,
+                limit = rate_limit.limit,
+                interval = %rate_limit.interval,
+                "video generation rate limit exceeded"
+            );
+            return Err(BotToolError::RateLimit(format!(
+                "video generation rate limit exceeded for this platform scope: {} active video generation{} per {}",
+                rate_limit.limit,
+                if rate_limit.limit == 1 { "" } else { "s" },
+                rate_limit.interval
+            )));
+        }
+        Ok(())
+    }
+
+    /// Submit a provider job and create its local pending row.
+    ///
+    /// In the rate-limited path this runs inside the per-scope critical section
+    /// so another call cannot observe the same active count before this row
+    /// exists.
+    pub(crate) async fn submit_and_persist_video_job(
+        &self,
+        request: VideoRequest,
+        prompt: String,
+    ) -> Result<VideoJobId, BotToolError>
+    where
+        G: VideoGenerator,
+        S: PersistentVideoStorage,
+    {
+        let job_id = self
+            .generator
+            .submit_video(request)
+            .await
+            .map_err(|error| BotToolError::Generator(error.to_string()))?;
+        self.storage
+            .create_video_job(CreateVideoJob {
+                turn_id: self.turn_id,
+                provider: self.provider.clone(),
+                provider_job_id: job_id.as_str().to_string(),
+                prompt,
+            })
+            .await
+            .map_err(|error| BotToolError::Storage(error.to_string()))?;
+        tracing::info!(job = %job_id, "video job submitted and persisted");
+        Ok(job_id)
     }
 }
 

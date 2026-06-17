@@ -218,264 +218,6 @@ fn usage_report_value_includes_groups_only_when_grouped() {
     assert!(value.get("truncated").is_none());
 }
 
-// Platform double used by reaction-tool tests. Every method except add_reaction
-// fails loudly so validation tests can prove no platform call was attempted.
-#[derive(Debug, Clone, Default)]
-struct ReactionRecordingPlatform {
-    reactions: Arc<Mutex<Vec<(MessageRef, ReactionKind)>>>,
-}
-
-impl MessagePlatformRegistry for ReactionRecordingPlatform {
-    type Error = TestPlatformError;
-
-    async fn bot_user(&self, _platform: &PlatformName) -> Result<UserProfile, Self::Error> {
-        Err(TestPlatformError("unexpected bot_user".to_string()))
-    }
-
-    async fn register_commands(
-        &self,
-        _commands: Vec<PlatformCommandDefinition>,
-    ) -> Result<(), Self::Error> {
-        Err(TestPlatformError(
-            "unexpected register_commands".to_string(),
-        ))
-    }
-
-    async fn next_event(&self) -> Result<PlatformEvent, Self::Error> {
-        Err(TestPlatformError("unexpected next_event".to_string()))
-    }
-
-    async fn respond_to_command(
-        &self,
-        _response: PlatformCommandResponse,
-    ) -> Result<(), Self::Error> {
-        Err(TestPlatformError(
-            "unexpected respond_to_command".to_string(),
-        ))
-    }
-
-    async fn send_message(&self, _request: SendMessage) -> Result<PostedMessage, Self::Error> {
-        Err(TestPlatformError("unexpected send_message".to_string()))
-    }
-
-    async fn delete_message(&self, _message: MessageRef) -> Result<(), Self::Error> {
-        Err(TestPlatformError("unexpected delete_message".to_string()))
-    }
-
-    async fn add_reaction(
-        &self,
-        message: MessageRef,
-        reaction: ReactionKind,
-    ) -> Result<(), Self::Error> {
-        self.reactions.lock().unwrap().push((message, reaction));
-        Ok(())
-    }
-
-    async fn remove_own_reaction(
-        &self,
-        _message: MessageRef,
-        _reaction: ReactionKind,
-    ) -> Result<(), Self::Error> {
-        Err(TestPlatformError(
-            "unexpected remove_own_reaction".to_string(),
-        ))
-    }
-
-    async fn typing(&self, _channel: ChannelRef) -> Result<(), Self::Error> {
-        Err(TestPlatformError("unexpected typing".to_string()))
-    }
-
-    async fn fetch_messages(
-        &self,
-        _request: FetchMessages,
-    ) -> Result<Vec<PlatformMessage>, Self::Error> {
-        Err(TestPlatformError("unexpected fetch_messages".to_string()))
-    }
-
-    async fn message_context(
-        &self,
-        _message: &PlatformMessage,
-        _relationship: PlatformMessageRelationship,
-    ) -> Result<serde_json::Value, Self::Error> {
-        Err(TestPlatformError("unexpected message_context".to_string()))
-    }
-
-    async fn parent_channel(&self, channel: ChannelRef) -> Result<ChannelRef, Self::Error> {
-        Ok(channel)
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("{0}")]
-struct TestPlatformError(String);
-
-// Tool-trace fixtures model generated-media client tools closely enough for
-// replay, reply-cleanup, and attachment-selection tests.
-fn generated_image_trace(uri: &str, public_url: &str) -> ToolTrace {
-    let tool_use_id = chudbot_api::ToolUseId::new("call-1");
-    ToolTrace::Client {
-        trace: chudbot_api::ClientToolTrace {
-            call: ClientToolCall {
-                id: tool_use_id.clone(),
-                name: ToolName::new("generate_image"),
-                input: json!({ "prompt": "a worm" }),
-            },
-            result: chudbot_api::ClientToolResult {
-                tool_use_id,
-                content: ClientToolResultContent::Json {
-                    value: json!({
-                        "uri": uri,
-                        "category": "image",
-                        "name": "generated.jpg",
-                        "mime_type": "image/jpeg",
-                        "size_bytes": 42,
-                        "delivery": {
-                            "platform_reply": "attached automatically"
-                        },
-                        "extra": {}
-                    }),
-                },
-                is_error: false,
-            },
-            trace_response: json!({
-                "uri": uri,
-                "category": "image",
-                "name": "generated.jpg",
-                "mime_type": "image/jpeg",
-                "size_bytes": 42,
-                "public_url": public_url,
-                "extra": {}
-            }),
-            usage: Vec::new(),
-        },
-    }
-}
-
-fn generated_video_trace(uri: &str, public_url: &str) -> ToolTrace {
-    let tool_use_id = chudbot_api::ToolUseId::new("call-1");
-    ToolTrace::Client {
-        trace: chudbot_api::ClientToolTrace {
-            call: ClientToolCall {
-                id: tool_use_id.clone(),
-                name: ToolName::new("generate_video"),
-                input: json!({ "prompt": "a worm riding a bike" }),
-            },
-            result: chudbot_api::ClientToolResult {
-                tool_use_id,
-                content: ClientToolResultContent::Json {
-                    value: json!({
-                        "uri": uri,
-                        "video_uri": uri,
-                        "category": "video",
-                        "name": "generated.mp4",
-                        "mime_type": "video/mp4",
-                        "size_bytes": MAX_OUTGOING_ATTACHMENT_BYTES + 1,
-                        "delivery": {
-                            "platform_reply": "attached automatically"
-                        },
-                        "extra": {}
-                    }),
-                },
-                is_error: false,
-            },
-            trace_response: json!({
-                "uri": uri,
-                "video_uri": uri,
-                "category": "video",
-                "name": "generated.mp4",
-                "mime_type": "video/mp4",
-                "size_bytes": MAX_OUTGOING_ATTACHMENT_BYTES + 1,
-                "public_url": public_url,
-                "extra": {}
-            }),
-            usage: Vec::new(),
-        },
-    }
-}
-
-fn attach_trace(uri: &str) -> ToolTrace {
-    let tool_use_id = chudbot_api::ToolUseId::new("call-attach");
-    ToolTrace::Client {
-        trace: chudbot_api::ClientToolTrace {
-            call: ClientToolCall {
-                id: tool_use_id.clone(),
-                name: ToolName::new(ATTACH_ASSET_TOOL),
-                input: json!({ "uri": uri }),
-            },
-            result: chudbot_api::ClientToolResult {
-                tool_use_id,
-                content: ClientToolResultContent::Json {
-                    value: json!({
-                        "uri": uri,
-                        "category": "image",
-                        "name": "generated.jpg",
-                        "mime_type": "image/jpeg",
-                        "size_bytes": 42,
-                        "attached": true,
-                    }),
-                },
-                is_error: false,
-            },
-            trace_response: json!({
-                "uri": uri,
-                "category": "image",
-                "name": "generated.jpg",
-                "mime_type": "image/jpeg",
-                "size_bytes": 42,
-                "attached": true,
-            }),
-            usage: Vec::new(),
-        },
-    }
-}
-
-// Minimal runtime config fixtures for tests that only need agent/provider
-// selection, not the full TOML loader path.
-fn test_model_spec(model: &str) -> ModelSpec {
-    ModelSpec {
-        id: ModelId::new(model),
-        server_tools: Default::default(),
-        sampling: SamplingOptions::default(),
-        provider_options: None,
-    }
-}
-
-fn test_agent_config(provider: &str, model: &str) -> AgentConfig {
-    AgentConfig {
-        provider: ProviderName::new(provider),
-        system_prompt: "test prompt".to_string(),
-        model: test_model_spec(model),
-        server_tools: None,
-        client_tools: None,
-        limits: None,
-        image_generation: None,
-        video_generation: None,
-        audio_transcription: None,
-        memory: false,
-        subagents: BTreeMap::new(),
-    }
-}
-
-fn test_bot_config() -> BotConfig {
-    let mut agents = BTreeMap::new();
-    agents.insert(
-        "assistant".to_string(),
-        test_agent_config("default_provider", "default_model"),
-    );
-    BotConfig {
-        web_base_url: "http://localhost:3000".to_string(),
-        default_agent: "assistant".to_string(),
-        agents,
-        admins: Vec::new(),
-        platforms: BTreeMap::new(),
-        extra_system_prompt: None,
-        version: String::new(),
-        limits: AgentLimits::default(),
-        thread_threshold_chars: DEFAULT_THREAD_THRESHOLD_CHARS,
-        thread_threshold_lines: DEFAULT_THREAD_THRESHOLD_LINES,
-    }
-}
-
 // Media-store doubles keep asset and generator tests in memory while preserving
 // the MediaStore/MediaRef contracts used by production code.
 #[derive(Debug, Clone)]
@@ -702,96 +444,96 @@ async fn image_generation_tool_saves_media_and_returns_uri() {
     assert_eq!(output.usage.len(), 1);
 }
 
-// Video generation fixtures exercise the persistent rate-limit path without
-// polling or downloading real provider jobs.
-#[derive(Debug, Clone)]
-struct CountingVideoGenerator {
-    submits: Arc<AtomicUsize>,
-    submit_delay: Duration,
+// Platform double used by reaction-tool tests. Every method except add_reaction
+// fails loudly so validation tests can prove no platform call was attempted.
+#[derive(Debug, Clone, Default)]
+struct ReactionRecordingPlatform {
+    reactions: Arc<Mutex<Vec<(MessageRef, ReactionKind)>>>,
 }
 
-impl VideoGenerator for CountingVideoGenerator {
-    type Error = TestVideoError;
+impl MessagePlatformRegistry for ReactionRecordingPlatform {
+    type Error = TestPlatformError;
 
-    fn backend_name(&self) -> &ProviderName {
-        static NAME: std::sync::OnceLock<ProviderName> = std::sync::OnceLock::new();
-        NAME.get_or_init(|| ProviderName::new("test_video"))
+    async fn bot_user(&self, _platform: &PlatformName) -> Result<UserProfile, Self::Error> {
+        Err(TestPlatformError("unexpected bot_user".to_string()))
     }
 
-    async fn submit_video(&self, _request: VideoRequest) -> Result<VideoJobId, Self::Error> {
-        let submit = self.submits.fetch_add(1, Ordering::SeqCst) + 1;
-        if !self.submit_delay.is_zero() {
-            tokio::time::sleep(self.submit_delay).await;
-        }
-        Ok(VideoJobId::new(format!("job-{submit}")))
+    async fn register_commands(
+        &self,
+        _commands: Vec<PlatformCommandDefinition>,
+    ) -> Result<(), Self::Error> {
+        Err(TestPlatformError(
+            "unexpected register_commands".to_string(),
+        ))
     }
 
-    async fn check_video(&self, _job: VideoJobId) -> Result<VideoJobStatus, Self::Error> {
-        Err(TestVideoError("unexpected poll".to_string()))
+    async fn next_event(&self) -> Result<PlatformEvent, Self::Error> {
+        Err(TestPlatformError("unexpected next_event".to_string()))
     }
 
-    async fn download_video(&self, _url: String) -> Result<Vec<u8>, Self::Error> {
-        Err(TestVideoError("unexpected download".to_string()))
+    async fn respond_to_command(
+        &self,
+        _response: PlatformCommandResponse,
+    ) -> Result<(), Self::Error> {
+        Err(TestPlatformError(
+            "unexpected respond_to_command".to_string(),
+        ))
+    }
+
+    async fn send_message(&self, _request: SendMessage) -> Result<PostedMessage, Self::Error> {
+        Err(TestPlatformError("unexpected send_message".to_string()))
+    }
+
+    async fn delete_message(&self, _message: MessageRef) -> Result<(), Self::Error> {
+        Err(TestPlatformError("unexpected delete_message".to_string()))
+    }
+
+    async fn add_reaction(
+        &self,
+        message: MessageRef,
+        reaction: ReactionKind,
+    ) -> Result<(), Self::Error> {
+        self.reactions.lock().unwrap().push((message, reaction));
+        Ok(())
+    }
+
+    async fn remove_own_reaction(
+        &self,
+        _message: MessageRef,
+        _reaction: ReactionKind,
+    ) -> Result<(), Self::Error> {
+        Err(TestPlatformError(
+            "unexpected remove_own_reaction".to_string(),
+        ))
+    }
+
+    async fn typing(&self, _channel: ChannelRef) -> Result<(), Self::Error> {
+        Err(TestPlatformError("unexpected typing".to_string()))
+    }
+
+    async fn fetch_messages(
+        &self,
+        _request: FetchMessages,
+    ) -> Result<Vec<PlatformMessage>, Self::Error> {
+        Err(TestPlatformError("unexpected fetch_messages".to_string()))
+    }
+
+    async fn message_context(
+        &self,
+        _message: &PlatformMessage,
+        _relationship: PlatformMessageRelationship,
+    ) -> Result<serde_json::Value, Self::Error> {
+        Err(TestPlatformError("unexpected message_context".to_string()))
+    }
+
+    async fn parent_channel(&self, channel: ChannelRef) -> Result<ChannelRef, Self::Error> {
+        Ok(channel)
     }
 }
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-struct TestVideoError(String);
-
-#[derive(Debug, Clone)]
-struct VideoRateLimitStorage {
-    count: Arc<AtomicU64>,
-    count_requests: Arc<Mutex<Vec<CountActiveVideoGenerations>>>,
-    creates: Arc<AtomicUsize>,
-    updates: Arc<AtomicUsize>,
-}
-
-impl VideoRateLimitStorage {
-    fn new(count: u64) -> Self {
-        Self {
-            count: Arc::new(AtomicU64::new(count)),
-            count_requests: Arc::new(Mutex::new(Vec::new())),
-            creates: Arc::new(AtomicUsize::new(0)),
-            updates: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-impl PersistentVideoStorage for VideoRateLimitStorage {
-    type Error = TestVideoStorageError;
-
-    async fn create_video_job(&self, input: CreateVideoJob) -> Result<StoredVideoJob, Self::Error> {
-        self.creates.fetch_add(1, Ordering::SeqCst);
-        self.count.fetch_add(1, Ordering::SeqCst);
-        Ok(StoredVideoJob {
-            turn_id: input.turn_id,
-            provider: input.provider,
-            provider_job_id: input.provider_job_id,
-            prompt: input.prompt,
-            status: "pending".to_string(),
-            output_uri: None,
-            error: None,
-        })
-    }
-
-    async fn update_video_job(&self, _input: UpdateVideoJob) -> Result<(), Self::Error> {
-        self.updates.fetch_add(1, Ordering::SeqCst);
-        Ok(())
-    }
-
-    async fn count_active_video_generations(
-        &self,
-        input: CountActiveVideoGenerations,
-    ) -> Result<u64, Self::Error> {
-        self.count_requests.lock().unwrap().push(input);
-        Ok(self.count.load(Ordering::SeqCst))
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("test storage error")]
-struct TestVideoStorageError;
+struct TestPlatformError(String);
 
 // Reaction tests protect the Discord-facing emoji contract, including reserved
 // bot status reactions and the guarantee that invalid input never touches I/O.
@@ -907,6 +649,97 @@ async fn add_reaction_tool_rejects_reserved_reaction_without_platform_call() {
     // malformed emoji: they should never trigger a platform call.
     assert!(platform.reactions.lock().unwrap().is_empty());
 }
+
+// Video generation fixtures exercise the persistent rate-limit path without
+// polling or downloading real provider jobs.
+#[derive(Debug, Clone)]
+struct CountingVideoGenerator {
+    submits: Arc<AtomicUsize>,
+    submit_delay: Duration,
+}
+
+impl VideoGenerator for CountingVideoGenerator {
+    type Error = TestVideoError;
+
+    fn backend_name(&self) -> &ProviderName {
+        static NAME: std::sync::OnceLock<ProviderName> = std::sync::OnceLock::new();
+        NAME.get_or_init(|| ProviderName::new("test_video"))
+    }
+
+    async fn submit_video(&self, _request: VideoRequest) -> Result<VideoJobId, Self::Error> {
+        let submit = self.submits.fetch_add(1, Ordering::SeqCst) + 1;
+        if !self.submit_delay.is_zero() {
+            tokio::time::sleep(self.submit_delay).await;
+        }
+        Ok(VideoJobId::new(format!("job-{submit}")))
+    }
+
+    async fn check_video(&self, _job: VideoJobId) -> Result<VideoJobStatus, Self::Error> {
+        Err(TestVideoError("unexpected poll".to_string()))
+    }
+
+    async fn download_video(&self, _url: String) -> Result<Vec<u8>, Self::Error> {
+        Err(TestVideoError("unexpected download".to_string()))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct TestVideoError(String);
+
+#[derive(Debug, Clone)]
+struct VideoRateLimitStorage {
+    count: Arc<AtomicU64>,
+    count_requests: Arc<Mutex<Vec<CountActiveVideoGenerations>>>,
+    creates: Arc<AtomicUsize>,
+    updates: Arc<AtomicUsize>,
+}
+
+impl VideoRateLimitStorage {
+    fn new(count: u64) -> Self {
+        Self {
+            count: Arc::new(AtomicU64::new(count)),
+            count_requests: Arc::new(Mutex::new(Vec::new())),
+            creates: Arc::new(AtomicUsize::new(0)),
+            updates: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl PersistentVideoStorage for VideoRateLimitStorage {
+    type Error = TestVideoStorageError;
+
+    async fn create_video_job(&self, input: CreateVideoJob) -> Result<StoredVideoJob, Self::Error> {
+        self.creates.fetch_add(1, Ordering::SeqCst);
+        self.count.fetch_add(1, Ordering::SeqCst);
+        Ok(StoredVideoJob {
+            turn_id: input.turn_id,
+            provider: input.provider,
+            provider_job_id: input.provider_job_id,
+            prompt: input.prompt,
+            status: "pending".to_string(),
+            output_uri: None,
+            error: None,
+        })
+    }
+
+    async fn update_video_job(&self, _input: UpdateVideoJob) -> Result<(), Self::Error> {
+        self.updates.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn count_active_video_generations(
+        &self,
+        input: CountActiveVideoGenerations,
+    ) -> Result<u64, Self::Error> {
+        self.count_requests.lock().unwrap().push(input);
+        Ok(self.count.load(Ordering::SeqCst))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("test storage error")]
+struct TestVideoStorageError;
 
 #[tokio::test]
 async fn video_rate_limit_fails_before_provider_submit() {
@@ -1057,6 +890,53 @@ fn rejects_invalid_video_rate_limit_config() {
         .expect_err("zero limit should be rejected");
 
     assert!(error.to_string().contains("must be greater than zero"));
+}
+
+// Minimal runtime config fixtures for tests that only need agent/provider
+// selection, not the full TOML loader path.
+fn test_model_spec(model: &str) -> ModelSpec {
+    ModelSpec {
+        id: ModelId::new(model),
+        server_tools: Default::default(),
+        sampling: SamplingOptions::default(),
+        provider_options: None,
+    }
+}
+
+fn test_agent_config(provider: &str, model: &str) -> AgentConfig {
+    AgentConfig {
+        provider: ProviderName::new(provider),
+        system_prompt: "test prompt".to_string(),
+        model: test_model_spec(model),
+        server_tools: None,
+        client_tools: None,
+        limits: None,
+        image_generation: None,
+        video_generation: None,
+        audio_transcription: None,
+        memory: false,
+        subagents: BTreeMap::new(),
+    }
+}
+
+fn test_bot_config() -> BotConfig {
+    let mut agents = BTreeMap::new();
+    agents.insert(
+        "assistant".to_string(),
+        test_agent_config("default_provider", "default_model"),
+    );
+    BotConfig {
+        web_base_url: "http://localhost:3000".to_string(),
+        default_agent: "assistant".to_string(),
+        agents,
+        admins: Vec::new(),
+        platforms: BTreeMap::new(),
+        extra_system_prompt: None,
+        version: String::new(),
+        limits: AgentLimits::default(),
+        thread_threshold_chars: DEFAULT_THREAD_THRESHOLD_CHARS,
+        thread_threshold_lines: DEFAULT_THREAD_THRESHOLD_LINES,
+    }
 }
 
 // System-agent tests pin the configured-agent override and inheritance rules for
@@ -1257,71 +1137,124 @@ fn repairs_bare_snowflake_mentions() {
     assert_eq!(fix_bare_mentions("short @123"), "short @123");
 }
 
-// Generated-media reply tests keep automatic attachment handling separate from
-// text cleanup and public-URL fallbacks.
-#[test]
-fn strips_generated_media_markdown_from_reply_text() {
-    let trace = generated_image_trace(
-        "file://images/generated.jpg",
-        "https://chud.example/images/generated.jpg",
-    );
-    let refs = generated_media_reply_refs(&[trace]);
-
-    let reply = strip_generated_media_refs(
-        "Worm generated.\n\n![image](https://chud.example/images/generated.jpg)\n\nfile://images/generated.jpg",
-        &refs,
-    );
-
-    assert_eq!(reply, "Worm generated.");
+// Tool-trace fixtures model generated-media client tools closely enough for
+// replay, reply-cleanup, and attachment-selection tests.
+fn generated_image_trace(uri: &str, public_url: &str) -> ToolTrace {
+    let tool_use_id = chudbot_api::ToolUseId::new("call-1");
+    ToolTrace::Client {
+        trace: chudbot_api::ClientToolTrace {
+            call: ClientToolCall {
+                id: tool_use_id.clone(),
+                name: ToolName::new("generate_image"),
+                input: json!({ "prompt": "a worm" }),
+            },
+            result: chudbot_api::ClientToolResult {
+                tool_use_id,
+                content: ClientToolResultContent::Json {
+                    value: json!({
+                        "uri": uri,
+                        "category": "image",
+                        "name": "generated.jpg",
+                        "mime_type": "image/jpeg",
+                        "size_bytes": 42,
+                        "delivery": {
+                            "platform_reply": "attached automatically"
+                        },
+                        "extra": {}
+                    }),
+                },
+                is_error: false,
+            },
+            trace_response: json!({
+                "uri": uri,
+                "category": "image",
+                "name": "generated.jpg",
+                "mime_type": "image/jpeg",
+                "size_bytes": 42,
+                "public_url": public_url,
+                "extra": {}
+            }),
+            usage: Vec::new(),
+        },
+    }
 }
 
-#[test]
-fn generated_media_strip_preserves_unrelated_links() {
-    let trace = generated_image_trace(
-        "file://images/generated.jpg",
-        "https://chud.example/images/generated.jpg",
-    );
-    let refs = generated_media_reply_refs(&[trace]);
-
-    let reply = strip_generated_media_refs(
-        "Done.\n\n-# [full trace](https://chud.example/c/abc)",
-        &refs,
-    );
-
-    assert_eq!(
-        reply,
-        "Done.\n\n-# [full trace](https://chud.example/c/abc)"
-    );
+fn generated_video_trace(uri: &str, public_url: &str) -> ToolTrace {
+    let tool_use_id = chudbot_api::ToolUseId::new("call-1");
+    ToolTrace::Client {
+        trace: chudbot_api::ClientToolTrace {
+            call: ClientToolCall {
+                id: tool_use_id.clone(),
+                name: ToolName::new("generate_video"),
+                input: json!({ "prompt": "a worm riding a bike" }),
+            },
+            result: chudbot_api::ClientToolResult {
+                tool_use_id,
+                content: ClientToolResultContent::Json {
+                    value: json!({
+                        "uri": uri,
+                        "video_uri": uri,
+                        "category": "video",
+                        "name": "generated.mp4",
+                        "mime_type": "video/mp4",
+                        "size_bytes": MAX_OUTGOING_ATTACHMENT_BYTES + 1,
+                        "delivery": {
+                            "platform_reply": "attached automatically"
+                        },
+                        "extra": {}
+                    }),
+                },
+                is_error: false,
+            },
+            trace_response: json!({
+                "uri": uri,
+                "video_uri": uri,
+                "category": "video",
+                "name": "generated.mp4",
+                "mime_type": "video/mp4",
+                "size_bytes": MAX_OUTGOING_ATTACHMENT_BYTES + 1,
+                "public_url": public_url,
+                "extra": {}
+            }),
+            usage: Vec::new(),
+        },
+    }
 }
 
-#[tokio::test]
-async fn oversized_generated_video_uses_public_url_fallback() {
-    let uri = "file://videos/generated.mp4";
-    let public_url = "https://chud.example/videos/generated.mp4";
-    let trace = generated_video_trace(uri, public_url);
-    let store = ReplyMediaStore::new(ReplyMediaRef::video(
-        uri,
-        (MAX_OUTGOING_ATTACHMENT_BYTES + 1) as u64,
-        public_url,
-    ));
-
-    let media = generated_reply_media(&store, &[trace]).await;
-
-    assert!(media.attachments.is_empty());
-    assert_eq!(media.public_urls, vec![public_url.to_string()]);
-}
-
-#[test]
-fn appends_generated_media_public_urls_to_reply_text() {
-    let reply = append_generated_media_public_urls(
-        "Done.  \n".to_string(),
-        &["https://chud.example/videos/generated.mp4".to_string()],
-    );
-
-    assert_eq!(
-        reply,
-        "Done.\n\nAttached media: https://chud.example/videos/generated.mp4"
-    );
+fn attach_trace(uri: &str) -> ToolTrace {
+    let tool_use_id = chudbot_api::ToolUseId::new("call-attach");
+    ToolTrace::Client {
+        trace: chudbot_api::ClientToolTrace {
+            call: ClientToolCall {
+                id: tool_use_id.clone(),
+                name: ToolName::new(ATTACH_ASSET_TOOL),
+                input: json!({ "uri": uri }),
+            },
+            result: chudbot_api::ClientToolResult {
+                tool_use_id,
+                content: ClientToolResultContent::Json {
+                    value: json!({
+                        "uri": uri,
+                        "category": "image",
+                        "name": "generated.jpg",
+                        "mime_type": "image/jpeg",
+                        "size_bytes": 42,
+                        "attached": true,
+                    }),
+                },
+                is_error: false,
+            },
+            trace_response: json!({
+                "uri": uri,
+                "category": "image",
+                "name": "generated.jpg",
+                "mime_type": "image/jpeg",
+                "size_bytes": 42,
+                "attached": true,
+            }),
+            usage: Vec::new(),
+        },
+    }
 }
 
 // Prompt/reply media fixtures distinguish model-visible transcript media from
@@ -1379,42 +1312,6 @@ impl MediaRef for PromptMediaRef {
                 uri: self.metadata.uri.clone(),
             })
         })
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ReplyMediaStore {
-    media: ReplyMediaRef,
-}
-
-impl ReplyMediaStore {
-    fn new(media: ReplyMediaRef) -> Self {
-        Self { media }
-    }
-}
-
-impl MediaStore for ReplyMediaStore {
-    async fn create_media(&self, _input: CreateMedia) -> Result<BoxedMediaRef, MediaError> {
-        Err(MediaError::UnsupportedCategory("test".to_string()))
-    }
-
-    async fn media_from_uri(&self, uri: &MediaUri) -> Result<BoxedMediaRef, MediaError> {
-        if self.media.uri() == uri {
-            return Ok(Box::new(self.media.clone()));
-        }
-        Err(MediaError::UnsupportedUri(uri.to_string()))
-    }
-
-    async fn media_from_name(
-        &self,
-        category: MediaCategory,
-        name: &str,
-    ) -> Result<BoxedMediaRef, MediaError> {
-        self.media_from_uri(&MediaUri::new(format!(
-            "file://{}/{name}",
-            category.prefix()
-        )))
-        .await
     }
 }
 
@@ -1486,6 +1383,109 @@ impl MediaRef for ReplyMediaRef {
             })
         })
     }
+}
+
+#[derive(Debug, Clone)]
+struct ReplyMediaStore {
+    media: ReplyMediaRef,
+}
+
+impl ReplyMediaStore {
+    fn new(media: ReplyMediaRef) -> Self {
+        Self { media }
+    }
+}
+
+impl MediaStore for ReplyMediaStore {
+    async fn create_media(&self, _input: CreateMedia) -> Result<BoxedMediaRef, MediaError> {
+        Err(MediaError::UnsupportedCategory("test".to_string()))
+    }
+
+    async fn media_from_uri(&self, uri: &MediaUri) -> Result<BoxedMediaRef, MediaError> {
+        if self.media.uri() == uri {
+            return Ok(Box::new(self.media.clone()));
+        }
+        Err(MediaError::UnsupportedUri(uri.to_string()))
+    }
+
+    async fn media_from_name(
+        &self,
+        category: MediaCategory,
+        name: &str,
+    ) -> Result<BoxedMediaRef, MediaError> {
+        self.media_from_uri(&MediaUri::new(format!(
+            "file://{}/{name}",
+            category.prefix()
+        )))
+        .await
+    }
+}
+
+// Generated-media reply tests keep automatic attachment handling separate from
+// text cleanup and public-URL fallbacks.
+#[test]
+fn strips_generated_media_markdown_from_reply_text() {
+    let trace = generated_image_trace(
+        "file://images/generated.jpg",
+        "https://chud.example/images/generated.jpg",
+    );
+    let refs = generated_media_reply_refs(&[trace]);
+
+    let reply = strip_generated_media_refs(
+        "Worm generated.\n\n![image](https://chud.example/images/generated.jpg)\n\nfile://images/generated.jpg",
+        &refs,
+    );
+
+    assert_eq!(reply, "Worm generated.");
+}
+
+#[test]
+fn generated_media_strip_preserves_unrelated_links() {
+    let trace = generated_image_trace(
+        "file://images/generated.jpg",
+        "https://chud.example/images/generated.jpg",
+    );
+    let refs = generated_media_reply_refs(&[trace]);
+
+    let reply = strip_generated_media_refs(
+        "Done.\n\n-# [full trace](https://chud.example/c/abc)",
+        &refs,
+    );
+
+    assert_eq!(
+        reply,
+        "Done.\n\n-# [full trace](https://chud.example/c/abc)"
+    );
+}
+
+#[tokio::test]
+async fn oversized_generated_video_uses_public_url_fallback() {
+    let uri = "file://videos/generated.mp4";
+    let public_url = "https://chud.example/videos/generated.mp4";
+    let trace = generated_video_trace(uri, public_url);
+    let store = ReplyMediaStore::new(ReplyMediaRef::video(
+        uri,
+        (MAX_OUTGOING_ATTACHMENT_BYTES + 1) as u64,
+        public_url,
+    ));
+
+    let media = generated_reply_media(&store, &[trace]).await;
+
+    assert!(media.attachments.is_empty());
+    assert_eq!(media.public_urls, vec![public_url.to_string()]);
+}
+
+#[test]
+fn appends_generated_media_public_urls_to_reply_text() {
+    let reply = append_generated_media_public_urls(
+        "Done.  \n".to_string(),
+        &["https://chud.example/videos/generated.mp4".to_string()],
+    );
+
+    assert_eq!(
+        reply,
+        "Done.\n\nAttached media: https://chud.example/videos/generated.mp4"
+    );
 }
 
 // Stored-asset tool tests verify which assets are exposed to the model, queued

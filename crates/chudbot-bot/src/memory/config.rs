@@ -92,6 +92,70 @@ impl Default for MemoryConfig {
     }
 }
 
+/// Resolved reserved agents used by the background memory scheduler.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryAgentSet {
+    /// Agent that turns recent conversation windows into diary entries.
+    pub(crate) diary: SystemAgentConfig,
+    /// Agent that compacts diary/profile state into the long-lived user memory.
+    pub(crate) compact: SystemAgentConfig,
+}
+
+impl MemoryAgentSet {
+    /// Iterate the reserved agents in stable scheduler order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &SystemAgentConfig> {
+        [&self.diary, &self.compact].into_iter()
+    }
+}
+
+/// Memory config validation errors returned after TOML deserialization.
+#[derive(Debug, Error)]
+pub enum MemoryConfigError {
+    /// Duration string is malformed, has an unsupported suffix, overflows, or
+    /// resolves to zero seconds.
+    #[error("invalid memory duration `{value}`; expected digits followed by s, m, h, or d")]
+    InvalidDuration {
+        /// Original invalid config value.
+        value: String,
+    },
+}
+
+/// Parse a positive duration with an `s`, `m`, `h`, or `d` suffix.
+///
+/// Whitespace around the value is ignored. The numeric portion must be an
+/// unsigned integer and the final result must fit in `u64` seconds.
+pub fn parse_duration_seconds(value: &str) -> Result<u64, MemoryConfigError> {
+    let value = value.trim();
+    let Some(unit) = value.chars().last() else {
+        return Err(MemoryConfigError::InvalidDuration {
+            value: value.to_string(),
+        });
+    };
+    let amount = &value[..value.len().saturating_sub(unit.len_utf8())];
+    let amount = amount
+        .parse::<u64>()
+        .map_err(|_| MemoryConfigError::InvalidDuration {
+            value: value.to_string(),
+        })?;
+    let multiplier = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        _ => {
+            return Err(MemoryConfigError::InvalidDuration {
+                value: value.to_string(),
+            });
+        }
+    };
+    amount
+        .checked_mul(multiplier)
+        .filter(|seconds| *seconds > 0)
+        .ok_or_else(|| MemoryConfigError::InvalidDuration {
+            value: value.to_string(),
+        })
+}
+
 impl MemoryConfig {
     /// Parse and validate [`Self::compaction_interval`].
     pub fn compaction_interval_seconds(&self) -> Result<u64, MemoryConfigError> {
@@ -162,22 +226,6 @@ impl MemoryConfig {
             .max(1)
             .saturating_mul(attempts.min(12));
         time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX))
-    }
-}
-
-/// Resolved reserved agents used by the background memory scheduler.
-#[derive(Debug, Clone)]
-pub(crate) struct MemoryAgentSet {
-    /// Agent that turns recent conversation windows into diary entries.
-    pub(crate) diary: SystemAgentConfig,
-    /// Agent that compacts diary/profile state into the long-lived user memory.
-    pub(crate) compact: SystemAgentConfig,
-}
-
-impl MemoryAgentSet {
-    /// Iterate the reserved agents in stable scheduler order.
-    pub(crate) fn iter(&self) -> impl Iterator<Item = &SystemAgentConfig> {
-        [&self.diary, &self.compact].into_iter()
     }
 }
 
@@ -267,54 +315,6 @@ fn default_retry_backoff_seconds() -> u64 {
 
 fn default_max_job_attempts() -> i32 {
     5
-}
-
-/// Memory config validation errors returned after TOML deserialization.
-#[derive(Debug, Error)]
-pub enum MemoryConfigError {
-    /// Duration string is malformed, has an unsupported suffix, overflows, or
-    /// resolves to zero seconds.
-    #[error("invalid memory duration `{value}`; expected digits followed by s, m, h, or d")]
-    InvalidDuration {
-        /// Original invalid config value.
-        value: String,
-    },
-}
-
-/// Parse a positive duration with an `s`, `m`, `h`, or `d` suffix.
-///
-/// Whitespace around the value is ignored. The numeric portion must be an
-/// unsigned integer and the final result must fit in `u64` seconds.
-pub fn parse_duration_seconds(value: &str) -> Result<u64, MemoryConfigError> {
-    let value = value.trim();
-    let Some(unit) = value.chars().last() else {
-        return Err(MemoryConfigError::InvalidDuration {
-            value: value.to_string(),
-        });
-    };
-    let amount = &value[..value.len().saturating_sub(unit.len_utf8())];
-    let amount = amount
-        .parse::<u64>()
-        .map_err(|_| MemoryConfigError::InvalidDuration {
-            value: value.to_string(),
-        })?;
-    let multiplier = match unit {
-        's' => 1,
-        'm' => 60,
-        'h' => 60 * 60,
-        'd' => 24 * 60 * 60,
-        _ => {
-            return Err(MemoryConfigError::InvalidDuration {
-                value: value.to_string(),
-            });
-        }
-    };
-    amount
-        .checked_mul(multiplier)
-        .filter(|seconds| *seconds > 0)
-        .ok_or_else(|| MemoryConfigError::InvalidDuration {
-            value: value.to_string(),
-        })
 }
 
 #[cfg(test)]

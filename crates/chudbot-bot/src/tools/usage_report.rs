@@ -17,6 +17,22 @@ pub(crate) struct UsageReportTool<S> {
     pub(crate) channel: ChannelRef,
 }
 
+/// Parsed usage report query plus presentation metadata.
+///
+/// `query` is the storage-facing aggregation request. `days` and `limit` keep
+/// the original presentation choices so the response can echo the requested
+/// window and trim the storage sentinel row.
+#[derive(Debug, Clone)]
+pub(crate) struct UsageReportRequest {
+    /// Storage query, including platform, scope, grouping, optional lower time
+    /// bound, and the one-row-overfetch limit used for truncation detection.
+    pub(crate) query: UsageCostQuery,
+    /// User-facing look-back window in days, before conversion to `query.since`.
+    pub(crate) days: Option<f64>,
+    /// Maximum number of group rows returned to the tool caller.
+    pub(crate) limit: u32,
+}
+
 impl<S> UsageReportTool<S>
 where
     S: BotStorage + Clone,
@@ -121,22 +137,6 @@ where
             usage: Vec::new(),
         })
     }
-}
-
-/// Parsed usage report query plus presentation metadata.
-///
-/// `query` is the storage-facing aggregation request. `days` and `limit` keep
-/// the original presentation choices so the response can echo the requested
-/// window and trim the storage sentinel row.
-#[derive(Debug, Clone)]
-pub(crate) struct UsageReportRequest {
-    /// Storage query, including platform, scope, grouping, optional lower time
-    /// bound, and the one-row-overfetch limit used for truncation detection.
-    pub(crate) query: UsageCostQuery,
-    /// User-facing look-back window in days, before conversion to `query.since`.
-    pub(crate) days: Option<f64>,
-    /// Maximum number of group rows returned to the tool caller.
-    pub(crate) limit: u32,
 }
 
 /// Parse the tool input into a storage aggregation request.

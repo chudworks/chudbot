@@ -59,6 +59,24 @@ pub(crate) fn attach_asset_spec() -> ClientToolSpec {
     }
 }
 
+/// Shared JSON schema for tools that accept one stored media URI.
+///
+/// Tool implementations still perform the security checks; the schema exists
+/// to guide model arguments and reject unrelated JSON fields before execution.
+pub(crate) fn asset_uri_tool_schema() -> ToolInputSchema {
+    ToolInputSchema::new(serde_json::json!({
+        "type": "object",
+        "required": ["uri"],
+        "properties": {
+            "uri": {
+                "type": "string",
+                "description": "A stored Chudbot file:// media URI such as file://images/abc.jpg, file://videos/abc.mp4, file://audio/abc.ogg, or file://avatars/abc.png. Do not pass local filesystem paths or public URLs."
+            }
+        },
+        "additionalProperties": false
+    }))
+}
+
 #[tracing::instrument(
     name = "tool.media_access.read",
     skip_all,
@@ -118,70 +136,6 @@ where
             value: value.clone(),
         },
         media: vec![media],
-        is_error: false,
-        trace_response: value,
-        usage: Vec::new(),
-    })
-}
-
-#[tracing::instrument(
-    name = "tool.media_access.attach",
-    skip_all,
-    fields(tool_call = %call.id)
-)]
-pub(crate) async fn attach_asset<M>(
-    media_store: &M,
-    call: ClientToolCall,
-) -> Result<ClientToolOutput, BotToolError>
-where
-    M: MediaStore,
-{
-    let uri = media_uri_from_tool_input(&call.input)?;
-    // Validate now, but leave byte loading and final attachment sizing to the
-    // reply-delivery path that consumes the successful tool trace.
-    let media = media_store
-        .media_from_uri(&uri)
-        .await
-        .map_err(|error| BotToolError::Media(error.to_string()))?;
-    if !attach_supports_media(media.as_ref()) {
-        tracing::warn!(
-            uri = %media.uri(),
-            category = ?media.category(),
-            mime_type = %media.mime_type(),
-            "attach rejected unsupported media asset"
-        );
-        return Err(BotToolError::InvalidInput(format!(
-            "`attach` only supports stored image assets; `{}` resolved as category `{:?}` with MIME type `{}`",
-            media.uri(),
-            media.category(),
-            media.mime_type()
-        )));
-    }
-
-    // `attach` communicates through trace JSON only. Keeping `media` empty
-    // prevents provider adapters from treating this as model-visible input.
-    let value = media_access_metadata_json(
-        media.as_ref(),
-        serde_json::json!({
-            "exists": true,
-            "attached": true,
-            "delivery": {
-                "platform_reply": "The image will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown image links in user-facing text.",
-                "deduplication": "If this URI is already queued by generated media or another attach call, it will only be sent once."
-            }
-        }),
-    );
-    tracing::info!(
-        uri = %media.uri(),
-        mime_type = %media.mime_type(),
-        size_bytes = media.size_bytes(),
-        "queued stored image asset for final reply attachment"
-    );
-    Ok(ClientToolOutput {
-        result: ClientToolResultContent::Json {
-            value: value.clone(),
-        },
-        media: Vec::new(),
         is_error: false,
         trace_response: value,
         usage: Vec::new(),
@@ -291,6 +245,70 @@ where
     })
 }
 
+#[tracing::instrument(
+    name = "tool.media_access.attach",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+pub(crate) async fn attach_asset<M>(
+    media_store: &M,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, BotToolError>
+where
+    M: MediaStore,
+{
+    let uri = media_uri_from_tool_input(&call.input)?;
+    // Validate now, but leave byte loading and final attachment sizing to the
+    // reply-delivery path that consumes the successful tool trace.
+    let media = media_store
+        .media_from_uri(&uri)
+        .await
+        .map_err(|error| BotToolError::Media(error.to_string()))?;
+    if !attach_supports_media(media.as_ref()) {
+        tracing::warn!(
+            uri = %media.uri(),
+            category = ?media.category(),
+            mime_type = %media.mime_type(),
+            "attach rejected unsupported media asset"
+        );
+        return Err(BotToolError::InvalidInput(format!(
+            "`attach` only supports stored image assets; `{}` resolved as category `{:?}` with MIME type `{}`",
+            media.uri(),
+            media.category(),
+            media.mime_type()
+        )));
+    }
+
+    // `attach` communicates through trace JSON only. Keeping `media` empty
+    // prevents provider adapters from treating this as model-visible input.
+    let value = media_access_metadata_json(
+        media.as_ref(),
+        serde_json::json!({
+            "exists": true,
+            "attached": true,
+            "delivery": {
+                "platform_reply": "The image will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown image links in user-facing text.",
+                "deduplication": "If this URI is already queued by generated media or another attach call, it will only be sent once."
+            }
+        }),
+    );
+    tracing::info!(
+        uri = %media.uri(),
+        mime_type = %media.mime_type(),
+        size_bytes = media.size_bytes(),
+        "queued stored image asset for final reply attachment"
+    );
+    Ok(ClientToolOutput {
+        result: ClientToolResultContent::Json {
+            value: value.clone(),
+        },
+        media: Vec::new(),
+        is_error: false,
+        trace_response: value,
+        usage: Vec::new(),
+    })
+}
+
 /// Parse the shared `uri` argument and reject non-stored URI forms early.
 ///
 /// This is only a coarse scope check. It prevents public URLs and local path
@@ -330,22 +348,4 @@ pub(crate) fn media_access_metadata_json(
         }
     }
     value
-}
-
-/// Shared JSON schema for tools that accept one stored media URI.
-///
-/// Tool implementations still perform the security checks; the schema exists
-/// to guide model arguments and reject unrelated JSON fields before execution.
-pub(crate) fn asset_uri_tool_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "required": ["uri"],
-        "properties": {
-            "uri": {
-                "type": "string",
-                "description": "A stored Chudbot file:// media URI such as file://images/abc.jpg, file://videos/abc.mp4, file://audio/abc.ogg, or file://avatars/abc.png. Do not pass local filesystem paths or public URLs."
-            }
-        },
-        "additionalProperties": false
-    }))
 }

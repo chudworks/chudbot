@@ -124,19 +124,6 @@ impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
 {
-    /// Resolve the cached title-agent config for the active conversation.
-    pub(crate) fn conversation_title_agent(
-        &self,
-        source_agent_name: &str,
-        platform: &PlatformName,
-    ) -> Result<&SystemAgentConfig, BotError> {
-        self.system_agents.conversation_title.get(
-            source_agent_name,
-            platform,
-            &self.config.default_agent,
-        )
-    }
-
     /// Start fire-and-log title generation for a newly answered conversation.
     ///
     /// This runs after the first turn has already been posted and stored, so a
@@ -252,6 +239,19 @@ where
         self.publish_conversation(conversation_id, ConversationEventKind::TitleUpdated);
         tracing::info!(title = %title, "conversation title set");
         Ok(())
+    }
+
+    /// Resolve the cached title-agent config for the active conversation.
+    pub(crate) fn conversation_title_agent(
+        &self,
+        source_agent_name: &str,
+        platform: &PlatformName,
+    ) -> Result<&SystemAgentConfig, BotError> {
+        self.system_agents.conversation_title.get(
+            source_agent_name,
+            platform,
+            &self.config.default_agent,
+        )
     }
 }
 

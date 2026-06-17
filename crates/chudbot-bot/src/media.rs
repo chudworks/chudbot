@@ -112,6 +112,24 @@ impl IncomingAudioTranscription {
     }
 }
 
+/// Build the synthetic input payload for the automatic transcription trace.
+pub(crate) fn incoming_audio_tool_input(
+    transcription: &IncomingAudioTranscription,
+) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "attachment_index": transcription.attachment_index,
+    });
+    if let Some(audio_uri) = &transcription.audio_uri
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert(
+            "audio_uri".to_string(),
+            serde_json::Value::String(audio_uri.clone()),
+        );
+    }
+    value
+}
+
 /// Media saved from a platform attachment and its original attachment index.
 #[derive(Debug)]
 pub(crate) struct StoredAttachmentMedia {
@@ -119,6 +137,14 @@ pub(crate) struct StoredAttachmentMedia {
     pub(crate) attachment_index: usize,
     /// Stored media ref created from the platform attachment.
     pub(crate) media: chudbot_api::BoxedMediaRef,
+}
+
+/// Generated media ready to attach to the platform reply plus URL fallbacks.
+pub(crate) struct GeneratedReplyMedia {
+    /// In-memory attachments ready for the platform adapter to send.
+    pub(crate) attachments: Vec<OutgoingAttachment>,
+    /// Public URLs for media that could not be attached directly.
+    pub(crate) public_urls: Vec<String>,
 }
 
 impl<R> BotRuntime<R>
@@ -322,14 +348,6 @@ where
     }
 }
 
-/// Generated media ready to attach to the platform reply plus URL fallbacks.
-pub(crate) struct GeneratedReplyMedia {
-    /// In-memory attachments ready for the platform adapter to send.
-    pub(crate) attachments: Vec<OutgoingAttachment>,
-    /// Public URLs for media that could not be attached directly.
-    pub(crate) public_urls: Vec<String>,
-}
-
 /// Resolve reply-deliverable media from tool traces into outgoing attachments.
 ///
 /// This handles both generated media and explicit `attach` tool requests. It
@@ -439,6 +457,14 @@ pub(crate) async fn push_oversized_generated_media_url(
             );
         }
     }
+}
+
+/// Push a non-empty string if it has not already appeared.
+pub(crate) fn push_unique_string(out: &mut Vec<String>, value: &str) {
+    if value.is_empty() || out.iter().any(|seen| seen == value) {
+        return;
+    }
+    out.push(value.to_string());
 }
 
 /// Append generated media fallback URLs to assistant text.
@@ -577,14 +603,6 @@ pub(crate) fn collect_generated_media_reply_refs(value: &serde_json::Value, out:
 /// still see prior assistant outputs as media context.
 pub(crate) fn replay_asset_belongs_to_user_turn(asset: &TurnAsset) -> bool {
     asset.source.starts_with("platform:")
-}
-
-/// Push a non-empty string if it has not already appeared.
-pub(crate) fn push_unique_string(out: &mut Vec<String>, value: &str) {
-    if value.is_empty() || out.iter().any(|seen| seen == value) {
-        return;
-    }
-    out.push(value.to_string());
 }
 
 /// Return whether a stored asset can be embedded in a model transcript.
@@ -735,24 +753,6 @@ pub(crate) fn audio_transcription_context_json(
         "text": transcription.text,
         "language": transcription.language,
         "duration_seconds": transcription.duration_seconds,
-    });
-    if let Some(audio_uri) = &transcription.audio_uri
-        && let Some(object) = value.as_object_mut()
-    {
-        object.insert(
-            "audio_uri".to_string(),
-            serde_json::Value::String(audio_uri.clone()),
-        );
-    }
-    value
-}
-
-/// Build the synthetic input payload for the automatic transcription trace.
-pub(crate) fn incoming_audio_tool_input(
-    transcription: &IncomingAudioTranscription,
-) -> serde_json::Value {
-    let mut value = serde_json::json!({
-        "attachment_index": transcription.attachment_index,
     });
     if let Some(audio_uri) = &transcription.audio_uri
         && let Some(object) = value.as_object_mut()
