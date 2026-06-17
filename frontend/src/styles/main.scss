@@ -8,7 +8,9 @@
     // Width of the centered content column. It's a *fixed* width, not
     // content-driven — see `min-width: 0` on the columns below, which
     // stops wide content from stretching the page per conversation.
-    --content-width: 1200px;
+    // 850px is about the minimum that keeps the five usage-metric
+    // boxes (152px each + gaps + 40px padding ≈ 835px) on one row.
+    --content-width: 850px;
 
     --fg: #eaeaea;
     --bg: #111;
