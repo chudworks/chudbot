@@ -1,4 +1,4 @@
-# Chudbot 2.0 configuration.
+# Chudbot configuration.
 #
 # Copy this file to config.toml and replace placeholder secrets. The runtime
 # reads only this TOML file plus CLI flags; it does not read environment

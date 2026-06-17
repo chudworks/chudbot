@@ -4,8 +4,8 @@ interface Props {
   trace: ToolTrace;
 }
 
-/** Renders one v2 trace event: client tool call/result, provider-side
- *  tool use, or provider grounding metadata. */
+/** Renders one trace event: client tool call/result, provider-side tool use,
+ *  or provider grounding metadata. */
 export default function ToolCall({ trace }: Props) {
   const view = traceView(trace);
   const media = collectMediaUris([view.response, view.tracePayload]);

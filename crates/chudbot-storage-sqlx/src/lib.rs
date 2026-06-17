@@ -1,6 +1,6 @@
 //! SQLx/Postgres storage for chudbot.
 //!
-//! This crate owns the database boundary for the v2 bot/runtime crates. It
+//! This crate owns the database boundary for the bot runtime. It
 //! intentionally uses runtime-checked SQLx queries so normal builds do not
 //! require a live `DATABASE_URL`.
 

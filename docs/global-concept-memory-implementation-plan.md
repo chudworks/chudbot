@@ -662,5 +662,5 @@ Behavior tests to add:
 7. Spawn `GlobalMemoryRuntime` beside the existing user-memory runtime.
 8. Add pre-agent recall and `memory:global:*` context injection.
 9. Add retry/replay tests.
-10. Update `config.example.toml` and `docs/2.0-api-shapes.md` after the code
-    lands.
+10. Update `config.example.toml` and the user-facing documentation after the
+    code lands.

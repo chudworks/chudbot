@@ -34,9 +34,9 @@ Production deploy:
 ## Configuration
 
 Copy `config.example.toml` to `config.toml`. The example is the reference for
-all supported v2 options: logging, database, web serving, storage, default
-privacy, named providers, platforms, agents, media generation bindings, and
-subagents.
+all supported options: logging, database, web serving, storage, default
+privacy, named providers, platforms, agents, media generation bindings, memory,
+and subagents.
 
 The runtime is agent-first. Agents select named provider services and model
 specs; provider credentials live under `[llm.*]`, `[image.*]`, and `[video.*]`.
@@ -49,10 +49,11 @@ specs; provider credentials live under `[llm.*]`, `[image.*]`, and `[video.*]`.
 - `chudbot-web`: Axum viewer/API/SSE server.
 - `chudbot-storage-sqlx`: Postgres storage.
 - `chudbot-asset-local`: local media storage.
-- `chudbot-xai`, `chudbot-openai`, `chudbot-anthropic`: provider crates.
+- `chudbot-xai`, `chudbot-gemini`, `chudbot-openai`,
+  `chudbot-openai-compat`, `chudbot-anthropic`: provider crates.
 - `chudbot-bin`: process launcher.
 
-See `AGENTS.md` and `docs/2.0-api-shapes.md` for migration details.
+See `AGENTS.md` for repository conventions and maintenance notes.
 
 ## License
 

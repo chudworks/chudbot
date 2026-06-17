@@ -1,4 +1,4 @@
-//! Anthropic provider crate for the chudbot 2.0 API.
+//! Anthropic provider crate for chudbot.
 
 mod llm;
 mod pricing;

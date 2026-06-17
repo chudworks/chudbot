@@ -1,4 +1,4 @@
-//! OpenAI provider crate for the chudbot 2.0 API.
+//! OpenAI provider crate for chudbot.
 
 mod image;
 mod llm;

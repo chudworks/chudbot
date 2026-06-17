@@ -1,6 +1,6 @@
 //! Discord platform implementation for chudbot.
 //!
-//! This crate is the only 2.0 crate that knows about Twilight and Discord
+//! This crate is the only workspace crate that knows about Twilight and Discord
 //! snowflakes. It converts gateway events and REST actions into the
 //! platform-neutral contracts from `chudbot-api`.
 

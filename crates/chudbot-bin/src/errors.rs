@@ -11,7 +11,7 @@ use crate::diagnostics::ConfigValidationReport;
 #[derive(Debug, Error)]
 pub enum ConfiguredLlmError {
     /// Provider was referenced but not implemented/configured.
-    #[error("provider `{0}` is not available in the 2.0 runtime")]
+    #[error("provider `{0}` is not available in this runtime")]
     Missing(ProviderName),
     /// Anthropic request failed.
     #[error(transparent)]
@@ -34,7 +34,7 @@ pub enum ConfiguredLlmError {
 #[derive(Debug, Error)]
 pub enum ConfiguredImageError {
     /// Provider was referenced but not implemented/configured.
-    #[error("image provider `{0}` is not available in the 2.0 runtime")]
+    #[error("image provider `{0}` is not available in this runtime")]
     Missing(ProviderName),
     /// Gemini image generation failed.
     #[error(transparent)]
@@ -51,7 +51,7 @@ pub enum ConfiguredImageError {
 #[derive(Debug, Error)]
 pub enum ConfiguredVideoError {
     /// Provider was referenced but not implemented/configured.
-    #[error("video provider `{0}` is not available in the 2.0 runtime")]
+    #[error("video provider `{0}` is not available in this runtime")]
     Missing(ProviderName),
     /// Gemini video generation failed.
     #[error(transparent)]
@@ -65,7 +65,7 @@ pub enum ConfiguredVideoError {
 #[derive(Debug, Error)]
 pub enum ConfiguredAudioError {
     /// Provider was referenced but not implemented/configured.
-    #[error("audio provider `{0}` is not available in the 2.0 runtime")]
+    #[error("audio provider `{0}` is not available in this runtime")]
     Missing(ProviderName),
     /// xAI audio transcription failed.
     #[error(transparent)]
@@ -76,7 +76,7 @@ pub enum ConfiguredAudioError {
 #[derive(Debug, Error)]
 pub enum ConfiguredPlatformError {
     /// No platform exists for a requested platform name.
-    #[error("message platform `{0}` is not available in the 2.0 runtime")]
+    #[error("message platform `{0}` is not available in this runtime")]
     Missing(chudbot_api::PlatformName),
     /// The registry is empty.
     #[error("no message platforms are configured")]

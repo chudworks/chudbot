@@ -1,4 +1,4 @@
-//! xAI provider crate for the chudbot 2.0 API.
+//! xAI provider crate for chudbot.
 
 mod audio;
 mod imagine;

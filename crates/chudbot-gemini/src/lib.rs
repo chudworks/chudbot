@@ -1,4 +1,4 @@
-//! Google Gemini API provider crate for the chudbot 2.0 API.
+//! Google Gemini API provider crate for chudbot.
 
 mod image;
 mod llm;

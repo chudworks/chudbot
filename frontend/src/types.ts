@@ -1,4 +1,4 @@
-// Mirrors the v2 viewer DTOs serialized by `chudbot-web`.
+// Mirrors the viewer DTOs serialized by `chudbot-web`.
 // Provider/platform/model ids are opaque strings. Do not parse or do
 // arithmetic on Discord snowflakes or platform ids.
 

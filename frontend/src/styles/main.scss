@@ -1,7 +1,6 @@
 // Color tokens. Dark theme is the default since the screenshot shows
 // the user has it on; light theme is a media-query override. Pick
-// matches the maud version's palette so the migration is visually
-// neutral (and tweakable later).
+// matches the original viewer palette and stays tweakable later.
 
 :root {
     color-scheme: light dark;

@@ -4,11 +4,10 @@ Chudbot is a Discord bot plus trace viewer. The bot runs model-backed
 agents, records the exact turn trace in Postgres, and serves a React viewer
 for `/c/<conversation-uuid>`.
 
-## Current Target
+## Current Architecture
 
-This repository is on the Chudbot 2.0 crate split. The old
-`grok-discord-bot-*` crates have been removed; use the `chudbot-*` crates as
-the source of truth.
+The `chudbot-*` workspace crates are the source of truth. Historical crate
+layouts live in git history, not in the current documentation.
 
 Workspace crates:
 
@@ -69,7 +68,7 @@ tmux session.
 
 `config.example.toml` is the config reference. Copy it to `config.toml`.
 
-The v2 config is agent-first:
+The config is agent-first:
 
 - `[bot.agents.<name>]` defines prompt, provider, model, tool exposure, media
   generation bindings, loop limits, and subagents.
@@ -116,8 +115,3 @@ guessable conversation discovery.
 - Mock external services in tests; do not hit live Discord or provider APIs.
 - Keep frontend changes compatible with the existing trace-viewer design unless
   the task explicitly asks for a redesign.
-
-## Migration Notes
-
-The migration handoff lives in `docs/2.0-api-shapes.md`. Keep it aligned with
-the real tree after any v2 crate, config, storage, web API, or script change.

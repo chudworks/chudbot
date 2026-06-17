@@ -86,7 +86,7 @@ impl ServicePlan {
     }
 }
 
-/// Concrete named LLM provider registry for implemented 2.0 providers.
+/// Concrete named LLM provider registry for implemented providers.
 #[derive(Debug, Clone)]
 pub struct ConfiguredLlmProviders {
     inner: Arc<ConfiguredLlmProvidersInner>,

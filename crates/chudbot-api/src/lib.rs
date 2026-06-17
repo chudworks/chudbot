@@ -1,4 +1,4 @@
-//! Contract crate for the chudbot 2.0 shape.
+//! Provider-neutral contracts for chudbot.
 //!
 //! This crate intentionally contains only provider/platform/storage-neutral
 //! types and traits. Concrete crates such as Discord, SQLx storage, and xAI
