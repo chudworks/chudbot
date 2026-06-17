@@ -1,4 +1,10 @@
-//! Google Gemini API image generation implementation.
+//! Gemini image generation through the `generateContent` API.
+//!
+//! Chudbot's provider-neutral image request is translated into a single Gemini
+//! user turn with one text part and zero or more inline image parts. Gemini can
+//! return both explanatory text and generated image bytes in the same candidate,
+//! so response decoding preserves text as the optional revised prompt while
+//! taking the first inline image payload as the generated image.
 
 use chudbot_api::{
     GeneratedImage, ImageGenerator, ImageRequest, MediaRef, ModelId, ProviderName, UsageSubject,
@@ -19,6 +25,8 @@ impl ImageGenerator for GeminiClient {
 
     #[tracing::instrument(name = "gemini.generate_image", skip_all)]
     async fn generate_image(&self, request: ImageRequest) -> Result<GeneratedImage, Self::Error> {
+        // Gemini image generation uses the same generateContent endpoint as
+        // chat, but constrains the generation config to request image output.
         let model = request
             .model
             .as_ref()
@@ -35,6 +43,8 @@ impl ImageGenerator for GeminiClient {
         let mut parts = Vec::with_capacity(request.references.len() + 1);
         parts.push(json!({ "text": request.prompt }));
         for reference in &request.references {
+            // References are inlined because the public Gemini endpoint accepts
+            // image inputs as content parts, not as multipart upload fields.
             parts.push(reference_image(reference.as_ref()).await?);
         }
 
@@ -52,6 +62,7 @@ impl ImageGenerator for GeminiClient {
     }
 }
 
+/// Convert a provider-neutral media reference into a Gemini inline image part.
 async fn reference_image(media: &dyn MediaRef) -> Result<Value, GeminiError> {
     let mime_type = media.mime_type();
     if !mime_type.starts_with("image/") {
@@ -63,7 +74,10 @@ async fn reference_image(media: &dyn MediaRef) -> Result<Value, GeminiError> {
     inline_media(media).await
 }
 
+/// Build Gemini's image generation controls from Chudbot's shared request knobs.
 fn image_generation_config(aspect_ratio: Option<&str>) -> Option<Value> {
+    // Ask Gemini for both text and image output: text is useful when the model
+    // revises or explains the prompt, while inlineData carries the image bytes.
     let image_config = json_strip_nulls(json!({
         "aspectRatio": aspect_ratio,
     }));
@@ -80,6 +94,7 @@ fn image_generation_config(aspect_ratio: Option<&str>) -> Option<Value> {
     }
 }
 
+/// Decode Gemini's mixed text/image response into Chudbot's generated image.
 fn image_from_response(
     response: Value,
     provider: &ProviderName,
@@ -101,6 +116,8 @@ fn image_from_response(
             revised_prompt.push_str(text);
         }
         if let Some(inline_data) = get_field(part, "inlineData", "inline_data") {
+            // Gemini may use either camelCase or snake_case in examples and
+            // responses; accept both so recorded raw payloads remain decodable.
             let data = get_field(inline_data, "data", "data")
                 .and_then(Value::as_str)
                 .ok_or_else(|| GeminiError::Decode("image inlineData lacked data".to_string()))?;

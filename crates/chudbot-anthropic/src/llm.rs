@@ -1,4 +1,10 @@
-//! Anthropic Messages API language-model implementation.
+//! Anthropic Messages API adapter for Chudbot's provider-neutral LLM contract.
+//!
+//! This module owns the translation between `Transcript` turns and Anthropic
+//! Messages request blocks, then maps Anthropic response blocks back into
+//! `AssistantStep` content, client tool calls, server tool usage, grounding,
+//! continuation state, and token usage. Provider-specific wire shapes stay here
+//! so the rest of the bot can operate on `chudbot-api` types.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
@@ -30,6 +36,9 @@ impl LlmBackend for AnthropicClient {
 
     #[tracing::instrument(name = "anthropic.step", skip_all, fields(model = %request.model))]
     async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
+        // Build Anthropic's request shape first; the response parser below
+        // mirrors this split so transport errors stay separate from mapping
+        // provider blocks back into the bot's agent-loop model.
         let (system, mut messages) =
             to_anthropic_messages(&request.transcript, self.provider_name()).await?;
         mark_last_block_ephemeral(&mut messages);
@@ -69,6 +78,9 @@ impl LlmBackend for AnthropicClient {
         );
         log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
 
+        // Anthropic interleaves text, client tools, server tools, and citations
+        // in one content array. Keep the raw array as the provider continuation
+        // so pause_turn and server-tool flows can be replayed exactly.
         let (text, client_tool_calls, server_tool_uses, grounding) =
             walk_blocks(&parsed.content, self.provider_name());
         let continuation = continuation_from_content(self.provider_name(), &parsed.content);
@@ -105,6 +117,7 @@ impl LlmBackend for AnthropicClient {
     }
 }
 
+/// Convert an Anthropic model document into Chudbot's optional model metadata.
 fn model_info_from_anthropic_model(requested_model: ModelId, raw: Value) -> ModelInfo {
     let id = raw
         .get("id")
@@ -120,6 +133,7 @@ fn model_info_from_anthropic_model(requested_model: ModelId, raw: Value) -> Mode
     }
 }
 
+/// Accept numeric limits whether Anthropic returns JSON numbers or strings.
 fn value_as_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number.as_u64(),
@@ -128,6 +142,11 @@ fn value_as_u64(value: &Value) -> Option<u64> {
     }
 }
 
+/// Render the provider-neutral transcript into Anthropic Messages inputs.
+///
+/// Instructions become a cached `system` block, prior Anthropic continuations
+/// are replayed verbatim, and fresh Chudbot content blocks are converted into
+/// the closest Anthropic block type.
 async fn to_anthropic_messages(
     transcript: &Transcript,
     provider: &ProviderName,
@@ -151,6 +170,9 @@ async fn to_anthropic_messages(
             TurnRole::User => "user",
         };
 
+        // A stored continuation supersedes reconstructed blocks for this turn:
+        // Anthropic needs its original response block sequence for pause_turn,
+        // server-tool, and encrypted/thinking-compatible continuations.
         let mut content = provider_continuation_content(turn, provider);
 
         if !content.is_empty() {
@@ -200,6 +222,7 @@ async fn to_anthropic_messages(
     Ok((system, messages))
 }
 
+/// Pull Anthropic continuation blocks out of a transcript turn without editing them.
 fn provider_continuation_content(
     turn: &chudbot_api::TranscriptTurn,
     provider: &ProviderName,
@@ -218,6 +241,7 @@ fn provider_continuation_content(
     content
 }
 
+/// Convert a Chudbot media reference into one of Anthropic's accepted image sources.
 async fn media_source(media: &dyn MediaRef) -> Result<Value, AnthropicError> {
     let mime_type = media.mime_type();
     if !mime_type.starts_with("image/") {
@@ -228,6 +252,9 @@ async fn media_source(media: &dyn MediaRef) -> Result<Value, AnthropicError> {
     }
 
     match media.load().await {
+        // Prefer inline bytes when the media store can provide them; this keeps
+        // private local assets usable without requiring an externally reachable
+        // media URL.
         Ok(loaded) => Ok(json!({
             "type": "base64",
             "media_type": loaded.media.mime_type(),
@@ -246,6 +273,7 @@ async fn media_source(media: &dyn MediaRef) -> Result<Value, AnthropicError> {
     }
 }
 
+/// Serialize a client tool result in Anthropic's `tool_result` block shape.
 fn tool_result_block(result: &ClientToolResult) -> Value {
     let mut obj = serde_json::Map::new();
     obj.insert("type".into(), Value::String("tool_result".into()));
@@ -263,6 +291,7 @@ fn tool_result_block(result: &ClientToolResult) -> Value {
     Value::Object(obj)
 }
 
+/// Anthropic accepts tool results as text, so JSON results are compacted first.
 fn client_tool_result_as_string(result: &ClientToolResult) -> String {
     match &result.content {
         ClientToolResultContent::Json { value } => {
@@ -272,6 +301,7 @@ fn client_tool_result_as_string(result: &ClientToolResult) -> String {
     }
 }
 
+/// Build the mixed client-tool and Anthropic-hosted server-tool declaration list.
 fn build_messages_tools(
     client_tools: &BTreeMap<ToolName, ClientToolSpec>,
     server_tools: &ServerToolSet,
@@ -285,6 +315,8 @@ fn build_messages_tools(
         }));
     }
     if server_tools.contains("web_search") {
+        // Chudbot's server-tool set is provider-neutral; Anthropic exposes web
+        // search as a hosted Messages tool with a dated tool type.
         tools.push(json!({
             "type": WEB_SEARCH_TOOL_TYPE,
             "name": WEB_SEARCH_TOOL_NAME,
@@ -294,6 +326,7 @@ fn build_messages_tools(
     tools
 }
 
+/// Split Anthropic response content into the pieces the agent loop consumes.
 fn walk_blocks(
     blocks: &[Value],
     provider: &ProviderName,
@@ -326,6 +359,9 @@ fn walk_blocks(
                 }
             }
             "server_tool_use" => {
+                // Anthropic sends hosted-tool request and result blocks
+                // separately. Hold the request until its result arrives so the
+                // trace can show one complete server-tool use.
                 let id = block
                     .get("id")
                     .and_then(Value::as_str)
@@ -341,6 +377,9 @@ fn walk_blocks(
                 if let Some(request) = pending_server_uses.remove(id) {
                     server_uses.push(server_tool_use_from_pair(provider, request, block.clone()));
                 } else {
+                    // Preserve orphaned results instead of dropping trace data;
+                    // some partial/provider-error responses may omit the request
+                    // block even though the result carries useful status/raw data.
                     server_uses.push(ServerToolUse {
                         provider: provider.clone(),
                         name: ToolName::new(WEB_SEARCH_TOOL_NAME),
@@ -369,12 +408,15 @@ fn walk_blocks(
     }
 
     for (_, request) in pending_server_uses {
+        // Surface unmatched requests as trace events so hosted-tool starts are
+        // still visible if Anthropic stops before producing a result block.
         server_uses.push(server_tool_use_from_request(provider, request));
     }
 
     (text, client_uses, server_uses, grounding)
 }
 
+/// Store Anthropic's raw content array for exact replay on the next request.
 fn continuation_from_content(
     provider: &ProviderName,
     content: &[Value],
@@ -385,6 +427,7 @@ fn continuation_from_content(
     })
 }
 
+/// Classify the assistant step for the provider-neutral agent loop.
 fn model_step_from_assistant_step(step: AssistantStep, stop_reason: Option<&str>) -> ModelStep {
     if !step.client_tool_calls.is_empty() {
         ModelStep::UseClientTools { step }
@@ -395,6 +438,7 @@ fn model_step_from_assistant_step(step: AssistantStep, stop_reason: Option<&str>
     }
 }
 
+/// Combine an Anthropic hosted-tool request and result into one trace record.
 fn server_tool_use_from_pair(
     provider: &ProviderName,
     request: Value,
@@ -431,6 +475,7 @@ fn server_tool_use_from_pair(
     }
 }
 
+/// Convert an unmatched Anthropic hosted-tool request into a trace record.
 fn server_tool_use_from_request(provider: &ProviderName, request: Value) -> ServerToolUse {
     let name = request
         .get("name")
@@ -452,6 +497,7 @@ fn server_tool_use_from_request(provider: &ProviderName, request: Value) -> Serv
     }
 }
 
+/// Emit a compact usage log line for Anthropic requests.
 fn log_usage(model: &str, usage: Option<&UsageRecord>, elapsed: Duration) {
     let duration_ms = elapsed.as_millis() as u64;
     match usage {
@@ -474,6 +520,7 @@ fn log_usage(model: &str, usage: Option<&UsageRecord>, elapsed: Duration) {
     }
 }
 
+/// Convert Anthropic's token accounting into Chudbot usage and local cost estimates.
 fn usage_from_anthropic(
     provider: &ProviderName,
     model: Option<ModelId>,
@@ -486,6 +533,8 @@ fn usage_from_anthropic(
     let cache_creation_5m_input_tokens = parsed.cache_creation_5m_input_tokens();
     let cache_creation_1h_input_tokens = parsed.cache_creation_1h_input_tokens();
     let cache_creation_input_tokens = parsed.cache_creation_input_tokens();
+    // Anthropic reports cache writes and reads separately from uncached input.
+    // Chudbot's aggregate input count includes all prompt-side token classes.
     let input_tokens = parsed
         .input_tokens
         .saturating_add(cache_creation_input_tokens)
@@ -518,15 +567,21 @@ fn usage_from_anthropic(
 /// Anthropic-specific per-request knobs.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct AnthropicOptions {
-    /// Anthropic Messages `thinking` block, e.g. `{ type = "adaptive" }`.
+    /// Anthropic Messages `thinking` block passed through as request JSON.
+    ///
+    /// Example provider options can include `{ "thinking": { "type": "adaptive" } }`.
     #[serde(default)]
     pub thinking: Option<Value>,
-    /// Anthropic effort level: `low`, `medium`, `high`, `max`, or model-specific values.
+    /// Anthropic effort level passed through to models that support it.
+    ///
+    /// Common values are `low`, `medium`, `high`, and `max`, though Anthropic
+    /// may add model-specific values.
     #[serde(default)]
     pub effort: Option<String>,
 }
 
 impl AnthropicOptions {
+    /// Decode provider-specific request options, ignoring malformed extras.
     fn from_request(request: &ModelStepRequest) -> Self {
         request
             .provider_options
@@ -536,6 +591,7 @@ impl AnthropicOptions {
     }
 }
 
+/// Borrowed request body for the Anthropic Messages API.
 #[derive(Serialize)]
 struct AnthropicRequest<'a> {
     model: &'a str,
@@ -555,6 +611,7 @@ struct AnthropicRequest<'a> {
     effort: Option<&'a str>,
 }
 
+/// Mark the newest content block as Anthropic's prompt-cache breakpoint.
 fn mark_last_block_ephemeral(messages: &mut [Value]) {
     if let Some(last) = messages.last_mut()
         && let Some(content) = last.get_mut("content").and_then(Value::as_array_mut)
@@ -565,6 +622,7 @@ fn mark_last_block_ephemeral(messages: &mut [Value]) {
     }
 }
 
+/// Minimal response shape needed from the Anthropic Messages API.
 #[derive(Deserialize)]
 struct AnthropicResponse {
     #[serde(default)]
@@ -577,6 +635,7 @@ struct AnthropicResponse {
     usage: Option<Value>,
 }
 
+/// Anthropic usage payload with both legacy and detailed cache-write fields.
 #[derive(Deserialize, Debug, Default)]
 struct Usage {
     #[serde(default)]
@@ -594,11 +653,13 @@ struct Usage {
 }
 
 impl Usage {
+    /// Return the total cache-write tokens regardless of which field shape is present.
     fn cache_creation_input_tokens(&self) -> u64 {
         self.cache_creation_input_tokens
             .max(self.cache_creation.total_input_tokens())
     }
 
+    /// Treat the old flat cache-write field as 5-minute cache usage.
     fn cache_creation_5m_input_tokens(&self) -> u64 {
         if self.cache_creation.total_input_tokens() == 0 {
             self.cache_creation_input_tokens
@@ -607,11 +668,13 @@ impl Usage {
         }
     }
 
+    /// Return detailed 1-hour cache-write usage when Anthropic reports it.
     fn cache_creation_1h_input_tokens(&self) -> u64 {
         self.cache_creation.ephemeral_1h_input_tokens
     }
 }
 
+/// Detailed prompt-cache write counters from newer Anthropic usage payloads.
 #[derive(Deserialize, Debug, Default)]
 struct CacheCreationUsage {
     #[serde(default)]
@@ -621,6 +684,7 @@ struct CacheCreationUsage {
 }
 
 impl CacheCreationUsage {
+    /// Sum all detailed cache-write buckets.
     fn total_input_tokens(&self) -> u64 {
         self.ephemeral_5m_input_tokens
             .saturating_add(self.ephemeral_1h_input_tokens)

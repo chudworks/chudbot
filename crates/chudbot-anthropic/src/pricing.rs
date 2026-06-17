@@ -1,14 +1,28 @@
+//! Local Anthropic usage-cost estimation.
+//!
+//! Anthropic reports token usage split across uncached input, prompt-cache
+//! writes, prompt-cache reads, and output. This module keeps those buckets
+//! separate until the final `usd_ticks` conversion so `UsageRecord.cost`
+//! reflects Anthropic's billing model while still using Chudbot's provider-
+//! neutral accounting shape.
+
 use std::collections::BTreeMap;
 
 use chudbot_api::{CostAmount, ModelId};
 use serde::{Deserialize, Serialize};
 
+// Anthropic documents cache write/read prices as multipliers over the normal
+// input-token price unless a model has an explicit override.
 const CACHE_CREATION_5M_MULTIPLIER: f64 = 1.25;
 const CACHE_CREATION_1H_MULTIPLIER: f64 = 2.0;
 const CACHE_READ_MULTIPLIER: f64 = 0.1;
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
 const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
 
+/// Built-in and operator-overridden Anthropic token prices.
+///
+/// The map is keyed by the exact model id used in config. Estimation also
+/// accepts Anthropic dated snapshot ids when their undated base model is known.
 #[derive(Debug, Clone)]
 pub(crate) struct AnthropicPricing {
     token: BTreeMap<ModelId, AnthropicTokenPricing>,
@@ -23,6 +37,7 @@ impl Default for AnthropicPricing {
 }
 
 impl AnthropicPricing {
+    /// Replace or add per-model token prices from `[llm.anthropic.pricing]`.
     pub(crate) fn apply_token_overrides(
         &mut self,
         pricing: BTreeMap<ModelId, AnthropicTokenPricing>,
@@ -30,6 +45,10 @@ impl AnthropicPricing {
         self.token.extend(pricing);
     }
 
+    /// Estimate text-token cost in Chudbot's `usd_ticks` accounting unit.
+    ///
+    /// Returns `None` when the provider did not report a model id, the model is
+    /// unknown, or the usage rounds to a zero-cost estimate.
     pub(crate) fn estimate_token_cost(
         &self,
         model: Option<&ModelId>,
@@ -37,6 +56,9 @@ impl AnthropicPricing {
     ) -> Option<CostAmount> {
         let pricing = pricing_for_model(&self.token, model?)?;
         let multiplier = usage.inference_geo_price_multiplier();
+
+        // Price each Anthropic usage bucket independently before adding them
+        // so cache writes and reads retain their distinct rates.
         let ticks = usd_ticks_for_tokens(
             usage.input_tokens,
             pricing.input_usd_per_million_tokens * multiplier,
@@ -61,7 +83,10 @@ impl AnthropicPricing {
     }
 }
 
-/// Anthropic text-token pricing for one model, in USD per 1M tokens.
+/// Anthropic text-token pricing for one model.
+///
+/// All prices are USD per 1M tokens. Optional cache prices fall back to
+/// Anthropic's published multipliers over the uncached input-token price.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AnthropicTokenPricing {
     /// Uncached input token price in USD per 1M tokens.
@@ -102,17 +127,29 @@ impl AnthropicTokenPricing {
     }
 }
 
+/// Token counts from one Anthropic Messages response.
+///
+/// These fields mirror Anthropic's usage payload closely. The caller is
+/// responsible for aggregating them into provider-neutral totals on
+/// `UsageRecord`; this struct is only for pricing.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct AnthropicTokenUsage<'a> {
+    /// Billable input tokens that were neither cache writes nor cache reads.
     pub(crate) input_tokens: u64,
+    /// Tokens written to a 5-minute prompt cache entry.
     pub(crate) cache_creation_5m_input_tokens: u64,
+    /// Tokens written to a 1-hour prompt cache entry.
     pub(crate) cache_creation_1h_input_tokens: u64,
+    /// Tokens served from Anthropic's prompt cache.
     pub(crate) cache_read_input_tokens: u64,
+    /// Billable generated output tokens.
     pub(crate) output_tokens: u64,
+    /// Optional Anthropic regional pricing hint, such as `"us"`.
     pub(crate) inference_geo: Option<&'a str>,
 }
 
 impl AnthropicTokenUsage<'_> {
+    /// Apply Anthropic's regional price adjustment when reported.
     fn inference_geo_price_multiplier(&self) -> f64 {
         match self.inference_geo {
             Some("us") => 1.1,
@@ -121,6 +158,9 @@ impl AnthropicTokenUsage<'_> {
     }
 }
 
+/// Built-in pricing defaults for commonly configured Anthropic model aliases.
+///
+/// Operators can override or extend this table in TOML without changing code.
 fn default_token_pricing() -> BTreeMap<ModelId, AnthropicTokenPricing> {
     let mut pricing = BTreeMap::new();
     insert_token_price(&mut pricing, "claude-fable-5", 10.00, 50.00);
@@ -140,6 +180,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, AnthropicTokenPricing> {
     pricing
 }
 
+/// Insert a model whose cache prices follow the default Anthropic multipliers.
 fn insert_token_price(
     pricing: &mut BTreeMap<ModelId, AnthropicTokenPricing>,
     model: &str,
@@ -158,6 +199,10 @@ fn insert_token_price(
     );
 }
 
+/// Convert token usage at a USD-per-million-token rate into `usd_ticks`.
+///
+/// The estimator rounds up so tiny but non-zero costs are not silently dropped,
+/// and saturates instead of overflowing on pathological inputs.
 fn usd_ticks_for_tokens(tokens: u64, usd_per_million_tokens: f64) -> u64 {
     if tokens == 0 || !usd_per_million_tokens.is_finite() || usd_per_million_tokens <= 0.0 {
         return 0;
@@ -172,6 +217,7 @@ fn usd_ticks_for_tokens(tokens: u64, usd_per_million_tokens: f64) -> u64 {
     }
 }
 
+/// Wrap a positive tick count in the provider-neutral cost shape.
 fn cost_from_ticks(ticks: u64) -> Option<CostAmount> {
     (ticks > 0).then(|| CostAmount {
         amount: ticks.to_string(),
@@ -180,6 +226,7 @@ fn cost_from_ticks(ticks: u64) -> Option<CostAmount> {
     })
 }
 
+/// Find pricing by exact id, then by undated base id for Anthropic snapshots.
 fn pricing_for_model<'a>(
     pricing: &'a BTreeMap<ModelId, AnthropicTokenPricing>,
     model: &ModelId,
@@ -189,6 +236,7 @@ fn pricing_for_model<'a>(
     })
 }
 
+/// Strip Anthropic's compact dated suffix, such as `-20251001`.
 fn strip_compact_date_suffix(model: &str) -> Option<&str> {
     const SUFFIX_LEN: usize = "-YYYYMMDD".len();
     let suffix_start = model.len().checked_sub(SUFFIX_LEN)?;

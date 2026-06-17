@@ -5,6 +5,12 @@
 //! crate uses OpenAI's Responses API; keep this crate separate because local
 //! compat hosts generally standardize on Chat Completions message and tool
 //! envelopes.
+//!
+//! The crate root owns the shared HTTP transport: endpoint joining, bearer
+//! authentication, retry policy, response decoding, and provider-neutral error
+//! classification. The `llm` module builds Chat Completions payloads from
+//! Chudbot transcripts and routes all network calls through
+//! [`OpenAiCompatClient`] so local backends get consistent diagnostics.
 
 mod llm;
 
@@ -17,7 +23,12 @@ use thiserror::Error;
 
 pub use llm::OpenAiCompatOptions;
 
-/// OpenAI-compatible API client.
+/// OpenAI-compatible API client for Chat Completions-style local backends.
+///
+/// The client is intentionally small and cloneable. Provider-specific request
+/// shaping lives in the backend modules, while this type centralizes the parts
+/// that should behave the same for `/chat/completions`, `/models`, and future
+/// compatibility endpoints.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
@@ -29,6 +40,9 @@ pub struct OpenAiCompatClient {
 impl OpenAiCompatClient {
     /// Construct from a configured provider name and base URL such as
     /// `http://127.0.0.1:8000/v1`.
+    ///
+    /// Pass the API root, not a method endpoint. Calls append paths like
+    /// `/chat/completions` with exactly one slash between the two parts.
     pub fn new(provider_name: ProviderName, base_url: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -61,6 +75,11 @@ impl OpenAiCompatClient {
         &self.provider_name
     }
 
+    /// Send a JSON POST through the shared retry and decode path.
+    ///
+    /// `label` identifies the operation in retry logs; `endpoint` remains the
+    /// wire path so diagnostics can point at the exact failing compatibility
+    /// method.
     pub(crate) async fn post_json<T>(
         &self,
         endpoint: &str,
@@ -81,6 +100,8 @@ impl OpenAiCompatClient {
         with_retry(RetryPolicy::default(), label, || {
             let request_url = url.clone();
             let mut request = self.http.post(&request_url).json(body);
+            // Local backends often ignore auth, but gateways and vLLM can use
+            // the same configured bearer token path as hosted providers.
             if let Some(api_key) = &self.api_key {
                 request = request.bearer_auth(api_key);
             }
@@ -110,6 +131,11 @@ impl OpenAiCompatClient {
         .await
     }
 
+    /// Fetch a JSON resource through the shared retry and decode path.
+    ///
+    /// The current LLM backend uses this for `/models`; keeping it beside
+    /// [`Self::post_json`] makes transport logging and auth behavior identical
+    /// across read and generation requests.
     pub(crate) async fn get_json<T>(
         &self,
         endpoint: &str,
@@ -128,6 +154,8 @@ impl OpenAiCompatClient {
         with_retry(RetryPolicy::default(), label, || {
             let request_url = url.clone();
             let mut request = self.http.get(&request_url);
+            // Mirror POST auth behavior so model discovery works through the
+            // same gateways as completions.
             if let Some(api_key) = &self.api_key {
                 request = request.bearer_auth(api_key);
             }
@@ -158,6 +186,8 @@ impl OpenAiCompatClient {
     }
 }
 
+/// Join a configured API root and method path without requiring config authors
+/// to remember whether either side owns the slash.
 fn endpoint_url(base_url: &str, endpoint: &str) -> String {
     format!(
         "{}/{}",
@@ -175,6 +205,8 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let status = resp.status();
+    // Read the body before branching on status so API errors can include the
+    // provider's payload instead of just an HTTP code.
     let body = resp.text().await.map_err(|e| {
         tracing::warn!(
             status = status.as_u16(),
@@ -184,6 +216,8 @@ where
         OpenAiCompatError::Decode(e.to_string())
     })?;
     if !status.is_success() {
+        // Error bodies from local servers can include full prompts or traces;
+        // keep enough for diagnosis while preventing oversized log records.
         let body = truncate_body(body, 600);
         tracing::warn!(
             provider = %provider,
@@ -198,6 +232,8 @@ where
         });
     }
 
+    // Decode via `Value` first so logs can distinguish invalid JSON from a
+    // valid but incompatible response envelope.
     let value = serde_json::from_str::<Value>(&body).map_err(|e| {
         tracing::warn!(
             status = status.as_u16(),
@@ -224,6 +260,9 @@ fn truncate_body(mut body: String, max: usize) -> String {
 }
 
 fn format_error_chain(error: &dyn StdError) -> String {
+    // Reqwest's display message can hide the useful source error, especially
+    // for DNS, TLS, and proxy failures. Preserve the chain in the user-facing
+    // provider error so config issues are debuggable from logs alone.
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(error) = source {
@@ -235,29 +274,36 @@ fn format_error_chain(error: &dyn StdError) -> String {
 }
 
 /// OpenAI-compatible provider error.
+///
+/// These variants describe the transport boundary rather than model semantics:
+/// request shaping failures are reported as decode/reference errors, while
+/// backend HTTP statuses keep their response body for operator diagnosis.
 #[derive(Debug, Error)]
 pub enum OpenAiCompatError {
-    /// Network/transport failure.
+    /// Network, DNS, TLS, timeout, or other request transport failure.
     #[error("transport error: {0}")]
     Transport(String),
-    /// API returned a non-success status.
+    /// API returned a non-success HTTP status.
     #[error("api error {status}: {body}")]
     Api {
         /// HTTP status code.
         status: u16,
-        /// Response body.
+        /// Truncated response body for diagnostics.
         body: String,
     },
-    /// Response decode failed.
+    /// Response JSON was invalid or did not match the expected envelope.
     #[error("decode error: {0}")]
     Decode(String),
-    /// Media reference could not be sent to the host.
+    /// Media reference could not be converted into a public URL or data URI.
     #[error("media reference error: {0}")]
     Reference(String),
 }
 
 impl ClassifyError for OpenAiCompatError {
     fn error_class(&self) -> ErrorClass {
+        // Retry only failures that can plausibly clear without changing the
+        // request. Bad payloads, unsupported media, and most HTTP statuses need
+        // config or code changes rather than another attempt.
         match self {
             Self::Api { status, .. } if *status == 429 || (500..=599).contains(status) => {
                 ErrorClass::ServerTransient

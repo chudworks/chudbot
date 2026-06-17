@@ -10,33 +10,74 @@
 //! In particular, submitting a paid async video job may have reached the server
 //! before the connection failed, so that path should retry server-transient
 //! statuses but not ambiguous transport errors.
+//!
+//! The flow has three parts:
+//!
+//! 1. Provider crates keep their concrete error types and implement
+//!    [`ClassifyError`] to expose only the retry-relevant category.
+//! 2. Callers choose a [`RetryPolicy`] for the operation they are about to run,
+//!    especially whether ambiguous network failures are safe to repeat.
+//! 3. [`with_retry`] runs the operation, classifies failures, logs handled
+//!    transient errors, sleeps, and returns either the first success or the
+//!    final error.
+//!
+//! This module is deliberately provider-neutral. It does not inspect HTTP
+//! status codes, provider error bodies, or transport library types directly;
+//! those details stay in the provider crate that owns the request.
 
 use std::fmt::Display;
 use std::future::Future;
 use std::time::Duration;
 
-/// How an error should be treated by [`with_retry`].
+/// Coarse retry decision returned by [`ClassifyError`].
+///
+/// This type is intentionally about retry behavior, not full error semantics.
+/// Provider errors should keep their original status, source chain, and message
+/// while exposing one of these buckets to the shared retry loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorClass {
-    /// The server received the request and reported a transient status, such as
-    /// HTTP 429 or 5xx.
+    /// The upstream returned a response that the caller considers transient,
+    /// such as HTTP 429 or 5xx.
     ServerTransient,
-    /// DNS, TCP, TLS, timeout, or another transport failure.
+    /// DNS, TCP, TLS, timeout, connection reset, or another failure before a
+    /// usable upstream response was available.
+    ///
+    /// A network failure can be ambiguous: the request may have reached the
+    /// upstream before the client observed the error. [`RetryPolicy`] decides
+    /// whether this class is safe for the current operation.
     Network,
-    /// Anything that retrying the same request is not expected to fix.
+    /// Anything that retrying the same request is not expected to fix, such as
+    /// invalid input, authorization failure, or unsupported model selection.
     Permanent,
 }
 
-/// Classifies a provider error so [`with_retry`] knows whether to retry it.
+/// Classifies a concrete provider error for shared retry handling.
+///
+/// Implement this in provider crates rather than teaching `chudbot-api` about
+/// provider-specific error enums, HTTP clients, or response formats. The
+/// returned class only controls retry behavior; [`with_retry`] returns the
+/// original error value unchanged when it gives up.
 pub trait ClassifyError {
     /// Bucket this error into an [`ErrorClass`].
+    ///
+    /// Classifications should be conservative. If a repeated request could
+    /// duplicate side effects, classify ambiguous failures as
+    /// [`ErrorClass::Network`] and let the caller choose a policy with
+    /// [`RetryPolicy::retry_network`] disabled.
     fn error_class(&self) -> ErrorClass;
 }
 
-/// Tunables for [`with_retry`].
+/// Retry limits and backoff timing for [`with_retry`].
+///
+/// The policy is passed per call site so provider code can distinguish safe
+/// read-like requests from operations where a retry might duplicate work
+/// upstream.
 #[derive(Debug, Clone, Copy)]
 pub struct RetryPolicy {
     /// Total attempts including the first.
+    ///
+    /// [`with_retry`] always performs the initial attempt. A value of `0` or
+    /// `1` therefore means "try once and do not retry".
     pub max_attempts: u32,
     /// Delay before the first retry; doubles on each subsequent retry.
     pub base_delay: Duration,
@@ -69,6 +110,8 @@ impl RetryPolicy {
 
     /// Backoff before the `retry`-th retry, where retry is 1-based.
     fn backoff(&self, retry: u32) -> Duration {
+        // Use saturating arithmetic so very large retry indexes cannot panic or
+        // wrap before the policy cap is applied.
         let factor = 2u32.saturating_pow(retry.saturating_sub(1));
         self.base_delay.saturating_mul(factor).min(self.max_delay)
     }
@@ -78,6 +121,13 @@ impl RetryPolicy {
 ///
 /// Returns the first success, or the last error once attempts are exhausted or
 /// the error class is not retryable.
+///
+/// `op` is a factory for one attempt, not a reusable future. It is called again
+/// for every retry, so provider code must create a fresh request/future each
+/// time and clone any retry-owned inputs before moving them into the attempt.
+///
+/// `label` is emitted as a structured tracing field on retry warnings. It is
+/// not included in the returned error.
 pub async fn with_retry<F, Fut, T, E>(policy: RetryPolicy, label: &str, mut op: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
@@ -86,14 +136,22 @@ where
 {
     let mut attempt: u32 = 1;
     loop {
+        // Step 1: run exactly one operation attempt. The closure is invoked
+        // inside the loop so retries construct fresh futures and request state.
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) => {
+                // Step 2: reduce the concrete provider error to retry policy.
                 let class = err.error_class();
+
+                // Step 3: stop on exhausted attempts or non-retryable classes,
+                // returning the original provider error unchanged.
                 if attempt >= policy.max_attempts || !policy.should_retry(class) {
                     return Err(err);
                 }
 
+                // Step 4: log the handled transient failure and wait before the
+                // next fresh attempt.
                 let delay = policy.backoff(attempt);
                 tracing::warn!(
                     label,

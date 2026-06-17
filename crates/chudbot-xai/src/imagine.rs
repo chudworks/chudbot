@@ -1,4 +1,11 @@
-//! xAI image and video generation implementation.
+//! xAI Grok Imagine image and video generation.
+//!
+//! This module is the media side of [`XaiClient`]. It translates chudbot's
+//! provider-neutral image and video requests into xAI's JSON API, normalizes
+//! the async video lifecycle, and maps xAI media usage blocks back onto shared
+//! [`UsageRecord`] values. Audio transcription reuses the media-reference and
+//! usage helpers here because xAI reports token/cost data with the same shape
+//! across generated media endpoints.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -31,10 +38,16 @@ impl ImageGenerator for XaiClient {
             model = ?request.model.as_ref().map(ModelId::as_str),
             "building xAI image request"
         );
+        // Resolve every reference before choosing the endpoint so failures are
+        // reported as media-reference errors instead of opaque xAI validation
+        // failures.
         let mut references = Vec::with_capacity(request.references.len());
         for reference in &request.references {
             references.push(media_provider_url(reference.as_ref()).await?);
         }
+
+        // xAI uses separate routes for text-to-image and image edits, but the
+        // response payload is the same base64 image envelope for both.
         let model = resolve_image_model(request.model.as_ref().map(ModelId::as_str));
         let body = build_image_body(
             model,
@@ -59,6 +72,9 @@ impl ImageGenerator for XaiClient {
         let bytes = B64
             .decode(b64.as_bytes())
             .map_err(|e| XaiError::Decode(format!("base64: {e}")))?;
+        // The public API currently returns JPEGs, but keep the provider's
+        // declared MIME type when it is present so downstream storage does not
+        // need xAI-specific assumptions.
         let mime_type = first
             .mime_type
             .or(first.content_type)
@@ -117,6 +133,9 @@ impl VideoGenerator for XaiClient {
             resolution = ?request.resolution.as_deref(),
             "building xAI video submit request"
         );
+        // The shared request type leaves resolution optional. xAI requires one,
+        // so use the cheapest/default preview size unless the caller was more
+        // specific.
         let mut body = json!({
             "model": model,
             "prompt": request.prompt,
@@ -131,6 +150,9 @@ impl VideoGenerator for XaiClient {
         if let Some(image) = request.image.as_ref() {
             body["image"] = json!({ "url": media_provider_url(image.as_ref()).await? });
         }
+        // Submitting a generation is not idempotent. Avoid retrying transport
+        // failures here so a dropped response does not accidentally create
+        // duplicate video jobs.
         let policy = chudbot_api::retry::RetryPolicy {
             retry_network: false,
             ..chudbot_api::retry::RetryPolicy::default()
@@ -148,6 +170,8 @@ impl VideoGenerator for XaiClient {
         let endpoint = format!("/videos/{}", job.as_str());
         let parsed: PollVideoResponse = self.get_json(&endpoint, "videogen[xai].check").await?;
         tracing::debug!(status = %parsed.status, "xAI video status received");
+        // Collapse xAI's string status vocabulary into chudbot's small public
+        // job-state enum. Unknown intermediate states remain pollable.
         match parsed.status.as_str() {
             "done" => {
                 let video = parsed.video.ok_or_else(|| {
@@ -185,6 +209,9 @@ impl VideoGenerator for XaiClient {
 
     #[tracing::instrument(name = "xai.download_video", skip_all)]
     async fn download_video(&self, url: String) -> Result<Vec<u8>, Self::Error> {
+        // Completed video jobs return a signed URL. The download is ordinary
+        // HTTP, but it still participates in the provider retry/logging path so
+        // callers see the same error categories as JSON requests.
         let resp = chudbot_api::retry::with_retry(
             chudbot_api::retry::RetryPolicy::default(),
             "videogen[xai].download",
@@ -239,6 +266,8 @@ fn build_image_body(
     }
     let ref_count = references.len();
     if ref_count > 0 {
+        // xAI accepts a single edit reference as `image`, but multiple
+        // references must be sent as `images`.
         let mut refs = references
             .into_iter()
             .map(|url| json!({ "url": url, "type": "image_url" }));
@@ -251,6 +280,10 @@ fn build_image_body(
     body
 }
 
+/// Resolve chudbot's friendly image-quality aliases to concrete xAI model ids.
+///
+/// Unknown model ids pass through unchanged so operators can opt into newer xAI
+/// models through config before this crate knows about them.
 fn resolve_image_model(model: Option<&str>) -> &str {
     let Some(model) = model else {
         return IMAGE_STANDARD_MODEL;
@@ -262,6 +295,11 @@ fn resolve_image_model(model: Option<&str>) -> &str {
     }
 }
 
+/// Resolve a media reference into a value xAI can consume as an image URL.
+///
+/// Stored media may already have a public URL. When it does not, fall back to a
+/// `data:` URI so local media stores and tests can still feed references to xAI
+/// endpoints without requiring a separately hosted object.
 pub(crate) async fn media_provider_url(media: &dyn MediaRef) -> Result<String, XaiError> {
     match media.public_url().await {
         Ok(url) => {
@@ -304,6 +342,12 @@ fn data_uri(mime_type: &str, bytes: &[u8]) -> String {
     format!("data:{mime_type};base64,{}", B64.encode(bytes))
 }
 
+/// Convert xAI's media `usage` object into chudbot's shared usage record.
+///
+/// xAI reports prices as integer `usd_ticks`; this keeps the provider value
+/// exact instead of attempting to re-scale it into dollars. Malformed or absent
+/// usage is ignored because generation should still succeed if accounting data
+/// is missing.
 pub(crate) fn usage_from_xai_media(
     provider: &ProviderName,
     model: Option<ModelId>,

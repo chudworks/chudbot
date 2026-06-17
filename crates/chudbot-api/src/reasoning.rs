@@ -1,8 +1,24 @@
-//! Provider-neutral reasoning metadata extracted from opaque continuations.
+//! Provider-neutral reasoning metadata for trace rendering.
 //!
-//! Continuations may contain replay-only provider state such as encrypted
-//! reasoning. The types here expose only normalized summary text and token
-//! counts that are safe for trace viewers.
+//! Provider continuations are stored as opaque JSON because each provider has a
+//! different replay contract. Some of that JSON may include reasoning metadata,
+//! replay-only signatures, or encrypted state. This module is the narrow
+//! extraction boundary that converts the provider-owned payload into the small,
+//! viewer-safe shape exposed by [`TurnReasoning`].
+//!
+//! The high-level flow is:
+//!
+//! 1. Read ordered [`ModelStepTrace`] records or a single
+//!    [`ProviderContinuation`].
+//! 2. Keep only recognized reasoning item shapes, such as Responses-style
+//!    `reasoning` items or Anthropic `thinking` markers.
+//! 3. Drop raw provider state and empty summaries before anything reaches the
+//!    web trace API.
+//! 4. Aggregate reasoning-token counts from model-step [`UsageRecord`] values.
+//!
+//! The resulting values are display metadata only. They are not fed back to
+//! providers; replay still uses the original opaque continuation stored on the
+//! transcript or model-step trace.
 
 use std::collections::BTreeMap;
 
@@ -14,21 +30,40 @@ use crate::storage::ModelStepTrace;
 use crate::transcript::ProviderContinuation;
 use crate::usage::{UsageRecord, UsageSubject};
 
-/// Viewer-safe reasoning metadata for one turn.
+/// Viewer-safe reasoning metadata for one completed turn.
+///
+/// A turn can have both summary items and token usage. Providers do not expose
+/// those consistently: one backend may return summary text without token
+/// accounting, while another may report reasoning tokens without any visible
+/// summary. Callers should treat the two collections as independent display
+/// channels.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnReasoning {
-    /// Reasoning summary items extracted from provider continuation payloads.
+    /// Normalized summary items extracted from provider continuation payloads.
+    ///
+    /// These items intentionally exclude encrypted content, provider replay
+    /// signatures, tool payloads, and non-reasoning message content.
     pub items: Vec<ReasoningItem>,
-    /// Aggregated reasoning token usage by provider/model.
+    /// Reasoning-token usage aggregated by provider/model.
+    ///
+    /// Usage rows are derived only from model-step usage records, so media,
+    /// client-tool, server-tool, and sub-agent usage cannot appear here even if
+    /// their raw records contain a reasoning-token field.
     pub usage: Vec<ReasoningUsage>,
 }
 
 impl TurnReasoning {
     /// Extract reasoning metadata from ordered provider model steps and usage.
+    ///
+    /// This is the trace-viewer path for a stored turn snapshot. Each model
+    /// step can carry its own continuation and model id, which lets multi-step
+    /// turns preserve the provider/model label attached to each reasoning item.
     pub fn from_model_steps_and_usage(
         model_steps: &[ModelStepTrace],
         usage: &[UsageRecord],
     ) -> Self {
+        // Step 1: walk continuations in model-step order so the viewer follows
+        // the same sequence the runtime observed.
         let items = model_steps
             .iter()
             .filter_map(|step| {
@@ -38,19 +73,28 @@ impl TurnReasoning {
             })
             .flatten()
             .collect();
+        // Step 2: fold token accounting separately because usage records are
+        // produced by accounting code, not by provider continuation parsing.
         let usage = reasoning_usage_from_records(usage);
         Self { items, usage }
     }
 
-    /// Extract reasoning metadata from the stored continuation and usage.
+    /// Extract reasoning metadata from a single stored continuation and usage.
+    ///
+    /// This helper supports callers that have a final continuation rather than
+    /// an ordered list of [`ModelStepTrace`] records. When a model id is
+    /// supplied, every extracted item is labeled with that model.
     pub fn from_continuation_and_usage(
         continuation: Option<&ProviderContinuation>,
         model: Option<&ModelId>,
         usage: &[UsageRecord],
     ) -> Self {
+        // Step 1: normalize the optional provider continuation into zero or
+        // more viewer-safe reasoning items.
         let items = continuation
             .map(|continuation| reasoning_items_from_continuation(continuation, model))
             .unwrap_or_default();
+        // Step 2: attach model-step reasoning-token usage, if any.
         let usage = reasoning_usage_from_records(usage);
         Self { items, usage }
     }
@@ -61,31 +105,49 @@ impl TurnReasoning {
     }
 }
 
-/// One provider reasoning item.
+/// One normalized provider reasoning item.
+///
+/// This is the item-level display shape consumed by the web trace viewer. It
+/// keeps provider identity and lightweight provider metadata, but its summary
+/// blocks are already sanitized and should not contain replay-only fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningItem {
     /// Provider that emitted the reasoning item.
     pub provider: ProviderName,
-    /// Model active for the turn, when known.
+    /// Model active for this model step, when known.
+    ///
+    /// Multi-step turns can contain items from more than one model if a future
+    /// runtime mixes providers/models inside one attempt.
     pub model: Option<ModelId>,
-    /// Provider item id, when present.
+    /// Provider item id, when present and safe to display.
     pub id: Option<String>,
-    /// Provider item status, when present.
+    /// Provider item status, when present and safe to display.
     pub status: Option<String>,
-    /// Summary text blocks extracted from the item.
+    /// Summary text blocks extracted from the provider item.
+    ///
+    /// Empty or whitespace-only summaries are filtered before a
+    /// [`ReasoningItem`] is built.
     pub summary: Vec<ReasoningSummary>,
 }
 
 /// One normalized reasoning summary text block.
+///
+/// Providers use different names for summary subtypes. The optional `kind`
+/// preserves that lightweight label for display while keeping the text payload
+/// provider-neutral.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningSummary {
     /// Provider-specific summary block kind, e.g. `summary_text`.
     pub kind: Option<String>,
-    /// Summary text.
+    /// Viewer-safe summary text.
     pub text: String,
 }
 
 /// Aggregated reasoning token usage for a provider/model pair.
+///
+/// This type is independent from [`ReasoningItem`] because some providers only
+/// report token counts, and because token usage can come from accounting paths
+/// that are separate from continuation extraction.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningUsage {
     /// Provider that reported the token usage.
@@ -96,21 +158,31 @@ pub struct ReasoningUsage {
     pub reasoning_tokens: u64,
 }
 
+/// Extract reasoning items from the array-or-object continuation shapes used by
+/// current providers.
 fn reasoning_items_from_continuation(
     continuation: &ProviderContinuation,
     model: Option<&ModelId>,
 ) -> Vec<ReasoningItem> {
     match &continuation.data {
+        // Responses-style providers store ordered output items as arrays.
         Value::Array(items) => items
             .iter()
             .filter_map(|item| reasoning_item_from_value(&continuation.provider, model, item))
             .collect(),
+        // Chat-compatible/local providers and some future backends can emit a
+        // single synthetic reasoning object.
         item => reasoning_item_from_value(&continuation.provider, model, item)
             .into_iter()
             .collect(),
     }
 }
 
+/// Convert one provider JSON object into a viewer-safe reasoning item.
+///
+/// Unknown item types deliberately return `None`; continuation payloads also
+/// carry messages, tool calls, citations, signatures, and encrypted replay
+/// state that are not reasoning summaries for the trace viewer.
 fn reasoning_item_from_value(
     provider: &ProviderName,
     model: Option<&ModelId>,
@@ -118,6 +190,8 @@ fn reasoning_item_from_value(
 ) -> Option<ReasoningItem> {
     let object = item.as_object()?;
     let item_type = object.get("type").and_then(Value::as_str);
+    // Step 1: classify only the provider item families that expose
+    // viewer-safe reasoning text or a safe placeholder.
     let summary = match item_type {
         Some("reasoning") => reasoning_summaries_from_value(object.get("summary")),
         Some("thinking") => anthropic_thinking_summaries(object),
@@ -129,6 +203,7 @@ fn reasoning_item_from_value(
         }
         _ => Vec::new(),
     };
+    // Step 2: never emit an item if all discovered summary text is empty.
     let summary: Vec<_> = summary
         .into_iter()
         .filter(|summary| !summary.text.trim().is_empty())
@@ -149,13 +224,18 @@ fn reasoning_item_from_value(
     })
 }
 
+/// Normalize Anthropic thinking blocks without exposing replay-only signatures.
 fn anthropic_thinking_summaries(object: &serde_json::Map<String, Value>) -> Vec<ReasoningSummary> {
+    // Prefer explicit thinking text when Anthropic returns it.
     if let Some(text) = object.get("thinking").and_then(Value::as_str)
         && !text.trim().is_empty()
     {
         return vec![summary_text(Some("thinking"), text)];
     }
 
+    // A signature without text means the provider gave replay state but no
+    // viewer-safe thought text. Surface that as a placeholder so the trace
+    // still explains why a reasoning block exists.
     if object.contains_key("signature") {
         return vec![summary_text(
             Some("thinking_omitted"),
@@ -166,6 +246,7 @@ fn anthropic_thinking_summaries(object: &serde_json::Map<String, Value>) -> Vec<
     Vec::new()
 }
 
+/// Normalize a Responses-style `summary` field into summary blocks.
 fn reasoning_summaries_from_value(value: Option<&Value>) -> Vec<ReasoningSummary> {
     match value {
         Some(Value::Array(entries)) => entries
@@ -177,6 +258,7 @@ fn reasoning_summaries_from_value(value: Option<&Value>) -> Vec<ReasoningSummary
     }
 }
 
+/// Convert one provider summary entry into a text block.
 fn reasoning_summary_from_entry(entry: &Value) -> Option<ReasoningSummary> {
     match entry {
         Value::String(text) => Some(summary_text(None, text)),
@@ -188,6 +270,7 @@ fn reasoning_summary_from_entry(entry: &Value) -> Option<ReasoningSummary> {
     }
 }
 
+/// Build a normalized summary block from borrowed provider fields.
 fn summary_text(kind: Option<&str>, text: &str) -> ReasoningSummary {
     ReasoningSummary {
         kind: kind.map(str::to_string),
@@ -195,12 +278,16 @@ fn summary_text(kind: Option<&str>, text: &str) -> ReasoningSummary {
     }
 }
 
+/// Aggregate positive model-step reasoning-token counts by provider/model.
 fn reasoning_usage_from_records(records: &[UsageRecord]) -> Vec<ReasoningUsage> {
     let mut by_provider_model = BTreeMap::<(ProviderName, Option<ModelId>), u64>::new();
     for record in records {
+        // Only language-model steps belong in the reasoning panel. Other
+        // subjects are displayed and billed elsewhere.
         if !matches!(record.subject, UsageSubject::ModelStep) {
             continue;
         }
+        // Missing and zero counts are equivalent for display.
         let Some(tokens) = record.reasoning_tokens.filter(|tokens| *tokens > 0) else {
             continue;
         };

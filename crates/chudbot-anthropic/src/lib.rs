@@ -1,4 +1,15 @@
-//! Anthropic provider crate for chudbot.
+//! Anthropic provider integration for Chudbot.
+//!
+//! This crate owns the Anthropic-specific HTTP client, Messages API language
+//! model adapter, and local token-pricing estimates. The public surface is
+//! intentionally small: callers construct an [`AnthropicClient`], optionally
+//! override endpoint or pricing configuration, and then use the backend traits
+//! implemented in the private modules.
+//!
+//! The shared client helpers in this module centralize retries, response
+//! decoding, provider-scoped tracing, and payload redaction so the Messages API
+//! implementation can focus on translating Chudbot transcripts into Anthropic
+//! request and response shapes.
 
 mod llm;
 mod pricing;
@@ -15,9 +26,15 @@ pub use llm::AnthropicOptions;
 pub use pricing::AnthropicTokenPricing;
 
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
+// Anthropic requires every request to pin an API version through this header.
 const API_VERSION: &str = "2023-06-01";
 
-/// Anthropic API client.
+/// Anthropic API client used by the provider implementations in this crate.
+///
+/// The client carries deployment-local provider identity as well as Anthropic
+/// credentials. That provider name is what shows up in Chudbot traces, usage
+/// records, and retry labels when a deployment registers more than one
+/// Anthropic-compatible service.
 #[derive(Debug, Clone)]
 pub struct AnthropicClient {
     http: reqwest::Client,
@@ -28,7 +45,11 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
-    /// Construct from a configured provider name and Anthropic API key.
+    /// Construct a client from a configured provider name and Anthropic API key.
+    ///
+    /// The default endpoint targets Anthropic's public API and token pricing is
+    /// initialized with the built-in estimate table. Use the builder methods to
+    /// point tests at a mock server or to override local cost estimates.
     pub fn new(provider_name: ProviderName, api_key: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -39,13 +60,21 @@ impl AnthropicClient {
         }
     }
 
-    /// Override the base URL. Useful for local tests.
+    /// Override the base URL.
+    ///
+    /// This is mainly used by tests and Anthropic-compatible gateways. Endpoint
+    /// arguments passed to request helpers are appended directly, so callers
+    /// should provide the versioned root URL without a trailing endpoint path.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
-    /// Override or add text-token pricing entries used for cost estimates.
+    /// Override or add text-token pricing entries used for local cost estimates.
+    ///
+    /// Anthropic returns usage counts but not billable cost. These entries let
+    /// the runtime turn usage into estimated `usd_ticks` without making another
+    /// provider-specific API call.
     pub fn with_token_pricing(mut self, pricing: BTreeMap<ModelId, AnthropicTokenPricing>) -> Self {
         self.pricing.apply_token_overrides(pricing);
         self
@@ -74,6 +103,12 @@ impl AnthropicClient {
         &self.pricing
     }
 
+    /// POST a JSON body to an Anthropic endpoint and deserialize the JSON result.
+    ///
+    /// This helper is the single write path for the Messages API adapter. It
+    /// attaches Anthropic's required authentication/version headers, logs a
+    /// redacted payload at debug level, retries errors classified as transient,
+    /// and delegates status/body handling to [`decode_response`].
     pub(crate) async fn post_json<T>(
         &self,
         endpoint: &str,
@@ -120,6 +155,10 @@ impl AnthropicClient {
         .await
     }
 
+    /// GET a JSON Anthropic endpoint and deserialize the result.
+    ///
+    /// Model metadata uses the same retry and decode path as generation calls
+    /// but has no request body to redact.
     pub(crate) async fn get_json<T>(&self, endpoint: &str, label: &str) -> Result<T, AnthropicError>
     where
         T: for<'de> Deserialize<'de>,
@@ -160,6 +199,12 @@ impl AnthropicClient {
     }
 }
 
+/// Decode a provider response into the caller's expected shape.
+///
+/// The function reads the body once, preserves compact API-error bodies for
+/// user-visible diagnostics, logs full successful JSON payloads only after
+/// redaction, and then performs the typed deserialization expected by the
+/// provider-specific caller.
 pub(crate) async fn decode_response<T>(
     resp: reqwest::Response,
     provider: &ProviderName,
@@ -169,6 +214,9 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let status = resp.status();
+    // Keep response-body read failures separate from JSON-shape failures; both
+    // are permanent for retry purposes, but the log text points at different
+    // provider or transport defects.
     let body = resp.text().await.map_err(|e| {
         tracing::warn!(
             status = status.as_u16(),
@@ -178,6 +226,8 @@ where
         AnthropicError::Decode(e.to_string())
     })?;
     if !status.is_success() {
+        // Preserve enough provider text to explain the failure without letting
+        // large HTML/proxy errors dominate traces or Discord-visible messages.
         log_text_response(provider, endpoint, status.as_u16(), &body);
         let body = truncate_body(body, 600);
         tracing::warn!(
@@ -210,6 +260,7 @@ where
     })
 }
 
+/// Truncate a response body to the byte budget used in diagnostics.
 pub(crate) fn truncate_body(mut body: String, max: usize) -> String {
     if body.len() > max {
         body.truncate(max);
@@ -217,6 +268,7 @@ pub(crate) fn truncate_body(mut body: String, max: usize) -> String {
     body
 }
 
+/// Log a JSON request after removing payload fields that can carry media bytes.
 fn log_json_request(provider: &ProviderName, endpoint: &str, body: &Value) {
     if tracing::enabled!(tracing::Level::DEBUG) {
         let body = stringify_redacted_json(body);
@@ -229,6 +281,7 @@ fn log_json_request(provider: &ProviderName, endpoint: &str, body: &Value) {
     }
 }
 
+/// Log a JSON response after removing payload fields that can carry media bytes.
 fn log_json_response(provider: &ProviderName, endpoint: &str, status: u16, body: &Value) {
     if tracing::enabled!(tracing::Level::DEBUG) {
         let body = stringify_redacted_json(body);
@@ -242,6 +295,7 @@ fn log_json_response(provider: &ProviderName, endpoint: &str, status: u16, body:
     }
 }
 
+/// Log a non-success text response with base64-like bodies redacted.
 fn log_text_response(provider: &ProviderName, endpoint: &str, status: u16, body: &str) {
     if tracing::enabled!(tracing::Level::DEBUG) {
         let body = redact_text_body(body);
@@ -255,11 +309,13 @@ fn log_text_response(provider: &ProviderName, endpoint: &str, status: u16, body:
     }
 }
 
+/// Serialize a JSON value for debug logs after recursively redacting blobs.
 fn stringify_redacted_json(value: &Value) -> String {
     serde_json::to_string(&redact_json(value, None))
         .unwrap_or_else(|_| "[unserializable JSON payload]".to_string())
 }
 
+/// Recursively redact strings that are likely to contain media or thinking data.
 fn redact_json(value: &Value, key: Option<&str>) -> Value {
     match value {
         Value::Array(items) => {
@@ -275,11 +331,15 @@ fn redact_json(value: &Value, key: Option<&str>) -> Value {
     }
 }
 
+/// Redact a string when the surrounding key or payload shape makes it sensitive.
 fn redact_string(key: Option<&str>, text: &str) -> String {
     if let Some(redacted) = redact_data_uri(text) {
         return redacted;
     }
 
+    // `encrypted_content` can contain Anthropic thinking continuations; `data`
+    // is only redacted when it looks like an encoded media payload because it is
+    // otherwise too generic to treat as sensitive by name alone.
     let known_payload_key = matches!(key, Some("b64_json" | "encrypted_content"));
     let possible_payload_key = matches!(key, Some("data"));
     if known_payload_key || (possible_payload_key && looks_like_base64(text)) {
@@ -292,6 +352,7 @@ fn redact_string(key: Option<&str>, text: &str) -> String {
     text.to_string()
 }
 
+/// Redact inline data URIs while preserving their MIME-type prefix.
 fn redact_data_uri(text: &str) -> Option<String> {
     let (prefix, payload) = text.split_once(";base64,")?;
     if !prefix.starts_with("data:") {
@@ -303,6 +364,7 @@ fn redact_data_uri(text: &str) -> Option<String> {
     ))
 }
 
+/// Redact or cap text bodies from failed responses before logging them.
 fn redact_text_body(body: &str) -> String {
     if looks_like_base64(body) {
         return format!(
@@ -313,6 +375,7 @@ fn redact_text_body(body: &str) -> String {
     truncate_body(body.to_string(), 4_000)
 }
 
+/// Heuristic for provider payloads that are probably encoded binary blobs.
 fn looks_like_base64(text: &str) -> bool {
     text.len() >= 256
         && text.bytes().all(|b| {
@@ -321,7 +384,11 @@ fn looks_like_base64(text: &str) -> bool {
         })
 }
 
-/// Anthropic provider error.
+/// Error type shared by Anthropic language-model and metadata calls.
+///
+/// The variants are deliberately coarse because retry decisions only need to
+/// distinguish network/transient API failures from permanent request, decode,
+/// or media-reference problems.
 #[derive(Debug, Error)]
 pub enum AnthropicError {
     /// Network/transport failure.
@@ -346,6 +413,9 @@ pub enum AnthropicError {
 impl ClassifyError for AnthropicError {
     fn error_class(&self) -> ErrorClass {
         match self {
+            // Anthropic rate limits and server failures are retryable through
+            // the shared provider retry policy. Other HTTP failures usually
+            // indicate invalid credentials, request shape, model, or media.
             Self::Api { status, .. } if *status == 429 || (500..=599).contains(status) => {
                 ErrorClass::ServerTransient
             }

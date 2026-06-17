@@ -1,4 +1,9 @@
 //! Google Gemini API Veo video generation implementation.
+//!
+//! Gemini's Veo surface is queue-based: submit a `predictLongRunning` request,
+//! poll the returned operation resource, then download the provider-scoped video
+//! URI with Gemini authentication. This module keeps that upstream shape hidden
+//! behind the neutral [`VideoGenerator`] contract.
 
 use chudbot_api::{
     MediaRef, ProviderName, VideoGenerator, VideoJobId, VideoJobStatus, VideoMeta, VideoRequest,
@@ -7,8 +12,10 @@ use serde_json::{Value, json};
 
 use crate::{GeminiClient, GeminiError, get_field, inline_media, json_strip_nulls, truncate_body};
 
+/// Veo model used when an agent does not bind an explicit model id.
 const DEFAULT_VIDEO_MODEL: &str = "veo-3.1-generate-preview";
 
+/// Video generation adapter for Gemini's long-running Veo API.
 impl VideoGenerator for GeminiClient {
     type Error = GeminiError;
 
@@ -16,6 +23,10 @@ impl VideoGenerator for GeminiClient {
         self.provider_name()
     }
 
+    /// Submit a Veo render and return Gemini's operation name as the job id.
+    ///
+    /// The response is intentionally not polled here. Runtime code owns the
+    /// schedule for later [`VideoGenerator::check_video`] calls.
     #[tracing::instrument(name = "gemini.submit_video", skip_all)]
     async fn submit_video(&self, request: VideoRequest) -> Result<VideoJobId, Self::Error> {
         let model = request
@@ -32,6 +43,9 @@ impl VideoGenerator for GeminiClient {
             resolution = ?request.resolution.as_deref(),
             "building Gemini video submit request"
         );
+
+        // Gemini expects prompt and optional image input under `instances`,
+        // while generation controls live under a sibling `parameters` object.
         let instance = video_instance(&request).await?;
         let parameters = video_parameters(&request);
         let body = json_strip_nulls(json!({
@@ -44,6 +58,8 @@ impl VideoGenerator for GeminiClient {
                 &endpoint,
                 &body,
                 chudbot_api::retry::RetryPolicy {
+                    // A transport retry can enqueue a second upstream render;
+                    // leave resubmission decisions to orchestration.
                     retry_network: false,
                     ..chudbot_api::retry::RetryPolicy::default()
                 },
@@ -59,8 +75,12 @@ impl VideoGenerator for GeminiClient {
         Ok(job)
     }
 
+    /// Poll one Gemini operation and map its current shape to the neutral job
+    /// status used by bot orchestration.
     #[tracing::instrument(name = "gemini.check_video", skip_all, fields(job = %job))]
     async fn check_video(&self, job: VideoJobId) -> Result<VideoJobStatus, Self::Error> {
+        // The submit response name is an operation resource path, so the API
+        // check is a direct GET against that path under the configured base URL.
         let endpoint = format!("/{}", job.as_str());
         let parsed: Value = self.get_json(&endpoint, "videogen[gemini].check").await?;
         if !parsed.get("done").and_then(Value::as_bool).unwrap_or(false) {
@@ -77,6 +97,8 @@ impl VideoGenerator for GeminiClient {
         let url = video_uri_from_response(response).ok_or_else(|| {
             GeminiError::Decode("done video operation lacked generated video URI".to_string())
         })?;
+        // Gemini does not currently return normalized duration or usage in the
+        // response shapes this crate accepts, so callers only receive the URI.
         Ok(VideoJobStatus::Done {
             meta: VideoMeta {
                 url,
@@ -86,12 +108,16 @@ impl VideoGenerator for GeminiClient {
         })
     }
 
+    /// Download the completed render from the provider-scoped URI returned by
+    /// Gemini's operation response.
     #[tracing::instrument(name = "gemini.download_video", skip_all)]
     async fn download_video(&self, url: String) -> Result<Vec<u8>, Self::Error> {
         let resp = chudbot_api::retry::with_retry(
             chudbot_api::retry::RetryPolicy::default(),
             "videogen[gemini].download",
             || {
+                // The generated URI is not treated as a public browser URL;
+                // authenticate the download through the same Gemini API key.
                 let request = self
                     .http()
                     .get(&url)
@@ -128,6 +154,7 @@ impl VideoGenerator for GeminiClient {
     }
 }
 
+/// Build the per-render input instance expected by `predictLongRunning`.
 async fn video_instance(request: &VideoRequest) -> Result<Value, GeminiError> {
     let mut instance = serde_json::Map::new();
     instance.insert("prompt".to_string(), Value::String(request.prompt.clone()));
@@ -137,6 +164,7 @@ async fn video_instance(request: &VideoRequest) -> Result<Value, GeminiError> {
     Ok(Value::Object(instance))
 }
 
+/// Convert Chudbot's optional image reference into Gemini inline image input.
 async fn video_image(media: &dyn MediaRef) -> Result<Value, GeminiError> {
     let mime_type = media.mime_type();
     if !mime_type.starts_with("image/") {
@@ -150,6 +178,7 @@ async fn video_image(media: &dyn MediaRef) -> Result<Value, GeminiError> {
     }))
 }
 
+/// Keep only provider controls the caller supplied.
 fn video_parameters(request: &VideoRequest) -> Option<Value> {
     let value = json_strip_nulls(json!({
         "aspectRatio": request.aspect_ratio.as_deref(),
@@ -162,6 +191,7 @@ fn video_parameters(request: &VideoRequest) -> Option<Value> {
     }
 }
 
+/// Extract a readable upstream failure while tolerating partial error objects.
 fn error_message(error: &Value) -> String {
     error
         .get("message")
@@ -170,6 +200,12 @@ fn error_message(error: &Value) -> String {
         .to_string()
 }
 
+/// Recover the generated video URI from known Gemini operation response shapes.
+///
+/// The API has appeared in both camelCase and snake_case forms, and examples
+/// have used both `generatedSamples` and `generatedVideos`. Accepting all known
+/// spellings keeps polling robust without loosening the rest of response
+/// decoding.
 fn video_uri_from_response(response: &Value) -> Option<String> {
     for path in [
         &[
@@ -196,6 +232,8 @@ fn video_uri_from_response(response: &Value) -> Option<String> {
     None
 }
 
+/// Traverse mixed object/array JSON paths, using `get_field` for key spelling
+/// tolerance and numeric path segments for array indexes.
 fn value_path<'a>(mut value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     for segment in path {
         value = if let Ok(index) = segment.parse::<usize>() {

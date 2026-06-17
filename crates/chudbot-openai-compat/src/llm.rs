@@ -1,4 +1,17 @@
-//! OpenAI-compatible Chat Completions language-model implementation.
+//! Chat Completions language-model adapter for OpenAI-compatible hosts.
+//!
+//! This module is the wire-format boundary between Chudbot's provider-neutral
+//! [`LlmBackend`] contract and servers that mimic OpenAI's `chat/completions`
+//! API. It intentionally keeps compatibility logic local to this crate:
+//! transcript blocks are lowered into Chat Completions messages, client tools
+//! are exposed as function tools, backend-specific request extensions are
+//! merged into the JSON body, and provider responses are normalized back into
+//! [`ModelStep`] values for the shared agent loop.
+//!
+//! Compatibility hosts vary more than the OpenAI surface suggests. Keep parsing
+//! permissive, preserve raw usage/model metadata where possible, and prefer
+//! small provider-local fallbacks over widening `chudbot-api` for one gateway's
+//! extra fields.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -29,6 +42,9 @@ impl LlmBackend for OpenAiCompatClient {
         fields(model = %request.model)
     )]
     async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
+        // Build the provider request in Chat Completions terms while preserving
+        // the shared agent-loop semantics: transcript, client tools, sampling,
+        // and opaque provider options all come from the already-shaped request.
         let messages = to_chat_messages(&request.transcript, self.provider_name()).await?;
         let tools = build_chat_tools(&request.client_tools);
         if !request.server_tools.is_empty() {
@@ -74,6 +90,9 @@ impl LlmBackend for OpenAiCompatClient {
         );
         log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
 
+        // Chudbot's agent loop consumes a single normalized assistant step. The
+        // raw Chat Completions finish reason is not needed: tool calls determine
+        // whether the loop executes tools or emits a final answer.
         let choice = parsed
             .choices
             .into_iter()
@@ -133,6 +152,9 @@ fn model_info_from_models_response(requested_model: ModelId, raw: Value) -> Opti
 }
 
 fn model_entry_from_models_response(requested_model: &ModelId, raw: &Value) -> Option<Value> {
+    // Some gateways return a single model object while others return OpenAI's
+    // list envelope. If a singleton list is all we have, treat it as the active
+    // deployment because local hosts often expose one model behind an alias.
     if model_id_matches(raw, requested_model) {
         return Some(raw.clone());
     }
@@ -152,6 +174,9 @@ fn model_id_matches(value: &Value, requested_model: &ModelId) -> bool {
 }
 
 fn model_info_from_compat_model(requested_model: ModelId, raw: Value) -> Option<ModelInfo> {
+    // Local Chat Completions servers do not agree on metadata keys. Search the
+    // common spellings seen across vLLM, llama.cpp-style gateways, and model
+    // cards, including nested metadata blocks.
     const CONTEXT_FIELDS: &[&str] = &[
         "context_window_tokens",
         "context_window",
@@ -217,6 +242,9 @@ async fn to_chat_messages(
     transcript: &Transcript,
     provider: &ProviderName,
 ) -> Result<Vec<Value>, OpenAiCompatError> {
+    // Translate Chudbot's mixed transcript blocks into the Chat Completions
+    // message sequence. Tool results are separate `role=tool` messages, so any
+    // buffered user text/media must be flushed before emitting one.
     let mut messages = Vec::new();
     if let Some(instructions) = &transcript.instructions
         && !instructions.is_empty()
@@ -237,6 +265,9 @@ async fn to_chat_messages(
                 match block {
                     ContentBlock::Text { text: t } => text.push_str(t),
                     ContentBlock::Media { media } => {
+                        // Chat Completions has no portable assistant-media
+                        // replay shape, so keep the transcript text/tool state
+                        // useful and leave media in the persisted trace only.
                         tracing::debug!(
                             uri = %media.uri(),
                             "skipping assistant media for OpenAI-compatible chat history"
@@ -248,6 +279,9 @@ async fn to_chat_messages(
                     ContentBlock::ClientToolResult(_) => {}
                     ContentBlock::Continuation(continuation) => {
                         if &continuation.provider == provider {
+                            // Reasoning continuations are stored for the trace
+                            // viewer. This compat surface has no supported way
+                            // to replay them into a later chat request.
                             tracing::debug!(
                                 provider = %provider,
                                 "OpenAI-compatible provider continuations are not replayed"
@@ -286,6 +320,9 @@ async fn to_chat_messages(
                     }
                     ContentBlock::Continuation(continuation) => {
                         if &continuation.provider == provider {
+                            // Match the assistant-side policy: preserve the
+                            // trace, but do not send private continuation data
+                            // to arbitrary OpenAI-compatible gateways.
                             tracing::debug!(
                                 provider = %provider,
                                 "OpenAI-compatible provider continuations are not replayed"
@@ -306,6 +343,8 @@ fn push_chat_user_message(
     text: &mut String,
     media_urls: &mut Vec<String>,
 ) {
+    // Keep simple text-only turns in the legacy string form; switch to content
+    // parts only when media forces the vision-capable shape.
     if text.is_empty() && media_urls.is_empty() {
         return;
     }
@@ -342,6 +381,8 @@ async fn media_url_or_data(media: &dyn MediaRef) -> Result<String, OpenAiCompatE
         }
         Err(public_error) => match media.load().await {
             Ok(loaded) => {
+                // Prefer fetchable URLs, but data URIs make local media stores
+                // usable with gateways that support OpenAI's image_url field.
                 tracing::debug!(
                     uri = %media.uri(),
                     category = ?media.category(),
@@ -421,6 +462,8 @@ fn parse_tool_calls(
     calls: &[ToolCall],
     deprecated_function_call: Option<&ToolCallFunction>,
 ) -> Vec<ClientToolCall> {
+    // Modern Chat Completions responses use `tool_calls`; older gateways may
+    // still emit the deprecated single `function_call` shape.
     if !calls.is_empty() {
         return calls
             .iter()
@@ -459,6 +502,9 @@ fn content_to_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(parts)) => parts.iter().fold(String::new(), |mut text, part| {
+            // Most compat hosts return string content, but some echo Responses-
+            // style content parts. Preserve only user-visible text/refusal
+            // fields and ignore provider-specific annotations.
             if part.get("type").and_then(Value::as_str) == Some("text")
                 && let Some(part_text) = part.get("text").and_then(Value::as_str)
             {
@@ -502,6 +548,9 @@ fn usage_from_compat(
     subject: UsageSubject,
     usage: Option<&Value>,
 ) -> Option<UsageRecord> {
+    // Usage is optional on many local hosts. When present, retain the raw object
+    // so future gateway-specific counters can be audited without changing this
+    // normalizer first.
     let raw = usage?.clone();
     let parsed = serde_json::from_value::<Usage>(raw.clone()).ok()?;
     Some(UsageRecord {
@@ -518,6 +567,13 @@ fn usage_from_compat(
     })
 }
 
+/// Provider-specific Chat Completions request options.
+///
+/// These options are parsed from [`ModelStepRequest::provider_options`] after
+/// routing has already selected this backend. They intentionally model only the
+/// fields this adapter understands generically; backend-specific knobs stay in
+/// [`OpenAiCompatOptions::extra_body`] and are merged into the request body
+/// after the standard Chudbot fields are generated.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OpenAiCompatOptions {
     /// Tool choice value sent when tools are present. Defaults to `"auto"`.
@@ -560,6 +616,9 @@ fn continuation_from_reasoning_content(
     provider: &ProviderName,
     reasoning_content: Option<&str>,
 ) -> Option<ProviderContinuation> {
+    // Several local reasoning models expose private chain-of-thought-ish text as
+    // `reasoning_content`. Store it as provider continuation data so the trace
+    // viewer can show it without pretending it is ordinary assistant content.
     let text = reasoning_content?.trim();
     if text.is_empty() {
         return None;
@@ -576,6 +635,10 @@ fn continuation_from_reasoning_content(
     })
 }
 
+/// Minimal Chat Completions response envelope consumed by this adapter.
+///
+/// Unknown fields are intentionally ignored because compat servers often add
+/// gateway-specific diagnostics, token details, or finish metadata.
 #[derive(Deserialize)]
 struct ChatResponse {
     #[serde(default)]
@@ -586,11 +649,13 @@ struct ChatResponse {
     usage: Option<Value>,
 }
 
+/// One Chat Completions choice.
 #[derive(Deserialize)]
 struct Choice {
     message: ResponseMessage,
 }
 
+/// Assistant message fields this adapter can normalize.
 #[derive(Deserialize)]
 struct ResponseMessage {
     #[serde(default)]
@@ -603,6 +668,7 @@ struct ResponseMessage {
     function_call: Option<ToolCallFunction>,
 }
 
+/// Modern function-tool call shape.
 #[derive(Deserialize)]
 struct ToolCall {
     #[serde(default)]
@@ -610,6 +676,7 @@ struct ToolCall {
     function: ToolCallFunction,
 }
 
+/// Shared payload for modern `tool_calls` and legacy `function_call`.
 #[derive(Deserialize)]
 struct ToolCallFunction {
     #[serde(default)]
@@ -618,6 +685,10 @@ struct ToolCallFunction {
     arguments: String,
 }
 
+/// OpenAI-compatible token counters.
+///
+/// Missing counters default to zero so partial local-host usage payloads still
+/// produce a best-effort [`UsageRecord`].
 #[derive(Deserialize, Debug, Default)]
 struct Usage {
     #[serde(default)]

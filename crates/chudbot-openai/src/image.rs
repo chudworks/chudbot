@@ -1,4 +1,15 @@
-//! OpenAI image generation implementation.
+//! OpenAI image generation and edit support.
+//!
+//! This module adapts Chudbot's provider-neutral [`ImageRequest`] into the two
+//! OpenAI image endpoints:
+//!
+//! - text-only requests use `POST /images/generations` with a JSON body.
+//! - requests with reference media use `POST /images/edits` with multipart
+//!   `image[]` parts.
+//!
+//! Both paths normalize OpenAI's image response into [`GeneratedImage`], attach
+//! any revised prompt, and translate token usage into Chudbot usage records with
+//! estimated cost data when pricing is configured.
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -36,6 +47,8 @@ impl ImageGenerator for OpenAiClient {
             "building OpenAI image request"
         );
 
+        // OpenAI uses separate endpoints and encodings for pure generation and
+        // reference-image edits, but both return the same image payload shape.
         if request.references.is_empty() {
             self.generate_from_text(&request.prompt, model, quality, size)
                 .await
@@ -47,6 +60,7 @@ impl ImageGenerator for OpenAiClient {
 }
 
 impl OpenAiClient {
+    /// Send a text-to-image request to OpenAI's JSON generation endpoint.
     async fn generate_from_text(
         &self,
         prompt: &str,
@@ -61,6 +75,8 @@ impl OpenAiClient {
             prompt_chars = prompt.chars().count(),
             "sending OpenAI text-to-image request"
         );
+        // Keep optional fields absent instead of null; OpenAI treats these as
+        // omitted provider defaults.
         let mut body = json!({
             "model": model,
             "prompt": prompt,
@@ -79,6 +95,7 @@ impl OpenAiClient {
         image_from_response(parsed, self.provider_name(), model, self.pricing())
     }
 
+    /// Send an image-edit request with one multipart part per reference image.
     async fn generate_from_edit(
         &self,
         request: &ImageRequest,
@@ -94,6 +111,8 @@ impl OpenAiClient {
             prompt_chars = request.prompt.chars().count(),
             "sending OpenAI image edit request"
         );
+        // Resolve every reference before opening the retry loop. That avoids
+        // reloading local media or refetching public URLs on each OpenAI retry.
         let mut references = Vec::with_capacity(request.references.len());
         for reference in &request.references {
             references.push(reference_image(reference.as_ref(), self).await?);
@@ -118,6 +137,9 @@ impl OpenAiClient {
                 if let Some(size) = size {
                     form = form.text("size", size.to_string());
                 }
+                // OpenAI's edit endpoint accepts repeated `image[]` fields;
+                // synthetic file names make request logs and provider errors
+                // easier to correlate with the local reference index.
                 for (i, reference) in references.iter().enumerate() {
                     let file_name = format!("image_{i}.{}", reference.ext);
                     let part = reqwest::multipart::Part::bytes(reference.bytes.clone())
@@ -139,6 +161,11 @@ impl OpenAiClient {
     }
 }
 
+/// Resolve media into a URL string accepted by the Responses API.
+///
+/// Text-generation messages can reference media by public URL. If the store
+/// cannot expose the media publicly, this falls back to an inline data URI so
+/// local attachments still work with OpenAI's multimodal input blocks.
 pub(crate) async fn media_bytes_or_url(media: &dyn MediaRef) -> Result<String, OpenAiError> {
     match media.public_url().await {
         Ok(url) => {
@@ -177,6 +204,11 @@ pub(crate) async fn media_bytes_or_url(media: &dyn MediaRef) -> Result<String, O
     }
 }
 
+/// Resolve an edit reference into bytes and a provider-safe MIME type.
+///
+/// The edit endpoint needs multipart bytes, so local media loads are preferred.
+/// Public URLs are only fetched when the media store cannot load the bytes
+/// directly.
 async fn reference_image(
     media: &dyn MediaRef,
     client: &OpenAiClient,
@@ -223,6 +255,10 @@ async fn reference_image(
     }
 }
 
+/// Convert a user-visible reference string into multipart bytes.
+///
+/// References currently come from media-store public URLs, but this also accepts
+/// data URIs so callers can reuse the resolver with already-inlined references.
 async fn reference_from_url_or_data(
     reference: &str,
     client: &OpenAiClient,
@@ -241,6 +277,8 @@ async fn reference_from_url_or_data(
         });
     }
 
+    // The edit endpoint needs bytes, not a remote URL. Fetch with the same HTTP
+    // client as provider calls so proxy and timeout configuration stays shared.
     if reference.starts_with("http://") || reference.starts_with("https://") {
         let resp = client.http().get(reference).send().await.map_err(|e| {
             tracing::warn!(error = %e, "failed to fetch OpenAI image reference URL");
@@ -287,6 +325,10 @@ async fn reference_from_url_or_data(
     )))
 }
 
+/// Build a scrubbed log representation of the multipart edit request.
+///
+/// The real request body contains binary image parts, so logs keep only the
+/// field name, synthetic file name, MIME type, and byte count for each part.
 fn image_edit_log_body(
     request: &ImageRequest,
     model: &str,
@@ -321,6 +363,7 @@ fn image_edit_log_body(
     body
 }
 
+/// Normalize OpenAI's image response into Chudbot's provider-neutral shape.
 fn image_from_response(
     parsed: ImagesResponse,
     provider: &ProviderName,
@@ -344,6 +387,8 @@ fn image_from_response(
         tracing::warn!(error = %e, "failed to decode OpenAI image base64 payload");
         OpenAiError::Decode(format!("base64: {e}"))
     })?;
+    // OpenAI reports a short output format such as `png`; store the concrete
+    // MIME type expected by downstream media writers.
     let mime_type = first
         .output_format
         .map(|format| static_mime(&format!("image/{format}")).to_string())
@@ -372,6 +417,8 @@ fn image_from_response(
     })
 }
 
+/// Send an image-specific HTTP request and preserve transport errors in
+/// [`OpenAiError`].
 async fn send_image_request(
     request: reqwest::RequestBuilder,
     label: &str,
@@ -385,6 +432,12 @@ async fn send_image_request(
     Ok(resp)
 }
 
+/// Interpret the image `model` field as either a real model id or a quality
+/// shortcut.
+///
+/// Chudbot exposes a single optional model string. For OpenAI images, common
+/// user-facing values such as `high` and `standard` are more useful as quality
+/// controls than model ids, so they are mapped onto the default image model.
 fn resolve_model_and_quality(model: Option<&str>) -> (&str, Option<&'static str>) {
     let Some(raw) = model else {
         return (DEFAULT_IMAGE_MODEL, None);
@@ -398,6 +451,7 @@ fn resolve_model_and_quality(model: Option<&str>) -> (&str, Option<&'static str>
     }
 }
 
+/// Map provider-neutral aspect hints to OpenAI's supported image sizes.
 fn map_aspect_to_size(aspect: Option<&str>) -> Option<&'static str> {
     match aspect?.trim() {
         "1:1" => Some("1024x1024"),
@@ -408,10 +462,12 @@ fn map_aspect_to_size(aspect: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Encode media bytes as a data URI for APIs that accept inline image URLs.
 fn data_uri(mime_type: &str, bytes: &[u8]) -> String {
     format!("data:{mime_type};base64,{}", B64.encode(bytes))
 }
 
+/// Decode a data URI into bytes and a normalized static image MIME type.
 fn decode_data_uri(uri: &str) -> Result<(&'static str, Vec<u8>), OpenAiError> {
     let rest = uri
         .strip_prefix("data:")
@@ -428,6 +484,7 @@ fn decode_data_uri(uri: &str) -> Result<(&'static str, Vec<u8>), OpenAiError> {
     ))
 }
 
+/// Collapse arbitrary MIME strings to the small set OpenAI image uploads need.
 fn static_mime(mime: &str) -> &'static str {
     match mime.split(';').next().unwrap_or("").trim() {
         "image/jpeg" | "image/jpg" => "image/jpeg",
@@ -436,6 +493,7 @@ fn static_mime(mime: &str) -> &'static str {
     }
 }
 
+/// Pick the synthetic upload extension that matches a normalized MIME type.
 fn ext_for_mime(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" => "jpg",
@@ -444,6 +502,7 @@ fn ext_for_mime(mime: &str) -> &'static str {
     }
 }
 
+/// Convert OpenAI image usage into a Chudbot usage record with local cost data.
 fn usage_from_openai_image(
     provider: &ProviderName,
     model: Option<ModelId>,
@@ -452,6 +511,9 @@ fn usage_from_openai_image(
 ) -> Option<UsageRecord> {
     let raw = usage?.clone();
     let parsed = serde_json::from_value::<ImageUsage>(raw.clone()).ok()?;
+    // Keep the raw provider usage for trace inspection, but calculate cost from
+    // the parsed token buckets so overrides can price text and image tokens
+    // separately.
     let cost = pricing.estimate_image_cost(
         model.as_ref(),
         ImagePricingUsage {
@@ -479,12 +541,14 @@ fn usage_from_openai_image(
     })
 }
 
+/// Bytes and provider-safe metadata for one multipart reference image.
 struct RefImage {
     bytes: Vec<u8>,
     mime: &'static str,
     ext: &'static str,
 }
 
+/// Minimal response shape shared by OpenAI image generation and edit endpoints.
 #[derive(Deserialize)]
 struct ImagesResponse {
     #[serde(default)]
@@ -495,6 +559,7 @@ struct ImagesResponse {
     usage: Option<Value>,
 }
 
+/// One generated image item from OpenAI.
 #[derive(Deserialize)]
 struct ImageResponseItem {
     #[serde(default)]
@@ -505,6 +570,7 @@ struct ImageResponseItem {
     output_format: Option<String>,
 }
 
+/// Token usage fields returned by OpenAI image models.
 #[derive(Deserialize, Debug, Default)]
 struct ImageUsage {
     #[serde(default)]
@@ -519,6 +585,7 @@ struct ImageUsage {
     total_tokens: Option<u64>,
 }
 
+/// Token buckets that OpenAI nests inside image usage totals.
 #[derive(Deserialize, Debug, Default)]
 struct ImageTokenDetails {
     #[serde(default)]

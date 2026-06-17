@@ -1,4 +1,9 @@
 //! xAI speech-to-text implementation.
+//!
+//! This module adapts Chudbot's provider-neutral [`AudioTranscriber`] contract
+//! to xAI's `/stt` endpoint. It keeps the provider-specific request shape,
+//! multipart upload rules, response decoding, and cost estimation contained in
+//! the xAI crate so callers only see [`AudioTranscription`] values.
 
 use chudbot_api::{
     AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
@@ -13,8 +18,15 @@ use crate::imagine::{media_provider_url, usage_from_xai_media};
 use crate::{XaiClient, XaiError, decode_response};
 
 const STT_ENDPOINT: &str = "/stt";
+
+/// xAI's REST STT price expressed in Chudbot's integer `usd_ticks` accounting.
+///
+/// The API response may include token-like usage without a usable cost. When
+/// that happens, the adapter keeps the provider usage and fills in an estimated
+/// duration-based cost from this rate.
 const XAI_STT_REST_USD_TICKS_PER_HOUR: f64 = 1_000_000_000.0;
 
+/// Implements Chudbot audio transcription with xAI's single-call STT API.
 impl AudioTranscriber for XaiClient {
     type Error = XaiError;
 
@@ -27,6 +39,9 @@ impl AudioTranscriber for XaiClient {
         &self,
         request: AudioTranscriptionRequest,
     ) -> Result<AudioTranscription, Self::Error> {
+        // Resolve the media before entering the retry loop so retries only
+        // repeat the upstream STT request, not local storage reads or URL
+        // signing.
         let audio = resolve_stt_audio(request.audio.as_ref()).await?;
         let model = request.model.clone();
         tracing::debug!(
@@ -41,6 +56,8 @@ impl AudioTranscriber for XaiClient {
             chudbot_api::retry::RetryPolicy::default(),
             "stt[xai]",
             || {
+                // Multipart forms consume their parts, so each retry builds a
+                // fresh body from the resolved audio representation.
                 let form = build_stt_form(&audio, request.language.as_deref(), &request.keyterms);
                 let request = self
                     .http()
@@ -58,6 +75,8 @@ impl AudioTranscriber for XaiClient {
             },
         )
         .await?;
+        // Keep the original JSON for usage/raw trace storage while decoding the
+        // response subset this adapter understands.
         let parsed: SttResponse = serde_json::from_value(raw.clone()).map_err(|error| {
             tracing::warn!(error = %error, "failed to decode xAI STT response shape");
             XaiError::Decode(error.to_string())
@@ -66,6 +85,8 @@ impl AudioTranscriber for XaiClient {
         let language = parsed
             .language
             .filter(|language| !language.trim().is_empty());
+        // Prefer provider usage details when present, then augment them with a
+        // local duration-based cost estimate if xAI omitted billable cost.
         let usage = stt_usage_with_cost_estimate(
             self.provider_name(),
             model.clone(),
@@ -93,6 +114,12 @@ impl AudioTranscriber for XaiClient {
     }
 }
 
+/// Audio payload form accepted by xAI STT.
+///
+/// Local bytes are preferred because they avoid exposing a public URL for media
+/// that may already be stored privately. URL submission is the fallback for
+/// media references that can publish or already expose an upstream URL but
+/// cannot be loaded into memory by this process.
 #[derive(Debug, Clone)]
 enum SttAudio {
     File {
@@ -114,6 +141,7 @@ impl SttAudio {
     }
 }
 
+/// Resolve a provider-neutral media reference into one of xAI's STT inputs.
 async fn resolve_stt_audio(audio: &dyn MediaRef) -> Result<SttAudio, XaiError> {
     match audio.load().await {
         Ok(loaded) => Ok(SttAudio::File {
@@ -122,6 +150,9 @@ async fn resolve_stt_audio(audio: &dyn MediaRef) -> Result<SttAudio, XaiError> {
             bytes: loaded.bytes,
         }),
         Err(load_error) => {
+            // Some media stores deliberately avoid returning bytes to every
+            // caller. If they can mint a public URL, xAI can fetch the audio
+            // directly and the transcription path still works.
             tracing::debug!(
                 uri = %audio.uri(),
                 error = %load_error,
@@ -133,6 +164,10 @@ async fn resolve_stt_audio(audio: &dyn MediaRef) -> Result<SttAudio, XaiError> {
     }
 }
 
+/// Build the multipart form accepted by `/stt`.
+///
+/// The audio source is sent as either a `file` part or a `url` field; the rest
+/// of the form carries optional transcription hints.
 fn build_stt_form(audio: &SttAudio, language: Option<&str>, keyterms: &[String]) -> Form {
     let mut form = Form::new();
     if let Some(language) = language {
@@ -150,6 +185,8 @@ fn build_stt_form(audio: &SttAudio, language: Option<&str>, keyterms: &[String])
             bytes,
         } => {
             let part = Part::bytes(bytes.clone()).file_name(file_name.clone());
+            // xAI can infer many files from their name/content, so an invalid
+            // local MIME string should not make an otherwise usable upload fail.
             let part = part.mime_str(mime_type).unwrap_or_else(|error| {
                 tracing::warn!(
                     mime_type = %mime_type,
@@ -167,6 +204,12 @@ fn build_stt_form(audio: &SttAudio, language: Option<&str>, keyterms: &[String])
     form
 }
 
+/// Convert provider usage into Chudbot usage records and fill cost gaps.
+///
+/// xAI media endpoints can return token-style usage records for accounting, but
+/// the STT response has historically omitted cost. This function preserves any
+/// provider usage and attaches a duration estimate only when every returned
+/// record lacks cost data.
 fn stt_usage_with_cost_estimate(
     provider: &ProviderName,
     model: Option<ModelId>,
@@ -194,6 +237,7 @@ fn stt_usage_with_cost_estimate(
     records
 }
 
+/// Build a duration-only STT usage record using the configured REST price.
 fn estimated_stt_usage(
     provider: &ProviderName,
     model: Option<ModelId>,
@@ -221,6 +265,10 @@ fn estimated_stt_usage(
     }
 }
 
+/// Partial xAI `/stt` response shape used by the adapter.
+///
+/// Optional/defaulted fields keep decoding tolerant of model/API variants that
+/// only return transcript text and a subset of metadata.
 #[derive(Debug, Deserialize)]
 struct SttResponse {
     text: String,
@@ -236,6 +284,7 @@ struct SttResponse {
     usage: Option<Value>,
 }
 
+/// Word-level timing metadata from xAI STT.
 #[derive(Debug, Deserialize)]
 struct SttWord {
     text: String,
@@ -322,6 +371,7 @@ mod tests {
     }
 }
 
+/// Channel-level transcript segment from multi-channel STT output.
 #[derive(Debug, Deserialize)]
 struct SttChannel {
     #[serde(default)]

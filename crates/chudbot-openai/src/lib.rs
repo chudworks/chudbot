@@ -1,4 +1,10 @@
 //! OpenAI provider crate for chudbot.
+//!
+//! This crate adapts OpenAI's public APIs to the provider-neutral contracts in
+//! `chudbot-api`. The language-model implementation uses the Responses API,
+//! the image implementation uses the OpenAI image endpoints, and the shared
+//! client in this module owns transport, retry classification, request/response
+//! logging, and local cost-estimation tables.
 
 mod image;
 mod llm;
@@ -12,12 +18,18 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
+/// Provider-specific Responses API options decoded from an agent model spec.
 pub use llm::OpenAiOptions;
+/// Cost-estimation override types accepted by the OpenAI runtime service.
 pub use pricing::{OpenAiImagePricing, OpenAiTokenPricing};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
-/// OpenAI API client.
+/// Shared OpenAI API client used by the LLM and image providers.
+///
+/// The client is intentionally small: it keeps the configured provider name
+/// for trace attribution, the base URL for gateway/test deployments, and the
+/// pricing tables needed to attach local cost estimates to usage records.
 #[derive(Debug, Clone)]
 pub struct OpenAiClient {
     http: reqwest::Client,
@@ -28,7 +40,10 @@ pub struct OpenAiClient {
 }
 
 impl OpenAiClient {
-    /// Construct from a configured provider name and OpenAI API key.
+    /// Construct a client for a configured provider name and OpenAI API key.
+    ///
+    /// The provider name is the runtime service key from config, not the model
+    /// id. It is carried through logs, continuations, and usage records.
     pub fn new(provider_name: ProviderName, api_key: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -39,35 +54,39 @@ impl OpenAiClient {
         }
     }
 
-    /// Override the base URL. Useful for local tests or gateway deployments.
+    /// Override the API base URL.
+    ///
+    /// The URL should include the API version prefix, for example
+    /// `https://api.openai.com/v1`. Tests and compatible gateways use this to
+    /// route the same request builders to non-production endpoints.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
         self
     }
 
-    /// Override or add text-token pricing entries used for cost estimates.
+    /// Override or add text-token pricing entries used for local cost estimates.
     pub fn with_token_pricing(mut self, pricing: BTreeMap<ModelId, OpenAiTokenPricing>) -> Self {
         self.pricing.apply_token_overrides(pricing);
         self
     }
 
-    /// Override or add image-token pricing entries used for cost estimates.
+    /// Override or add image-token pricing entries used for local cost estimates.
     pub fn with_image_pricing(mut self, pricing: BTreeMap<ModelId, OpenAiImagePricing>) -> Self {
         self.pricing.apply_image_overrides(pricing);
         self
     }
 
-    /// Borrow the underlying HTTP client.
+    /// Borrow the underlying HTTP client for endpoint-specific request builders.
     pub fn http(&self) -> &reqwest::Client {
         &self.http
     }
 
-    /// Borrow the API key.
+    /// Borrow the API key for request builders that cannot use `post_json`.
     pub fn api_key(&self) -> &str {
         &self.api_key
     }
 
-    /// Borrow the base URL.
+    /// Borrow the configured API base URL.
     pub fn base_url(&self) -> &str {
         &self.base_url
     }
@@ -97,6 +116,8 @@ impl OpenAiClient {
             base_url = %self.base_url,
             "sending OpenAI JSON request"
         );
+        // Request builders are consumed by `send`, so construct a fresh one for
+        // every retry attempt while keeping response decoding in one shared path.
         with_retry(RetryPolicy::default(), label, || {
             let request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
             async move {
@@ -132,6 +153,8 @@ impl OpenAiClient {
             base_url = %self.base_url,
             "sending OpenAI JSON GET request"
         );
+        // Model metadata fetches use the same retry and decode behavior as JSON
+        // writes so transport failures classify consistently across endpoints.
         with_retry(RetryPolicy::default(), label, || {
             let request = self.http.get(&url).bearer_auth(&self.api_key);
             async move {
@@ -157,6 +180,11 @@ impl OpenAiClient {
     }
 }
 
+/// Remove top-level null fields before sending JSON to OpenAI.
+///
+/// Request builders use `then_some(...).flatten()` to express optional API
+/// fields. Stripping only the top-level object preserves nested payloads while
+/// keeping provider requests free of explicit JSON nulls.
 pub(crate) fn json_strip_nulls(mut value: Value) -> Value {
     if let Value::Object(map) = &mut value {
         map.retain(|_, v| !v.is_null());
@@ -164,6 +192,7 @@ pub(crate) fn json_strip_nulls(mut value: Value) -> Value {
     value
 }
 
+/// Decode a JSON response after status handling and redacted debug logging.
 pub(crate) async fn decode_response<T>(
     resp: reqwest::Response,
     provider: &ProviderName,
@@ -173,6 +202,8 @@ where
     T: for<'de> Deserialize<'de>,
 {
     let status = resp.status();
+    // Read the body once so the error path, debug logs, and typed decode all
+    // operate on the same bytes from reqwest.
     let body = resp.text().await.map_err(|e| {
         tracing::warn!(
             status = status.as_u16(),
@@ -182,6 +213,8 @@ where
         OpenAiError::Decode(e.to_string())
     })?;
     if !status.is_success() {
+        // Keep detailed payloads available at DEBUG, but return a short error
+        // body because API errors are stored and surfaced outside this crate.
         log_text_response(provider, endpoint, status.as_u16(), &body);
         let body = truncate_body(body, 600);
         tracing::warn!(
@@ -195,6 +228,8 @@ where
         });
     }
 
+    // Decode through `Value` first so debug logs can redact the raw provider
+    // shape before the endpoint-specific response type consumes it.
     let value = serde_json::from_str::<Value>(&body).map_err(|e| {
         tracing::warn!(
             status = status.as_u16(),
@@ -221,6 +256,7 @@ pub(crate) fn truncate_body(mut body: String, max: usize) -> String {
     body
 }
 
+/// Log an outbound JSON request with media and encrypted payloads redacted.
 pub(crate) fn log_json_request(provider: &ProviderName, endpoint: &str, body: &Value) {
     if tracing::enabled!(tracing::Level::DEBUG) {
         let body = stringify_redacted_json(body);
@@ -284,6 +320,9 @@ fn redact_string(key: Option<&str>, text: &str) -> String {
         return redacted;
     }
 
+    // OpenAI image and reasoning payloads can be very large. The key-aware path
+    // catches known response fields, while the `data` heuristic covers API
+    // variants without hiding ordinary text fields.
     let known_payload_key = matches!(key, Some("b64_json" | "encrypted_content"));
     let possible_payload_key = matches!(key, Some("data"));
     if known_payload_key || (possible_payload_key && looks_like_base64(text)) {

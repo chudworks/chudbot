@@ -4,6 +4,25 @@
 //! around how a SQL database happens to expose rows. A Postgres implementation
 //! can still answer them with joins and indexes; a JSON-file implementation
 //! could answer the same calls by loading one document.
+//!
+//! # Runtime Flow
+//!
+//! 1. Platform code resolves an incoming message to an existing conversation
+//!    with [`ConversationLookup`] or opens one with [`OpenConversation`].
+//! 2. The bot starts a [`Turn`] with [`BeginTurn`], captures the prompt and
+//!    model-facing context with [`SaveTurnInput`], then appends tool and model
+//!    step trace rows as the agent runs.
+//! 3. Platform messages and threads are connected back to durable state through
+//!    [`MessageLink`] and [`ChannelLink`].
+//! 4. [`FinishTurn`] records the terminal outcome, usage, reply text, and the
+//!    response ordering that future turns may replay.
+//! 5. The trace viewer and future model requests load [`ConversationSnapshot`],
+//!    while background memory jobs use the user-memory DTOs and job contracts
+//!    near the bottom of this module.
+//!
+//! The storage backend owns atomicity for operations that allocate ordinals,
+//! claim leases, or decide retry eligibility. The bot runtime owns provider
+//! calls, platform IO, and policy decisions before it invokes this trait.
 
 use std::future::Future;
 
@@ -20,29 +39,37 @@ use crate::tool::ToolTrace;
 use crate::transcript::{ProviderContinuation, Transcript};
 use crate::usage::{UsageCostQuery, UsageCostRow, UsageRecord};
 
-/// Privacy mode for context gathering.
+// Conversation lifecycle, trace replay, and runtime policy DTOs.
+
+/// Privacy mode for context gathering before a model request.
+///
+/// The runtime interprets these modes when choosing how much platform history
+/// to fetch. Storage only persists the selected policy and user opt-in state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum PrivacyMode {
-    /// Open channel-history access.
+    /// Fetch history visible in the active channel.
     Open {
-        /// History size.
+        /// Maximum platform messages to include.
         history_size: u32,
     },
-    /// Only operate in one channel.
+    /// Fetch history only from a configured channel.
     ChannelOnly {
         /// Allowed channel.
         channel: ChannelRef,
-        /// History size.
+        /// Maximum platform messages to include.
         history_size: u32,
     },
-    /// Per-user opt-in.
+    /// Fetch history, but redact messages for users who have not opted in.
     OptIn,
-    /// Only conversation history.
+    /// Rebuild context only from stored conversation turns.
     ConversationOnly,
 }
 
-/// How to locate a conversation.
+/// Durable handles that can identify a conversation.
+///
+/// Message and channel lookups go through storage-owned link tables so platform
+/// adapters do not need to know the internal conversation id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConversationLookup {
@@ -64,8 +91,10 @@ pub enum ConversationLookup {
     },
 }
 
-/// Full conversation snapshot needed to prepare later model requests and
-/// render a trace.
+/// Read model for a conversation and all trace data needed by callers.
+///
+/// This is the main read shape for both prompt replay and `/c/<id>` rendering:
+/// callers do not stitch separate row types together outside storage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationSnapshot {
     /// Conversation metadata.
@@ -74,7 +103,7 @@ pub struct ConversationSnapshot {
     pub turns: Vec<TurnSnapshot>,
 }
 
-/// Conversation metadata.
+/// Conversation metadata shared by future turns and the trace viewer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {
     /// Conversation id.
@@ -108,7 +137,11 @@ pub struct Conversation {
     pub stopped_by: Option<UserRef>,
 }
 
-/// One turn plus the trace data needed to reconstruct model input.
+/// One turn plus the trace data needed to reconstruct model input and output.
+///
+/// The vectors are already ordered for replay/rendering. Storage backends should
+/// do that ordering once instead of leaking table-specific sort rules to
+/// callers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnSnapshot {
     /// Turn metadata.
@@ -129,6 +162,10 @@ pub struct TurnSnapshot {
 }
 
 /// Provider model-step trace for replay and audit.
+///
+/// A single user turn may involve multiple provider calls when the model asks
+/// for tools or continuation. Each step records the provider/model boundary and
+/// the opaque continuation the provider needs for future replay.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelStepTrace {
     /// Zero-based model step ordinal within the attempt.
@@ -144,6 +181,8 @@ pub struct ModelStepTrace {
 }
 
 /// Model step terminal kind.
+///
+/// This describes why one provider call stopped, not the final turn status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelStepKind {
@@ -155,7 +194,12 @@ pub enum ModelStepKind {
     ClientTools,
 }
 
-/// Turn metadata.
+/// Turn metadata for one user message.
+///
+/// Turn ordering has two axes: [`Self::ordinal`] tracks user-message arrival,
+/// while [`Self::response_ordinal`] tracks which assistant replies are eligible
+/// for future replay. That split lets hot-thread turns run concurrently without
+/// leaking incomplete or later replies into an earlier prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Turn {
     /// Turn id.
@@ -232,6 +276,11 @@ pub enum TurnStatus {
 }
 
 /// Context item persisted for trace/viewer replay.
+///
+/// These are normalized model-input records. They may point at platform
+/// messages, stored media, memory recall, or tool-generated context; the source
+/// string is intentionally runtime-defined so new context producers do not need
+/// new storage API methods.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextItem {
     /// Position in the turn context.
@@ -247,6 +296,9 @@ pub struct ContextItem {
 }
 
 /// Asset associated with a turn.
+///
+/// Assets are stored separately from transcript text so traces can replay media
+/// by stable [`MediaUri`] without embedding bytes in conversation rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TurnAsset {
     /// Stored asset URI.
@@ -259,7 +311,7 @@ pub struct TurnAsset {
     pub mime_type: Option<String>,
 }
 
-/// New conversation input.
+/// Input for opening a new durable conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenConversation {
     /// Channel where it starts.
@@ -280,7 +332,10 @@ pub struct OpenConversation {
     pub title: Option<String>,
 }
 
-/// Begin a turn in a conversation.
+/// Input for allocating a new turn in a conversation.
+///
+/// Storage uses this to allocate the user-message ordinal and capture the
+/// history cutoff before model work starts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeginTurn {
     /// Conversation id.
@@ -299,6 +354,11 @@ pub struct BeginTurn {
 }
 
 /// Save the prompt/context metadata for a turn before the model runs.
+///
+/// This call marks the boundary between runtime prompt assembly and provider
+/// execution. Implementations may persist both normalized context rows and the
+/// optional transcript snapshot, but callers must not assume every backend
+/// stores the transcript verbatim.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveTurnInput {
     /// Turn id.
@@ -313,13 +373,20 @@ pub struct SaveTurnInput {
     pub system_instructions: String,
     /// Context items.
     pub context: Vec<ContextItem>,
-    /// Initial transcript assembled from the context. This is optional
-    /// because some stores may only persist normalized context rows.
+    /// Initial transcript assembled from the context.
+    ///
+    /// This is skipped during serialization because it is a runtime convenience,
+    /// not part of the portable storage DTO. Some stores persist only the
+    /// normalized context rows above.
     #[serde(skip)]
     pub transcript: Option<Transcript>,
 }
 
-/// Finish a turn.
+/// Terminal update for a turn.
+///
+/// A completed turn becomes replayable for later model requests. Failed and
+/// cancelled turns remain visible in traces but do not receive a response
+/// ordinal unless a later retry succeeds.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FinishTurn {
@@ -359,6 +426,10 @@ pub enum FinishTurn {
 }
 
 /// Link from a platform message to a conversation/turn.
+///
+/// This is the storage boundary that lets platform replies, edits, and follow-up
+/// messages find the internal conversation without embedding Chudbot ids in the
+/// platform payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageLink {
     /// Platform message.
@@ -372,6 +443,9 @@ pub struct MessageLink {
 }
 
 /// Link from a platform channel/thread to a conversation/turn.
+///
+/// Thread-like platforms may expose the reply surface as its own channel id.
+/// This link keeps that platform shape out of the conversation model.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelLink {
     /// Platform channel.
@@ -400,6 +474,9 @@ pub struct RetryTurn {
 }
 
 /// Conversation stop/resume request.
+///
+/// Stopping is durable state, not a platform-only affordance, so future events
+/// can consistently reject or resume work across process restarts.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ConversationStop {
@@ -417,7 +494,10 @@ pub enum ConversationStop {
     },
 }
 
-/// Agent resolution input.
+/// Inputs needed to resolve the effective agent selection for an event.
+///
+/// The runtime passes every scope it knows; storage applies the precedence used
+/// by persisted selections.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResolveAgent {
     /// Messaging platform/provider name.
@@ -433,6 +513,9 @@ pub struct ResolveAgent {
 }
 
 /// Scoped agent selection target.
+///
+/// The variants are ordered from narrowest to broadest. Resolution checks can
+/// walk the same hierarchy without making callers understand storage keys.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case")]
 pub enum AgentSelection {
@@ -482,7 +565,13 @@ pub struct RuntimeSettings {
     pub user_opted_in: bool,
 }
 
+// Media generation, viewer profile, and user-memory DTOs.
+
 /// Video job status persisted by storage.
+///
+/// Async video providers return provider job ids first and assets later. This
+/// row is the durable join point between a turn, provider polling, and the final
+/// stored media URI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredVideoJob {
     /// Turn id.
@@ -530,6 +619,9 @@ pub struct UpdateVideoJob {
 }
 
 /// Input for counting video generations that consume a rolling-window quota.
+///
+/// Storage counts jobs by platform scope so the runtime can enforce limits
+/// without hard-coding provider-specific job states.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CountActiveVideoGenerations {
     /// Messaging platform whose video generations are counted.
@@ -542,6 +634,9 @@ pub struct CountActiveVideoGenerations {
 }
 
 /// Stored user metadata for viewer read models.
+///
+/// This is deliberately a viewer/read shape: runtime identity comes from
+/// [`UserRef`], while this DTO carries display and avatar data for trace pages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredUserProfile {
     /// Last platform profile seen for this user.
@@ -551,6 +646,10 @@ pub struct StoredUserProfile {
 }
 
 /// Platform-neutral key for one user's memory in one workspace/scope.
+///
+/// The `scope_key` is already normalized by the platform/runtime layer, usually
+/// with a prefix such as `guild:`. Storage treats the three fields as opaque
+/// equality keys and does not parse platform-specific ids.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct UserMemoryKey {
     /// Messaging platform, e.g. `discord`.
@@ -562,13 +661,15 @@ pub struct UserMemoryKey {
 }
 
 impl UserMemoryKey {
-    /// Stable key used by durable memory job leases and dedupe records.
+    /// Stable string key used by durable memory job leases and dedupe records.
     pub fn memory_key(&self) -> String {
+        // Keep this flat and deterministic: leases compare the rendered key
+        // without needing to understand platform-specific scope syntax.
         format!("{}:{}:{}", self.platform, self.scope_key, self.user_key)
     }
 }
 
-/// Raw user-memory event kind.
+/// Raw user-memory event kind for the append-only memory ledger.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UserMemoryEventKind {
@@ -585,6 +686,10 @@ pub enum UserMemoryEventKind {
 }
 
 /// Raw user-memory ledger event.
+///
+/// Events are provenance-rich inputs to memory compaction. They are not the
+/// current profile by themselves; [`UserMemoryDocument`] is the compact read
+/// model used for lookup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMemoryEvent {
     /// Event id.
@@ -618,6 +723,9 @@ pub struct UserMemoryEvent {
 }
 
 /// Input for appending a memory ledger event.
+///
+/// Appends may be produced by tools, operators, diary jobs, or future import
+/// paths. Storage assigns ids and timestamps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewUserMemoryEvent {
     /// Subject user.
@@ -643,6 +751,10 @@ pub struct NewUserMemoryEvent {
 }
 
 /// Generated diary artifact for one user's recent turns.
+///
+/// A diary entry summarizes a bounded turn window and becomes source material
+/// for later compaction. It is also exposed to memory lookup as recent context
+/// without replacing the compact profile.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMemoryDiaryEntry {
     /// Entry id.
@@ -701,6 +813,10 @@ pub struct NewUserMemoryDiaryEntry {
 }
 
 /// Current compact user memory profile.
+///
+/// This is the profile shape consumed by lookup tools. It records source
+/// cutoffs so storage can ask for only newly pending ledger events and diary
+/// entries during the next compaction pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMemoryDocument {
     /// Subject user.
@@ -727,6 +843,9 @@ pub struct UserMemoryDocument {
 }
 
 /// Input for replacing the compact memory document.
+///
+/// Saving a revision should update the current document and preserve a
+/// historical revision/source row atomically in backends that support it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NewUserMemoryDocumentRevision {
     /// Subject user.
@@ -754,6 +873,9 @@ pub struct NewUserMemoryDocumentRevision {
 }
 
 /// Durable memory job kind.
+///
+/// Memory work is split so diary jobs summarize raw turns, then compact jobs
+/// merge ledger and diary material into the current profile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryJobKind {
@@ -764,6 +886,9 @@ pub enum MemoryJobKind {
 }
 
 /// Durable memory job claimed for processing.
+///
+/// Jobs use leases rather than in-process queues so multiple bot processes can
+/// share work and recover abandoned jobs after a crash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMemoryJob {
     /// Job id.
@@ -792,6 +917,9 @@ pub struct UserMemoryJob {
 }
 
 /// Scheduler inputs for enqueueing due memory work.
+///
+/// The scheduler passes policy timestamps; storage decides which users/windows
+/// are due and deduplicates active jobs.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct MemoryJobSchedule {
     /// Scheduler timestamp.
@@ -811,6 +939,9 @@ pub struct MemoryJobSchedule {
 }
 
 /// Memory job completion status.
+///
+/// A worker reports the result of a claimed job with this enum. Storage then
+/// clears the lease, schedules the next attempt, or marks the job terminal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum MemoryJobCompletion {
@@ -839,8 +970,9 @@ pub enum MemoryJobCompletion {
 }
 
 impl MemoryJobCompletion {
-    /// Borrow the completed job id.
+    /// Borrow the job id shared by every completion outcome.
     pub fn job_id(&self) -> uuid::Uuid {
+        // Every variant is a state transition for exactly one leased job row.
         match self {
             Self::Completed { job_id }
             | Self::Retry { job_id, .. }
@@ -850,6 +982,10 @@ impl MemoryJobCompletion {
 }
 
 /// Request for a bounded memory diary transcript window.
+///
+/// The memory worker uses this to load only completed turns for one subject and
+/// one time window. Storage filters replay-only material before returning
+/// [`UserMemoryTurn`] rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryTurnWindow {
     /// Subject user.
@@ -865,6 +1001,10 @@ pub struct MemoryTurnWindow {
 }
 
 /// One completed turn loaded for the memory pipeline.
+///
+/// This is narrower than [`TurnSnapshot`]: diary generation needs the user and
+/// assistant text plus selected media/tool outputs, not every persisted trace
+/// row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMemoryTurn {
     /// Conversation id.
@@ -915,13 +1055,23 @@ pub struct UserMemoryAudioTranscription {
 }
 
 /// Bot persistence API.
+///
+/// The trait is organized in the order the runtime usually touches storage:
+/// conversation/turn lifecycle, message/channel links, runtime policy,
+/// generated media accounting, usage reports, and background user-memory work.
+/// Implementations own transactional details for allocation, ordering, retry
+/// eligibility, and job leasing; callers receive workflow-shaped results.
 pub trait BotStorage: Send + Sync {
     /// Storage error type.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    // Conversation lifecycle and trace capture.
+
     /// Load a complete conversation snapshot by id or by linked platform
-    /// message. This is the primary history-loading operation for follow-up
-    /// model requests.
+    /// message/channel.
+    ///
+    /// This is the primary history-loading operation for follow-up model
+    /// requests and the web trace viewer.
     fn load_conversation(
         &self,
         lookup: ConversationLookup,
@@ -933,7 +1083,7 @@ pub trait BotStorage: Send + Sync {
         input: OpenConversation,
     ) -> impl Future<Output = Result<ConversationSnapshot, Self::Error>> + Send;
 
-    /// Begin a new turn.
+    /// Begin a new turn and allocate its ordering metadata.
     fn begin_turn(
         &self,
         input: BeginTurn,
@@ -961,6 +1111,8 @@ pub trait BotStorage: Send + Sync {
         trace: ModelStepTrace,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    // Platform link indexes.
+
     /// Link a platform message to a turn/conversation.
     fn link_message(
         &self,
@@ -986,6 +1138,10 @@ pub trait BotStorage: Send + Sync {
     ) -> impl Future<Output = Result<Vec<MessageLink>, Self::Error>> + Send;
 
     /// Complete, fail, or cancel a turn.
+    ///
+    /// Implementations should persist usage with the terminal update. On
+    /// success, they also assign the response ordinal that makes the assistant
+    /// reply replayable for later turns.
     fn finish_turn(
         &self,
         input: FinishTurn,
@@ -1003,6 +1159,8 @@ pub trait BotStorage: Send + Sync {
         &self,
         input: ConversationStop,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+
+    // Runtime policy and user/profile metadata.
 
     /// Resolve the effective agent name for a turn.
     fn resolve_agent(
@@ -1094,6 +1252,8 @@ pub trait BotStorage: Send + Sync {
         title: String,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    // Generated media and usage accounting.
+
     /// Create a video job.
     fn create_video_job(
         &self,
@@ -1119,6 +1279,8 @@ pub trait BotStorage: Send + Sync {
         &self,
         query: UsageCostQuery,
     ) -> impl Future<Output = Result<Vec<UsageCostRow>, Self::Error>> + Send;
+
+    // User-memory ledger, compaction, and durable job queue.
 
     /// Load the current compact memory profile for one user.
     fn load_user_memory_document(

@@ -1,4 +1,10 @@
 //! Google Gemini API language-model implementation.
+//!
+//! This module is the provider boundary between Chudbot's neutral transcript,
+//! tool, and usage contracts and Gemini's `generateContent` JSON shape. It owns
+//! request translation, response walking, provider continuations, server-tool
+//! metadata, and usage decoding; transport, authentication, and media helpers
+//! live in sibling modules.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -23,6 +29,8 @@ impl LlmBackend for GeminiClient {
 
     #[tracing::instrument(name = "gemini.step", skip_all, fields(model = %request.model))]
     async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
+        // Convert the durable transcript first so Gemini continuations can
+        // short-circuit re-encoding for provider-native content.
         let contents = to_gemini_contents(&request.transcript, self.provider_name()).await?;
         let tools = build_tools(&request.client_tools, &request.server_tools);
         let tool_config = build_tool_config(&request.server_tools);
@@ -41,6 +49,9 @@ impl LlmBackend for GeminiClient {
         let endpoint = format!("/models/{}:generateContent", request.model.as_str());
         let started = Instant::now();
         let parsed: Value = self.post_json(&endpoint, &body, "llm[gemini]").await?;
+        // Chudbot consumes only the first candidate today. The raw candidate
+        // content is kept as a continuation so follow-up turns can echo Gemini's
+        // native function-call and thought-bearing parts back to the provider.
         let candidate = parsed
             .get("candidates")
             .and_then(Value::as_array)
@@ -66,6 +77,8 @@ impl LlmBackend for GeminiClient {
 
         let (text, client_tool_calls, mut server_tool_uses, mut grounding) =
             walk_content(content, self.provider_name());
+        // Gemini may attach grounding and server-side web-search metadata at
+        // the candidate level instead of inside individual parts.
         if let Some(metadata) = get_field(candidate, "groundingMetadata", "grounding_metadata") {
             grounding.push(GroundingMetadata {
                 provider: self.provider_name().clone(),
@@ -128,11 +141,13 @@ impl LlmBackend for GeminiClient {
     }
 }
 
+/// Builds a Gemini model endpoint from either `gemini-*` or `models/gemini-*`.
 fn gemini_model_endpoint(model: &ModelId) -> String {
     let model = model.as_str().trim_start_matches("models/");
     format!("/models/{model}")
 }
 
+/// Normalizes Gemini model metadata into the provider-neutral `ModelInfo`.
 fn model_info_from_gemini(requested_model: ModelId, raw: Value) -> ModelInfo {
     let id = get_field(&raw, "baseModelId", "base_model_id")
         .and_then(Value::as_str)
@@ -163,6 +178,12 @@ fn value_as_u64(value: &Value) -> Option<u64> {
     }
 }
 
+/// Converts a Chudbot transcript into Gemini `contents` entries.
+///
+/// Provider continuations are emitted verbatim when present. Otherwise each
+/// turn is rebuilt from neutral text, media, client-tool call, and tool-result
+/// blocks. A call-id to name index is carried forward because Gemini requires a
+/// `functionResponse.name`, while Chudbot tool results only store the call id.
 async fn to_gemini_contents(
     transcript: &Transcript,
     provider: &ProviderName,
@@ -214,6 +235,7 @@ async fn to_gemini_contents(
     Ok(contents)
 }
 
+/// Returns the Gemini-native content saved from a previous model response.
 fn provider_continuation_content(
     turn: &chudbot_api::TranscriptTurn,
     provider: &ProviderName,
@@ -223,6 +245,8 @@ fn provider_continuation_content(
             && &continuation.provider == provider
         {
             let mut data = continuation.data.clone();
+            // Older continuations may predate role persistence. Gemini content
+            // is model-authored in this position, so default to `model`.
             if data.get("role").is_none()
                 && let Some(obj) = data.as_object_mut()
             {
@@ -234,6 +258,7 @@ fn provider_continuation_content(
     None
 }
 
+/// Adds function-call names from an echoed continuation to the local call index.
 fn index_function_calls(content: &Value, call_names: &mut BTreeMap<String, String>) {
     let Some(parts) = content.get("parts").and_then(Value::as_array) else {
         return;
@@ -249,6 +274,7 @@ fn index_function_calls(content: &Value, call_names: &mut BTreeMap<String, Strin
     }
 }
 
+/// Converts system instructions into Gemini's separate `systemInstruction`.
 fn system_instruction(transcript: &Transcript) -> Option<Value> {
     transcript
         .instructions
@@ -257,6 +283,7 @@ fn system_instruction(transcript: &Transcript) -> Option<Value> {
         .map(|instructions| json!({ "parts": [{ "text": instructions }] }))
 }
 
+/// Encodes a Chudbot client-tool call as a Gemini `functionCall` part.
 fn function_call_part(call: &ClientToolCall) -> Value {
     json!({
         "functionCall": {
@@ -267,6 +294,7 @@ fn function_call_part(call: &ClientToolCall) -> Value {
     })
 }
 
+/// Encodes a Chudbot client-tool result as a Gemini `functionResponse` part.
 fn function_response_part(result: &ClientToolResult, name: &str) -> Value {
     json!({
         "functionResponse": {
@@ -277,6 +305,7 @@ fn function_response_part(result: &ClientToolResult, name: &str) -> Value {
     })
 }
 
+/// Shapes arbitrary tool output into Gemini's required response object.
 fn tool_result_response(result: &ClientToolResult) -> Value {
     let mut response = Map::new();
     match &result.content {
@@ -296,9 +325,12 @@ fn tool_result_response(result: &ClientToolResult) -> Value {
             response.insert("result".to_string(), Value::String(text.clone()));
         }
     }
+    // Gemini expects the response field to be an object even when a tool returns
+    // a scalar, array, or plain text value.
     Value::Object(response)
 }
 
+/// Builds Gemini tool declarations for Chudbot client tools and server tools.
 fn build_tools(
     client_tools: &BTreeMap<ToolName, ClientToolSpec>,
     server_tools: &ServerToolSet,
@@ -321,12 +353,14 @@ fn build_tools(
     tools
 }
 
+/// Requests provider-side server-tool telemetry when Gemini web search is on.
 fn build_tool_config(server_tools: &ServerToolSet) -> Option<Value> {
     server_tools
         .contains("web_search")
         .then(|| json!({ "includeServerSideToolInvocations": true }))
 }
 
+/// Builds the optional Gemini generation config from neutral sampling knobs.
 fn build_generation_config(request: &ModelStepRequest, options: &GeminiOptions) -> Option<Value> {
     let thinking_config = build_thinking_config(options);
     let value = json_strip_nulls(json!({
@@ -341,6 +375,7 @@ fn build_generation_config(request: &ModelStepRequest, options: &GeminiOptions) 
     }
 }
 
+/// Builds Gemini's thinking config only when caller-supplied options exist.
 fn build_thinking_config(options: &GeminiOptions) -> Option<Value> {
     let value = json_strip_nulls(json!({
         "thinkingLevel": options.thinking_level.as_deref(),
@@ -353,6 +388,10 @@ fn build_thinking_config(options: &GeminiOptions) -> Option<Value> {
     }
 }
 
+/// Walks Gemini response parts into Chudbot text, tool calls, and metadata.
+///
+/// Thought text is intentionally omitted from user-facing assistant content, but
+/// preserved in the provider continuation stored on the resulting step.
 fn walk_content(
     content: &Value,
     provider: &ProviderName,
@@ -377,6 +416,9 @@ fn walk_content(
         if !thought && let Some(part_text) = part.get("text").and_then(Value::as_str) {
             text.push_str(part_text);
         }
+        // Gemini function calls map directly to Chudbot client-tool calls. Code
+        // execution is provider-side and remains a raw server-tool record for
+        // the trace viewer.
         if let Some(function_call) = get_field(part, "functionCall", "function_call") {
             client_tool_calls.push(client_tool_call_from_part(function_call));
         }
@@ -413,6 +455,7 @@ fn walk_content(
     (text, client_tool_calls, server_tool_uses, grounding)
 }
 
+/// Decodes a Gemini `functionCall` part into a neutral client-tool call.
 fn client_tool_call_from_part(function_call: &Value) -> ClientToolCall {
     let id = function_call
         .get("id")
@@ -434,6 +477,7 @@ fn client_tool_call_from_part(function_call: &Value) -> ClientToolCall {
     }
 }
 
+/// Stores Gemini content for the next turn when there are native parts to echo.
 fn continuation_from_content(
     provider: &ProviderName,
     content: &Value,
@@ -448,6 +492,7 @@ fn continuation_from_content(
     })
 }
 
+/// Applies provider-specific escape hatches after the normal request is built.
 fn merge_extra_body(body: &mut Value, extra_body: Option<Value>) {
     let Some(Value::Object(extra)) = extra_body else {
         return;
@@ -460,6 +505,7 @@ fn merge_extra_body(body: &mut Value, extra_body: Option<Value>) {
     }
 }
 
+/// Emits a structured usage event without making usage required for success.
 fn log_usage(model: &str, usage: Option<&UsageRecord>, elapsed: Duration) {
     let duration_ms = elapsed.as_millis() as u64;
     match usage {
@@ -483,6 +529,7 @@ fn log_usage(model: &str, usage: Option<&UsageRecord>, elapsed: Duration) {
     }
 }
 
+/// Converts Gemini usage metadata into Chudbot's normalized usage record.
 pub(crate) fn usage_from_gemini(
     provider: &ProviderName,
     model: Option<ModelId>,
@@ -505,7 +552,11 @@ pub(crate) fn usage_from_gemini(
     })
 }
 
-/// Gemini-specific per-request knobs.
+/// Gemini-specific per-request knobs accepted through agent provider options.
+///
+/// These fields are intentionally close to Gemini's request names. Unknown
+/// fields are rejected when this type is deserialized directly, keeping
+/// provider-option validation strict instead of silently accepting stale keys.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GeminiOptions {
@@ -533,6 +584,7 @@ impl GeminiOptions {
     }
 }
 
+/// Gemini usage payload, accepting both snake_case and lowerCamelCase names.
 #[derive(Deserialize, Debug, Default)]
 struct UsageMetadata {
     #[serde(default, alias = "promptTokenCount")]

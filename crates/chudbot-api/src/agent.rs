@@ -1,4 +1,27 @@
-//! Agent runtime and sub-agent adapters.
+//! Provider-neutral agent runtime and sub-agent adapters.
+//!
+//! This module is the orchestration contract between a configured model,
+//! provider-neutral transcripts, and locally executed client tools. It does not
+//! know about Discord, storage, HTTP providers, or concrete tool registries:
+//! callers build those pieces elsewhere and pass in a [`Model`] plus one
+//! [`ClientToolExecutor`].
+//!
+//! A normal run flows through four stages:
+//!
+//! 1. [`AgentSpec`] supplies static agent behavior: instructions, loop limits,
+//!    and optional tool allowlists.
+//! 2. [`Agent::run`] injects the instructions into the incoming [`Transcript`],
+//!    normalizes model/agent tool exposure, and calls the [`LlmBackend`] one
+//!    step at a time.
+//! 3. Provider-side tools and grounding are recorded as trace data, while
+//!    client-side tool calls are executed locally and returned to the model as a
+//!    user turn.
+//! 4. The final [`AgentRun`] returns the completed transcript, provider
+//!    continuation data, trace records, and usage records that higher layers can
+//!    persist.
+//!
+//! [`Subagent`] reuses the same runner contract to expose one configured agent
+//! as a client-side tool for another agent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -21,20 +44,28 @@ use crate::tool::{
 use crate::transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptTurn, TurnRole};
 use crate::usage::UsageRecord;
 
-/// Static agent configuration.
+/// Static, provider-neutral agent configuration.
 ///
-/// This is TOML-shaped data. It intentionally does not carry runtime tool
-/// implementations.
+/// This is TOML-shaped data for the parts of an agent that are independent of
+/// a concrete provider or platform. It intentionally does not carry runtime
+/// tool implementations, provider clients, or model routing; callers pair it
+/// with a [`Model`] and a [`ClientToolExecutor`] when building an [`Agent`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
     /// Agent instructions applied to each run's transcript.
     pub system_prompt: String,
-    /// Provider-side/server-side tools this agent allows. `None` means all
-    /// server tools allowed by the model config are available.
+    /// Provider-side/server-side tools this agent allows.
+    ///
+    /// `None` means every server tool allowed by the model config is available
+    /// to the provider. When set, the runner intersects this set with the
+    /// model's server-tool set after trimming and lowercasing names.
     #[serde(default)]
     pub server_tools: Option<ServerToolSet>,
-    /// Optional static list of client tool names enabled for this agent. `None`
-    /// means all runtime tools supplied to the agent are exposed.
+    /// Optional static list of client tool names enabled for this agent.
+    ///
+    /// `None` means every runtime tool supplied by the executor is exposed. A
+    /// populated list only filters the executor's definitions; it does not
+    /// create tools by name.
     #[serde(default)]
     pub client_tools: Option<Vec<ToolName>>,
     /// Agent loop limits.
@@ -42,7 +73,7 @@ pub struct AgentSpec {
 }
 
 impl AgentSpec {
-    /// Create an agent spec.
+    /// Create an agent spec with default loop limits and no tool restrictions.
     pub fn new(system_prompt: impl Into<String>) -> Self {
         Self {
             system_prompt: system_prompt.into(),
@@ -52,13 +83,17 @@ impl AgentSpec {
         }
     }
 
-    /// Restrict the runtime tool surface to these tool names.
+    /// Restrict the runtime client-tool surface to these tool names.
+    ///
+    /// The names are matched against the [`ClientToolDefinition`] values
+    /// returned by the runtime executor. Unknown names simply expose nothing by
+    /// themselves.
     pub fn with_client_tools(mut self, client_tools: Vec<ToolName>) -> Self {
         self.client_tools = Some(client_tools);
         self
     }
 
-    /// Set loop limits.
+    /// Set the model/tool loop limits for this agent.
     pub fn with_limits(mut self, limits: AgentLimits) -> Self {
         self.limits = limits;
         self
@@ -69,7 +104,11 @@ impl<B, T> Agent<B, T>
 where
     T: ClientToolExecutor,
 {
-    /// Construct an agent with one runtime client tool executor.
+    /// Construct a runnable agent from a model, static spec, and tool executor.
+    ///
+    /// The executor owns all local/client-side tool implementations for this
+    /// agent. Agent-level `client_tools` config is only an allowlist over the
+    /// executor's advertised definitions.
     pub fn new(model: Model<B>, spec: AgentSpec, tool_executor: T) -> Self {
         Self {
             model,
@@ -78,7 +117,11 @@ where
         }
     }
 
-    /// Convert this agent into a client-side tool.
+    /// Convert this agent into a client-side tool for another agent.
+    ///
+    /// The returned [`Subagent`] contains the nested runtime and its model-facing
+    /// description. The outer executor still chooses the actual tool name when
+    /// registering it.
     pub fn into_subagent(self, tool_description: impl Into<String>) -> Subagent<B, T> {
         Subagent {
             agent: self,
@@ -87,7 +130,12 @@ where
     }
 }
 
-/// Concrete agent built from a model, an agent spec, and runtime client tools.
+/// Concrete provider-neutral agent runtime.
+///
+/// `Agent` is intentionally small: the model contains provider routing and
+/// model config, the spec contains agent behavior, and the executor contains
+/// local tool implementations. Platform-specific code decides how to build
+/// those pieces before calling [`Self::run`].
 pub struct Agent<B, T = NoClientTools> {
     /// Callable model.
     model: Model<B>,
@@ -111,7 +159,11 @@ where
     }
 }
 
-/// Error produced while running an [`Agent`].
+/// Terminal error returned by [`Agent::run`] before an [`AgentRun`] exists.
+///
+/// Recoverable model-requested tool failures are converted into tool result
+/// blocks and sent back to the model; provider/backend failures stay out of the
+/// transcript and are returned through this error type.
 #[derive(Debug, Error)]
 pub enum AgentRunError<BE>
 where
@@ -122,10 +174,11 @@ where
     Model(#[source] BE),
 }
 
-/// Agent loop limits.
+/// Limits for the provider/tool loop inside [`Agent::run`].
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct AgentLimits {
-    /// Maximum model/tool iterations.
+    /// Maximum model steps before the run returns
+    /// [`AgentOutcome::IterationLimit`].
     pub max_iterations: u32,
 }
 
@@ -135,28 +188,40 @@ impl Default for AgentLimits {
     }
 }
 
-/// Agent run output.
+/// Complete output from a finished agent loop.
+///
+/// This is the handoff object for bot/runtime layers: it includes the
+/// model-facing transcript after the attempt, auditable tool/model traces,
+/// provider continuation state for replay, and direct model usage. Tool traces
+/// may carry additional usage from nested agents or media providers.
 #[derive(Debug, Clone)]
 pub struct AgentRun {
-    /// Final outcome.
+    /// Final outcome of the loop.
     pub outcome: AgentOutcome,
-    /// Transcript after the run.
+    /// Transcript after the run, including final assistant content or any
+    /// intermediate assistant/tool-result turns that were produced before the
+    /// loop stopped.
     pub transcript: Transcript,
-    /// Tool trace records.
+    /// Tool trace records in model-observed order.
     pub trace: Vec<ToolTrace>,
-    /// Ordered provider model-step traces.
+    /// Ordered provider model-step traces for replay and auditing.
     pub model_steps: Vec<ModelStepTrace>,
-    /// Last model id reported by a provider.
+    /// Last concrete model id reported by a provider during the run.
     pub last_model_id: Option<ModelId>,
-    /// Final provider continuation to persist for cross-turn replay.
+    /// Last provider continuation to persist for cross-turn replay.
     pub final_continuation: Option<ProviderContinuation>,
-    /// Usage/cost accumulated directly by the agent run. Tool trace entries
-    /// may also carry their own usage.
+    /// Usage/cost accumulated directly by model steps in this agent run.
+    ///
+    /// Client and server tool trace entries may also carry their own usage; use
+    /// [`Self::all_usage`] when billing/reporting code needs the full total.
     pub usage: Vec<UsageRecord>,
 }
 
 impl AgentRun {
-    /// Collect usage from the run and every traced tool that carries usage.
+    /// Collect model usage plus every traced client/server tool usage record.
+    ///
+    /// Grounding-only trace records have no usage channel today, so they are
+    /// intentionally skipped.
     pub fn all_usage(&self) -> Vec<UsageRecord> {
         let mut usage = self.usage.clone();
         for trace in &self.trace {
@@ -170,7 +235,12 @@ impl AgentRun {
     }
 }
 
-/// Agent run outcome.
+/// Outcome recorded for an agent attempt.
+///
+/// [`Agent::run`] currently returns transport/provider failures as
+/// [`AgentRunError`]. The `Failed` variant is still part of the persistable
+/// contract for higher layers that may convert non-transport failures into a
+/// partial run.
 #[derive(Debug, Clone)]
 pub enum AgentOutcome {
     /// Completed with a final answer.
@@ -185,7 +255,7 @@ pub enum AgentOutcome {
         /// Partial assistant answer if any.
         partial: Option<AssistantAnswer>,
     },
-    /// Hit the iteration cap.
+    /// Hit the iteration cap before the provider returned a final answer.
     IterationLimit {
         /// Configured maximum.
         max_iterations: u32,
@@ -197,16 +267,21 @@ pub enum AgentOutcome {
     },
 }
 
-/// Assistant answer.
+/// Final assistant answer returned by a completed run.
 #[derive(Debug, Clone)]
 pub struct AssistantAnswer {
-    /// Plain text answer. Derived from text blocks for convenience.
+    /// Plain text answer derived by concatenating final text blocks.
     pub text: String,
-    /// Full answer blocks.
+    /// Full provider-neutral answer blocks, including non-text media if present.
     pub blocks: Vec<ContentBlock>,
 }
 
-/// Agent error.
+/// Persistable agent failure reason.
+///
+/// This is separate from [`AgentRunError`]: `AgentRunError` is the Rust error
+/// channel for a run that could not produce an [`AgentRun`], while `AgentError`
+/// is stored inside [`AgentOutcome::Failed`] when higher layers have a partial
+/// run to persist.
 #[derive(Debug, Clone, Error, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AgentError {
@@ -229,7 +304,13 @@ where
     B: LlmBackend,
     T: ClientToolExecutor,
 {
-    /// Run this agent against one transcript.
+    /// Run this agent against one transcript until final answer or loop limit.
+    ///
+    /// The incoming transcript supplies the conversation turns and optional
+    /// provider routing id. The runner replaces any existing instructions with
+    /// this agent's system prompt, then repeats provider calls until the backend
+    /// returns final content, asks for client tools, asks for a provider
+    /// continuation, or the configured iteration limit is reached.
     #[tracing::instrument(
         name = "agent.run",
         skip_all,
@@ -244,6 +325,8 @@ where
         )
     )]
     pub async fn run(&self, transcript: Transcript) -> Result<AgentRun, AgentRunError<B::Error>> {
+        // Prepare model input. Agent instructions are owned by the spec, so a
+        // caller-provided transcript cannot accidentally carry stale system text.
         let Transcript { id, turns, .. } = transcript;
         let initial_turns = turns.len();
         let mut transcript = Transcript {
@@ -252,11 +335,17 @@ where
             turns,
         };
 
+        // Resolve the model-visible tool surfaces once for this run. Provider
+        // crates receive normalized server-tool names; local client tools remain
+        // keyed by the repo's typed `ToolName`.
         let client_tools = enabled_tool_specs(&self.spec, &self.tool_executor);
         let server_tools = enabled_server_tools(
             &self.model.spec.server_tools,
             self.spec.server_tools.as_ref(),
         );
+        // Populate structured tracing fields after computing the effective
+        // request shape. These fields are intentionally low-cardinality except
+        // for transcript/model ids.
         let span = tracing::Span::current();
         if let Some(id) = transcript.id.as_deref() {
             span.record("transcript_id", id);
@@ -272,6 +361,8 @@ where
         span.record("server_tools", server_tools.len());
         tracing::info!("starting agent run");
 
+        // Accumulators returned in `AgentRun`. The transcript is the model's
+        // replayable view; trace/model_steps/usage are the audit view.
         let mut trace = Vec::new();
         let mut model_steps = Vec::new();
         let mut usage = Vec::new();
@@ -280,6 +371,7 @@ where
         let provider = self.model.backend.backend_name().clone();
 
         for iteration in 0..self.spec.limits.max_iterations {
+            // Step 1: ask the routed backend what should happen next.
             tracing::debug!(
                 iteration = iteration + 1,
                 turns = transcript.turns.len(),
@@ -311,8 +403,13 @@ where
                 }
             };
 
+            // Step 2: fold the provider's step into transcript, traces, usage,
+            // and continuation state. Client tool calls get an extra local
+            // dispatch phase before the next provider step.
             match step {
                 ModelStep::Final { step } => {
+                    // Final content is both returned as `AssistantAnswer` and
+                    // appended to the replay transcript as an assistant turn.
                     model_steps.push(model_step_trace(
                         iteration,
                         ModelStepKind::Final,
@@ -357,6 +454,9 @@ where
                     });
                 }
                 ModelStep::Continue { step } => {
+                    // Continuations are provider-owned state. We record and
+                    // replay them as transcript blocks, but only the backend
+                    // that created the continuation should interpret them.
                     model_steps.push(model_step_trace(
                         iteration,
                         ModelStepKind::Continue,
@@ -380,6 +480,9 @@ where
                     append_assistant_step(&mut transcript, step);
                 }
                 ModelStep::UseClientTools { step } => {
+                    // Preserve the assistant tool-call turn before appending
+                    // local results. Providers rely on this call/result order
+                    // when converting the neutral transcript to native shapes.
                     model_steps.push(model_step_trace(
                         iteration,
                         ModelStepKind::ClientTools,
@@ -405,11 +508,17 @@ where
                     let calls = step.client_tool_calls.clone();
                     append_assistant_step(&mut transcript, step);
 
+                    // Tool calls run concurrently, then are sorted back into
+                    // the provider-requested order before they become the next
+                    // user turn.
                     let tool_results =
                         execute_client_tool_calls(&client_tools, &self.tool_executor, calls).await;
                     let mut result_blocks = Vec::with_capacity(tool_results.len());
                     for (result, tool_trace, media) in tool_results {
                         result_blocks.push(ContentBlock::ClientToolResult(result));
+                        // Media handles are shown to the next model step as
+                        // native media blocks, while the trace keeps only the
+                        // JSON/text protocol result and audit payload.
                         result_blocks
                             .extend(media.into_iter().map(|media| ContentBlock::Media { media }));
                         trace.push(ToolTrace::Client { trace: tool_trace });
@@ -429,6 +538,8 @@ where
             }
         }
 
+        // The caller still gets the partial transcript and audit data so a UI
+        // can show exactly how far the loop got before the limit stopped it.
         tracing::warn!(
             max_iterations = self.spec.limits.max_iterations,
             trace_records = trace.len(),
@@ -449,6 +560,10 @@ where
     }
 }
 
+/// Build the compact provider-step record stored with a turn.
+///
+/// `iteration` is zero-based to match `ModelStepTrace::ordinal`; logs display
+/// one-based iteration numbers for human reading.
 fn model_step_trace(
     iteration: u32,
     kind: ModelStepKind,
@@ -464,6 +579,11 @@ fn model_step_trace(
     }
 }
 
+/// Append provider-owned trace events from one model step.
+///
+/// Server tools and grounding are already complete when the provider returns a
+/// step. They do not produce local tool results, so they go straight into the
+/// trace stream instead of the transcript.
 fn append_step_trace(trace: &mut Vec<ToolTrace>, step: &AssistantStep) {
     trace.extend(
         step.server_tool_uses
@@ -479,6 +599,11 @@ fn append_step_trace(trace: &mut Vec<ToolTrace>, step: &AssistantStep) {
     );
 }
 
+/// Resolve the client tools visible to the model for this agent run.
+///
+/// The runtime executor advertises the real available tools. `AgentSpec` can
+/// only narrow that set by name; this keeps static config from inventing a
+/// callable tool that the executor does not own.
 fn enabled_tool_specs(
     spec: &AgentSpec,
     tool_executor: &impl ClientToolExecutor,
@@ -494,6 +619,11 @@ fn enabled_tool_specs(
         .collect()
 }
 
+/// Resolve provider-side tools by intersecting model and agent allowlists.
+///
+/// The model config is the hard upper bound for provider-native capabilities.
+/// Agent config can narrow that set, but cannot enable a provider-side tool the
+/// model config did not allow.
 fn enabled_server_tools(
     model_tools: &ServerToolSet,
     agent_tools: Option<&ServerToolSet>,
@@ -507,6 +637,7 @@ fn enabled_server_tools(
     model_tools.intersection(&agent_tools).cloned().collect()
 }
 
+/// Normalize a set of provider-side tool names for cross-provider matching.
 fn normalized_server_tools(tools: &ServerToolSet) -> BTreeSet<String> {
     tools
         .iter()
@@ -514,11 +645,20 @@ fn normalized_server_tools(tools: &ServerToolSet) -> BTreeSet<String> {
         .collect()
 }
 
+/// Normalize one provider-side tool name.
+///
+/// Empty entries are ignored so config like `["web_search", " "]` does not
+/// produce a phantom provider tool.
 fn normalize_server_tool(tool: &str) -> Option<String> {
     let tool = tool.trim();
     (!tool.is_empty()).then(|| tool.to_ascii_lowercase())
 }
 
+/// Execute all client tool calls from one provider step.
+///
+/// Calls are dispatched concurrently to avoid serializing independent tool
+/// latency. The returned vector is sorted back to the provider's original call
+/// order before the results are appended to the transcript.
 async fn execute_client_tool_calls(
     enabled_tools: &BTreeMap<ToolName, ClientToolSpec>,
     tool_executor: &impl ClientToolExecutor,
@@ -560,6 +700,8 @@ async fn execute_client_tool_calls(
                 output
             }
             Err(error) => {
+                // Tool failures are model-visible results, not fatal agent
+                // errors. The model gets one more chance to recover or explain.
                 tracing::warn!(
                     tool = %call.name,
                     tool_use_id = %call.id,
@@ -593,6 +735,8 @@ async fn execute_client_tool_calls(
         completed.push((index, result, tool_trace, output.media));
     }
 
+    // Futures complete in latency order; transcript/tool-result order must
+    // match the assistant's requested call order.
     completed.sort_by_key(|(index, _, _, _)| *index);
     let completed = completed
         .into_iter()
@@ -602,6 +746,11 @@ async fn execute_client_tool_calls(
     completed
 }
 
+/// Convert executor definitions to the map shape expected by providers.
+///
+/// The first definition for a name wins. Duplicate names are almost certainly a
+/// wiring bug, but keeping the first definition preserves deterministic request
+/// shape and avoids changing behavior mid-run.
 fn tool_specs(definitions: Vec<ClientToolDefinition>) -> BTreeMap<ToolName, ClientToolSpec> {
     let mut specs = BTreeMap::new();
     for definition in definitions {
@@ -617,6 +766,7 @@ fn tool_specs(definitions: Vec<ClientToolDefinition>) -> BTreeMap<ToolName, Clie
     specs
 }
 
+/// Dispatch one enabled client tool call through the runtime executor.
 async fn call_client_tool<T>(
     enabled_tools: &BTreeMap<ToolName, ClientToolSpec>,
     tool_executor: &T,
@@ -633,6 +783,8 @@ where
         "dispatching client tool"
     );
     if !enabled_tools.contains_key(&tool_name) {
+        // The model asked for a tool outside this agent's allowlist. Return an
+        // unknown-tool error so the outer loop can surface it as a tool result.
         tracing::warn!(
             tool = %tool_name,
             tool_use_id = %tool_use_id,
@@ -645,6 +797,8 @@ where
     if let Err(error) = &output
         && error.is_unknown()
     {
+        // The allowlist said the tool should exist, but the executor could not
+        // route it. That points to stale config or inconsistent registration.
         tracing::warn!(
             tool = %tool_name,
             tool_use_id = %tool_use_id,
@@ -654,6 +808,10 @@ where
     output
 }
 
+/// Append assistant content, client tool calls, and continuation state.
+///
+/// Empty assistant steps are skipped to avoid adding no-op turns during
+/// provider continuation loops.
 fn append_assistant_step(transcript: &mut Transcript, step: AssistantStep) {
     let mut blocks = step.content;
     blocks.extend(
@@ -673,6 +831,7 @@ fn append_assistant_step(transcript: &mut Transcript, step: AssistantStep) {
     }
 }
 
+/// Split final content into the convenience text field and the full block list.
 fn answer_from_content(content: Vec<ContentBlock>) -> AssistantAnswer {
     let text = content
         .iter()
@@ -693,8 +852,11 @@ fn answer_from_content(content: Vec<ContentBlock>) -> AssistantAnswer {
 
 /// An agent exposed as one client-side tool.
 ///
-/// `Subagent` owns an agent and turns a parent model's tool call into
-/// a nested [`Transcript`].
+/// `Subagent` owns a full nested [`Agent`] and turns a parent model's tool call
+/// into a one-turn [`Transcript`] for that nested agent. It deliberately does
+/// not store the tool name: the outer [`ClientToolExecutor`] owns registration
+/// and dispatch, while this type owns only the model-facing description and the
+/// nested run behavior.
 #[derive(Debug)]
 pub struct Subagent<B, T: ClientToolExecutor = NoClientTools> {
     /// Nested agent runtime.
@@ -708,12 +870,18 @@ where
     B: LlmBackend,
     T: ClientToolExecutor,
 {
+    /// Convert the parent tool input into the nested agent's user message.
     fn transcript_for_input(&self, input: serde_json::Value) -> Transcript {
         let mut transcript = Transcript::new();
         transcript.push(TranscriptTurn::text(TurnRole::User, tool_input_text(input)));
         transcript
     }
 
+    /// Convert the nested run into the generic client-tool output contract.
+    ///
+    /// The parent model only receives a text result plus an `is_error` flag.
+    /// Full nested trace/usage detail is packed into `trace_response` and
+    /// `usage` for persistence by the caller.
     fn output_from_run(&self, run: &AgentRun) -> ClientToolOutput {
         let (result, is_error) = match &run.outcome {
             AgentOutcome::Completed { answer } => (
@@ -756,7 +924,11 @@ where
     B: LlmBackend,
     T: ClientToolExecutor,
 {
-    /// Tool specification shown to a parent model.
+    /// Build the tool specification shown to a parent model.
+    ///
+    /// Every subagent accepts the same JSON input shape: an object with a
+    /// `prompt` string. The configured description tells the parent model when
+    /// this nested agent is useful.
     pub fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.tool_description.clone(),
@@ -765,6 +937,11 @@ where
     }
 
     /// Execute one parent-model tool call by running the nested agent.
+    ///
+    /// This returns a boxed future so the runtime executor can store
+    /// heterogeneous subagents behind one wrapper, while the nested agent itself
+    /// still uses the generic [`LlmBackend`] and [`ClientToolExecutor`]
+    /// contracts internally.
     pub fn call(
         &self,
         call: ClientToolCall,
@@ -780,6 +957,8 @@ where
             );
             async move {
                 tracing::debug!("starting subagent tool call");
+                // The registration name has already selected this subagent.
+                // Only the parent-provided input becomes nested model context.
                 let run = self
                     .agent
                     .run(self.transcript_for_input(call.input))
@@ -799,6 +978,7 @@ where
     }
 }
 
+/// JSON Schema for all subagent tool inputs.
 fn prompt_input_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",
@@ -813,6 +993,10 @@ fn prompt_input_schema() -> ToolInputSchema {
     }))
 }
 
+/// Extract the prompt string from a subagent call input.
+///
+/// Falling back to the whole JSON value keeps malformed inputs observable to
+/// the nested model instead of dropping context on the floor.
 fn tool_input_text(input: serde_json::Value) -> String {
     input
         .get("prompt")
@@ -821,6 +1005,7 @@ fn tool_input_text(input: serde_json::Value) -> String {
         .unwrap_or_else(|| input.to_string())
 }
 
+/// Serialize the nested run summary into one trace payload.
 fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
     match &run.outcome {
         AgentOutcome::Completed { answer } => serde_json::json!({
@@ -846,6 +1031,7 @@ fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
     }
 }
 
+/// Low-cardinality outcome label for structured logs.
 fn agent_outcome_kind(outcome: &AgentOutcome) -> &'static str {
     match outcome {
         AgentOutcome::Completed { .. } => "completed",

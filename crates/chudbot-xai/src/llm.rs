@@ -1,4 +1,10 @@
 //! xAI Responses API language-model implementation.
+//!
+//! This module is the boundary between Chudbot's provider-neutral
+//! [`ModelStepRequest`] contract and xAI's `/responses` JSON shape. It is
+//! responsible for translating transcripts into replayable Responses input,
+//! preserving xAI continuation items for future turns, decoding model output
+//! into text/tool/server-use blocks, and normalizing usage into Chudbot records.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -15,6 +21,7 @@ use serde_json::{Value, json};
 use crate::imagine::media_provider_url;
 use crate::{XaiClient, XaiError, json_strip_nulls};
 
+/// Request encrypted reasoning blobs so later turns can replay provider state.
 const REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
 
 impl LlmBackend for XaiClient {
@@ -26,6 +33,9 @@ impl LlmBackend for XaiClient {
 
     #[tracing::instrument(name = "xai.step", skip_all, fields(model = %request.model))]
     async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
+        // Build the full Responses payload up front: transcript replay, tool
+        // declarations, sampling knobs, and provider-specific options all have
+        // to agree before xAI can continue the turn.
         let input = to_responses_input(&request.transcript, self.provider_name()).await?;
         let tools = build_responses_tools(&request.client_tools, &request.server_tools);
         let options = XaiOptions::from_request(&request);
@@ -51,6 +61,8 @@ impl LlmBackend for XaiClient {
 
         let started = Instant::now();
         let parsed: ResponsesResponse = self.post_json("/responses", &body, "llm[xai]").await?;
+        // Prefer xAI's echoed model id when present; aliases can resolve to a
+        // concrete serving model and downstream usage records should reflect it.
         let model_id = parsed
             .model
             .as_deref()
@@ -66,6 +78,9 @@ impl LlmBackend for XaiClient {
 
         let continuation = continuation_from_output(self.provider_name(), &parsed.output);
 
+        // Split the mixed Responses output stream into Chudbot's assistant
+        // step surface while keeping the raw server/citation data available to
+        // the trace viewer.
         let (text, client_tool_calls, server_tool_uses) =
             walk_output(&parsed.output, self.provider_name());
         let grounding = parsed
@@ -93,6 +108,9 @@ impl LlmBackend for XaiClient {
             usage: usage.into_iter().collect(),
         };
 
+        // Client tool calls keep the conversation loop alive; text with no
+        // client calls is final, and empty content means the model produced
+        // replayable/provider state but still needs another turn.
         if !step.client_tool_calls.is_empty() {
             Ok(ModelStep::UseClientTools { step })
         } else if step.content.is_empty() {
@@ -107,11 +125,14 @@ impl LlmBackend for XaiClient {
         &self,
         request: ModelInfoRequest,
     ) -> Result<Option<ModelInfo>, Self::Error> {
+        // xAI exposes model metadata as a list, so select the requested model
+        // locally instead of relying on a per-model endpoint.
         let raw: Value = self.get_json("/models", "model_info[xai]").await?;
         Ok(model_info_from_models_response(request.model, raw))
     }
 }
 
+/// Extract token limits from either a single model object or an OpenAI-style list.
 fn model_info_from_models_response(requested_model: ModelId, raw: Value) -> Option<ModelInfo> {
     let entry = model_entry_from_models_response(&requested_model, &raw)?;
     model_info_from_api_model(requested_model, entry)
@@ -122,6 +143,9 @@ fn model_entry_from_models_response(requested_model: &ModelId, raw: &Value) -> O
         return Some(raw.clone());
     }
 
+    // Some compatible endpoints return a single-entry `data` list without an
+    // exact id match; treating that as authoritative keeps model-info discovery
+    // useful for self-hosted or aliasing deployments.
     let data = raw.get("data").and_then(Value::as_array)?;
     data.iter()
         .find(|entry| model_id_matches(entry, requested_model))
@@ -137,6 +161,8 @@ fn model_id_matches(value: &Value, requested_model: &ModelId) -> bool {
 }
 
 fn model_info_from_api_model(requested_model: ModelId, raw: Value) -> Option<ModelInfo> {
+    // xAI-compatible model metadata has not used one stable field name for
+    // token limits, so accept the common names seen across Responses-like APIs.
     const CONTEXT_FIELDS: &[&str] = &[
         "context_window_tokens",
         "context_window",
@@ -183,6 +209,9 @@ fn find_u64_field(value: &Value, fields: &[&str]) -> Option<u64> {
         return Some(found);
     }
 
+    // Providers often nest limits under `capabilities`, `limits`, or similar
+    // objects; recurse through object children but avoid arrays to keep this
+    // predictable.
     object
         .values()
         .filter(|value| value.is_object())
@@ -220,6 +249,9 @@ async fn to_responses_input(
         };
 
         let mut echo = Vec::new();
+        // Continuations are provider-specific raw Responses output. When a
+        // previous xAI turn can be replayed, prefer it over synthesizing a lossy
+        // assistant message from stored text.
         for block in &message.blocks {
             if let ContentBlock::Continuation(continuation) = block
                 && &continuation.provider == provider
@@ -248,6 +280,8 @@ async fn to_responses_input(
         let id = transcript_turn_message_id(message);
         let mut text = String::new();
         let mut media_urls = Vec::new();
+        // Tool calls and tool results are standalone Responses items, so flush
+        // any accumulated user/assistant message before appending them.
         for block in &message.blocks {
             match block {
                 ContentBlock::Text { text: t } => text.push_str(t),
@@ -289,6 +323,7 @@ fn push_responses_message(
     media_urls: &mut Vec<String>,
 ) {
     if media_urls.is_empty() {
+        // Text-only turns use the compact Responses message shape.
         if !text.is_empty() {
             input.push(json_strip_nulls(json!({
                 "id": id,
@@ -300,6 +335,8 @@ fn push_responses_message(
         return;
     }
 
+    // Any media forces the content-array shape so text and images stay ordered
+    // within one logical transcript message.
     let mut content = Vec::with_capacity(media_urls.len() + 1);
     if !text.is_empty() {
         content.push(json!({ "type": "input_text", "text": text.as_str() }));
@@ -320,6 +357,8 @@ fn continuation_from_output(
     provider: &ProviderName,
     output: &[Value],
 ) -> Option<ProviderContinuation> {
+    // Persist the replayable subset of raw output so a later step can resume
+    // xAI-side reasoning/tool state instead of reconstructing it from text.
     let items = replayable_continuation_items(output.iter().cloned());
     (!items.is_empty()).then_some(ProviderContinuation {
         provider: provider.clone(),
@@ -345,6 +384,9 @@ fn replayable_continuation_item(item: Value) -> Option<Value> {
         return Some(item);
     }
 
+    // xAI rejects malformed encrypted reasoning on replay. Dropping only the
+    // bad item preserves the rest of the continuation and lets the transcript
+    // fall back to stored assistant text when no replayable state remains.
     tracing::warn!(
         item_id = item
             .get("id")
@@ -357,6 +399,9 @@ fn replayable_continuation_item(item: Value) -> Option<Value> {
 }
 
 fn is_replayable_encrypted_content(text: &str) -> bool {
+    // The encrypted field is expected to be base64/base64url-like text; commas
+    // and other punctuation are a strong signal that a streamed blob was
+    // corrupted before storage.
     !text.is_empty()
         && text.bytes().all(|b| {
             b.is_ascii_alphanumeric()
@@ -373,6 +418,8 @@ fn transcript_turn_message_id(message: &chudbot_api::TranscriptTurn) -> Option<&
 }
 
 fn client_tool_result_as_string(result: &chudbot_api::ClientToolResult) -> String {
+    // Responses function outputs are strings even when Chudbot's tool result is
+    // structured JSON.
     match &result.content {
         chudbot_api::ClientToolResultContent::Json { value } => {
             serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
@@ -387,6 +434,8 @@ fn build_responses_tools(
 ) -> Vec<Value> {
     let mut tools = Vec::with_capacity(client_tools.len() + 2);
     for (name, tool) in client_tools {
+        // Client tools become Responses function tools whose results are routed
+        // back through Chudbot before the model continues.
         tools.push(json!({
             "type": "function",
             "name": name.as_str(),
@@ -394,6 +443,8 @@ fn build_responses_tools(
             "parameters": tool.input_schema.as_json_schema(),
         }));
     }
+    // Server tools are executed by xAI and reported back as raw *_call output
+    // items for trace visibility.
     if server_tools.contains("web_search") {
         tools.push(json!({ "type": "web_search" }));
     }
@@ -415,6 +466,8 @@ fn walk_output(
         let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
         match kind {
             "message" => {
+                // xAI can return message content either as a Responses block
+                // array or as a compact string, depending on model/API path.
                 if let Some(content) = item.get("content").and_then(Value::as_array) {
                     for block in content {
                         let block_kind = block.get("type").and_then(Value::as_str).unwrap_or("");
@@ -429,6 +482,8 @@ fn walk_output(
                 }
             }
             "function_call" => {
+                // Chudbot-owned function calls are the only output items that
+                // turn into client tool work for the next loop iteration.
                 let id = item
                     .get("call_id")
                     .and_then(Value::as_str)
@@ -447,6 +502,9 @@ fn walk_output(
                 });
             }
             other if other.ends_with("_call") => {
+                // All non-function *_call items are provider-executed server
+                // tools. Preserve the raw item because each tool has its own
+                // evolving response shape.
                 server_uses.push(ServerToolUse {
                     provider: provider.clone(),
                     name: ToolName::new(other.trim_end_matches("_call")),
@@ -506,6 +564,8 @@ fn usage_from_xai(
 ) -> Option<UsageRecord> {
     let raw = usage?.clone();
     let parsed = serde_json::from_value::<Usage>(raw.clone()).ok()?;
+    // xAI reports authoritative micro-dollar ticks directly, so mark them as
+    // non-estimated instead of applying local pricing tables.
     let cost = (parsed.cost_in_usd_ticks > 0).then(|| CostAmount {
         amount: parsed.cost_in_usd_ticks.to_string(),
         unit: "usd_ticks".to_string(),
@@ -525,6 +585,7 @@ fn usage_from_xai(
     })
 }
 
+/// xAI-specific model request options supplied through `provider_options.value`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct XaiOptions {
     /// Reasoning effort: `low`, `medium`, or `high`.
@@ -533,6 +594,7 @@ pub struct XaiOptions {
 }
 
 impl XaiOptions {
+    /// Decode routed provider options, treating absent or malformed values as defaults.
     fn from_request(request: &ModelStepRequest) -> Self {
         request
             .provider_options
@@ -542,6 +604,7 @@ impl XaiOptions {
     }
 }
 
+/// Minimal `/responses` payload fields consumed by the LLM backend.
 #[derive(Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
@@ -554,6 +617,7 @@ struct ResponsesResponse {
     usage: Option<Value>,
 }
 
+/// xAI usage payload normalized into Chudbot usage records.
 #[derive(Deserialize, Debug, Default)]
 struct Usage {
     #[serde(default)]
@@ -570,6 +634,7 @@ struct Usage {
     cost_in_usd_ticks: u64,
 }
 
+/// Nested token details reused by xAI input and output usage sections.
 #[derive(Deserialize, Debug, Default)]
 struct TokenDetails {
     #[serde(default)]

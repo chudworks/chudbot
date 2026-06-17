@@ -1,11 +1,29 @@
+//! Built-in OpenAI price tables and local usage-cost estimation.
+//!
+//! The OpenAI APIs return token usage but not billing totals, so this module
+//! converts reported usage into Chudbot's `usd_ticks` accounting unit. The
+//! tables here are defaults only: deployment config can override or add model
+//! entries through [`OpenAiClient::with_token_pricing`] and
+//! [`OpenAiClient::with_image_pricing`].
+//!
+//! [`OpenAiClient::with_token_pricing`]: crate::OpenAiClient::with_token_pricing
+//! [`OpenAiClient::with_image_pricing`]: crate::OpenAiClient::with_image_pricing
+
 use std::collections::BTreeMap;
 
 use chudbot_api::{CostAmount, ModelId};
 use serde::{Deserialize, Serialize};
 
+/// Token-count denominator used by OpenAI pricing pages.
 const TOKENS_PER_MILLION: f64 = 1_000_000.0;
+/// Fixed-point USD scale shared by usage reports.
 const USD_TICKS_PER_DOLLAR: f64 = 10_000_000_000.0;
 
+/// Runtime pricing registry for OpenAI text and image providers.
+///
+/// The maps are keyed by model id so exact deployment overrides can replace
+/// built-ins. Lookup also falls back from dated snapshot ids to their base
+/// model when there is no exact entry.
 #[derive(Debug, Clone)]
 pub(crate) struct OpenAiPricing {
     token: BTreeMap<ModelId, OpenAiTokenPricing>,
@@ -22,14 +40,22 @@ impl Default for OpenAiPricing {
 }
 
 impl OpenAiPricing {
+    /// Merge configured text-token pricing into the built-in defaults.
     pub(crate) fn apply_token_overrides(&mut self, pricing: BTreeMap<ModelId, OpenAiTokenPricing>) {
         self.token.extend(pricing);
     }
 
+    /// Merge configured image-token pricing into the built-in defaults.
     pub(crate) fn apply_image_overrides(&mut self, pricing: BTreeMap<ModelId, OpenAiImagePricing>) {
         self.image.extend(pricing);
     }
 
+    /// Estimate Responses API usage cost from reported token buckets.
+    ///
+    /// Returns `None` when there is no model, no known pricing entry, or the
+    /// billable estimate is zero ticks. Cached input tokens use the
+    /// cached rate when one is configured and otherwise fall back to regular
+    /// input pricing.
     pub(crate) fn estimate_token_cost(
         &self,
         model: Option<&ModelId>,
@@ -52,12 +78,19 @@ impl OpenAiPricing {
         cost_from_ticks(ticks)
     }
 
+    /// Estimate image-generation usage cost from the token buckets OpenAI may report.
+    ///
+    /// Image endpoints have changed their usage shape over time. This accepts
+    /// both aggregate and modality-specific buckets, then charges text input,
+    /// image input, optional text output, and image output independently.
     pub(crate) fn estimate_image_cost(
         &self,
         model: Option<&ModelId>,
         usage: ImagePricingUsage,
     ) -> Option<CostAmount> {
         let pricing = pricing_for_model(&self.image, model?)?;
+        // Older payloads can report only aggregate input tokens. Treat the
+        // portion not attributed to image input as text input.
         let text_input_tokens = usage.text_input_tokens.unwrap_or_else(|| {
             usage.input_tokens.unwrap_or(0).saturating_sub(
                 usage
@@ -69,6 +102,8 @@ impl OpenAiPricing {
         let image_input_tokens = usage.image_input_tokens.unwrap_or(0);
         let cached_text_input_tokens = usage.cached_text_input_tokens.unwrap_or(0);
         let cached_image_input_tokens = usage.cached_image_input_tokens.unwrap_or(0);
+        // If only aggregate output is present, prefer image output because the
+        // image endpoint's billable output is normally the generated image.
         let fallback_output_tokens = usage.output_tokens.unwrap_or(0).saturating_sub(
             usage
                 .text_output_tokens
@@ -113,9 +148,11 @@ impl OpenAiPricing {
 /// OpenAI text-token pricing for one model, in USD per 1M tokens.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct OpenAiTokenPricing {
-    /// Input token price in USD per 1M tokens.
+    /// Uncached input token price in USD per 1M tokens.
     pub input_usd_per_million_tokens: f64,
     /// Cached input token price in USD per 1M tokens.
+    ///
+    /// When omitted, cached input is charged at the uncached input rate.
     #[serde(default)]
     pub cached_input_usd_per_million_tokens: Option<f64>,
     /// Output token price in USD per 1M tokens.
@@ -128,11 +165,15 @@ pub struct OpenAiImagePricing {
     /// Text input token price in USD per 1M tokens.
     pub text_input_usd_per_million_tokens: f64,
     /// Cached text input token price in USD per 1M tokens.
+    ///
+    /// When omitted, cached text input is charged at the uncached text rate.
     #[serde(default)]
     pub cached_text_input_usd_per_million_tokens: Option<f64>,
     /// Image input token price in USD per 1M tokens.
     pub image_input_usd_per_million_tokens: f64,
     /// Cached image input token price in USD per 1M tokens.
+    ///
+    /// When omitted, cached image input is charged at the uncached image rate.
     #[serde(default)]
     pub cached_image_input_usd_per_million_tokens: Option<f64>,
     /// Image output token price in USD per 1M tokens.
@@ -142,18 +183,31 @@ pub struct OpenAiImagePricing {
     pub text_output_usd_per_million_tokens: Option<f64>,
 }
 
+/// Normalized image usage fields accepted by the image cost estimator.
+///
+/// Fields are optional because OpenAI image usage payloads can include only
+/// aggregate buckets, only modality-specific buckets, or a mix of both.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ImagePricingUsage {
+    /// Aggregate input tokens across text and image inputs.
     pub(crate) input_tokens: Option<u64>,
+    /// Input tokens attributable to text prompts.
     pub(crate) text_input_tokens: Option<u64>,
+    /// Input tokens attributable to image references.
     pub(crate) image_input_tokens: Option<u64>,
+    /// Cached text input tokens.
     pub(crate) cached_text_input_tokens: Option<u64>,
+    /// Cached image input tokens.
     pub(crate) cached_image_input_tokens: Option<u64>,
+    /// Aggregate output tokens across text and generated-image output.
     pub(crate) output_tokens: Option<u64>,
+    /// Output tokens attributable to text emitted by the model.
     pub(crate) text_output_tokens: Option<u64>,
+    /// Output tokens attributable to generated images.
     pub(crate) image_output_tokens: Option<u64>,
 }
 
+/// Built-in Responses API prices used when config does not override a model.
 fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
     let mut pricing = BTreeMap::new();
     pricing.insert(
@@ -223,6 +277,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
     pricing
 }
 
+/// Built-in image-generation prices used when config does not override a model.
 fn default_image_pricing() -> BTreeMap<ModelId, OpenAiImagePricing> {
     let mut pricing = BTreeMap::new();
     pricing.insert(
@@ -272,10 +327,12 @@ fn default_image_pricing() -> BTreeMap<ModelId, OpenAiImagePricing> {
     pricing
 }
 
+/// Convert a token count and USD-per-million rate into `usd_ticks`.
 fn usd_ticks_for_tokens(tokens: u64, usd_per_million_tokens: f64) -> u64 {
     if tokens == 0 || !usd_per_million_tokens.is_finite() || usd_per_million_tokens <= 0.0 {
         return 0;
     }
+    // Round up so tiny but nonzero billable usage is not silently dropped.
     let ticks = ((tokens as f64) * usd_per_million_tokens * USD_TICKS_PER_DOLLAR
         / TOKENS_PER_MILLION)
         .ceil();
@@ -286,6 +343,7 @@ fn usd_ticks_for_tokens(tokens: u64, usd_per_million_tokens: f64) -> u64 {
     }
 }
 
+/// Build a usage cost value when there is a nonzero estimate.
 fn cost_from_ticks(ticks: u64) -> Option<CostAmount> {
     (ticks > 0).then(|| CostAmount {
         amount: ticks.to_string(),
@@ -294,12 +352,14 @@ fn cost_from_ticks(ticks: u64) -> Option<CostAmount> {
     })
 }
 
+/// Find exact pricing first, then fall back from dated snapshot ids.
 fn pricing_for_model<'a, T>(pricing: &'a BTreeMap<ModelId, T>, model: &ModelId) -> Option<&'a T> {
     pricing.get(model).or_else(|| {
         strip_dated_model_suffix(model.as_str()).and_then(|base| pricing.get(&ModelId::new(base)))
     })
 }
 
+/// Strip `-YYYY-MM-DD` model suffixes used by OpenAI snapshot ids.
 fn strip_dated_model_suffix(model: &str) -> Option<&str> {
     const SUFFIX_LEN: usize = "-YYYY-MM-DD".len();
     let suffix_start = model.len().checked_sub(SUFFIX_LEN)?;

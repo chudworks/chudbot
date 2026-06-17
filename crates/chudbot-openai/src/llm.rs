@@ -1,4 +1,10 @@
 //! OpenAI Responses API language-model implementation.
+//!
+//! This module is the boundary between Chudbot's provider-neutral transcript
+//! model and OpenAI's Responses API. It serializes turns into `input` items,
+//! advertises Chudbot client tools as OpenAI function tools, preserves OpenAI
+//! continuation items for later turns, and folds Responses output back into
+//! text, tool calls, server-tool usage, grounding metadata, and token usage.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -16,6 +22,7 @@ use crate::image::media_bytes_or_url;
 use crate::pricing::OpenAiPricing;
 use crate::{OpenAiClient, OpenAiError, json_strip_nulls};
 
+/// Response fields needed to replay OpenAI reasoning continuations on later turns.
 const REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
 
 impl LlmBackend for OpenAiClient {
@@ -27,6 +34,8 @@ impl LlmBackend for OpenAiClient {
 
     #[tracing::instrument(name = "openai.step", skip_all, fields(model = %request.model))]
     async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
+        // Build the provider request in layers so provider options affect only
+        // OpenAI-specific knobs while transcript and tool mapping stay stable.
         let input = to_responses_input(&request.transcript, self).await?;
         let tools = build_responses_tools(&request.client_tools, &request.server_tools);
         let options = OpenAiOptions::from_request(&request);
@@ -66,6 +75,8 @@ impl LlmBackend for OpenAiClient {
         );
         log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
 
+        // Store raw output items as the continuation. Responses reasoning items
+        // are opaque to Chudbot but must be sent back verbatim for stateful models.
         let output = Value::Array(parsed.output.clone());
         let continuation = (!parsed.output.is_empty()).then_some(ProviderContinuation {
             provider: self.provider_name().clone(),
@@ -90,6 +101,8 @@ impl LlmBackend for OpenAiClient {
             usage: usage.into_iter().collect(),
         };
 
+        // The bot turn loop uses this classification to decide whether to run
+        // tools, ask the provider to keep going, or deliver assistant text.
         if !step.client_tool_calls.is_empty() {
             Ok(ModelStep::UseClientTools { step })
         } else if step.content.is_empty() {
@@ -110,6 +123,10 @@ impl LlmBackend for OpenAiClient {
     }
 }
 
+/// Extract known model limits from OpenAI's model metadata response.
+///
+/// OpenAI-compatible gateways do not agree on field names, so this accepts the
+/// common spellings used by OpenAI, vLLM-style servers, and model catalogs.
 fn model_info_from_openai_model(requested_model: ModelId, raw: Value) -> Option<ModelInfo> {
     const CONTEXT_FIELDS: &[&str] = &[
         "context_window_tokens",
@@ -148,6 +165,7 @@ fn model_info_from_openai_model(requested_model: ModelId, raw: Value) -> Option<
     })
 }
 
+/// Find the first numeric metadata field, descending into nested objects.
 fn find_u64_field(value: &Value, fields: &[&str]) -> Option<u64> {
     let object = value.as_object()?;
     if let Some(found) = fields
@@ -163,6 +181,7 @@ fn find_u64_field(value: &Value, fields: &[&str]) -> Option<u64> {
         .find_map(|value| find_u64_field(value, fields))
 }
 
+/// Parse numeric fields returned either as JSON numbers or decimal strings.
 fn value_as_u64(value: &Value) -> Option<u64> {
     match value {
         Value::Number(number) => number.as_u64(),
@@ -171,6 +190,11 @@ fn value_as_u64(value: &Value) -> Option<u64> {
     }
 }
 
+/// Convert a Chudbot transcript into OpenAI Responses `input` items.
+///
+/// The important details are preserving provider continuations, flushing mixed
+/// text/media messages before tool events, and sending application instructions
+/// as `developer` messages rather than user-visible content.
 async fn to_responses_input(
     transcript: &Transcript,
     client: &OpenAiClient,
@@ -193,6 +217,7 @@ async fn to_responses_input(
             if let ContentBlock::Continuation(continuation) = block
                 && &continuation.provider == client.provider_name()
             {
+                // Only this provider can safely replay its opaque continuation payload.
                 match &continuation.data {
                     Value::Array(items) => echo.extend(items.iter().cloned()),
                     other => echo.push(other.clone()),
@@ -203,6 +228,8 @@ async fn to_responses_input(
             .iter()
             .any(|item| item.get("type").and_then(Value::as_str) != Some("reasoning"));
         if full_echo {
+            // A full Responses output item already carries the assistant message or
+            // tool call, so replay it verbatim instead of rebuilding that turn.
             input.extend(echo);
             continue;
         }
@@ -218,6 +245,8 @@ async fn to_responses_input(
                 }
                 ContentBlock::Continuation(_) => {}
                 ContentBlock::ClientToolCall(call) => {
+                    // Tool calls are standalone Responses items; flush pending
+                    // message content first so transcript ordering survives replay.
                     push_responses_message(&mut input, role, &mut text, &mut media_urls);
                     let args = serde_json::to_string(&call.input).unwrap_or_else(|_| "{}".into());
                     input.push(json!({
@@ -228,6 +257,8 @@ async fn to_responses_input(
                     }));
                 }
                 ContentBlock::ClientToolResult(result) => {
+                    // Responses expects function outputs at top level, not inside a
+                    // message content array.
                     push_responses_message(&mut input, role, &mut text, &mut media_urls);
                     input.push(json!({
                         "type": "function_call_output",
@@ -243,6 +274,7 @@ async fn to_responses_input(
     Ok(input)
 }
 
+/// Flush accumulated text and media into one Responses message item.
 fn push_responses_message(
     input: &mut Vec<Value>,
     role: &str,
@@ -269,6 +301,7 @@ fn push_responses_message(
     media_urls.clear();
 }
 
+/// Flatten Chudbot tool-result content into OpenAI's string output field.
 fn client_tool_result_as_string(result: &ClientToolResult) -> String {
     match &result.content {
         ClientToolResultContent::Json { value } => {
@@ -278,6 +311,10 @@ fn client_tool_result_as_string(result: &ClientToolResult) -> String {
     }
 }
 
+/// Return whether the model accepts `temperature` and `top_p`.
+///
+/// Reasoning-family models reject sampling knobs, so request shaping omits them
+/// for those model ids instead of letting the API fail the turn.
 fn model_supports_sampling(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     let reasoning = model.starts_with("o1")
@@ -287,6 +324,7 @@ fn model_supports_sampling(model: &str) -> bool {
     !reasoning
 }
 
+/// Advertise Chudbot client tools and supported OpenAI-hosted tools.
 fn build_responses_tools(
     client_tools: &BTreeMap<ToolName, ClientToolSpec>,
     server_tools: &ServerToolSet,
@@ -306,6 +344,7 @@ fn build_responses_tools(
     tools
 }
 
+/// Build the OpenAI `reasoning` option object, omitting it when unset.
 fn build_reasoning_options(options: &OpenAiOptions) -> Option<Value> {
     let value = json_strip_nulls(json!({
         "effort": options.reasoning_effort.as_deref(),
@@ -317,6 +356,7 @@ fn build_reasoning_options(options: &OpenAiOptions) -> Option<Value> {
     }
 }
 
+/// Build the OpenAI `text` option object, omitting it when unset.
 fn build_text_options(options: &OpenAiOptions) -> Option<Value> {
     let value = json_strip_nulls(json!({
         "verbosity": options.text_verbosity.as_deref(),
@@ -327,6 +367,11 @@ fn build_text_options(options: &OpenAiOptions) -> Option<Value> {
     }
 }
 
+/// Decode Responses output items into Chudbot's provider-neutral assistant step.
+///
+/// OpenAI may interleave messages, function calls, and hosted-tool calls.
+/// Chudbot keeps raw hosted-tool items for trace display and stores citation
+/// annotations as grounding metadata.
 fn walk_output(
     output: &[Value],
     provider: &ProviderName,
@@ -356,6 +401,8 @@ fn walk_output(
                         if let Some(annotations) =
                             block.get("annotations").and_then(Value::as_array)
                         {
+                            // Preserve URL citations without normalizing OpenAI's
+                            // annotation shape into a provider-independent schema.
                             for annotation in annotations {
                                 if annotation.get("type").and_then(Value::as_str)
                                     == Some("url_citation")
@@ -388,6 +435,8 @@ fn walk_output(
                 });
             }
             other if other.ends_with("_call") => {
+                // Hosted tools such as `web_search_call` are not Chudbot client tools;
+                // record them as provider server-tool uses for trace visibility.
                 server_uses.push(ServerToolUse {
                     provider: provider.clone(),
                     name: ToolName::new(other.trim_end_matches("_call")),
@@ -424,6 +473,7 @@ fn walk_output(
     (text, client_calls, server_uses, grounding)
 }
 
+/// Log token usage from a completed Responses request.
 fn log_usage(model: &str, usage: Option<&UsageRecord>, elapsed: Duration) {
     let duration_ms = elapsed.as_millis() as u64;
     match usage {
@@ -447,6 +497,7 @@ fn log_usage(model: &str, usage: Option<&UsageRecord>, elapsed: Duration) {
     }
 }
 
+/// Convert OpenAI usage JSON into Chudbot's usage record and cost estimate.
 fn usage_from_openai(
     provider: &ProviderName,
     model: Option<ModelId>,
@@ -476,6 +527,10 @@ fn usage_from_openai(
     })
 }
 
+/// OpenAI-specific per-agent options routed through `ProviderOptions`.
+///
+/// These values map directly to Responses request fields and are intentionally
+/// separate from Chudbot's provider-neutral sampling options.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct OpenAiOptions {
     /// Reasoning effort: `none`, `minimal`, `low`, `medium`, `high`, or `xhigh`.
@@ -490,6 +545,7 @@ pub struct OpenAiOptions {
 }
 
 impl OpenAiOptions {
+    /// Decode OpenAI provider options from a model-step request.
     fn from_request(request: &ModelStepRequest) -> Self {
         request
             .provider_options
@@ -499,6 +555,7 @@ impl OpenAiOptions {
     }
 }
 
+/// Minimal shape Chudbot needs from a Responses API response.
 #[derive(Deserialize)]
 struct ResponsesResponse {
     #[serde(default)]
@@ -509,6 +566,7 @@ struct ResponsesResponse {
     usage: Option<Value>,
 }
 
+/// Token usage shape returned by OpenAI Responses.
 #[derive(Deserialize, Debug, Default)]
 struct Usage {
     #[serde(default)]
@@ -523,6 +581,7 @@ struct Usage {
     total_tokens: u64,
 }
 
+/// Nested token counters used for cache and reasoning details.
 #[derive(Deserialize, Debug, Default)]
 struct TokenDetails {
     #[serde(default)]
