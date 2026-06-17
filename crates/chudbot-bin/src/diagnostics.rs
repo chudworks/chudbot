@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::error::Error as _;
 use std::fmt;
 use std::fmt::Write as _;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -17,6 +19,11 @@ use crate::config::RuntimeConfig;
 const DATETIME_FIELD: &str = "$__toml_private_datetime";
 const MAX_SOURCE_LINE_CHARS: usize = 160;
 const SOURCE_WINDOW_CHARS: usize = 120;
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_BOLD_RED: &str = "\x1b[1;31m";
+const ANSI_BLUE: &str = "\x1b[34m";
+const ANSI_GREEN: &str = "\x1b[32m";
+const ANSI_BOLD: &str = "\x1b[1m";
 
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigSource {
@@ -185,15 +192,17 @@ pub(crate) struct ConfigValidationReport {
     input: String,
     lines: LineIndex,
     diagnostics: Vec<ConfigDiagnostic>,
+    ansi: bool,
 }
 
 impl ConfigValidationReport {
-    fn new(source: &ConfigSource, diagnostics: Vec<ConfigDiagnostic>) -> Self {
+    fn new(source: &ConfigSource, diagnostics: Vec<ConfigDiagnostic>, ansi: bool) -> Self {
         Self {
             path: source.path.clone(),
             input: source.input.clone(),
             lines: source.lines.clone(),
             diagnostics,
+            ansi,
         }
     }
 
@@ -201,18 +210,28 @@ impl ConfigValidationReport {
         self.diagnostics.len()
     }
 
-    pub(crate) fn render(&self) -> String {
+    #[cfg(test)]
+    fn render(&self) -> String {
+        self.render_with_style(DiagnosticStyle::plain())
+    }
+
+    pub(crate) fn render_for_stderr(&self) -> String {
+        self.render_with_style(DiagnosticStyle::new(self.ansi && stderr_supports_color()))
+    }
+
+    fn render_with_style(&self, style: DiagnosticStyle) -> String {
         let mut out = String::new();
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             if index > 0 {
                 out.push('\n');
             }
-            diagnostic.render(&self.path, &self.input, &self.lines, &mut out);
+            diagnostic.render(&self.path, &self.input, &self.lines, style, &mut out);
         }
         if self.diagnostics.len() > 1 {
             let _ = writeln!(
                 out,
-                "\nerror: aborting due to {} config errors",
+                "\n{}: aborting due to {} config errors",
+                style.error("error"),
                 self.diagnostics.len()
             );
         }
@@ -278,21 +297,40 @@ impl ConfigDiagnostic {
         self
     }
 
-    fn render(&self, path: &Path, input: &str, lines: &LineIndex, out: &mut String) {
-        let _ = writeln!(out, "error: {}", self.message);
+    fn render(
+        &self,
+        path: &Path,
+        input: &str,
+        lines: &LineIndex,
+        style: DiagnosticStyle,
+        out: &mut String,
+    ) {
+        let _ = writeln!(
+            out,
+            "{}: {}",
+            style.error("error"),
+            style.bold(&self.message)
+        );
         if let Some(primary) = self.labels.first() {
             let (line, column) = lines.line_col(input, primary.span.start);
-            let _ = writeln!(out, "  --> {}:{}:{}", path.display(), line + 1, column + 1);
-            write_gutter_separator(out, line + 1);
+            let _ = writeln!(
+                out,
+                "  {} {}:{}:{}",
+                style.location_arrow("-->"),
+                path.display(),
+                line + 1,
+                column + 1
+            );
+            write_gutter_separator(out, line + 1, style);
             for label in &self.labels {
-                render_label(input, lines, label, out);
+                render_label(input, lines, label, style, out);
             }
         }
         for note in &self.notes {
-            let _ = writeln!(out, "  = note: {note}");
+            let _ = writeln!(out, "  = {}: {note}", style.note("note"));
         }
         if let Some(help) = &self.help {
-            let _ = writeln!(out, "  = help: {help}");
+            let _ = writeln!(out, "  = {}: {help}", style.help("help"));
         }
     }
 }
@@ -301,6 +339,64 @@ impl ConfigDiagnostic {
 struct DiagnosticLabel {
     span: Range<usize>,
     message: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DiagnosticStyle {
+    color: bool,
+}
+
+impl DiagnosticStyle {
+    fn new(color: bool) -> Self {
+        Self { color }
+    }
+
+    #[cfg(test)]
+    fn plain() -> Self {
+        Self { color: false }
+    }
+
+    fn error(self, text: &str) -> String {
+        self.paint(ANSI_BOLD_RED, text)
+    }
+
+    fn caret(self, text: &str) -> String {
+        self.paint(ANSI_BOLD_RED, text)
+    }
+
+    fn gutter(self, text: &str) -> String {
+        self.paint(ANSI_BLUE, text)
+    }
+
+    fn location_arrow(self, text: &str) -> String {
+        self.paint(ANSI_BLUE, text)
+    }
+
+    fn note(self, text: &str) -> String {
+        self.paint(ANSI_GREEN, text)
+    }
+
+    fn help(self, text: &str) -> String {
+        self.paint(ANSI_GREEN, text)
+    }
+
+    fn bold(self, text: &str) -> String {
+        self.paint(ANSI_BOLD, text)
+    }
+
+    fn paint(self, code: &str, text: &str) -> String {
+        if self.color {
+            format!("{code}{text}{ANSI_RESET}")
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+pub(crate) fn stderr_supports_color() -> bool {
+    std::io::stderr().is_terminal()
+        && env::var_os("NO_COLOR").is_none()
+        && env::var("TERM").map_or(true, |term| term != "dumb")
 }
 
 #[derive(Debug, Clone)]
@@ -342,12 +438,18 @@ impl LineIndex {
     }
 }
 
-fn write_gutter_separator(out: &mut String, max_line_number: usize) {
+fn write_gutter_separator(out: &mut String, max_line_number: usize, style: DiagnosticStyle) {
     let width = max_line_number.to_string().len();
-    let _ = writeln!(out, "{:width$} |", "", width = width);
+    let _ = writeln!(out, "{:width$} {}", "", style.gutter("|"), width = width);
 }
 
-fn render_label(input: &str, lines: &LineIndex, label: &DiagnosticLabel, out: &mut String) {
+fn render_label(
+    input: &str,
+    lines: &LineIndex,
+    label: &DiagnosticLabel,
+    style: DiagnosticStyle,
+    out: &mut String,
+) {
     let start = label.span.start.min(input.len());
     let mut end = label.span.end.min(input.len()).max(start);
     if end == start {
@@ -376,20 +478,34 @@ fn render_label(input: &str, lines: &LineIndex, label: &DiagnosticLabel, out: &m
                 let start_col = byte_to_char_col(line_text, highlight_start_byte);
                 let end_col = byte_to_char_col(line_text, highlight_end_byte).max(start_col + 1);
                 let window = SourceLineWindow::new(line_text, start_col, end_col);
-                let _ = writeln!(out, "{:>width$} | {}", line + 1, window.text, width = width);
+                let _ = writeln!(
+                    out,
+                    "{:>width$} {} {}",
+                    line + 1,
+                    style.gutter("|"),
+                    window.text,
+                    width = width
+                );
                 let caret_len = window.end_col.saturating_sub(window.start_col).max(1);
                 let _ = writeln!(
                     out,
-                    "{:width$} | {}{} {}",
+                    "{:width$} {} {}{} {}",
                     "",
+                    style.gutter("|"),
                     " ".repeat(window.start_col),
-                    "^".repeat(caret_len),
-                    label.message,
+                    style.caret(&"^".repeat(caret_len)),
+                    style.error(&label.message),
                     width = width
                 );
             }
             RenderedLine::Ellipsis => {
-                let _ = writeln!(out, "{:width$} | ...", "", width = width);
+                let _ = writeln!(
+                    out,
+                    "{:width$} {} ...",
+                    "",
+                    style.gutter("|"),
+                    width = width
+                );
             }
         }
     }
@@ -483,7 +599,11 @@ pub(crate) fn validate_runtime_config(
     if diagnostics.is_empty() {
         Ok(())
     } else {
-        Err(ConfigValidationReport::new(source, diagnostics))
+        Err(ConfigValidationReport::new(
+            source,
+            diagnostics,
+            config.logging.ansi,
+        ))
     }
 }
 
@@ -1283,7 +1403,25 @@ fn toml_key(value: &str) -> String {
     quoted
 }
 
-pub(crate) fn render_toml_error(path: &Path, input: &str, error: &toml::de::Error) -> String {
+pub(crate) fn render_toml_error_for_stderr(
+    path: &Path,
+    input: &str,
+    error: &toml::de::Error,
+) -> String {
+    render_toml_error_with_style(
+        path,
+        input,
+        error,
+        DiagnosticStyle::new(stderr_supports_color()),
+    )
+}
+
+fn render_toml_error_with_style(
+    path: &Path,
+    input: &str,
+    error: &toml::de::Error,
+    style: DiagnosticStyle,
+) -> String {
     let source = ConfigSource::new(path.to_path_buf(), input.to_string());
     let mut diagnostic =
         ConfigDiagnostic::new(format!("could not parse config file `{}`", path.display()))
@@ -1297,7 +1435,13 @@ pub(crate) fn render_toml_error(path: &Path, input: &str, error: &toml::de::Erro
         diagnostic = diagnostic.with_note(error.to_string());
     }
     let mut out = String::new();
-    diagnostic.render(source.path(), source.input(), &source.lines, &mut out);
+    diagnostic.render(
+        source.path(),
+        source.input(),
+        &source.lines,
+        style,
+        &mut out,
+    );
     out
 }
 
@@ -1379,6 +1523,19 @@ token = "token"
         assert!(rendered.contains("provider = \"missing-llm\""));
         assert!(rendered.contains("rate_limit.limit must be greater than zero"));
         assert!(rendered.contains("aborting due to"));
+        assert!(!rendered.contains("\x1b["));
+    }
+
+    #[test]
+    fn colored_render_includes_ansi_sequences_when_enabled() {
+        let (_input, config, source) = invalid_config();
+        let report = validate_runtime_config(&config, &source).unwrap_err();
+        let rendered = report.render_with_style(DiagnosticStyle::new(true));
+
+        assert!(rendered.contains("\x1b[1;31merror\x1b[0m"));
+        assert!(rendered.contains("\x1b[34m-->\x1b[0m"));
+        assert!(rendered.contains("\x1b[34m|\x1b[0m"));
+        assert!(rendered.contains("\x1b[32mhelp\x1b[0m"));
     }
 
     #[test]

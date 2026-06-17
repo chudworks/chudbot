@@ -16,7 +16,7 @@ use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::WebState;
 use clap::{Parser, Subcommand};
 use config::{LoadedRuntimeConfig, LogFormat, LoggingConfig, LoggingFilterError, RuntimeConfig};
-use diagnostics::render_toml_error;
+use diagnostics::render_toml_error_for_stderr;
 use errors::{BinError, ConfigError};
 use platforms::ConfiguredMessagePlatforms;
 use runtime::run_runtime_services;
@@ -179,7 +179,7 @@ fn log_start(config_path: &Path, command: &Command, config: &RuntimeConfig) {
 fn report_error(error: &BinError) {
     match error {
         BinError::ConfigValidation(report) => {
-            eprint!("{}", report.render());
+            eprint!("{}", report.render_for_stderr());
             return;
         }
         BinError::Config(ConfigError::Parse {
@@ -187,7 +187,10 @@ fn report_error(error: &BinError) {
             content,
             source,
         }) => {
-            eprint!("{}", render_toml_error(path, content, source.as_ref()));
+            eprint!(
+                "{}",
+                render_toml_error_for_stderr(path, content, source.as_ref())
+            );
             return;
         }
         _ => {}
