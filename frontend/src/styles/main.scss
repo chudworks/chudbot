@@ -5,7 +5,9 @@
 :root {
     color-scheme: light dark;
 
-    // Max width of the centered content column (header, turns, footer).
+    // Width of the centered content column. It's a *fixed* width, not
+    // content-driven — see `min-width: 0` on the columns below, which
+    // stops wide content from stretching the page per conversation.
     --content-width: 1200px;
 
     --fg: #eaeaea;
@@ -88,8 +90,9 @@ pre {
 
 .app-footer {
     margin-top: auto;
-    max-width: var(--content-width);
     width: 100%;
+    max-width: var(--content-width);
+    min-width: 0;
     margin-left: auto;
     margin-right: auto;
     padding: 1rem 1.25rem 1.5rem;
@@ -105,7 +108,15 @@ pre {
 main.center,
 main.conv,
 header.conv-header {
+    width: 100%;
     max-width: var(--content-width);
+    // These are flex children of `.app`. A flex item defaults to
+    // `min-width: auto` (its content's min size), so one wide token (a
+    // long URL, a wide code block) would push the column past
+    // `max-width` and make the page width vary per conversation.
+    // `min-width: 0` pins the column to `max-width` and wraps/scrolls
+    // wide content inside it instead.
+    min-width: 0;
     margin: 0 auto;
     padding: 2rem 1.25rem;
 }
