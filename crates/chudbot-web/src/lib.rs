@@ -1,6 +1,6 @@
 //! Web trace viewer service.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -555,9 +555,20 @@ async fn model_info_for_snapshot<L>(llms: &L, snapshot: &ConversationSnapshot) -
 where
     L: LlmProviderRegistry,
 {
-    let targets = model_info_targets(snapshot);
     let mut out = Vec::new();
-    for (provider, model) in targets {
+    let Some((provider, model)) = latest_context_model_target(snapshot) else {
+        return out;
+    };
+    if !llms.contains_provider(&provider) {
+        tracing::debug!(
+            provider = %provider,
+            model = %model,
+            "skipping model metadata for provider unavailable in this runtime"
+        );
+        return out;
+    }
+
+    {
         let request = ModelInfoRequest {
             model: model.clone(),
             provider_options: None,
@@ -580,30 +591,18 @@ where
     out
 }
 
-fn model_info_targets(snapshot: &ConversationSnapshot) -> BTreeSet<(ProviderName, ModelId)> {
-    let mut targets = BTreeSet::new();
-    targets.insert((
-        snapshot.conversation.provider.clone(),
-        snapshot.conversation.initial_model.clone(),
-    ));
-
-    for turn in &snapshot.turns {
-        if let (Some(provider), Some(model)) = (&turn.turn.provider, &turn.turn.model) {
-            targets.insert((provider.clone(), model.clone()));
-        }
-        for step in &turn.model_steps {
-            targets.insert((step.provider.clone(), step.model.clone()));
-        }
-        for usage in &turn.usage {
-            if matches!(&usage.subject, UsageSubject::ModelStep)
-                && let Some(model) = &usage.model
-            {
-                targets.insert((usage.provider.clone(), model.clone()));
+fn latest_context_model_target(snapshot: &ConversationSnapshot) -> Option<(ProviderName, ModelId)> {
+    for turn in snapshot.turns.iter().rev() {
+        for usage in turn.usage.iter().rev() {
+            if !matches!(&usage.subject, UsageSubject::ModelStep) || usage.input_tokens.is_none() {
+                continue;
+            }
+            if let Some(model) = usage.model.clone().or_else(|| turn.turn.model.clone()) {
+                return Some((usage.provider.clone(), model));
             }
         }
     }
-
-    targets
+    None
 }
 
 /// Viewer-facing tool trace event.

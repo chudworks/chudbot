@@ -122,7 +122,8 @@ impl ConfiguredLlmProviders {
                     base_url,
                     pricing,
                 } => {
-                    let mut client = chudbot_anthropic::AnthropicClient::new(api_key.clone());
+                    let mut client =
+                        chudbot_anthropic::AnthropicClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -143,7 +144,8 @@ impl ConfiguredLlmProviders {
                     base_url,
                     pricing,
                 } => {
-                    let mut client = chudbot_openai::OpenAiClient::new(api_key.clone());
+                    let mut client =
+                        chudbot_openai::OpenAiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -160,8 +162,10 @@ impl ConfiguredLlmProviders {
                     providers.openai.insert(name.clone(), client);
                 }
                 LlmProviderConfig::OpenAiCompat { base_url, api_key } => {
-                    let mut client =
-                        chudbot_openai_compat::OpenAiCompatClient::new(base_url.clone());
+                    let mut client = chudbot_openai_compat::OpenAiCompatClient::new(
+                        name.clone(),
+                        base_url.clone(),
+                    );
                     if let Some(api_key) = api_key {
                         client = client.with_api_key(api_key.clone());
                     }
@@ -174,7 +178,8 @@ impl ConfiguredLlmProviders {
                     providers.openai_compat.insert(name.clone(), client);
                 }
                 LlmProviderConfig::Gemini { api_key, base_url } => {
-                    let mut client = chudbot_gemini::GeminiClient::new(api_key.clone());
+                    let mut client =
+                        chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -187,7 +192,7 @@ impl ConfiguredLlmProviders {
                     providers.gemini.insert(name.clone(), client);
                 }
                 LlmProviderConfig::Xai { api_key, base_url } => {
-                    let mut client = chudbot_xai::XaiClient::new(api_key.clone());
+                    let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -353,7 +358,8 @@ impl ConfiguredImageGenerators {
                     base_url,
                     pricing,
                 } => {
-                    let mut client = chudbot_openai::OpenAiClient::new(api_key.clone());
+                    let mut client =
+                        chudbot_openai::OpenAiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -370,7 +376,7 @@ impl ConfiguredImageGenerators {
                     providers.openai.insert(name.clone(), client);
                 }
                 ImageProviderConfig::Xai { api_key, base_url } => {
-                    let mut client = chudbot_xai::XaiClient::new(api_key.clone());
+                    let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -383,7 +389,8 @@ impl ConfiguredImageGenerators {
                     providers.xai.insert(name.clone(), client);
                 }
                 ImageProviderConfig::Gemini { api_key, base_url } => {
-                    let mut client = chudbot_gemini::GeminiClient::new(api_key.clone());
+                    let mut client =
+                        chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -482,7 +489,7 @@ impl ConfiguredVideoGenerators {
         for (name, provider) in config {
             match provider {
                 VideoProviderConfig::Xai { api_key, base_url } => {
-                    let mut client = chudbot_xai::XaiClient::new(api_key.clone());
+                    let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -495,7 +502,8 @@ impl ConfiguredVideoGenerators {
                     providers.xai.insert(name.clone(), client);
                 }
                 VideoProviderConfig::Gemini { api_key, base_url } => {
-                    let mut client = chudbot_gemini::GeminiClient::new(api_key.clone());
+                    let mut client =
+                        chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -626,7 +634,7 @@ impl ConfiguredAudioTranscribers {
         for (name, provider) in config {
             match provider {
                 AudioProviderConfig::Xai { api_key, base_url } => {
-                    let mut client = chudbot_xai::XaiClient::new(api_key.clone());
+                    let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
@@ -677,5 +685,86 @@ impl AudioTranscriberRegistry for ConfiguredAudioTranscribers {
         }
         tracing::warn!("requested audio provider is missing from registry");
         Err(ConfiguredAudioError::Missing(provider.clone()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_llm_provider_name_is_recorded_backend_name() {
+        let provider = ProviderName::new("claude");
+        let config = BTreeMap::from([(
+            provider.clone(),
+            LlmProviderConfig::Anthropic {
+                api_key: "test-key".to_string(),
+                base_url: None,
+                pricing: BTreeMap::new(),
+            },
+        )]);
+
+        let registry = ConfiguredLlmProviders::from_config(&config);
+        let client = registry
+            .inner
+            .anthropic
+            .get(&provider)
+            .expect("configured anthropic client");
+
+        assert_eq!(LlmBackend::backend_name(client), &provider);
+    }
+
+    #[test]
+    fn configured_media_provider_names_are_recorded_backend_names() {
+        let image_provider = ProviderName::new("grok_images");
+        let image_config = BTreeMap::from([(
+            image_provider.clone(),
+            ImageProviderConfig::Xai {
+                api_key: "test-key".to_string(),
+                base_url: None,
+            },
+        )]);
+        let images = ConfiguredImageGenerators::from_config(&image_config);
+        let image_client = images
+            .inner
+            .xai
+            .get(&image_provider)
+            .expect("configured xai image client");
+        assert_eq!(ImageGenerator::backend_name(image_client), &image_provider);
+
+        let video_provider = ProviderName::new("grok_video");
+        let video_config = BTreeMap::from([(
+            video_provider.clone(),
+            VideoProviderConfig::Xai {
+                api_key: "test-key".to_string(),
+                base_url: None,
+            },
+        )]);
+        let videos = ConfiguredVideoGenerators::from_config(&video_config);
+        let video_client = videos
+            .inner
+            .xai
+            .get(&video_provider)
+            .expect("configured xai video client");
+        assert_eq!(VideoGenerator::backend_name(video_client), &video_provider);
+
+        let audio_provider = ProviderName::new("grok_audio");
+        let audio_config = BTreeMap::from([(
+            audio_provider.clone(),
+            AudioProviderConfig::Xai {
+                api_key: "test-key".to_string(),
+                base_url: None,
+            },
+        )]);
+        let audio = ConfiguredAudioTranscribers::from_config(&audio_config);
+        let audio_client = audio
+            .inner
+            .xai
+            .get(&audio_provider)
+            .expect("configured xai audio client");
+        assert_eq!(
+            AudioTranscriber::backend_name(audio_client),
+            &audio_provider
+        );
     }
 }

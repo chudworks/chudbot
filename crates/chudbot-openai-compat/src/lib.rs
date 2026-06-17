@@ -27,13 +27,14 @@ pub struct OpenAiCompatClient {
 }
 
 impl OpenAiCompatClient {
-    /// Construct from a base URL such as `http://127.0.0.1:8000/v1`.
-    pub fn new(base_url: impl Into<String>) -> Self {
+    /// Construct from a configured provider name and base URL such as
+    /// `http://127.0.0.1:8000/v1`.
+    pub fn new(provider_name: ProviderName, base_url: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: None,
             base_url: base_url.into(),
-            provider_name: ProviderName::new("openai_compat"),
+            provider_name,
         }
     }
 

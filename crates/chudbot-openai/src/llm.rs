@@ -597,7 +597,7 @@ mod tests {
 
     #[test]
     fn replays_full_output_verbatim_when_present() {
-        let client = OpenAiClient::new("key");
+        let client = OpenAiClient::new(ProviderName::new("openai"), "key");
         let mut transcript = Transcript::new();
         transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
         transcript.push(TranscriptTurn {
@@ -631,7 +631,7 @@ mod tests {
 
     #[test]
     fn sends_transcript_instructions_as_developer_message() {
-        let client = OpenAiClient::new("key");
+        let client = OpenAiClient::new(ProviderName::new("openai"), "key");
         let mut transcript = Transcript::new();
         transcript.instructions = Some("Follow the application rules.".to_string());
         transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));

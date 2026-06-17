@@ -28,13 +28,13 @@ pub struct AnthropicClient {
 }
 
 impl AnthropicClient {
-    /// Construct from an Anthropic API key.
-    pub fn new(api_key: impl Into<String>) -> Self {
+    /// Construct from a configured provider name and Anthropic API key.
+    pub fn new(provider_name: ProviderName, api_key: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
-            provider_name: ProviderName::new("anthropic"),
+            provider_name,
             pricing: pricing::AnthropicPricing::default(),
         }
     }

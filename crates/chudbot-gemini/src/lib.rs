@@ -24,13 +24,13 @@ pub struct GeminiClient {
 }
 
 impl GeminiClient {
-    /// Construct from a Gemini API key.
-    pub fn new(api_key: impl Into<String>) -> Self {
+    /// Construct from a configured provider name and Gemini API key.
+    pub fn new(provider_name: ProviderName, api_key: impl Into<String>) -> Self {
         Self {
             http: reqwest::Client::new(),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
-            provider_name: ProviderName::new("gemini"),
+            provider_name,
         }
     }
 
