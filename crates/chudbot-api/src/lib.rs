@@ -37,10 +37,9 @@ pub use llm::{
 pub use media::{
     AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
     AudioTranscriptionRequest, BoxedMediaRef, CreateMedia, GeneratedImage, GeneratedVideo,
-    ImageGenerator, ImageGeneratorTool, ImageGeneratorToolExt, ImageRequest, LoadedMedia,
-    MediaCategory, MediaError, MediaFuture, MediaMetadata, MediaRef, MediaStore, MediaToolError,
-    MediaUri, PublicMediaUrl, UrlMediaRef, VideoGenerator, VideoGeneratorTool,
-    VideoGeneratorToolExt, VideoJobStatus, VideoMeta, VideoRequest,
+    ImageGenerator, ImageRequest, LoadedMedia, MediaCategory, MediaError, MediaFuture,
+    MediaMetadata, MediaRef, MediaStore, MediaUri, PublicMediaUrl, UrlMediaRef, VideoGenerator,
+    VideoJobStatus, VideoMeta, VideoRequest,
 };
 pub use platform::{
     AttachmentRef, FetchMessages, MessagePlatform, OutgoingAttachment, PlatformCommand,
