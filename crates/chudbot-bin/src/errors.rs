@@ -5,6 +5,7 @@ use thiserror::Error;
 use tokio::task::JoinError;
 
 use crate::config::LoggingFilterError;
+use crate::diagnostics::ConfigValidationReport;
 
 /// Errors from the concrete provider registry.
 #[derive(Debug, Error)]
@@ -102,6 +103,9 @@ pub enum BinError {
     /// Config load failed.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// Config validation failed.
+    #[error(transparent)]
+    ConfigValidation(#[from] ConfigValidationReport),
     /// Bot config failed validation.
     #[error(transparent)]
     Bot(#[from] chudbot_bot::BotError),
@@ -128,58 +132,6 @@ pub enum BinError {
         /// Join error.
         source: JoinError,
     },
-    /// Agent provider has no matching `[llm.<name>]` config.
-    #[error("agent `{agent}` uses provider `{provider}` but no matching [llm] entry exists")]
-    MissingProviderConfig {
-        /// Agent name.
-        agent: String,
-        /// Provider name.
-        provider: ProviderName,
-    },
-    /// Memory provider has no matching `[llm.<name>]` config.
-    #[error("memory agent `{agent}` uses provider `{provider}` but no matching [llm] entry exists")]
-    MissingMemoryProviderConfig {
-        /// Memory agent name.
-        agent: String,
-        /// Provider name.
-        provider: ProviderName,
-    },
-    /// Agent image provider has no matching `[image.<name>]` config.
-    #[error(
-        "agent `{agent}` uses image provider `{provider}` but no matching [image] entry exists"
-    )]
-    MissingImageProviderConfig {
-        /// Agent name.
-        agent: String,
-        /// Provider name.
-        provider: ProviderName,
-    },
-    /// Agent video provider has no matching `[video.<name>]` config.
-    #[error(
-        "agent `{agent}` uses video provider `{provider}` but no matching [video] entry exists"
-    )]
-    MissingVideoProviderConfig {
-        /// Agent name.
-        agent: String,
-        /// Provider name.
-        provider: ProviderName,
-    },
-    /// Agent audio provider has no matching `[audio.<name>]` config.
-    #[error(
-        "agent `{agent}` uses audio provider `{provider}` but no matching [audio] entry exists"
-    )]
-    MissingAudioProviderConfig {
-        /// Agent name.
-        agent: String,
-        /// Provider name.
-        provider: ProviderName,
-    },
-    /// Platform binding has no matching platform config.
-    #[error("platform `{platform}` is bound in [bot.platforms] but has no [platforms] entry")]
-    MissingPlatformConfig {
-        /// Platform name.
-        platform: chudbot_api::PlatformName,
-    },
     /// Database URL was omitted.
     #[error("database.url must not be empty")]
     MissingDatabaseUrl,
@@ -205,8 +157,10 @@ pub enum ConfigError {
     Parse {
         /// Path.
         path: PathBuf,
+        /// Source TOML.
+        content: Box<str>,
         /// Source error.
         #[source]
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 }

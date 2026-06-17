@@ -1,11 +1,12 @@
 mod config;
+mod diagnostics;
 mod errors;
 mod platforms;
 mod runtime;
 mod services;
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::time::Duration;
@@ -14,8 +15,9 @@ use chudbot_bot::{BotRuntime, BotRuntimeParts};
 use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::WebState;
 use clap::{Parser, Subcommand};
-use config::{LogFormat, LoggingConfig, LoggingFilterError, RuntimeConfig};
-use errors::BinError;
+use config::{LoadedRuntimeConfig, LogFormat, LoggingConfig, LoggingFilterError, RuntimeConfig};
+use diagnostics::render_toml_error;
+use errors::{BinError, ConfigError};
 use platforms::ConfiguredMessagePlatforms;
 use runtime::run_runtime_services;
 use services::ServicePlan;
@@ -53,38 +55,29 @@ async fn main() -> ExitCode {
         .expect("failed to install rustls crypto provider");
 
     let args = Args::parse();
-    let config = match RuntimeConfig::load(&args.config) {
-        Ok(config) => config,
+    let loaded = match RuntimeConfig::load_with_source(&args.config) {
+        Ok(loaded) => loaded,
         Err(error) => {
-            init_tracing(&LoggingConfig::default()).expect("default logging filter must be valid");
             let error = BinError::Config(error);
-            tracing::error!(error = %error, "chudbot failed");
             report_error(&error);
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = init_tracing(&config.logging) {
-        let error = BinError::from(error);
-        report_error(&error);
-        return ExitCode::FAILURE;
+    let check_config = matches!(args.command, Command::CheckConfig);
+    if !check_config {
+        if let Err(error) = init_tracing(&loaded.config.logging) {
+            let error = BinError::from(error);
+            report_error(&error);
+            return ExitCode::FAILURE;
+        }
+        log_start(&args.config, &args.command, &loaded.config);
     }
-    tracing::info!(
-        version = VERSION,
-        config = %args.config.display(),
-        command = ?args.command,
-        agents = config.bot.agents.len(),
-        llm_providers = config.llm.len(),
-        image_providers = config.image.len(),
-        video_providers = config.video.len(),
-        audio_providers = config.audio.len(),
-        platforms = config.platforms.len(),
-        memory_enabled = config.memory.enabled,
-        "chudbot starting"
-    );
-    match run(args.command, args.config, config).await {
+    match run(args.command, args.config, loaded).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            tracing::error!(error = %error, "chudbot failed");
+            if !matches!(error, BinError::ConfigValidation(_)) {
+                tracing::error!(error = %error, "chudbot failed");
+            }
             report_error(&error);
             ExitCode::FAILURE
         }
@@ -99,11 +92,14 @@ async fn main() -> ExitCode {
 async fn run(
     command: Command,
     config_path: PathBuf,
-    config: RuntimeConfig,
+    loaded: LoadedRuntimeConfig,
 ) -> Result<(), BinError> {
+    let LoadedRuntimeConfig { config, source } = loaded;
     match command {
         Command::CheckConfig => {
-            config.validate()?;
+            config.validate_all(&source)?;
+            init_tracing(&config.logging)?;
+            log_start(&config_path, &Command::CheckConfig, &config);
             let plan = ServicePlan::build(&config)?;
             tracing::info!(
                 llm_providers = plan.llms.configured_count(),
@@ -125,7 +121,7 @@ async fn run(
         }
         Command::Serve => {
             let mut config = config;
-            config.validate()?;
+            config.validate_all(&source)?;
             let storage = SqlxStorage::connect(&config.database.url)
                 .await?
                 .with_default_privacy(config.default_privacy.clone());
@@ -164,7 +160,39 @@ async fn run(
     }
 }
 
+fn log_start(config_path: &Path, command: &Command, config: &RuntimeConfig) {
+    tracing::info!(
+        version = VERSION,
+        config = %config_path.display(),
+        command = ?command,
+        agents = config.bot.agents.len(),
+        llm_providers = config.llm.len(),
+        image_providers = config.image.len(),
+        video_providers = config.video.len(),
+        audio_providers = config.audio.len(),
+        platforms = config.platforms.len(),
+        memory_enabled = config.memory.enabled,
+        "chudbot starting"
+    );
+}
+
 fn report_error(error: &BinError) {
+    match error {
+        BinError::ConfigValidation(report) => {
+            eprint!("{}", report.render());
+            return;
+        }
+        BinError::Config(ConfigError::Parse {
+            path,
+            content,
+            source,
+        }) => {
+            eprint!("{}", render_toml_error(path, content, source.as_ref()));
+            return;
+        }
+        _ => {}
+    }
+
     eprintln!("Error: {error}");
     let mut source = std::error::Error::source(error);
     while let Some(error) = source {

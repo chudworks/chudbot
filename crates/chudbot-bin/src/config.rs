@@ -1,7 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::net::SocketAddr;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use chudbot_api::{ModelId, PrivacyMode, ProviderName};
 use chudbot_bot::{BotConfig, MemoryConfig};
@@ -11,6 +9,7 @@ use thiserror::Error;
 use tracing_subscriber::EnvFilter;
 
 use crate::VERSION;
+use crate::diagnostics::{ConfigSource, ConfigValidationReport, validate_runtime_config};
 use crate::errors::{BinError, ConfigError};
 
 /// Full process configuration.
@@ -49,6 +48,15 @@ pub struct RuntimeConfig {
     /// Local media storage config.
     #[serde(default)]
     pub storage: LocalStorageConfig,
+}
+
+/// Runtime config plus source text used for diagnostics.
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedRuntimeConfig {
+    /// Deserialized runtime config.
+    pub(crate) config: RuntimeConfig,
+    /// Original TOML source.
+    pub(crate) source: ConfigSource,
 }
 
 /// Process logging/tracing configuration.
@@ -119,9 +127,9 @@ fn default_privacy() -> PrivacyMode {
 }
 
 impl RuntimeConfig {
-    /// Load config from TOML.
+    /// Load config from TOML and retain source text for diagnostics.
     #[tracing::instrument(name = "config.load", skip_all, fields(path = %path.display()))]
-    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+    pub(crate) fn load_with_source(path: &Path) -> Result<LoadedRuntimeConfig, ConfigError> {
         tracing::debug!("reading config file");
         let content = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
@@ -130,7 +138,8 @@ impl RuntimeConfig {
         tracing::debug!(bytes = content.len(), "read config file");
         let mut config: Self = toml::from_str(&content).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
-            source,
+            content: content.clone().into_boxed_str(),
+            source: Box::new(source),
         })?;
         if config.bot.version.is_empty() {
             config.bot.version = VERSION.to_string();
@@ -145,120 +154,13 @@ impl RuntimeConfig {
             platforms = config.platforms.len(),
             "loaded runtime config"
         );
-        Ok(config)
+        let source = ConfigSource::new(path.to_path_buf(), content);
+        Ok(LoadedRuntimeConfig { config, source })
     }
 
-    /// Validate cross references.
-    #[tracing::instrument(
-        name = "config.validate",
-        skip_all,
-        fields(
-            agents = self.bot.agents.len(),
-            llm_providers = self.llm.len(),
-            image_providers = self.image.len(),
-            video_providers = self.video.len(),
-            audio_providers = self.audio.len(),
-            platforms = self.platforms.len(),
-        )
-    )]
-    pub fn validate(&self) -> Result<(), BinError> {
-        self.validate_database()?;
-        self.logging.filter()?;
-        self.bot.validate()?;
-        self.memory.compaction_interval_seconds()?;
-        self.memory.diary_backfill_window_seconds()?;
-        self.memory.diary_interval_seconds()?;
-
-        let provider_names = self.llm.keys().collect::<BTreeSet<_>>();
-        let image_provider_names = self.image.keys().collect::<BTreeSet<_>>();
-        let video_provider_names = self.video.keys().collect::<BTreeSet<_>>();
-        let audio_provider_names = self.audio.keys().collect::<BTreeSet<_>>();
-        if self.memory.enabled {
-            let memory_agents = self
-                .memory
-                .resolved_agent_providers(&self.bot.agents, self.bot.limits);
-            for (agent, provider) in memory_agents {
-                if !provider_names.contains(&provider) {
-                    tracing::warn!(
-                        agent = %agent,
-                        provider = %provider,
-                        "memory agent references missing provider config"
-                    );
-                    return Err(BinError::MissingMemoryProviderConfig { agent, provider });
-                }
-            }
-        }
-        for (agent_name, agent) in &self.bot.agents {
-            if !provider_names.contains(&agent.provider) {
-                tracing::warn!(
-                    agent = %agent_name,
-                    provider = %agent.provider,
-                    "agent references missing provider config"
-                );
-                return Err(BinError::MissingProviderConfig {
-                    agent: agent_name.clone(),
-                    provider: agent.provider.clone(),
-                });
-            }
-            if let Some(binding) = &agent.image_generation
-                && !image_provider_names.contains(&binding.provider)
-            {
-                tracing::warn!(
-                    agent = %agent_name,
-                    provider = %binding.provider,
-                    model = %binding.model,
-                    "agent references missing image provider config"
-                );
-                return Err(BinError::MissingImageProviderConfig {
-                    agent: agent_name.clone(),
-                    provider: binding.provider.clone(),
-                });
-            }
-            if let Some(binding) = &agent.video_generation
-                && !video_provider_names.contains(&binding.provider)
-            {
-                tracing::warn!(
-                    agent = %agent_name,
-                    provider = %binding.provider,
-                    model = %binding.model,
-                    "agent references missing video provider config"
-                );
-                return Err(BinError::MissingVideoProviderConfig {
-                    agent: agent_name.clone(),
-                    provider: binding.provider.clone(),
-                });
-            }
-            if let Some(binding) = &agent.audio_transcription
-                && !audio_provider_names.contains(&binding.provider)
-            {
-                tracing::warn!(
-                    agent = %agent_name,
-                    provider = %binding.provider,
-                    model = ?binding.model.as_ref(),
-                    "agent references missing audio provider config"
-                );
-                return Err(BinError::MissingAudioProviderConfig {
-                    agent: agent_name.clone(),
-                    provider: binding.provider.clone(),
-                });
-            }
-        }
-
-        for platform in self.bot.platforms.keys() {
-            if !self.platforms.contains_key(platform) {
-                tracing::warn!(
-                    platform = %platform,
-                    "bot platform binding references missing platform config"
-                );
-                return Err(BinError::MissingPlatformConfig {
-                    platform: platform.clone(),
-                });
-            }
-        }
-
-        SocketAddr::from_str(&self.web.listen)?;
-        tracing::info!("runtime config validated");
-        Ok(())
+    /// Validate config and return all static diagnostics with TOML spans.
+    pub(crate) fn validate_all(&self, source: &ConfigSource) -> Result<(), ConfigValidationReport> {
+        validate_runtime_config(self, source)
     }
 
     pub(crate) fn validate_database(&self) -> Result<(), BinError> {
