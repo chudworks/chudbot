@@ -9,12 +9,15 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chudbot_api::ProviderName;
+use chudbot_api::{PrivacyMode, ProviderName};
 use chudbot_bot::{GenerationBinding, TranscriptionBinding, VideoGenerationRateLimit};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::config::RuntimeConfig;
+use crate::config::{
+    AudioProviderConfig, ImageProviderConfig, LlmProviderConfig, MessagePlatformConfig,
+    RuntimeConfig, VideoProviderConfig,
+};
 
 const DATETIME_FIELD: &str = "$__toml_private_datetime";
 const MAX_SOURCE_LINE_CHARS: usize = 160;
@@ -53,7 +56,7 @@ impl ConfigSource {
         &self.input
     }
 
-    fn span_for(&self, path: &[PathPart<'_>]) -> Option<Range<usize>> {
+    fn node_for(&self, path: &[PathPart<'_>]) -> Option<&toml::Spanned<SourceNode>> {
         let mut value = self.root.as_ref()?;
         for part in path {
             value = match (value.get_ref(), part) {
@@ -62,7 +65,22 @@ impl ConfigSource {
                 _ => return None,
             };
         }
-        Some(value.span())
+        Some(value)
+    }
+
+    fn table_at(
+        &self,
+        path: &[PathPart<'_>],
+    ) -> Option<&BTreeMap<String, toml::Spanned<SourceNode>>> {
+        self.node_for(path)?.get_ref().as_table()
+    }
+
+    fn array_at(&self, path: &[PathPart<'_>]) -> Option<&[toml::Spanned<SourceNode>]> {
+        self.node_for(path)?.get_ref().as_array()
+    }
+
+    fn span_for(&self, path: &[PathPart<'_>]) -> Option<Range<usize>> {
+        self.node_for(path).map(toml::Spanned::span)
     }
 
     fn nearest_span_for(&self, path: &[PathPart<'_>]) -> Option<Range<usize>> {
@@ -96,6 +114,26 @@ enum SourceNode {
     Scalar,
     Array(Vec<toml::Spanned<SourceNode>>),
     Table(BTreeMap<String, toml::Spanned<SourceNode>>),
+}
+
+impl SourceNode {
+    fn as_table(&self) -> Option<&BTreeMap<String, toml::Spanned<SourceNode>>> {
+        match self {
+            Self::Table(entries) => Some(entries),
+            Self::Scalar | Self::Array(_) => None,
+        }
+    }
+
+    fn as_array(&self) -> Option<&[toml::Spanned<SourceNode>]> {
+        match self {
+            Self::Array(items) => Some(items),
+            Self::Scalar | Self::Table(_) => None,
+        }
+    }
+
+    fn is_table(&self) -> bool {
+        matches!(self, Self::Table(_))
+    }
 }
 
 impl<'de> Deserialize<'de> for SourceNode {
@@ -584,11 +622,129 @@ impl SourceLineWindow {
     }
 }
 
+const ROOT_KEYS: &[&str] = &[
+    "database",
+    "logging",
+    "bot",
+    "memory",
+    "default_privacy",
+    "llm",
+    "image",
+    "video",
+    "audio",
+    "platforms",
+    "web",
+    "storage",
+];
+const DATABASE_KEYS: &[&str] = &["url"];
+const LOGGING_KEYS: &[&str] = &["filter", "format", "ansi"];
+const WEB_KEYS: &[&str] = &[
+    "listen",
+    "title_prefix",
+    "frontend_dir",
+    "favicon_path",
+    "public_base_url",
+    "og_image_path",
+    "trust_forwarded_for",
+];
+const STORAGE_KEYS: &[&str] = &[
+    "images_dir",
+    "videos_dir",
+    "audio_dir",
+    "avatars_dir",
+    "public_base_url",
+];
+const MEMORY_KEYS: &[&str] = &[
+    "enabled",
+    "poll_interval_seconds",
+    "compaction_interval",
+    "diary_backfill_window",
+    "diary_interval",
+    "lease_seconds",
+    "max_jobs_per_tick",
+    "max_concurrent_jobs",
+    "max_transcript_turns_per_diary_job",
+    "retry_backoff_seconds",
+    "max_job_attempts",
+];
+const DEFAULT_PRIVACY_OPEN_KEYS: &[&str] = &["mode", "history_size"];
+const DEFAULT_PRIVACY_CHANNEL_ONLY_KEYS: &[&str] = &["mode", "channel", "history_size"];
+const DEFAULT_PRIVACY_NO_HISTORY_KEYS: &[&str] = &["mode"];
+const USER_REF_KEYS: &[&str] = &["platform", "guild_id", "user_id"];
+const CHANNEL_REF_KEYS: &[&str] = &["platform", "guild_id", "channel_id"];
+const BOT_KEYS: &[&str] = &[
+    "web_base_url",
+    "default_agent",
+    "agents",
+    "admins",
+    "platforms",
+    "extra_system_prompt",
+    "version",
+    "limits",
+    "thread_threshold_chars",
+    "thread_threshold_lines",
+];
+const LIMIT_KEYS: &[&str] = &["max_iterations"];
+const PLATFORM_BINDING_KEYS: &[&str] = &["agent"];
+const AGENT_KEYS: &[&str] = &[
+    "provider",
+    "system_prompt",
+    "model",
+    "server_tools",
+    "client_tools",
+    "limits",
+    "image_generation",
+    "video_generation",
+    "audio_transcription",
+    "memory",
+    "subagents",
+];
+const MODEL_KEYS: &[&str] = &["id", "server_tools", "sampling", "provider_options"];
+const SAMPLING_KEYS: &[&str] = &["max_output_tokens", "temperature", "top_p"];
+const PROVIDER_OPTIONS_KEYS: &[&str] = &["value"];
+const GENERATION_BINDING_KEYS: &[&str] = &["provider", "model", "rate_limit"];
+const TRANSCRIPTION_BINDING_KEYS: &[&str] = &["provider", "model", "wake_word"];
+const RATE_LIMIT_KEYS: &[&str] = &["limit", "interval", "bypass_scopes"];
+const PLATFORM_SCOPE_BYPASS_KEYS: &[&str] = &["platform", "scope_id"];
+const SUBAGENT_BINDING_KEYS: &[&str] = &["agent", "description"];
+const LLM_XAI_KEYS: &[&str] = &["kind", "api_key", "base_url"];
+const LLM_OPENAI_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing"];
+const LLM_ANTHROPIC_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing"];
+const LLM_OPENAI_COMPAT_KEYS: &[&str] = &["kind", "base_url", "api_key"];
+const LLM_GEMINI_KEYS: &[&str] = &["kind", "api_key", "base_url"];
+const IMAGE_OPENAI_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing"];
+const IMAGE_XAI_KEYS: &[&str] = &["kind", "api_key", "base_url"];
+const IMAGE_GEMINI_KEYS: &[&str] = &["kind", "api_key", "base_url"];
+const VIDEO_PROVIDER_KEYS: &[&str] = &["kind", "api_key", "base_url"];
+const AUDIO_PROVIDER_KEYS: &[&str] = &["kind", "api_key", "base_url"];
+const DISCORD_PLATFORM_KEYS: &[&str] = &["kind", "token", "dev_guild_id"];
+const OPENAI_TOKEN_PRICING_KEYS: &[&str] = &[
+    "input_usd_per_million_tokens",
+    "cached_input_usd_per_million_tokens",
+    "output_usd_per_million_tokens",
+];
+const OPENAI_IMAGE_PRICING_KEYS: &[&str] = &[
+    "text_input_usd_per_million_tokens",
+    "cached_text_input_usd_per_million_tokens",
+    "image_input_usd_per_million_tokens",
+    "cached_image_input_usd_per_million_tokens",
+    "image_output_usd_per_million_tokens",
+    "text_output_usd_per_million_tokens",
+];
+const ANTHROPIC_TOKEN_PRICING_KEYS: &[&str] = &[
+    "input_usd_per_million_tokens",
+    "cache_creation_5m_usd_per_million_tokens",
+    "cache_creation_1h_usd_per_million_tokens",
+    "cache_read_usd_per_million_tokens",
+    "output_usd_per_million_tokens",
+];
+
 pub(crate) fn validate_runtime_config(
     config: &RuntimeConfig,
     source: &ConfigSource,
 ) -> Result<(), ConfigValidationReport> {
     let mut diagnostics = Vec::new();
+    validate_unexpected_keys(config, source, &mut diagnostics);
     validate_database(config, source, &mut diagnostics);
     validate_logging(config, source, &mut diagnostics);
     validate_bot_config(config, source, &mut diagnostics);
@@ -604,6 +760,432 @@ pub(crate) fn validate_runtime_config(
             diagnostics,
             config.logging.ansi,
         ))
+    }
+}
+
+fn validate_unexpected_keys(
+    config: &RuntimeConfig,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    validate_known_keys(source, diagnostics, &[], ROOT_KEYS);
+    validate_known_keys(source, diagnostics, &[key("database")], DATABASE_KEYS);
+    validate_known_keys(source, diagnostics, &[key("logging")], LOGGING_KEYS);
+    validate_known_keys(source, diagnostics, &[key("web")], WEB_KEYS);
+    validate_known_keys(source, diagnostics, &[key("storage")], STORAGE_KEYS);
+    validate_known_keys(source, diagnostics, &[key("memory")], MEMORY_KEYS);
+    validate_default_privacy_unexpected_keys(&config.default_privacy, source, diagnostics);
+    validate_bot_unexpected_keys(config, source, diagnostics);
+    validate_runtime_provider_unexpected_keys(config, source, diagnostics);
+}
+
+fn validate_default_privacy_unexpected_keys(
+    privacy: &PrivacyMode,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let path = [key("default_privacy")];
+    match privacy {
+        PrivacyMode::Open { .. } => {
+            validate_known_keys(source, diagnostics, &path, DEFAULT_PRIVACY_OPEN_KEYS);
+        }
+        PrivacyMode::ChannelOnly { .. } => {
+            validate_known_keys(
+                source,
+                diagnostics,
+                &path,
+                DEFAULT_PRIVACY_CHANNEL_ONLY_KEYS,
+            );
+            validate_known_keys(
+                source,
+                diagnostics,
+                &child_path(&path, "channel"),
+                CHANNEL_REF_KEYS,
+            );
+        }
+        PrivacyMode::OptIn | PrivacyMode::ConversationOnly => {
+            validate_known_keys(source, diagnostics, &path, DEFAULT_PRIVACY_NO_HISTORY_KEYS);
+        }
+    }
+}
+
+fn validate_bot_unexpected_keys(
+    config: &RuntimeConfig,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let bot_path = [key("bot")];
+    validate_known_keys(source, diagnostics, &bot_path, BOT_KEYS);
+    validate_known_keys(
+        source,
+        diagnostics,
+        &child_path(&bot_path, "limits"),
+        LIMIT_KEYS,
+    );
+    validate_array_item_keys(
+        source,
+        diagnostics,
+        &child_path(&bot_path, "admins"),
+        USER_REF_KEYS,
+    );
+    validate_map_entry_keys(
+        source,
+        diagnostics,
+        &child_path(&bot_path, "platforms"),
+        PLATFORM_BINDING_KEYS,
+    );
+
+    let agents_path = child_path(&bot_path, "agents");
+    for agent_name in config.bot.agents.keys() {
+        validate_agent_unexpected_keys(source, diagnostics, &agents_path, agent_name);
+    }
+}
+
+fn validate_agent_unexpected_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    agents_path: &[PathPart<'_>],
+    agent_name: &str,
+) {
+    let agent_path = child_path(agents_path, agent_name);
+    validate_known_keys(source, diagnostics, &agent_path, AGENT_KEYS);
+    validate_known_keys(
+        source,
+        diagnostics,
+        &child_path(&agent_path, "limits"),
+        LIMIT_KEYS,
+    );
+    let model_path = child_path(&agent_path, "model");
+    validate_known_keys(source, diagnostics, &model_path, MODEL_KEYS);
+    validate_known_keys(
+        source,
+        diagnostics,
+        &child_path(&model_path, "sampling"),
+        SAMPLING_KEYS,
+    );
+    validate_known_keys(
+        source,
+        diagnostics,
+        &child_path(&model_path, "provider_options"),
+        PROVIDER_OPTIONS_KEYS,
+    );
+    validate_generation_binding_unexpected_keys(
+        source,
+        diagnostics,
+        &child_path(&agent_path, "image_generation"),
+    );
+    validate_generation_binding_unexpected_keys(
+        source,
+        diagnostics,
+        &child_path(&agent_path, "video_generation"),
+    );
+    validate_transcription_binding_unexpected_keys(
+        source,
+        diagnostics,
+        &child_path(&agent_path, "audio_transcription"),
+    );
+    validate_map_entry_keys(
+        source,
+        diagnostics,
+        &child_path(&agent_path, "subagents"),
+        SUBAGENT_BINDING_KEYS,
+    );
+}
+
+fn validate_generation_binding_unexpected_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    binding_path: &[PathPart<'_>],
+) {
+    validate_known_keys(source, diagnostics, binding_path, GENERATION_BINDING_KEYS);
+    let rate_limit_path = child_path(binding_path, "rate_limit");
+    validate_known_keys(source, diagnostics, &rate_limit_path, RATE_LIMIT_KEYS);
+    validate_array_item_keys(
+        source,
+        diagnostics,
+        &child_path(&rate_limit_path, "bypass_scopes"),
+        PLATFORM_SCOPE_BYPASS_KEYS,
+    );
+}
+
+fn validate_transcription_binding_unexpected_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    binding_path: &[PathPart<'_>],
+) {
+    validate_known_keys(
+        source,
+        diagnostics,
+        binding_path,
+        TRANSCRIPTION_BINDING_KEYS,
+    );
+}
+
+fn validate_runtime_provider_unexpected_keys(
+    config: &RuntimeConfig,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    for (provider_name, provider) in &config.llm {
+        validate_llm_provider_unexpected_keys(
+            source,
+            diagnostics,
+            provider_name.as_str(),
+            provider,
+        );
+    }
+    for (provider_name, provider) in &config.image {
+        validate_image_provider_unexpected_keys(
+            source,
+            diagnostics,
+            provider_name.as_str(),
+            provider,
+        );
+    }
+    for (provider_name, provider) in &config.video {
+        validate_video_provider_unexpected_keys(
+            source,
+            diagnostics,
+            provider_name.as_str(),
+            provider,
+        );
+    }
+    for (provider_name, provider) in &config.audio {
+        validate_audio_provider_unexpected_keys(
+            source,
+            diagnostics,
+            provider_name.as_str(),
+            provider,
+        );
+    }
+    for (platform_name, platform) in &config.platforms {
+        validate_platform_unexpected_keys(source, diagnostics, platform_name.as_str(), platform);
+    }
+}
+
+fn validate_llm_provider_unexpected_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    provider_name: &str,
+    provider: &LlmProviderConfig,
+) {
+    let path = [key("llm"), key(provider_name)];
+    match provider {
+        LlmProviderConfig::Xai { .. } => {
+            validate_known_keys(source, diagnostics, &path, LLM_XAI_KEYS);
+        }
+        LlmProviderConfig::OpenAi { .. } => {
+            validate_known_keys(source, diagnostics, &path, LLM_OPENAI_KEYS);
+            validate_map_entry_keys(
+                source,
+                diagnostics,
+                &child_path(&path, "pricing"),
+                OPENAI_TOKEN_PRICING_KEYS,
+            );
+        }
+        LlmProviderConfig::Anthropic { .. } => {
+            validate_known_keys(source, diagnostics, &path, LLM_ANTHROPIC_KEYS);
+            validate_map_entry_keys(
+                source,
+                diagnostics,
+                &child_path(&path, "pricing"),
+                ANTHROPIC_TOKEN_PRICING_KEYS,
+            );
+        }
+        LlmProviderConfig::OpenAiCompat { .. } => {
+            validate_known_keys(source, diagnostics, &path, LLM_OPENAI_COMPAT_KEYS);
+        }
+        LlmProviderConfig::Gemini { .. } => {
+            validate_known_keys(source, diagnostics, &path, LLM_GEMINI_KEYS);
+        }
+    }
+}
+
+fn validate_image_provider_unexpected_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    provider_name: &str,
+    provider: &ImageProviderConfig,
+) {
+    let path = [key("image"), key(provider_name)];
+    match provider {
+        ImageProviderConfig::OpenAi { .. } => {
+            validate_known_keys(source, diagnostics, &path, IMAGE_OPENAI_KEYS);
+            validate_map_entry_keys(
+                source,
+                diagnostics,
+                &child_path(&path, "pricing"),
+                OPENAI_IMAGE_PRICING_KEYS,
+            );
+        }
+        ImageProviderConfig::Xai { .. } => {
+            validate_known_keys(source, diagnostics, &path, IMAGE_XAI_KEYS);
+        }
+        ImageProviderConfig::Gemini { .. } => {
+            validate_known_keys(source, diagnostics, &path, IMAGE_GEMINI_KEYS);
+        }
+    }
+}
+
+fn validate_video_provider_unexpected_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    provider_name: &str,
+    provider: &VideoProviderConfig,
+) {
+    let path = [key("video"), key(provider_name)];
+    match provider {
+        VideoProviderConfig::Xai { .. } | VideoProviderConfig::Gemini { .. } => {
+            validate_known_keys(source, diagnostics, &path, VIDEO_PROVIDER_KEYS);
+        }
+    }
+}
+
+fn validate_audio_provider_unexpected_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    provider_name: &str,
+    provider: &AudioProviderConfig,
+) {
+    let path = [key("audio"), key(provider_name)];
+    match provider {
+        AudioProviderConfig::Xai { .. } => {
+            validate_known_keys(source, diagnostics, &path, AUDIO_PROVIDER_KEYS);
+        }
+    }
+}
+
+fn validate_platform_unexpected_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    platform_name: &str,
+    platform: &MessagePlatformConfig,
+) {
+    let path = [key("platforms"), key(platform_name)];
+    match platform {
+        MessagePlatformConfig::Discord { .. } => {
+            validate_known_keys(source, diagnostics, &path, DISCORD_PLATFORM_KEYS);
+        }
+    }
+}
+
+fn validate_known_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    path: &[PathPart<'_>],
+    allowed: &[&str],
+) {
+    let Some(entries) = source.table_at(path) else {
+        return;
+    };
+    for (entry_name, entry) in entries {
+        if !allowed.contains(&entry_name.as_str()) {
+            diagnostics.push(unexpected_key_diagnostic(
+                source, path, entry_name, entry, allowed,
+            ));
+        }
+    }
+}
+
+fn validate_map_entry_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    map_path: &[PathPart<'_>],
+    entry_allowed: &[&str],
+) {
+    let Some(entries) = source.table_at(map_path) else {
+        return;
+    };
+    for entry_name in entries.keys() {
+        validate_known_keys(
+            source,
+            diagnostics,
+            &child_path(map_path, entry_name),
+            entry_allowed,
+        );
+    }
+}
+
+fn validate_array_item_keys(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    array_path: &[PathPart<'_>],
+    item_allowed: &[&str],
+) {
+    let Some(items) = source.array_at(array_path) else {
+        return;
+    };
+    for index in 0..items.len() {
+        validate_known_keys(
+            source,
+            diagnostics,
+            &indexed_path(array_path, index),
+            item_allowed,
+        );
+    }
+}
+
+fn child_path<'a>(path: &[PathPart<'a>], child: &'a str) -> Vec<PathPart<'a>> {
+    let mut out = path.to_vec();
+    out.push(key(child));
+    out
+}
+
+fn indexed_path<'a>(path: &[PathPart<'a>], child: usize) -> Vec<PathPart<'a>> {
+    let mut out = path.to_vec();
+    out.push(index(child));
+    out
+}
+
+fn unexpected_key_diagnostic(
+    source: &ConfigSource,
+    parent_path: &[PathPart<'_>],
+    entry_name: &str,
+    entry: &toml::Spanned<SourceNode>,
+    allowed: &[&str],
+) -> ConfigDiagnostic {
+    let mut full_path = parent_path.to_vec();
+    full_path.push(key(entry_name));
+    let entry_kind = if entry.get_ref().is_table() {
+        "section"
+    } else {
+        "key"
+    };
+    let span = source
+        .span_for(&full_path)
+        .unwrap_or_else(|| entry.span())
+        .clone();
+    ConfigDiagnostic::new(format!(
+        "unexpected config {entry_kind} `{}`",
+        config_path(&full_path)
+    ))
+    .with_label(DiagnosticLabel {
+        span,
+        message: format!("unexpected {entry_kind} here"),
+    })
+    .with_optional_help(unexpected_key_help(entry_name, allowed))
+}
+
+fn unexpected_key_help(entry_name: &str, allowed: &[&str]) -> Option<String> {
+    if allowed.is_empty() {
+        return None;
+    }
+    let allowed_names = allowed
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect::<BTreeSet<_>>();
+    let expected = allowed
+        .iter()
+        .map(|name| format!("`{}`", toml_key(name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(suggestion) = closest_name(entry_name, &allowed_names) {
+        Some(format!(
+            "did you mean `{}`?; expected keys here: {expected}",
+            toml_key(suggestion)
+        ))
+    } else {
+        Some(format!("expected keys here: {expected}"))
     }
 }
 
@@ -1380,6 +1962,28 @@ fn table_path(parts: &[&str]) -> String {
     )
 }
 
+fn config_path(parts: &[PathPart<'_>]) -> String {
+    let mut out = String::new();
+    for part in parts {
+        match part {
+            PathPart::Key(key) => {
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(&toml_key(key));
+            }
+            PathPart::Index(index) => {
+                let _ = write!(out, "[{index}]");
+            }
+        }
+    }
+    if out.is_empty() {
+        "top level".to_string()
+    } else {
+        out
+    }
+}
+
 fn toml_key(value: &str) -> String {
     if !value.is_empty()
         && value
@@ -1536,6 +2140,99 @@ token = "token"
         assert!(rendered.contains("\x1b[34m-->\x1b[0m"));
         assert!(rendered.contains("\x1b[34m|\x1b[0m"));
         assert!(rendered.contains("\x1b[32mhelp\x1b[0m"));
+    }
+
+    #[test]
+    fn unexpected_keys_are_reported_with_local_suggestions() {
+        let input = r#"
+[database]
+url = "postgres://localhost/chudbot"
+pool_size = 5
+
+[web]
+listen = "127.0.0.1:1860"
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+frontned_dir = "typo"
+
+[default_privacy]
+mode = "open"
+history_size = 20
+channel = { platform = "discord", guild_id = "1", channel_id = "2" }
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+admins = [{ platform = "discord", user_id = "123", nickname = "Chud" }]
+
+[bot.agents.default]
+provider = "openai"
+system_prompt = "hi"
+persona = "old"
+
+[bot.agents.default.model]
+id = "gpt-test"
+model_typo = true
+
+[bot.agents.default.model.provider_options]
+value = { reasoning_effort = "high", nested = { arbitrary = true } }
+unexpected_envelope = true
+
+[bot.agents.default.video_generation]
+provider = "grok_video"
+model = "grok-imagine-video"
+
+[bot.agents.default.video_generation.rate_limit]
+limit = 1
+bypass_scopes = [{ platform = "discord", scope_id = "123", guild = "456" }]
+
+[bot.agents.default.subagents.ask]
+agent = "default"
+description = "Ask self"
+extra = true
+
+[llm.openai]
+kind = "openai"
+api_key = "key"
+organization = "old"
+
+[llm.openai.pricing.gpt-test]
+input_usd_per_million_tokens = 1.0
+output_usd_per_million_tokens = 2.0
+typo = 3.0
+
+[video.grok_video]
+kind = "xai"
+api_key = "key"
+
+[personas.default]
+provider = "openai"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
+        let report = validate_runtime_config(&config, &source).unwrap_err();
+        let rendered = report.render();
+
+        assert!(rendered.contains("unexpected config key `database.pool_size`"));
+        assert!(rendered.contains("unexpected config key `web.frontned_dir`"));
+        assert!(rendered.contains("did you mean `frontend_dir`?"));
+        assert!(rendered.contains("unexpected config section `default_privacy.channel`"));
+        assert!(rendered.contains("unexpected config key `bot.admins[0].nickname`"));
+        assert!(rendered.contains("unexpected config key `bot.agents.default.persona`"));
+        assert!(rendered.contains("unexpected config key `bot.agents.default.model.model_typo`"));
+        assert!(rendered.contains(
+            "unexpected config key `bot.agents.default.model.provider_options.unexpected_envelope`"
+        ));
+        assert!(!rendered.contains("reasoning_effort"));
+        assert!(rendered.contains(
+            "unexpected config key `bot.agents.default.video_generation.rate_limit.bypass_scopes[0].guild`"
+        ));
+        assert!(
+            rendered.contains("unexpected config key `bot.agents.default.subagents.ask.extra`")
+        );
+        assert!(rendered.contains("unexpected config key `llm.openai.organization`"));
+        assert!(rendered.contains("unexpected config key `llm.openai.pricing.gpt-test.typo`"));
+        assert!(rendered.contains("unexpected config section `personas`"));
     }
 
     #[test]

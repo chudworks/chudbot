@@ -58,7 +58,6 @@ const EMPTY_MEMORY: &str = "(no stored memory)";
 
 /// User-memory runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Global memory switch.
     #[serde(default)]

@@ -481,7 +481,6 @@ pub struct GenerationBinding {
 
 /// Active-video rate limit for a video-generation binding.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VideoGenerationRateLimit {
     /// Maximum pending plus successful video generations per interval.
     pub limit: u32,
@@ -495,7 +494,6 @@ pub struct VideoGenerationRateLimit {
 
 /// One platform scope exempt from a video-generation rate limit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PlatformScopeBypass {
     /// Messaging platform, e.g. `discord`.
     pub platform: PlatformName,

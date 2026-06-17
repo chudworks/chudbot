@@ -134,7 +134,6 @@ pub struct SamplingOptions {
 
 /// Provider-specific options for the already-routed backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ProviderOptions {
     /// Provider-owned serialized value.
     pub value: serde_json::Value,
