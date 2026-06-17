@@ -9,7 +9,9 @@ use chudbot_api::{
     ProviderName, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
-use chudbot_web::{EventBus, WebConfig};
+use chudbot_bot::BotRuntimeTypes;
+use chudbot_storage_sqlx::SqlxStorage;
+use chudbot_web::{EventBus, WebConfig, WebRuntimeTypes};
 use moka::future::Cache;
 use serde_json::json;
 
@@ -20,12 +22,13 @@ use crate::config::{
 use crate::errors::{
     BinError, ConfiguredAudioError, ConfiguredImageError, ConfiguredLlmError, ConfiguredVideoError,
 };
+use crate::platforms::ConfiguredMessagePlatforms;
 
 const MODEL_INFO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Services that can be built before storage/platform implementations exist.
+/// Services built during process bootstrap before storage/platforms connect.
 #[derive(Debug)]
-pub struct ServicePlan {
+pub struct BootstrapServices {
     /// LLM provider registry.
     pub llms: ConfiguredLlmProviders,
     /// Image generation registry.
@@ -42,7 +45,28 @@ pub struct ServicePlan {
     pub web: WebConfig,
 }
 
-impl ServicePlan {
+/// Concrete bot runtime service type set built by this binary.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConfiguredBotRuntime;
+
+impl BotRuntimeTypes for ConfiguredBotRuntime {
+    type Platforms = ConfiguredMessagePlatforms;
+    type Storage = SqlxStorage;
+    type Media = LocalMediaStore;
+    type Llms = ConfiguredLlmProviders;
+    type Images = ConfiguredImageGenerators;
+    type Videos = ConfiguredVideoGenerators;
+    type Audio = ConfiguredAudioTranscribers;
+    type Events = EventBus;
+}
+
+impl WebRuntimeTypes for ConfiguredBotRuntime {
+    type Storage = <Self as BotRuntimeTypes>::Storage;
+    type Media = <Self as BotRuntimeTypes>::Media;
+    type Llms = <Self as BotRuntimeTypes>::Llms;
+}
+
+impl BootstrapServices {
     #[tracing::instrument(
         name = "services.build",
         skip_all,
@@ -76,7 +100,7 @@ impl ServicePlan {
             video_providers = videos.configured_count(),
             audio_providers = audio.configured_count(),
             event_capacity = 256,
-            "built service plan"
+            "built bootstrap services"
         );
         Ok(Self {
             llms,

@@ -1,11 +1,7 @@
 use std::net::SocketAddr;
 
-use chudbot_api::{
-    AudioTranscriberRegistry, BotStorage, EventSink, ImageGeneratorRegistry, LlmProviderRegistry,
-    MediaStore, MessagePlatformRegistry, VideoGeneratorRegistry,
-};
-use chudbot_bot::{BotRunOptions, BotRuntime};
-use chudbot_web::WebState;
+use chudbot_bot::{BotRunOptions, BotRuntime, BotRuntimeTypes};
+use chudbot_web::{WebRuntimeTypes, WebState};
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
@@ -14,20 +10,13 @@ use crate::errors::BinError;
 
 /// Run fully constructed bot and web services until a process shutdown signal
 /// or either service exits.
-pub async fn run_runtime_services<P, S, M, L, I, V, A, E>(
-    bot: BotRuntime<P, S, M, L, I, V, A, E>,
-    web: WebState<S, M, L>,
+pub async fn run_runtime_services<R>(
+    bot: BotRuntime<R>,
+    web: WebState<R>,
     listen: SocketAddr,
 ) -> Result<(), BinError>
 where
-    P: MessagePlatformRegistry + Clone + 'static,
-    S: BotStorage + Clone + Send + Sync + 'static,
-    M: MediaStore + Clone + Send + Sync + 'static,
-    L: LlmProviderRegistry + Clone + 'static,
-    I: ImageGeneratorRegistry + Clone + 'static,
-    V: VideoGeneratorRegistry + Clone + 'static,
-    A: AudioTranscriberRegistry + Clone + 'static,
-    E: EventSink + Clone + 'static,
+    R: BotRuntimeTypes + WebRuntimeTypes + 'static,
 {
     let shutdown = CancellationToken::new();
     let bot_shutdown = shutdown.child_token();

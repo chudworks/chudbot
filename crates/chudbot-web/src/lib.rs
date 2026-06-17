@@ -155,21 +155,54 @@ pub struct WebConfig {
     pub trust_forwarded_for: bool,
 }
 
+/// Compile-time service types for the web runtime.
+pub trait WebRuntimeTypes: 'static {
+    type Storage: BotStorage + Clone + Send + Sync + 'static;
+    type Media: MediaStore + Clone + Send + Sync + 'static;
+    type Llms: LlmProviderRegistry + Clone + Send + Sync + 'static;
+}
+
 /// State shared by web handlers.
-#[derive(Debug, Clone)]
-pub struct WebState<S, M, L> {
-    storage: S,
-    media_store: M,
-    llms: L,
+#[derive(Debug)]
+pub struct WebState<R: WebRuntimeTypes> {
+    storage: R::Storage,
+    media_store: R::Media,
+    llms: R::Llms,
     events: EventBus,
     config: WebConfig,
     static_files: StaticFileCache,
     shutdown: CancellationToken,
 }
 
-impl<S, M, L> WebState<S, M, L> {
+impl<R> Clone for WebState<R>
+where
+    R: WebRuntimeTypes,
+{
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            media_store: self.media_store.clone(),
+            llms: self.llms.clone(),
+            events: self.events.clone(),
+            config: self.config.clone(),
+            static_files: self.static_files.clone(),
+            shutdown: self.shutdown.clone(),
+        }
+    }
+}
+
+impl<R> WebState<R>
+where
+    R: WebRuntimeTypes,
+{
     /// Build web state from concrete services.
-    pub fn new(storage: S, media_store: M, llms: L, events: EventBus, config: WebConfig) -> Self {
+    pub fn new(
+        storage: R::Storage,
+        media_store: R::Media,
+        llms: R::Llms,
+        events: EventBus,
+        config: WebConfig,
+    ) -> Self {
         tracing::debug!(
             frontend_dir = %config.frontend_dir.display(),
             title_prefix = %config.title_prefix,
@@ -283,27 +316,6 @@ impl EventSink for EventBus {
     }
 }
 
-/// Run the web server.
-#[tracing::instrument(
-    name = "web.run",
-    skip_all,
-    fields(
-        listen = %listen,
-        frontend_dir = %state.config.frontend_dir.display(),
-    )
-)]
-pub async fn run<S, M, L>(
-    state: WebState<S, M, L>,
-    listen: SocketAddr,
-) -> Result<(), WebServerError>
-where
-    S: BotStorage + Clone + Send + Sync + 'static,
-    M: MediaStore + Clone + Send + Sync + 'static,
-    L: LlmProviderRegistry + Clone + Send + Sync + 'static,
-{
-    run_until_shutdown(state, listen, std::future::pending::<()>()).await
-}
-
 /// Run the web server until the supplied shutdown future resolves.
 #[tracing::instrument(
     name = "web.run_until_shutdown",
@@ -313,15 +325,13 @@ where
         frontend_dir = %state.config.frontend_dir.display(),
     )
 )]
-pub async fn run_until_shutdown<S, M, L, F>(
-    state: WebState<S, M, L>,
+pub async fn run_until_shutdown<R, F>(
+    state: WebState<R>,
     listen: SocketAddr,
     shutdown: F,
 ) -> Result<(), WebServerError>
 where
-    S: BotStorage + Clone + Send + Sync + 'static,
-    M: MediaStore + Clone + Send + Sync + 'static,
-    L: LlmProviderRegistry + Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
     F: Future<Output = ()> + Send + 'static,
 {
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -343,11 +353,9 @@ where
 }
 
 /// Build an Axum router for the viewer.
-pub fn router<S, M, L>(state: WebState<S, M, L>) -> Router
+pub fn router<R>(state: WebState<R>) -> Router
 where
-    S: BotStorage + Clone + Send + Sync + 'static,
-    M: MediaStore + Clone + Send + Sync + 'static,
-    L: LlmProviderRegistry + Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     tracing::debug!(
         frontend_dir = %state.config.frontend_dir.display(),
@@ -355,26 +363,26 @@ where
     );
     let trust_forwarded_for = state.config.trust_forwarded_for;
     let api = Router::new()
-        .route("/api/config", get(get_config::<S, M, L>))
-        .route("/api/conversations/{id}", get(get_conversation::<S, M, L>))
+        .route("/api/config", get(get_config::<R>))
+        .route("/api/conversations/{id}", get(get_conversation::<R>))
         .route(
             "/api/conversations/{id}/events",
-            get(conversation_events::<S, M, L>),
+            get(conversation_events::<R>),
         )
         .layer(cache_layer(CACHE_NO_STORE));
 
     Router::new()
         .merge(api)
-        .route("/videos/{name}", get(get_video::<S, M, L>))
-        .route("/audio/{name}", get(get_audio::<S, M, L>))
-        .route("/avatars/{name}", get(get_avatar::<S, M, L>))
-        .route("/images/{name}", get(get_image::<S, M, L>))
-        .route("/favicon.ico", get(get_favicon::<S, M, L>))
-        .route("/og-image", get(get_og_image::<S, M, L>))
+        .route("/videos/{name}", get(get_video::<R>))
+        .route("/audio/{name}", get(get_audio::<R>))
+        .route("/avatars/{name}", get(get_avatar::<R>))
+        .route("/images/{name}", get(get_image::<R>))
+        .route("/favicon.ico", get(get_favicon::<R>))
+        .route("/og-image", get(get_og_image::<R>))
         .route("/robots.txt", get(get_robots))
         .route("/assets", get(frontend_assets_root))
-        .route("/assets/{*path}", get(get_frontend_asset::<S, M, L>))
-        .fallback(spa_index::<S, M, L>)
+        .route("/assets/{*path}", get(get_frontend_asset::<R>))
+        .fallback(spa_index::<R>)
         .layer(x_robots_layer())
         .layer(middleware::from_fn(block_crawlers))
         .layer(middleware::from_fn_with_state(
@@ -421,11 +429,9 @@ impl IntoResponse for ApiError {
 }
 
 #[tracing::instrument(name = "web.get_config", skip_all)]
-async fn get_config<S, M, L>(State(state): State<WebState<S, M, L>>) -> Json<serde_json::Value>
+async fn get_config<R>(State(state): State<WebState<R>>) -> Json<serde_json::Value>
 where
-    S: Clone + Send + Sync + 'static,
-    M: Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     tracing::debug!("serving web config");
     Json(serde_json::json!({
@@ -439,14 +445,12 @@ where
     skip_all,
     fields(conversation = %id)
 )]
-async fn get_conversation<S, M, L>(
-    State(state): State<WebState<S, M, L>>,
+async fn get_conversation<R>(
+    State(state): State<WebState<R>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ConversationView>, ApiError>
 where
-    S: BotStorage + Clone + Send + Sync + 'static,
-    M: Clone + Send + Sync + 'static,
-    L: LlmProviderRegistry + Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     let snapshot = state
         .storage
@@ -798,14 +802,12 @@ fn user_key(user: &UserRef) -> String {
     skip_all,
     fields(conversation = %id)
 )]
-async fn conversation_events<S, M, L>(
-    State(state): State<WebState<S, M, L>>,
+async fn conversation_events<R>(
+    State(state): State<WebState<R>>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError>
 where
-    S: BotStorage + Clone + Send + Sync + 'static,
-    M: Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     let conversation_id = ConversationId(id);
     state
@@ -865,14 +867,12 @@ async fn frontend_assets_root() -> Response {
 }
 
 #[tracing::instrument(name = "web.get_frontend_asset", skip_all, fields(path = %path))]
-async fn get_frontend_asset<S, M, L>(
-    State(state): State<WebState<S, M, L>>,
+async fn get_frontend_asset<R>(
+    State(state): State<WebState<R>>,
     Path(path): Path<String>,
 ) -> Response
 where
-    S: Clone + Send + Sync + 'static,
-    M: Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     let Some(relative_path) = static_relative_path(&path) else {
         tracing::debug!("invalid frontend asset path");
@@ -883,21 +883,17 @@ where
 }
 
 #[tracing::instrument(name = "web.get_favicon", skip_all)]
-async fn get_favicon<S, M, L>(State(state): State<WebState<S, M, L>>) -> Response
+async fn get_favicon<R>(State(state): State<WebState<R>>) -> Response
 where
-    S: Clone + Send + Sync + 'static,
-    M: Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     serve_configured_image(state.config.favicon_path.as_deref(), "favicon").await
 }
 
 #[tracing::instrument(name = "web.get_og_image", skip_all)]
-async fn get_og_image<S, M, L>(State(state): State<WebState<S, M, L>>) -> Response
+async fn get_og_image<R>(State(state): State<WebState<R>>) -> Response
 where
-    S: Clone + Send + Sync + 'static,
-    M: Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     serve_configured_image(state.config.og_image_path.as_deref(), "og image").await
 }
@@ -1146,53 +1142,45 @@ async fn block_crawlers(req: Request, next: Next) -> Response {
 }
 
 #[tracing::instrument(name = "web.get_image", skip_all, fields(name = %name))]
-async fn get_image<S, M, L>(
-    State(state): State<WebState<S, M, L>>,
+async fn get_image<R>(
+    State(state): State<WebState<R>>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError>
 where
-    S: Clone + Send + Sync + 'static,
-    M: MediaStore + Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     load_media_response(&state.media_store, MediaCategory::Image, &name).await
 }
 
 #[tracing::instrument(name = "web.get_video", skip_all, fields(name = %name))]
-async fn get_video<S, M, L>(
-    State(state): State<WebState<S, M, L>>,
+async fn get_video<R>(
+    State(state): State<WebState<R>>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError>
 where
-    S: Clone + Send + Sync + 'static,
-    M: MediaStore + Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     load_media_response(&state.media_store, MediaCategory::Video, &name).await
 }
 
 #[tracing::instrument(name = "web.get_audio", skip_all, fields(name = %name))]
-async fn get_audio<S, M, L>(
-    State(state): State<WebState<S, M, L>>,
+async fn get_audio<R>(
+    State(state): State<WebState<R>>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError>
 where
-    S: Clone + Send + Sync + 'static,
-    M: MediaStore + Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     load_media_response(&state.media_store, MediaCategory::Audio, &name).await
 }
 
 #[tracing::instrument(name = "web.get_avatar", skip_all, fields(name = %name))]
-async fn get_avatar<S, M, L>(
-    State(state): State<WebState<S, M, L>>,
+async fn get_avatar<R>(
+    State(state): State<WebState<R>>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError>
 where
-    S: Clone + Send + Sync + 'static,
-    M: MediaStore + Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     load_media_response(&state.media_store, MediaCategory::Avatar, &name).await
 }
@@ -1241,14 +1229,9 @@ where
 }
 
 #[tracing::instrument(name = "web.spa_index", skip_all, fields(path = %uri.path()))]
-async fn spa_index<S, M, L>(
-    State(state): State<WebState<S, M, L>>,
-    uri: axum::http::Uri,
-) -> Response
+async fn spa_index<R>(State(state): State<WebState<R>>, uri: axum::http::Uri) -> Response
 where
-    S: BotStorage + Clone + Send + Sync + 'static,
-    M: Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     let preview_meta = match conversation_path_id(uri.path()) {
         Some(id) => conversation_preview_meta(&state, id).await,
@@ -1277,11 +1260,9 @@ fn conversation_path_id(path: &str) -> Option<Uuid> {
     skip_all,
     fields(conversation = %id)
 )]
-async fn conversation_preview_meta<S, M, L>(state: &WebState<S, M, L>, id: Uuid) -> Option<String>
+async fn conversation_preview_meta<R>(state: &WebState<R>, id: Uuid) -> Option<String>
 where
-    S: BotStorage + Clone + Send + Sync + 'static,
-    M: Clone + Send + Sync + 'static,
-    L: Clone + Send + Sync + 'static,
+    R: WebRuntimeTypes,
 {
     let snapshot = state
         .storage

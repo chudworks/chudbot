@@ -139,17 +139,29 @@ When in any doubt, ALLOW.
 
 Respond with EXACTLY one token: ALLOW or REFUSE. No punctuation. No explanation.";
 
+/// Compile-time service types for a bot runtime.
+pub trait BotRuntimeTypes {
+    type Platforms: MessagePlatformRegistry + Clone + Send + Sync + 'static;
+    type Storage: BotStorage + Clone + Send + Sync + 'static;
+    type Media: MediaStore + Clone + Send + Sync + 'static;
+    type Llms: LlmProviderRegistry + Clone + Send + Sync + 'static;
+    type Images: ImageGeneratorRegistry + Clone + Send + Sync + 'static;
+    type Videos: VideoGeneratorRegistry + Clone + Send + Sync + 'static;
+    type Audio: AudioTranscriberRegistry + Clone + Send + Sync + 'static;
+    type Events: EventSink + Clone + Send + Sync + 'static;
+}
+
 /// Platform-neutral bot runtime.
-#[derive(Debug, Clone)]
-pub struct BotRuntime<P, S, M, L, I, V, A, E> {
-    platforms: P,
-    storage: S,
-    media_store: M,
-    llms: L,
-    images: I,
-    videos: V,
-    audio: A,
-    events: E,
+#[derive(Debug)]
+pub struct BotRuntime<R: BotRuntimeTypes> {
+    platforms: R::Platforms,
+    storage: R::Storage,
+    media_store: R::Media,
+    llms: R::Llms,
+    images: R::Images,
+    videos: R::Videos,
+    audio: R::Audio,
+    events: R::Events,
     background: TaskTracker,
     turn_cancellations: TurnCancellations,
     video_rate_limit_locks: VideoRateLimitLocks,
@@ -159,25 +171,50 @@ pub struct BotRuntime<P, S, M, L, I, V, A, E> {
     system_agents: RuntimeSystemAgents,
 }
 
+impl<R> Clone for BotRuntime<R>
+where
+    R: BotRuntimeTypes,
+{
+    fn clone(&self) -> Self {
+        Self {
+            platforms: self.platforms.clone(),
+            storage: self.storage.clone(),
+            media_store: self.media_store.clone(),
+            llms: self.llms.clone(),
+            images: self.images.clone(),
+            videos: self.videos.clone(),
+            audio: self.audio.clone(),
+            events: self.events.clone(),
+            background: self.background.clone(),
+            turn_cancellations: self.turn_cancellations.clone(),
+            video_rate_limit_locks: self.video_rate_limit_locks.clone(),
+            download_http: self.download_http.clone(),
+            config: self.config.clone(),
+            memory_config: self.memory_config.clone(),
+            system_agents: self.system_agents.clone(),
+        }
+    }
+}
+
 /// Runtime service implementations supplied by the binary crate.
 #[derive(Debug, Clone)]
-pub struct BotRuntimeParts<P, S, M, L, I, V, A, E> {
+pub struct BotRuntimeParts<R: BotRuntimeTypes> {
     /// Message platform registry.
-    pub platforms: P,
+    pub platforms: R::Platforms,
     /// Durable bot storage.
-    pub storage: S,
+    pub storage: R::Storage,
     /// Media storage.
-    pub media_store: M,
+    pub media_store: R::Media,
     /// LLM provider registry.
-    pub llms: L,
+    pub llms: R::Llms,
     /// Image generation registry.
-    pub images: I,
+    pub images: R::Images,
     /// Video generation registry.
-    pub videos: V,
+    pub videos: R::Videos,
     /// Audio transcription registry.
-    pub audio: A,
+    pub audio: R::Audio,
     /// Live event sink.
-    pub events: E,
+    pub events: R::Events,
     /// User-memory runtime configuration.
     pub memory: memory::MemoryConfig,
 }
@@ -464,9 +501,12 @@ impl TypingIndicator {
     }
 }
 
-impl<P, S, M, L, I, V, A, E> BotRuntime<P, S, M, L, I, V, A, E> {
+impl<R> BotRuntime<R>
+where
+    R: BotRuntimeTypes,
+{
     /// Construct a bot runtime.
-    pub fn new(parts: BotRuntimeParts<P, S, M, L, I, V, A, E>, config: BotConfig) -> Self {
+    pub fn new(parts: BotRuntimeParts<R>, config: BotConfig) -> Self {
         tracing::debug!(
             agents = config.agents.len(),
             platforms = config.platforms.len(),
@@ -499,38 +539,10 @@ impl<P, S, M, L, I, V, A, E> BotRuntime<P, S, M, L, I, V, A, E> {
     }
 }
 
-impl<P, S, M, L, I, V, A, E> BotRuntime<P, S, M, L, I, V, A, E>
+impl<R> BotRuntime<R>
 where
-    P: MessagePlatformRegistry + Clone + 'static,
-    S: BotStorage + Clone + 'static,
-    M: MediaStore + Clone + 'static,
-    L: LlmProviderRegistry + Clone + 'static,
-    I: ImageGeneratorRegistry + Clone + 'static,
-    V: VideoGeneratorRegistry + Clone + 'static,
-    A: AudioTranscriberRegistry + Clone + 'static,
-    E: EventSink + Clone + 'static,
+    R: BotRuntimeTypes + 'static,
 {
-    /// Run the platform event loop until the registry emits shutdown.
-    #[tracing::instrument(
-        name = "bot.run",
-        skip_all,
-        fields(
-            agents = self.config.agents.len(),
-            platforms = self.config.platforms.len(),
-            default_agent = %self.config.default_agent,
-        )
-    )]
-    pub async fn run(&self) -> Result<(), BotError> {
-        self.run_until_shutdown(CancellationToken::new()).await
-    }
-
-    /// Run the platform event loop until the registry emits shutdown or the
-    /// supplied shutdown token is cancelled.
-    pub async fn run_until_shutdown(&self, shutdown: CancellationToken) -> Result<(), BotError> {
-        self.run_with_options(shutdown, BotRunOptions::default())
-            .await
-    }
-
     /// Run the platform event loop with explicit shutdown behavior.
     #[tracing::instrument(
         name = "bot.run_with_options",
@@ -1635,7 +1647,7 @@ where
         turn_id: TurnId,
         top_level: bool,
         stack: &mut Vec<String>,
-    ) -> Result<Agent<RoutedLlmBackend<L>>, BotError> {
+    ) -> Result<Agent<RoutedLlmBackend<R::Llms>>, BotError> {
         self.ensure_agent_services_exist(agent_name, agent_config)?;
         if stack.iter().any(|name| name == agent_name) {
             tracing::warn!("recursive agent reference detected");
@@ -1653,7 +1665,7 @@ where
             ensure_client_tool_enabled(&mut spec.client_tools, memory::FORGET_USER_MEMORY_TOOL);
         }
 
-        let mut tools: Vec<RuntimeTool<P, S, M, L, I, V, A>> = Vec::new();
+        let mut tools: Vec<RuntimeTool<R>> = Vec::new();
         if top_level {
             if !matches!(settings.privacy, PrivacyMode::ConversationOnly) {
                 tracing::debug!(tool = FETCH_MESSAGES_TOOL, "attaching runtime tool");
@@ -1888,7 +1900,7 @@ where
         Ok(builder.into_agent(model))
     }
 
-    fn system_agent(&self, agent_config: &SystemAgentConfig) -> Agent<RoutedLlmBackend<L>> {
+    fn system_agent(&self, agent_config: &SystemAgentConfig) -> Agent<RoutedLlmBackend<R::Llms>> {
         agent_config.spec.clone().into_agent(Model {
             backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
             spec: agent_config.model.clone(),
@@ -4163,64 +4175,52 @@ struct StoredAttachmentMedia {
 }
 
 #[derive(Debug)]
-enum RuntimeTool<P, S, M, L, I, V, A>
-where
-    L: LlmProviderRegistry,
-    I: ImageGeneratorRegistry,
-    V: VideoGeneratorRegistry,
-    A: AudioTranscriberRegistry,
-{
+enum RuntimeTool<R: BotRuntimeTypes> {
     Fetch {
         name: ToolName,
-        tool: FetchMessagesTool<P, S>,
+        tool: FetchMessagesTool<R::Platforms, R::Storage>,
     },
     Status {
         name: ToolName,
-        tool: PostStatusTool<P, S>,
+        tool: PostStatusTool<R::Platforms, R::Storage>,
     },
     Reaction {
         name: ToolName,
-        tool: AddReactionTool<P>,
+        tool: AddReactionTool<R::Platforms>,
     },
     UsageReport {
         name: ToolName,
-        tool: UsageReportTool<S>,
+        tool: UsageReportTool<R::Storage>,
     },
     Image {
         name: ToolName,
-        tool: ImageGeneratorTool<RoutedImageGenerator<I>, M>,
+        tool: ImageGeneratorTool<RoutedImageGenerator<R::Images>, R::Media>,
     },
     Video {
         name: ToolName,
-        tool: PersistentVideoGeneratorTool<RoutedVideoGenerator<V>, M, S>,
+        tool: PersistentVideoGeneratorTool<RoutedVideoGenerator<R::Videos>, R::Media, R::Storage>,
     },
     Audio {
         name: ToolName,
-        tool: AudioTranscriptionTool<RoutedAudioTranscriber<A>, M>,
+        tool: AudioTranscriptionTool<RoutedAudioTranscriber<R::Audio>, R::Media>,
     },
     Asset {
         name: ToolName,
-        tool: MediaAccessTool<M>,
+        tool: MediaAccessTool<R::Media>,
     },
     Memory {
         name: ToolName,
-        tool: memory::MemoryClientTool<S>,
+        tool: memory::MemoryClientTool<R::Storage>,
     },
     Subagent {
         name: ToolName,
-        tool: Subagent<RoutedLlmBackend<L>>,
+        tool: Subagent<RoutedLlmBackend<R::Llms>>,
     },
 }
 
-impl<P, S, M, L, I, V, A> RuntimeTool<P, S, M, L, I, V, A>
+impl<R> RuntimeTool<R>
 where
-    P: MessagePlatformRegistry + Clone + 'static,
-    S: BotStorage + Clone + 'static,
-    M: MediaStore + Clone + 'static,
-    L: LlmProviderRegistry + Clone + 'static,
-    I: ImageGeneratorRegistry + Clone + 'static,
-    V: VideoGeneratorRegistry + Clone + 'static,
-    A: AudioTranscriberRegistry + Clone + 'static,
+    R: BotRuntimeTypes,
 {
     fn start(self, spec: AgentSpec) -> AgentBuilder {
         match self {

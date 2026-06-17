@@ -20,7 +20,7 @@ use diagnostics::render_toml_error_for_stderr;
 use errors::{BinError, ConfigError};
 use platforms::ConfiguredMessagePlatforms;
 use runtime::run_runtime_services;
-use services::ServicePlan;
+use services::{BootstrapServices, ConfiguredBotRuntime};
 
 const VERSION: &str = env!("GIT_VERSION");
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
@@ -100,12 +100,12 @@ async fn run(
             config.validate_all(&source)?;
             init_tracing(&config.logging)?;
             log_start(&config_path, &Command::CheckConfig, &config);
-            let plan = ServicePlan::build(&config)?;
+            let services = BootstrapServices::build(&config)?;
             tracing::info!(
-                llm_providers = plan.llms.configured_count(),
-                image_providers = plan.images.configured_count(),
-                video_providers = plan.videos.configured_count(),
-                audio_providers = plan.audio.configured_count(),
+                llm_providers = services.llms.configured_count(),
+                image_providers = services.images.configured_count(),
+                video_providers = services.videos.configured_count(),
+                audio_providers = services.audio.configured_count(),
                 platforms = config.platforms.len(),
                 agents = config.bot.agents.len(),
                 "configuration is valid"
@@ -134,28 +134,34 @@ async fn run(
                 "resolved build version"
             );
             config.bot.version = version_label.clone();
-            let mut plan = ServicePlan::build(&config)?;
-            plan.web.version = format!("{version_label} ({VERSION})");
+            let mut services = BootstrapServices::build(&config)?;
+            services.web.version = format!("{version_label} ({VERSION})");
             let storage = storage.with_app_version_id(app_version.id);
             let platforms =
                 ConfiguredMessagePlatforms::connect_from_config(&config.platforms).await?;
             let listen = SocketAddr::from_str(&config.web.listen)?;
-            let llms = plan.llms.clone();
-            let bot = BotRuntime::new(
-                BotRuntimeParts {
+            let llms = services.llms.clone();
+            let bot = BotRuntime::<ConfiguredBotRuntime>::new(
+                BotRuntimeParts::<ConfiguredBotRuntime> {
                     platforms,
                     storage: storage.clone(),
-                    media_store: plan.media_store.clone(),
-                    llms: plan.llms,
-                    images: plan.images,
-                    videos: plan.videos,
-                    audio: plan.audio,
-                    events: plan.events.clone(),
+                    media_store: services.media_store.clone(),
+                    llms: services.llms,
+                    images: services.images,
+                    videos: services.videos,
+                    audio: services.audio,
+                    events: services.events.clone(),
                     memory: config.memory,
                 },
                 config.bot,
             );
-            let web = WebState::new(storage, plan.media_store, llms, plan.events, plan.web);
+            let web = WebState::<ConfiguredBotRuntime>::new(
+                storage,
+                services.media_store,
+                llms,
+                services.events,
+                services.web,
+            );
             run_runtime_services(bot, web, listen).await
         }
     }
