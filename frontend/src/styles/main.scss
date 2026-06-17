@@ -142,12 +142,21 @@ header.conv-header {
     margin-top: 0.9rem;
 
     &__metrics {
-        display: grid;
-        grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
+        // Flex, not grid: the five metrics never divide evenly into a
+        // fixed column count, so a grid leaves a ragged half-empty last
+        // row, and `1fr` tracks stretched each box across the wide
+        // header. A centered flex row keeps the boxes compact and keeps
+        // every wrapped row centered (notably on mobile).
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: center;
         gap: 0.55rem;
     }
 
     &__metric {
+        // Uniform compact width: don't grow (so a box is never stretched
+        // to fill empty space), but allow shrinking on very tight screens.
+        flex: 0 1 9.5rem;
         min-width: 0;
         border: 1px solid var(--border);
         border-radius: 6px;
@@ -221,9 +230,11 @@ header.conv-header {
     }
 }
 
-@media (max-width: 680px) {
-    .usage-summary__metrics {
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+@media (max-width: 480px) {
+    // Narrower basis so two boxes still fit (and stay centered) per row
+    // down to ~320px-wide phones instead of dropping to one per row.
+    .usage-summary__metric {
+        flex-basis: 7.5rem;
     }
 }
 
