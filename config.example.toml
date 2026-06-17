@@ -170,6 +170,11 @@ input_usd_per_million_tokens = 3.00
 # cache_creation_1h_usd_per_million_tokens = 6.00
 # cache_read_usd_per_million_tokens = 0.30
 output_usd_per_million_tokens = 15.00
+# Anthropic exposes context limits through its Models API, so model_info is
+# usually unnecessary here. You can still use it to patch or override metadata.
+# [llm.anthropic.model_info."claude-sonnet-4-6"]
+# context_window_tokens = 1000000
+# max_output_tokens = 64000
 
 [llm.gemini]
 kind = "gemini"
@@ -184,6 +189,12 @@ api_key = "AIza..."
 kind = "openai_compat"
 base_url = "http://127.0.0.1:8000/v1"
 api_key = "EMPTY"
+# Useful when your OpenAI-compatible /models endpoint omits context limits, or
+# when it reports implementation ids that do not match the configured agent
+# model id.
+[llm.local_compat.model_info."Qwen/Qwen3-32B"]
+context_window_tokens = 32768
+# max_output_tokens = 8192
 
 # Named image-generation services.
 

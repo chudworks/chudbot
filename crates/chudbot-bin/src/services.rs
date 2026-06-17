@@ -4,14 +4,16 @@ use std::sync::Arc;
 use chudbot_api::{
     AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
     GeneratedImage, ImageGenerator, ImageGeneratorRegistry, ImageRequest, LlmBackend,
-    LlmProviderRegistry, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest, ProviderName,
-    VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
+    LlmProviderRegistry, ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest,
+    ProviderName, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
 use chudbot_web::{EventBus, WebConfig};
+use serde_json::json;
 
 use crate::config::{
-    AudioProviderConfig, ImageProviderConfig, LlmProviderConfig, RuntimeConfig, VideoProviderConfig,
+    AudioProviderConfig, ImageProviderConfig, LlmModelInfoConfig, LlmProviderConfig, RuntimeConfig,
+    VideoProviderConfig,
 };
 use crate::errors::{
     BinError, ConfiguredAudioError, ConfiguredImageError, ConfiguredLlmError, ConfiguredVideoError,
@@ -97,6 +99,7 @@ struct ConfiguredLlmProvidersInner {
     openai: BTreeMap<ProviderName, chudbot_openai::OpenAiClient>,
     openai_compat: BTreeMap<ProviderName, chudbot_openai_compat::OpenAiCompatClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
+    model_info: BTreeMap<ProviderName, BTreeMap<ModelId, ModelInfo>>,
 }
 
 impl Default for ConfiguredLlmProviders {
@@ -116,11 +119,14 @@ impl ConfiguredLlmProviders {
     fn from_config(config: &BTreeMap<ProviderName, LlmProviderConfig>) -> Self {
         let mut providers = ConfiguredLlmProvidersInner::default();
         for (name, provider) in config {
+            let model_info = configured_model_info(provider);
+            let model_info_fallbacks = model_info.len();
             match provider {
                 LlmProviderConfig::Anthropic {
                     api_key,
                     base_url,
                     pricing,
+                    ..
                 } => {
                     let mut client =
                         chudbot_anthropic::AnthropicClient::new(name.clone(), api_key.clone());
@@ -135,6 +141,7 @@ impl ConfiguredLlmProviders {
                         kind = "anthropic",
                         base_url_override = base_url.is_some(),
                         pricing_overrides = pricing.len(),
+                        model_info_fallbacks,
                         "registered LLM provider"
                     );
                     providers.anthropic.insert(name.clone(), client);
@@ -143,6 +150,7 @@ impl ConfiguredLlmProviders {
                     api_key,
                     base_url,
                     pricing,
+                    ..
                 } => {
                     let mut client =
                         chudbot_openai::OpenAiClient::new(name.clone(), api_key.clone());
@@ -157,11 +165,14 @@ impl ConfiguredLlmProviders {
                         kind = "openai",
                         base_url_override = base_url.is_some(),
                         pricing_overrides = pricing.len(),
+                        model_info_fallbacks,
                         "registered LLM provider"
                     );
                     providers.openai.insert(name.clone(), client);
                 }
-                LlmProviderConfig::OpenAiCompat { base_url, api_key } => {
+                LlmProviderConfig::OpenAiCompat {
+                    base_url, api_key, ..
+                } => {
                     let mut client = chudbot_openai_compat::OpenAiCompatClient::new(
                         name.clone(),
                         base_url.clone(),
@@ -173,11 +184,14 @@ impl ConfiguredLlmProviders {
                         provider = %name,
                         kind = "openai_compat",
                         auth_configured = api_key.is_some(),
+                        model_info_fallbacks,
                         "registered LLM provider"
                     );
                     providers.openai_compat.insert(name.clone(), client);
                 }
-                LlmProviderConfig::Gemini { api_key, base_url } => {
+                LlmProviderConfig::Gemini {
+                    api_key, base_url, ..
+                } => {
                     let mut client =
                         chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
@@ -187,11 +201,14 @@ impl ConfiguredLlmProviders {
                         provider = %name,
                         kind = "gemini",
                         base_url_override = base_url.is_some(),
+                        model_info_fallbacks,
                         "registered LLM provider"
                     );
                     providers.gemini.insert(name.clone(), client);
                 }
-                LlmProviderConfig::Xai { api_key, base_url } => {
+                LlmProviderConfig::Xai {
+                    api_key, base_url, ..
+                } => {
                     let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
@@ -200,10 +217,14 @@ impl ConfiguredLlmProviders {
                         provider = %name,
                         kind = "xai",
                         base_url_override = base_url.is_some(),
+                        model_info_fallbacks,
                         "registered LLM provider"
                     );
                     providers.xai.insert(name.clone(), client);
                 }
+            }
+            if !model_info.is_empty() {
+                providers.model_info.insert(name.clone(), model_info);
             }
         }
         Self {
@@ -287,6 +308,11 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
         provider: &ProviderName,
         request: ModelInfoRequest,
     ) -> Result<Option<ModelInfo>, Self::Error> {
+        if let Some(info) = self.configured_model_info(provider, &request.model) {
+            tracing::debug!("using configured model metadata");
+            return Ok(Some(info));
+        }
+
         if let Some(client) = self.inner.anthropic.get(provider) {
             tracing::debug!(kind = "anthropic", "fetching model metadata");
             return LlmBackend::fetch_model_info(client, request)
@@ -320,6 +346,39 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
         tracing::warn!("requested provider is missing from registry");
         Err(ConfiguredLlmError::Missing(provider.clone()))
     }
+}
+
+impl ConfiguredLlmProviders {
+    fn configured_model_info(&self, provider: &ProviderName, model: &ModelId) -> Option<ModelInfo> {
+        self.inner.model_info.get(provider)?.get(model).cloned()
+    }
+}
+
+fn configured_model_info(provider: &LlmProviderConfig) -> BTreeMap<ModelId, ModelInfo> {
+    provider
+        .model_info()
+        .iter()
+        .filter_map(|(model, info)| {
+            configured_model_info_entry(model, info).map(|info| (model.clone(), info))
+        })
+        .collect()
+}
+
+fn configured_model_info_entry(model: &ModelId, info: &LlmModelInfoConfig) -> Option<ModelInfo> {
+    if info.context_window_tokens.is_none() && info.max_output_tokens.is_none() {
+        return None;
+    }
+
+    Some(ModelInfo {
+        id: model.clone(),
+        context_window_tokens: info.context_window_tokens,
+        max_output_tokens: info.max_output_tokens,
+        raw: Some(json!({
+            "source": "config",
+            "context_window_tokens": info.context_window_tokens,
+            "max_output_tokens": info.max_output_tokens,
+        })),
+    })
 }
 
 /// Concrete named image-generation provider registry.
@@ -701,6 +760,7 @@ mod tests {
                 api_key: "test-key".to_string(),
                 base_url: None,
                 pricing: BTreeMap::new(),
+                model_info: BTreeMap::new(),
             },
         )]);
 
@@ -712,6 +772,122 @@ mod tests {
             .expect("configured anthropic client");
 
         assert_eq!(LlmBackend::backend_name(client), &provider);
+    }
+
+    #[test]
+    fn configured_llm_model_info_fallback_is_loaded_for_every_provider_kind() {
+        let provider = ProviderName::new("claude");
+        let xai_provider = ProviderName::new("grok");
+        let openai_provider = ProviderName::new("openai");
+        let compat_provider = ProviderName::new("local");
+        let gemini_provider = ProviderName::new("gemini");
+        let model = ModelId::new("claude-haiku-4-5-20251001");
+        let model_info = || {
+            BTreeMap::from([(
+                model.clone(),
+                LlmModelInfoConfig {
+                    context_window_tokens: Some(200_000),
+                    max_output_tokens: Some(8_192),
+                },
+            )])
+        };
+        let config = BTreeMap::from([
+            (
+                provider.clone(),
+                LlmProviderConfig::Anthropic {
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    pricing: BTreeMap::new(),
+                    model_info: model_info(),
+                },
+            ),
+            (
+                xai_provider.clone(),
+                LlmProviderConfig::Xai {
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    model_info: model_info(),
+                },
+            ),
+            (
+                openai_provider.clone(),
+                LlmProviderConfig::OpenAi {
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    pricing: BTreeMap::new(),
+                    model_info: model_info(),
+                },
+            ),
+            (
+                compat_provider.clone(),
+                LlmProviderConfig::OpenAiCompat {
+                    base_url: "http://127.0.0.1:1234/v1".to_string(),
+                    api_key: None,
+                    model_info: model_info(),
+                },
+            ),
+            (
+                gemini_provider.clone(),
+                LlmProviderConfig::Gemini {
+                    api_key: "test-key".to_string(),
+                    base_url: None,
+                    model_info: model_info(),
+                },
+            ),
+        ]);
+
+        let registry = ConfiguredLlmProviders::from_config(&config);
+        for provider in [
+            &provider,
+            &xai_provider,
+            &openai_provider,
+            &compat_provider,
+            &gemini_provider,
+        ] {
+            let info = registry
+                .configured_model_info(provider, &model)
+                .expect("configured model info");
+            assert_eq!(info.id, model);
+            assert_eq!(info.context_window_tokens, Some(200_000));
+            assert_eq!(info.max_output_tokens, Some(8_192));
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_llm_model_info_is_returned_without_provider_lookup() {
+        let provider = ProviderName::new("local");
+        let model = ModelId::new("local-model");
+        let config = BTreeMap::from([(
+            provider.clone(),
+            LlmProviderConfig::OpenAiCompat {
+                base_url: "http://127.0.0.1:1/v1".to_string(),
+                api_key: None,
+                model_info: BTreeMap::from([(
+                    model.clone(),
+                    LlmModelInfoConfig {
+                        context_window_tokens: Some(131_072),
+                        max_output_tokens: Some(8_192),
+                    },
+                )]),
+            },
+        )]);
+
+        let registry = ConfiguredLlmProviders::from_config(&config);
+        let info = LlmProviderRegistry::fetch_model_info(
+            &registry,
+            &provider,
+            ModelInfoRequest {
+                model: model.clone(),
+                provider_options: None,
+            },
+        )
+        .await
+        .expect("model info lookup")
+        .expect("configured model info");
+
+        assert_eq!(info.id, model);
+        assert_eq!(info.context_window_tokens, Some(131_072));
+        assert_eq!(info.max_output_tokens, Some(8_192));
     }
 
     #[test]

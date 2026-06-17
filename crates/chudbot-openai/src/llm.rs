@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
-    ContentBlock, GroundingMetadata, LlmBackend, ModelId, ModelStep, ModelStepRequest,
-    ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName, ToolUseId,
-    Transcript, TurnRole, UsageRecord, UsageSubject,
+    ContentBlock, GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep,
+    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName,
+    ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -97,6 +97,77 @@ impl LlmBackend for OpenAiClient {
         } else {
             Ok(ModelStep::Final { step })
         }
+    }
+
+    #[tracing::instrument(name = "openai.model_info", skip_all, fields(model = %request.model))]
+    async fn fetch_model_info(
+        &self,
+        request: ModelInfoRequest,
+    ) -> Result<Option<ModelInfo>, Self::Error> {
+        let endpoint = format!("/models/{}", request.model.as_str());
+        let raw: Value = self.get_json(&endpoint, "model_info[openai]").await?;
+        Ok(model_info_from_openai_model(request.model, raw))
+    }
+}
+
+fn model_info_from_openai_model(requested_model: ModelId, raw: Value) -> Option<ModelInfo> {
+    const CONTEXT_FIELDS: &[&str] = &[
+        "context_window_tokens",
+        "context_window",
+        "context_length",
+        "max_context_length",
+        "max_context_len",
+        "max_input_tokens",
+        "input_token_limit",
+        "max_model_len",
+    ];
+    const OUTPUT_FIELDS: &[&str] = &[
+        "max_output_tokens",
+        "max_completion_tokens",
+        "output_token_limit",
+        "max_tokens",
+    ];
+
+    let context_window_tokens = find_u64_field(&raw, CONTEXT_FIELDS);
+    let max_output_tokens = find_u64_field(&raw, OUTPUT_FIELDS);
+    if context_window_tokens.is_none() && max_output_tokens.is_none() {
+        return None;
+    }
+
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ModelId::new)
+        .unwrap_or(requested_model);
+    Some(ModelInfo {
+        id,
+        context_window_tokens,
+        max_output_tokens,
+        raw: Some(raw),
+    })
+}
+
+fn find_u64_field(value: &Value, fields: &[&str]) -> Option<u64> {
+    let object = value.as_object()?;
+    if let Some(found) = fields
+        .iter()
+        .find_map(|field| object.get(*field).and_then(value_as_u64))
+    {
+        return Some(found);
+    }
+
+    object
+        .values()
+        .filter(|value| value.is_object())
+        .find_map(|value| find_u64_field(value, fields))
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
     }
 }
 
@@ -665,6 +736,24 @@ mod tests {
         assert_eq!(record.reasoning_tokens, Some(303));
         assert_eq!(record.total_tokens, Some(755));
         assert!(record.cost.is_none());
+    }
+
+    #[test]
+    fn openai_model_info_uses_provider_limits_when_present() {
+        let info = model_info_from_openai_model(
+            ModelId::new("gpt-test"),
+            json!({
+                "id": "gpt-test",
+                "max_input_tokens": 1048576,
+                "max_output_tokens": "32768"
+            }),
+        )
+        .expect("model metadata");
+
+        assert_eq!(info.id, ModelId::new("gpt-test"));
+        assert_eq!(info.context_window_tokens, Some(1_048_576));
+        assert_eq!(info.max_output_tokens, Some(32_768));
+        assert!(info.raw.is_some());
     }
 
     #[test]

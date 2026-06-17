@@ -120,6 +120,41 @@ impl OpenAiClient {
         })
         .await
     }
+
+    pub(crate) async fn get_json<T>(&self, endpoint: &str, label: &str) -> Result<T, OpenAiError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let url = format!("{}{}", self.base_url, endpoint);
+        tracing::debug!(
+            provider = %self.provider_name,
+            endpoint = %endpoint,
+            base_url = %self.base_url,
+            "sending OpenAI JSON GET request"
+        );
+        with_retry(RetryPolicy::default(), label, || {
+            let request = self.http.get(&url).bearer_auth(&self.api_key);
+            async move {
+                let resp = request.send().await.map_err(|e| {
+                    tracing::warn!(
+                        provider = %self.provider_name,
+                        endpoint = %endpoint,
+                        error = %e,
+                        "OpenAI GET request transport error"
+                    );
+                    OpenAiError::Transport(e.to_string())
+                })?;
+                tracing::debug!(
+                    provider = %self.provider_name,
+                    endpoint = %endpoint,
+                    status = %resp.status(),
+                    "received OpenAI GET response"
+                );
+                decode_response(resp, &self.provider_name, endpoint).await
+            }
+        })
+        .await
+    }
 }
 
 pub(crate) fn json_strip_nulls(mut value: Value) -> Value {

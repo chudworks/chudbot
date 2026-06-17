@@ -119,6 +119,45 @@ impl AnthropicClient {
         })
         .await
     }
+
+    pub(crate) async fn get_json<T>(&self, endpoint: &str, label: &str) -> Result<T, AnthropicError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let url = format!("{}{}", self.base_url, endpoint);
+        tracing::debug!(
+            provider = %self.provider_name,
+            endpoint = %endpoint,
+            base_url = %self.base_url,
+            "sending Anthropic JSON GET request"
+        );
+        with_retry(RetryPolicy::default(), label, || {
+            let request = self
+                .http
+                .get(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION);
+            async move {
+                let resp = request.send().await.map_err(|e| {
+                    tracing::warn!(
+                        provider = %self.provider_name,
+                        endpoint = %endpoint,
+                        error = %e,
+                        "Anthropic GET request transport error"
+                    );
+                    AnthropicError::Transport(e.to_string())
+                })?;
+                tracing::debug!(
+                    provider = %self.provider_name,
+                    endpoint = %endpoint,
+                    status = %resp.status(),
+                    "received Anthropic GET response"
+                );
+                decode_response(resp, &self.provider_name, endpoint).await
+            }
+        })
+        .await
+    }
 }
 
 pub(crate) async fn decode_response<T>(

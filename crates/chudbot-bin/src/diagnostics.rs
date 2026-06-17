@@ -707,11 +707,11 @@ const TRANSCRIPTION_BINDING_KEYS: &[&str] = &["provider", "model", "wake_word"];
 const RATE_LIMIT_KEYS: &[&str] = &["limit", "interval", "bypass_scopes"];
 const PLATFORM_SCOPE_BYPASS_KEYS: &[&str] = &["platform", "scope_id"];
 const SUBAGENT_BINDING_KEYS: &[&str] = &["agent", "description"];
-const LLM_XAI_KEYS: &[&str] = &["kind", "api_key", "base_url"];
-const LLM_OPENAI_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing"];
-const LLM_ANTHROPIC_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing"];
-const LLM_OPENAI_COMPAT_KEYS: &[&str] = &["kind", "base_url", "api_key"];
-const LLM_GEMINI_KEYS: &[&str] = &["kind", "api_key", "base_url"];
+const LLM_XAI_KEYS: &[&str] = &["kind", "api_key", "base_url", "model_info"];
+const LLM_OPENAI_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing", "model_info"];
+const LLM_ANTHROPIC_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing", "model_info"];
+const LLM_OPENAI_COMPAT_KEYS: &[&str] = &["kind", "base_url", "api_key", "model_info"];
+const LLM_GEMINI_KEYS: &[&str] = &["kind", "api_key", "base_url", "model_info"];
 const IMAGE_OPENAI_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing"];
 const IMAGE_XAI_KEYS: &[&str] = &["kind", "api_key", "base_url"];
 const IMAGE_GEMINI_KEYS: &[&str] = &["kind", "api_key", "base_url"];
@@ -738,6 +738,7 @@ const ANTHROPIC_TOKEN_PRICING_KEYS: &[&str] = &[
     "cache_read_usd_per_million_tokens",
     "output_usd_per_million_tokens",
 ];
+const LLM_MODEL_INFO_KEYS: &[&str] = &["context_window_tokens", "max_output_tokens"];
 
 pub(crate) fn validate_runtime_config(
     config: &RuntimeConfig,
@@ -970,6 +971,12 @@ fn validate_llm_provider_unexpected_keys(
     provider: &LlmProviderConfig,
 ) {
     let path = [key("llm"), key(provider_name)];
+    validate_map_entry_keys(
+        source,
+        diagnostics,
+        &child_path(&path, "model_info"),
+        LLM_MODEL_INFO_KEYS,
+    );
     match provider {
         LlmProviderConfig::Xai { .. } => {
             validate_known_keys(source, diagnostics, &path, LLM_XAI_KEYS);

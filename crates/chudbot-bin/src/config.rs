@@ -288,6 +288,9 @@ pub enum LlmProviderConfig {
         /// Optional base URL override.
         #[serde(default)]
         base_url: Option<String>,
+        /// Optional per-model metadata fallback.
+        #[serde(default)]
+        model_info: BTreeMap<ModelId, LlmModelInfoConfig>,
     },
     /// OpenAI provider.
     #[serde(rename = "openai")]
@@ -300,6 +303,9 @@ pub enum LlmProviderConfig {
         /// Optional per-model text-token pricing overrides.
         #[serde(default)]
         pricing: BTreeMap<ModelId, chudbot_openai::OpenAiTokenPricing>,
+        /// Optional per-model metadata fallback.
+        #[serde(default)]
+        model_info: BTreeMap<ModelId, LlmModelInfoConfig>,
     },
     /// Anthropic provider.
     Anthropic {
@@ -311,6 +317,9 @@ pub enum LlmProviderConfig {
         /// Optional per-model text-token pricing overrides.
         #[serde(default)]
         pricing: BTreeMap<ModelId, chudbot_anthropic::AnthropicTokenPricing>,
+        /// Optional per-model metadata fallback.
+        #[serde(default)]
+        model_info: BTreeMap<ModelId, LlmModelInfoConfig>,
     },
     /// OpenAI-compatible provider placeholder.
     #[serde(rename = "openai_compat")]
@@ -320,6 +329,9 @@ pub enum LlmProviderConfig {
         /// Optional API key.
         #[serde(default)]
         api_key: Option<String>,
+        /// Optional per-model metadata fallback.
+        #[serde(default)]
+        model_info: BTreeMap<ModelId, LlmModelInfoConfig>,
     },
     /// Google Gemini API provider.
     Gemini {
@@ -328,7 +340,33 @@ pub enum LlmProviderConfig {
         /// Optional base URL override.
         #[serde(default)]
         base_url: Option<String>,
+        /// Optional per-model metadata fallback.
+        #[serde(default)]
+        model_info: BTreeMap<ModelId, LlmModelInfoConfig>,
     },
+}
+
+impl LlmProviderConfig {
+    pub(crate) fn model_info(&self) -> &BTreeMap<ModelId, LlmModelInfoConfig> {
+        match self {
+            Self::Xai { model_info, .. }
+            | Self::OpenAi { model_info, .. }
+            | Self::Anthropic { model_info, .. }
+            | Self::OpenAiCompat { model_info, .. }
+            | Self::Gemini { model_info, .. } => model_info,
+        }
+    }
+}
+
+/// Configured fallback metadata for one LLM model id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmModelInfoConfig {
+    /// Maximum context-window tokens accepted by the model.
+    #[serde(default)]
+    pub context_window_tokens: Option<u64>,
+    /// Maximum output tokens the model can produce, when known separately.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
 }
 
 /// Named image-generation provider config.

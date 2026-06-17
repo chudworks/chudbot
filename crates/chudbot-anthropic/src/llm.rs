@@ -7,9 +7,9 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
-    ContentBlock, GroundingMetadata, LlmBackend, MediaRef, ModelId, ModelStep, ModelStepRequest,
-    ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName, ToolUseId,
-    Transcript, TurnRole, UsageRecord, UsageSubject,
+    ContentBlock, GroundingMetadata, LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest,
+    ModelStep, ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
+    ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -92,6 +92,39 @@ impl LlmBackend for AnthropicClient {
             step,
             parsed.stop_reason.as_deref(),
         ))
+    }
+
+    #[tracing::instrument(name = "anthropic.model_info", skip_all, fields(model = %request.model))]
+    async fn fetch_model_info(
+        &self,
+        request: ModelInfoRequest,
+    ) -> Result<Option<ModelInfo>, Self::Error> {
+        let endpoint = format!("/models/{}", request.model.as_str());
+        let raw: Value = self.get_json(&endpoint, "model_info[anthropic]").await?;
+        Ok(Some(model_info_from_anthropic_model(request.model, raw)))
+    }
+}
+
+fn model_info_from_anthropic_model(requested_model: ModelId, raw: Value) -> ModelInfo {
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ModelId::new)
+        .unwrap_or(requested_model);
+    ModelInfo {
+        id,
+        context_window_tokens: raw.get("max_input_tokens").and_then(value_as_u64),
+        max_output_tokens: raw.get("max_tokens").and_then(value_as_u64),
+        raw: Some(raw),
+    }
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
     }
 }
 
@@ -864,6 +897,24 @@ mod tests {
 
         assert_eq!(body["thinking"], thinking);
         assert_eq!(body["effort"], "medium");
+    }
+
+    #[test]
+    fn anthropic_model_info_preserves_token_limits() {
+        let info = model_info_from_anthropic_model(
+            ModelId::new("claude-haiku-4-5-20251001"),
+            json!({
+                "id": "claude-haiku-4-5-20251001",
+                "type": "model",
+                "max_input_tokens": 200000,
+                "max_tokens": 64000
+            }),
+        );
+
+        assert_eq!(info.id, ModelId::new("claude-haiku-4-5-20251001"));
+        assert_eq!(info.context_window_tokens, Some(200_000));
+        assert_eq!(info.max_output_tokens, Some(64_000));
+        assert!(info.raw.is_some());
     }
 
     #[test]
