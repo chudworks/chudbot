@@ -4,6 +4,10 @@
 
 :root {
     color-scheme: light dark;
+
+    // Max width of the centered content column (header, turns, footer).
+    --content-width: 1200px;
+
     --fg: #eaeaea;
     --bg: #111;
     --muted: #999;
@@ -84,7 +88,7 @@ pre {
 
 .app-footer {
     margin-top: auto;
-    max-width: 860px;
+    max-width: var(--content-width);
     width: 100%;
     margin-left: auto;
     margin-right: auto;
@@ -101,7 +105,7 @@ pre {
 main.center,
 main.conv,
 header.conv-header {
-    max-width: 860px;
+    max-width: var(--content-width);
     margin: 0 auto;
     padding: 2rem 1.25rem;
 }
