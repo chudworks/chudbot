@@ -56,19 +56,6 @@ struct PlatformEventPump {
     task: JoinHandle<()>,
 }
 
-impl Default for ConfiguredMessagePlatforms {
-    fn default() -> Self {
-        let (_events_tx, events) = tokio::sync::mpsc::channel(1);
-        Self {
-            inner: Arc::new(ConfiguredMessagePlatformsInner {
-                discord: BTreeMap::new(),
-                events: tokio::sync::Mutex::new(events),
-                event_pumps: tokio::sync::Mutex::new(Vec::new()),
-            }),
-        }
-    }
-}
-
 /// Spawn a Discord event pump and convert pump panics into registry errors.
 ///
 /// `DiscordPlatform` owns the Twilight gateway shard and already translates
