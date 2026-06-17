@@ -108,6 +108,53 @@ impl OpenAiCompatClient {
         })
         .await
     }
+
+    pub(crate) async fn get_json<T>(
+        &self,
+        endpoint: &str,
+        label: &str,
+    ) -> Result<T, OpenAiCompatError>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        let url = endpoint_url(&self.base_url, endpoint);
+        tracing::debug!(
+            provider = %self.provider_name,
+            endpoint = %endpoint,
+            base_url = %self.base_url,
+            "sending OpenAI-compatible JSON GET request"
+        );
+        with_retry(RetryPolicy::default(), label, || {
+            let request_url = url.clone();
+            let mut request = self.http.get(&request_url);
+            if let Some(api_key) = &self.api_key {
+                request = request.bearer_auth(api_key);
+            }
+            async move {
+                let resp = request.send().await.map_err(|e| {
+                    let error_chain = format_error_chain(&e);
+                    tracing::warn!(
+                        provider = %self.provider_name,
+                        endpoint = %endpoint,
+                        url = %request_url,
+                        error = %e,
+                        error_chain = %error_chain,
+                        error_debug = ?e,
+                        "OpenAI-compatible GET request transport error"
+                    );
+                    OpenAiCompatError::Transport(error_chain)
+                })?;
+                tracing::debug!(
+                    provider = %self.provider_name,
+                    endpoint = %endpoint,
+                    status = %resp.status(),
+                    "received OpenAI-compatible GET response"
+                );
+                decode_response(resp, &self.provider_name, endpoint).await
+            }
+        })
+        .await
+    }
 }
 
 fn endpoint_url(base_url: &str, endpoint: &str) -> String {

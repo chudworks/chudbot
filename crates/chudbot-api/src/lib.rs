@@ -14,6 +14,7 @@ pub mod llm;
 pub mod media;
 pub mod platform;
 pub mod reasoning;
+pub mod registries;
 pub mod retry;
 pub mod storage;
 pub mod tool;
@@ -30,8 +31,8 @@ pub use ids::{
     ToolName, ToolUseId, TurnId, UserRef, VideoJobId,
 };
 pub use llm::{
-    AssistantStep, LlmBackend, Model, ModelSpec, ModelStep, ModelStepRequest, ProviderOptions,
-    SamplingOptions, ServerToolSet,
+    AssistantStep, LlmBackend, Model, ModelInfo, ModelInfoRequest, ModelSpec, ModelStep,
+    ModelStepRequest, ProviderOptions, SamplingOptions, ServerToolSet,
 };
 pub use media::{
     AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
@@ -50,6 +51,10 @@ pub use platform::{
     PostedMessage, ReactionKind, SendMessage, ThreadRequest, UserProfile,
 };
 pub use reasoning::{ReasoningItem, ReasoningSummary, ReasoningUsage, TurnReasoning};
+pub use registries::{
+    AudioTranscriberRegistry, ImageGeneratorRegistry, LlmProviderRegistry, MessagePlatformRegistry,
+    VideoGeneratorRegistry,
+};
 pub use storage::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ContextItem, Conversation,
     ConversationLookup, ConversationSnapshot, ConversationStop, CountActiveVideoGenerations,

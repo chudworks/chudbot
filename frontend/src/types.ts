@@ -6,6 +6,7 @@ export interface ConversationView {
   conversation: Conversation;
   turns: TurnView[];
   users: Record<string, UserMetadata>;
+  model_info: ModelInfo[];
 }
 
 export interface Conversation {
@@ -163,6 +164,14 @@ export interface UsageRecord {
   cached_input_tokens?: number | null;
   cost?: CostAmount | null;
   raw?: unknown;
+}
+
+export interface ModelInfo {
+  provider: string;
+  requested_model: string;
+  model: string;
+  context_window_tokens?: number | null;
+  max_output_tokens?: number | null;
 }
 
 export interface TurnReasoning {

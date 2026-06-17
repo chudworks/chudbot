@@ -140,6 +140,7 @@ async fn run(
             let platforms =
                 ConfiguredMessagePlatforms::connect_from_config(&config.platforms).await?;
             let listen = SocketAddr::from_str(&config.web.listen)?;
+            let llms = plan.llms.clone();
             let bot = BotRuntime::new(
                 BotRuntimeParts {
                     platforms,
@@ -154,7 +155,7 @@ async fn run(
                 },
                 config.bot,
             );
-            let web = WebState::new(storage, plan.media_store, plan.events, plan.web);
+            let web = WebState::new(storage, plan.media_store, llms, plan.events, plan.web);
             run_runtime_services(bot, web, listen).await
         }
     }

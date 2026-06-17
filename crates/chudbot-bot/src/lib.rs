@@ -17,9 +17,7 @@ pub use config::{
 };
 pub use memory::MemoryConfig;
 pub use registries::{
-    AudioTranscriberRegistry, ImageGeneratorRegistry, LlmProviderRegistry, MessagePlatformRegistry,
     RoutedAudioTranscriber, RoutedImageGenerator, RoutedLlmBackend, RoutedVideoGenerator,
-    VideoGeneratorRegistry,
 };
 
 pub(crate) use config::{
@@ -34,14 +32,15 @@ use std::time::Duration;
 
 use chudbot_api::{
     Agent, AgentBuilder, AgentLimits, AgentOutcome, AgentSelection, AgentSpec, AttachmentRef,
-    AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, BeginTurn, BotStorage,
-    ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult,
-    ClientToolResultContent, ClientToolSpec, ClientToolTrace, ContentBlock, Conversation,
-    ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
+    AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
+    BeginTurn, BotStorage, ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput,
+    ClientToolResult, ClientToolResultContent, ClientToolSpec, ClientToolTrace, ContentBlock,
+    Conversation, ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
     ConversationStop, CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink,
-    ExternalId, FetchMessages, FinishTurn, ImageGeneratorTool, LiveEvent, MediaCategory, MediaRef,
-    MediaStore, MediaUri, MessageLink, MessageRef, Model, ModelId, ModelSpec, ModelStep,
-    ModelStepKind, ModelStepTrace, OpenConversation, OutgoingAttachment, PlatformCommand,
+    ExternalId, FetchMessages, FinishTurn, ImageGeneratorRegistry, ImageGeneratorTool, LiveEvent,
+    LlmProviderRegistry, MediaCategory, MediaRef, MediaStore, MediaUri, MessageLink,
+    MessagePlatformRegistry, MessageRef, Model, ModelId, ModelSpec, ModelStep, ModelStepKind,
+    ModelStepTrace, OpenConversation, OutgoingAttachment, PlatformCommand,
     PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
     PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
     PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
@@ -50,7 +49,8 @@ use chudbot_api::{
     StoredVideoJob, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, ToolUseId,
     Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob,
     UrlMediaRef, UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord,
-    UserProfile, UserRef, VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    UserProfile, UserRef, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus,
+    VideoRequest,
 };
 use serde::Serialize;
 use thiserror::Error;

@@ -1,5 +1,6 @@
 //! Web trace viewer service.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -17,9 +18,10 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use chudbot_api::{
     BotStorage, ClientToolCall, ClientToolResult, ClientToolResultContent, ContextItem,
-    Conversation, ConversationId, ConversationLookup, EventSink, GroundingMetadata, LiveEvent,
-    MediaCategory, MediaStore, MediaUri, ServerToolUse, ToolTrace, Turn, TurnAsset, TurnReasoning,
-    TurnSnapshot, UsageRecord, UserRef,
+    Conversation, ConversationId, ConversationLookup, ConversationSnapshot, EventSink,
+    GroundingMetadata, LiveEvent, LlmProviderRegistry, MediaCategory, MediaStore, MediaUri,
+    ModelId, ModelInfo, ModelInfoRequest, ProviderName, ServerToolUse, ToolTrace, Turn, TurnAsset,
+    TurnReasoning, TurnSnapshot, UsageRecord, UsageSubject, UserRef,
 };
 use futures::{Stream, StreamExt};
 use http_body::Body as _;
@@ -155,18 +157,19 @@ pub struct WebConfig {
 
 /// State shared by web handlers.
 #[derive(Debug, Clone)]
-pub struct WebState<S, M> {
+pub struct WebState<S, M, L> {
     storage: S,
     media_store: M,
+    llms: L,
     events: EventBus,
     config: WebConfig,
     static_files: StaticFileCache,
     shutdown: CancellationToken,
 }
 
-impl<S, M> WebState<S, M> {
+impl<S, M, L> WebState<S, M, L> {
     /// Build web state from concrete services.
-    pub fn new(storage: S, media_store: M, events: EventBus, config: WebConfig) -> Self {
+    pub fn new(storage: S, media_store: M, llms: L, events: EventBus, config: WebConfig) -> Self {
         tracing::debug!(
             frontend_dir = %config.frontend_dir.display(),
             title_prefix = %config.title_prefix,
@@ -176,6 +179,7 @@ impl<S, M> WebState<S, M> {
         Self {
             storage,
             media_store,
+            llms,
             events,
             config,
             static_files: StaticFileCache::new(),
@@ -288,10 +292,14 @@ impl EventSink for EventBus {
         frontend_dir = %state.config.frontend_dir.display(),
     )
 )]
-pub async fn run<S, M>(state: WebState<S, M>, listen: SocketAddr) -> Result<(), WebServerError>
+pub async fn run<S, M, L>(
+    state: WebState<S, M, L>,
+    listen: SocketAddr,
+) -> Result<(), WebServerError>
 where
     S: BotStorage + Clone + Send + Sync + 'static,
     M: MediaStore + Clone + Send + Sync + 'static,
+    L: LlmProviderRegistry + Clone + Send + Sync + 'static,
 {
     run_until_shutdown(state, listen, std::future::pending::<()>()).await
 }
@@ -305,14 +313,15 @@ where
         frontend_dir = %state.config.frontend_dir.display(),
     )
 )]
-pub async fn run_until_shutdown<S, M, F>(
-    state: WebState<S, M>,
+pub async fn run_until_shutdown<S, M, L, F>(
+    state: WebState<S, M, L>,
     listen: SocketAddr,
     shutdown: F,
 ) -> Result<(), WebServerError>
 where
     S: BotStorage + Clone + Send + Sync + 'static,
     M: MediaStore + Clone + Send + Sync + 'static,
+    L: LlmProviderRegistry + Clone + Send + Sync + 'static,
     F: Future<Output = ()> + Send + 'static,
 {
     let listener = tokio::net::TcpListener::bind(listen).await?;
@@ -334,10 +343,11 @@ where
 }
 
 /// Build an Axum router for the viewer.
-pub fn router<S, M>(state: WebState<S, M>) -> Router
+pub fn router<S, M, L>(state: WebState<S, M, L>) -> Router
 where
     S: BotStorage + Clone + Send + Sync + 'static,
     M: MediaStore + Clone + Send + Sync + 'static,
+    L: LlmProviderRegistry + Clone + Send + Sync + 'static,
 {
     tracing::debug!(
         frontend_dir = %state.config.frontend_dir.display(),
@@ -345,26 +355,26 @@ where
     );
     let trust_forwarded_for = state.config.trust_forwarded_for;
     let api = Router::new()
-        .route("/api/config", get(get_config::<S, M>))
-        .route("/api/conversations/{id}", get(get_conversation::<S, M>))
+        .route("/api/config", get(get_config::<S, M, L>))
+        .route("/api/conversations/{id}", get(get_conversation::<S, M, L>))
         .route(
             "/api/conversations/{id}/events",
-            get(conversation_events::<S, M>),
+            get(conversation_events::<S, M, L>),
         )
         .layer(cache_layer(CACHE_NO_STORE));
 
     Router::new()
         .merge(api)
-        .route("/videos/{name}", get(get_video::<S, M>))
-        .route("/audio/{name}", get(get_audio::<S, M>))
-        .route("/avatars/{name}", get(get_avatar::<S, M>))
-        .route("/images/{name}", get(get_image::<S, M>))
-        .route("/favicon.ico", get(get_favicon::<S, M>))
-        .route("/og-image", get(get_og_image::<S, M>))
+        .route("/videos/{name}", get(get_video::<S, M, L>))
+        .route("/audio/{name}", get(get_audio::<S, M, L>))
+        .route("/avatars/{name}", get(get_avatar::<S, M, L>))
+        .route("/images/{name}", get(get_image::<S, M, L>))
+        .route("/favicon.ico", get(get_favicon::<S, M, L>))
+        .route("/og-image", get(get_og_image::<S, M, L>))
         .route("/robots.txt", get(get_robots))
         .route("/assets", get(frontend_assets_root))
-        .route("/assets/{*path}", get(get_frontend_asset::<S, M>))
-        .fallback(spa_index::<S, M>)
+        .route("/assets/{*path}", get(get_frontend_asset::<S, M, L>))
+        .fallback(spa_index::<S, M, L>)
         .layer(x_robots_layer())
         .layer(middleware::from_fn(block_crawlers))
         .layer(middleware::from_fn_with_state(
@@ -411,10 +421,11 @@ impl IntoResponse for ApiError {
 }
 
 #[tracing::instrument(name = "web.get_config", skip_all)]
-async fn get_config<S, M>(State(state): State<WebState<S, M>>) -> Json<serde_json::Value>
+async fn get_config<S, M, L>(State(state): State<WebState<S, M, L>>) -> Json<serde_json::Value>
 where
     S: Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     tracing::debug!("serving web config");
     Json(serde_json::json!({
@@ -428,13 +439,14 @@ where
     skip_all,
     fields(conversation = %id)
 )]
-async fn get_conversation<S, M>(
-    State(state): State<WebState<S, M>>,
+async fn get_conversation<S, M, L>(
+    State(state): State<WebState<S, M, L>>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ConversationView>, ApiError>
 where
     S: BotStorage + Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
+    L: LlmProviderRegistry + Clone + Send + Sync + 'static,
 {
     let snapshot = state
         .storage
@@ -450,11 +462,13 @@ where
         "loaded conversation snapshot"
     );
     let users = user_metadata(&state.storage, &snapshot).await?;
+    let model_info = model_info_for_snapshot(&state.llms, &snapshot).await;
     let turns = snapshot.turns.into_iter().map(TurnView::from).collect();
     Ok(Json(ConversationView {
         conversation: snapshot.conversation,
         turns,
         users,
+        model_info,
     }))
 }
 
@@ -466,7 +480,36 @@ pub struct ConversationView {
     /// Ordered turn snapshots, shaped for the viewer.
     pub turns: Vec<TurnView>,
     /// User metadata keyed by `platform:guild:user` string.
-    pub users: std::collections::BTreeMap<String, UserMetadata>,
+    pub users: BTreeMap<String, UserMetadata>,
+    /// Provider-reported model metadata keyed by provider/model pairs.
+    pub model_info: Vec<ModelInfoView>,
+}
+
+/// Viewer-facing provider model metadata.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelInfoView {
+    /// Provider registry key.
+    pub provider: ProviderName,
+    /// Model id used to request metadata.
+    pub requested_model: ModelId,
+    /// Provider-reported model id.
+    pub model: ModelId,
+    /// Maximum input/context tokens accepted by the model.
+    pub context_window_tokens: Option<u64>,
+    /// Maximum output tokens the model can produce, when reported separately.
+    pub max_output_tokens: Option<u64>,
+}
+
+impl ModelInfoView {
+    fn new(provider: ProviderName, requested_model: ModelId, info: ModelInfo) -> Self {
+        Self {
+            provider,
+            requested_model,
+            model: info.id,
+            context_window_tokens: info.context_window_tokens,
+            max_output_tokens: info.max_output_tokens,
+        }
+    }
 }
 
 /// One turn plus viewer-safe trace data.
@@ -506,6 +549,61 @@ impl From<TurnSnapshot> for TurnView {
             reasoning,
         }
     }
+}
+
+async fn model_info_for_snapshot<L>(llms: &L, snapshot: &ConversationSnapshot) -> Vec<ModelInfoView>
+where
+    L: LlmProviderRegistry,
+{
+    let targets = model_info_targets(snapshot);
+    let mut out = Vec::new();
+    for (provider, model) in targets {
+        let request = ModelInfoRequest {
+            model: model.clone(),
+            provider_options: None,
+        };
+        match llms.fetch_model_info(&provider, request).await {
+            Ok(Some(info)) => out.push(ModelInfoView::new(provider, model, info)),
+            Ok(None) => tracing::debug!(
+                provider = %provider,
+                model = %model,
+                "model metadata unavailable"
+            ),
+            Err(error) => tracing::warn!(
+                provider = %provider,
+                model = %model,
+                error = %error,
+                "failed to fetch model metadata"
+            ),
+        }
+    }
+    out
+}
+
+fn model_info_targets(snapshot: &ConversationSnapshot) -> BTreeSet<(ProviderName, ModelId)> {
+    let mut targets = BTreeSet::new();
+    targets.insert((
+        snapshot.conversation.provider.clone(),
+        snapshot.conversation.initial_model.clone(),
+    ));
+
+    for turn in &snapshot.turns {
+        if let (Some(provider), Some(model)) = (&turn.turn.provider, &turn.turn.model) {
+            targets.insert((provider.clone(), model.clone()));
+        }
+        for step in &turn.model_steps {
+            targets.insert((step.provider.clone(), step.model.clone()));
+        }
+        for usage in &turn.usage {
+            if matches!(&usage.subject, UsageSubject::ModelStep)
+                && let Some(model) = &usage.model
+            {
+                targets.insert((usage.provider.clone(), model.clone()));
+            }
+        }
+    }
+
+    targets
 }
 
 /// Viewer-facing tool trace event.
@@ -701,13 +799,14 @@ fn user_key(user: &UserRef) -> String {
     skip_all,
     fields(conversation = %id)
 )]
-async fn conversation_events<S, M>(
-    State(state): State<WebState<S, M>>,
+async fn conversation_events<S, M, L>(
+    State(state): State<WebState<S, M, L>>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, ApiError>
 where
     S: BotStorage + Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     let conversation_id = ConversationId(id);
     state
@@ -767,13 +866,14 @@ async fn frontend_assets_root() -> Response {
 }
 
 #[tracing::instrument(name = "web.get_frontend_asset", skip_all, fields(path = %path))]
-async fn get_frontend_asset<S, M>(
-    State(state): State<WebState<S, M>>,
+async fn get_frontend_asset<S, M, L>(
+    State(state): State<WebState<S, M, L>>,
     Path(path): Path<String>,
 ) -> Response
 where
     S: Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     let Some(relative_path) = static_relative_path(&path) else {
         tracing::debug!("invalid frontend asset path");
@@ -784,19 +884,21 @@ where
 }
 
 #[tracing::instrument(name = "web.get_favicon", skip_all)]
-async fn get_favicon<S, M>(State(state): State<WebState<S, M>>) -> Response
+async fn get_favicon<S, M, L>(State(state): State<WebState<S, M, L>>) -> Response
 where
     S: Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     serve_configured_image(state.config.favicon_path.as_deref(), "favicon").await
 }
 
 #[tracing::instrument(name = "web.get_og_image", skip_all)]
-async fn get_og_image<S, M>(State(state): State<WebState<S, M>>) -> Response
+async fn get_og_image<S, M, L>(State(state): State<WebState<S, M, L>>) -> Response
 where
     S: Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     serve_configured_image(state.config.og_image_path.as_deref(), "og image").await
 }
@@ -1045,49 +1147,53 @@ async fn block_crawlers(req: Request, next: Next) -> Response {
 }
 
 #[tracing::instrument(name = "web.get_image", skip_all, fields(name = %name))]
-async fn get_image<S, M>(
-    State(state): State<WebState<S, M>>,
+async fn get_image<S, M, L>(
+    State(state): State<WebState<S, M, L>>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError>
 where
     S: Clone + Send + Sync + 'static,
     M: MediaStore + Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     load_media_response(&state.media_store, MediaCategory::Image, &name).await
 }
 
 #[tracing::instrument(name = "web.get_video", skip_all, fields(name = %name))]
-async fn get_video<S, M>(
-    State(state): State<WebState<S, M>>,
+async fn get_video<S, M, L>(
+    State(state): State<WebState<S, M, L>>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError>
 where
     S: Clone + Send + Sync + 'static,
     M: MediaStore + Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     load_media_response(&state.media_store, MediaCategory::Video, &name).await
 }
 
 #[tracing::instrument(name = "web.get_audio", skip_all, fields(name = %name))]
-async fn get_audio<S, M>(
-    State(state): State<WebState<S, M>>,
+async fn get_audio<S, M, L>(
+    State(state): State<WebState<S, M, L>>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError>
 where
     S: Clone + Send + Sync + 'static,
     M: MediaStore + Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     load_media_response(&state.media_store, MediaCategory::Audio, &name).await
 }
 
 #[tracing::instrument(name = "web.get_avatar", skip_all, fields(name = %name))]
-async fn get_avatar<S, M>(
-    State(state): State<WebState<S, M>>,
+async fn get_avatar<S, M, L>(
+    State(state): State<WebState<S, M, L>>,
     Path(name): Path<String>,
 ) -> Result<Response, ApiError>
 where
     S: Clone + Send + Sync + 'static,
     M: MediaStore + Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     load_media_response(&state.media_store, MediaCategory::Avatar, &name).await
 }
@@ -1136,10 +1242,14 @@ where
 }
 
 #[tracing::instrument(name = "web.spa_index", skip_all, fields(path = %uri.path()))]
-async fn spa_index<S, M>(State(state): State<WebState<S, M>>, uri: axum::http::Uri) -> Response
+async fn spa_index<S, M, L>(
+    State(state): State<WebState<S, M, L>>,
+    uri: axum::http::Uri,
+) -> Response
 where
     S: BotStorage + Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     let preview_meta = match conversation_path_id(uri.path()) {
         Some(id) => conversation_preview_meta(&state, id).await,
@@ -1168,10 +1278,11 @@ fn conversation_path_id(path: &str) -> Option<Uuid> {
     skip_all,
     fields(conversation = %id)
 )]
-async fn conversation_preview_meta<S, M>(state: &WebState<S, M>, id: Uuid) -> Option<String>
+async fn conversation_preview_meta<S, M, L>(state: &WebState<S, M, L>, id: Uuid) -> Option<String>
 where
     S: BotStorage + Clone + Send + Sync + 'static,
     M: Clone + Send + Sync + 'static,
+    L: Clone + Send + Sync + 'static,
 {
     let snapshot = state
         .storage

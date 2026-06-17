@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
-    ContentBlock, GroundingMetadata, LlmBackend, ModelId, ModelStep, ModelStepRequest,
-    ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName, ToolUseId,
-    Transcript, TurnRole, UsageRecord, UsageSubject,
+    ContentBlock, GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep,
+    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName,
+    ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -115,6 +115,51 @@ impl LlmBackend for GeminiClient {
         } else {
             Ok(ModelStep::Final { step })
         }
+    }
+
+    #[tracing::instrument(name = "gemini.model_info", skip_all, fields(model = %request.model))]
+    async fn fetch_model_info(
+        &self,
+        request: ModelInfoRequest,
+    ) -> Result<Option<ModelInfo>, Self::Error> {
+        let endpoint = gemini_model_endpoint(&request.model);
+        let raw: Value = self.get_json(&endpoint, "model_info[gemini]").await?;
+        Ok(Some(model_info_from_gemini(request.model, raw)))
+    }
+}
+
+fn gemini_model_endpoint(model: &ModelId) -> String {
+    let model = model.as_str().trim_start_matches("models/");
+    format!("/models/{model}")
+}
+
+fn model_info_from_gemini(requested_model: ModelId, raw: Value) -> ModelInfo {
+    let id = get_field(&raw, "baseModelId", "base_model_id")
+        .and_then(Value::as_str)
+        .or_else(|| raw.get("name").and_then(Value::as_str))
+        .map(|value| value.trim_start_matches("models/"))
+        .filter(|value| !value.is_empty())
+        .map(ModelId::new)
+        .unwrap_or(requested_model);
+    ModelInfo {
+        id,
+        context_window_tokens: u64_field(&raw, &["inputTokenLimit", "input_token_limit"]),
+        max_output_tokens: u64_field(&raw, &["outputTokenLimit", "output_token_limit"]),
+        raw: Some(raw),
+    }
+}
+
+fn u64_field(value: &Value, names: &[&str]) -> Option<u64> {
+    names
+        .iter()
+        .find_map(|name| value.get(*name).and_then(value_as_u64))
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
     }
 }
 
@@ -560,6 +605,24 @@ mod tests {
         assert_eq!(usage.reasoning_tokens, Some(5));
         assert_eq!(usage.total_tokens, Some(25));
         assert!(usage.raw.is_some());
+    }
+
+    #[test]
+    fn gemini_model_info_preserves_context_limits() {
+        let info = model_info_from_gemini(
+            ModelId::new("gemini-3.5-flash"),
+            json!({
+                "name": "models/gemini-3.5-flash",
+                "baseModelId": "gemini-3.5-flash",
+                "inputTokenLimit": 1048576,
+                "outputTokenLimit": 65536
+            }),
+        );
+
+        assert_eq!(info.id, ModelId::new("gemini-3.5-flash"));
+        assert_eq!(info.context_window_tokens, Some(1_048_576));
+        assert_eq!(info.max_output_tokens, Some(65_536));
+        assert!(info.raw.is_some());
     }
 
     #[test]

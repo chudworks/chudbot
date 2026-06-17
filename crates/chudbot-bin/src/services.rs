@@ -2,14 +2,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use chudbot_api::{
-    AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, GeneratedImage,
-    ImageGenerator, ImageRequest, LlmBackend, ModelStep, ModelStepRequest, ProviderName,
-    VideoGenerator, VideoJobId, VideoJobStatus, VideoRequest,
+    AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
+    GeneratedImage, ImageGenerator, ImageGeneratorRegistry, ImageRequest, LlmBackend,
+    LlmProviderRegistry, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest, ProviderName,
+    VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
-use chudbot_bot::{
-    AudioTranscriberRegistry, ImageGeneratorRegistry, LlmProviderRegistry, VideoGeneratorRegistry,
-};
 use chudbot_web::{EventBus, WebConfig};
 
 use crate::config::{
@@ -267,6 +265,50 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching model step");
             return LlmBackend::step(client, request)
+                .await
+                .map_err(ConfiguredLlmError::Xai);
+        }
+        tracing::warn!("requested provider is missing from registry");
+        Err(ConfiguredLlmError::Missing(provider.clone()))
+    }
+
+    #[tracing::instrument(
+        name = "llm_registry.model_info",
+        skip_all,
+        fields(provider = %provider, model = %request.model)
+    )]
+    async fn fetch_model_info(
+        &self,
+        provider: &ProviderName,
+        request: ModelInfoRequest,
+    ) -> Result<Option<ModelInfo>, Self::Error> {
+        if let Some(client) = self.inner.anthropic.get(provider) {
+            tracing::debug!(kind = "anthropic", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::Anthropic);
+        }
+        if let Some(client) = self.inner.openai.get(provider) {
+            tracing::debug!(kind = "openai", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::OpenAi);
+        }
+        if let Some(client) = self.inner.openai_compat.get(provider) {
+            tracing::debug!(kind = "openai_compat", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::OpenAiCompat);
+        }
+        if let Some(client) = self.inner.gemini.get(provider) {
+            tracing::debug!(kind = "gemini", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
+                .await
+                .map_err(ConfiguredLlmError::Gemini);
+        }
+        if let Some(client) = self.inner.xai.get(provider) {
+            tracing::debug!(kind = "xai", "fetching model metadata");
+            return LlmBackend::fetch_model_info(client, request)
                 .await
                 .map_err(ConfiguredLlmError::Xai);
         }

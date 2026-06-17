@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 
-use chudbot_api::{BotStorage, EventSink, MediaStore};
-use chudbot_bot::{
-    AudioTranscriberRegistry, BotRunOptions, BotRuntime, ImageGeneratorRegistry,
-    LlmProviderRegistry, MessagePlatformRegistry, VideoGeneratorRegistry,
+use chudbot_api::{
+    AudioTranscriberRegistry, BotStorage, EventSink, ImageGeneratorRegistry, LlmProviderRegistry,
+    MediaStore, MessagePlatformRegistry, VideoGeneratorRegistry,
 };
+use chudbot_bot::{BotRunOptions, BotRuntime};
 use chudbot_web::WebState;
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +16,7 @@ use crate::errors::BinError;
 /// or either service exits.
 pub async fn run_runtime_services<P, S, M, L, I, V, A, E>(
     bot: BotRuntime<P, S, M, L, I, V, A, E>,
-    web: WebState<S, M>,
+    web: WebState<S, M, L>,
     listen: SocketAddr,
 ) -> Result<(), BinError>
 where

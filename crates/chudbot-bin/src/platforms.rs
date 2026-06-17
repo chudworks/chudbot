@@ -3,11 +3,10 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use chudbot_api::{
-    ChannelRef, FetchMessages, MessagePlatform, MessageRef, PlatformCommandDefinition,
-    PlatformCommandResponse, PlatformEvent, PlatformMessage, PlatformMessageRelationship,
-    PostedMessage, ReactionKind, SendMessage, UserProfile,
+    ChannelRef, FetchMessages, MessagePlatform, MessagePlatformRegistry, MessageRef,
+    PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
+    PlatformMessageRelationship, PostedMessage, ReactionKind, SendMessage, UserProfile,
 };
-use chudbot_bot::MessagePlatformRegistry;
 use futures::FutureExt;
 use tokio::task::{JoinError, JoinHandle};
 

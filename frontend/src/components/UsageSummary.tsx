@@ -1,7 +1,8 @@
-import type { CostAmount, ToolTrace, TurnView, UsageRecord, UsageSubject } from '../types';
+import type { CostAmount, ModelInfo, ToolTrace, TurnView, UsageRecord, UsageSubject } from '../types';
 
 interface Props {
   turns: TurnView[];
+  modelInfo: ModelInfo[];
 }
 
 type Metric = {
@@ -34,11 +35,19 @@ type UsageGroup = {
   costs: CostTotals;
 };
 
+type ContextUsage = {
+  provider: string;
+  model: string;
+  usedTokens: number;
+  limitTokens: number | null;
+};
+
 const USD_TICKS_PER_DOLLAR = 10_000_000_000;
 
-export default function UsageSummary({ turns }: Props) {
+export default function UsageSummary({ turns, modelInfo }: Props) {
   const records = collectConversationUsage(turns);
-  if (records.length === 0) return null;
+  const contextUsage = currentContextUsage(turns, modelInfo);
+  if (records.length === 0 && !contextUsage) return null;
 
   const summary = summarize(records);
   const groups = groupUsage(records);
@@ -47,50 +56,53 @@ export default function UsageSummary({ turns }: Props) {
     <section className="usage-summary" aria-label="Conversation usage">
       <div className="usage-summary__metrics">
         <UsageMetric label="Cost" value={formatCosts(summary.costs)} />
+        <UsageMetric label="Context" value={formatContextUsage(contextUsage)} />
         <UsageMetric label="Total tokens" value={formatMetric(summary.totalTokens)} />
         <UsageMetric label="Reasoning" value={formatMetric(summary.reasoningTokens)} />
         <UsageMetric label="Cached input" value={formatMetric(summary.cachedTokens)} />
       </div>
-      <details className="usage-summary__details">
-        <summary>Usage by source</summary>
-        <div className="usage-summary__table-wrap">
-          <table className="usage-table">
-            <thead>
-              <tr>
-                <th scope="col">Work</th>
-                <th scope="col">Provider/model</th>
-                <th scope="col" className="usage-table__num">Total</th>
-                <th scope="col" className="usage-table__num">Input</th>
-                <th scope="col" className="usage-table__num">Cached</th>
-                <th scope="col" className="usage-table__num">Output</th>
-                <th scope="col" className="usage-table__num">Reasoning</th>
-                <th scope="col" className="usage-table__num">Cost</th>
-              </tr>
-            </thead>
-            <tbody>
-              {groups.map((group) => (
-                <tr key={group.key}>
-                  <td>
-                    <span className="usage-table__subject">{group.subject}</span>
-                    <span className="usage-table__count">
-                      {formatNumber(group.count)} {group.count === 1 ? 'record' : 'records'}
-                    </span>
-                  </td>
-                  <td>
-                    <code>{providerModelLabel(group.provider, group.model)}</code>
-                  </td>
-                  <td className="usage-table__num">{formatMetric(group.totalTokens)}</td>
-                  <td className="usage-table__num">{formatMetric(group.inputTokens)}</td>
-                  <td className="usage-table__num">{formatMetric(group.cachedTokens)}</td>
-                  <td className="usage-table__num">{formatMetric(group.outputTokens)}</td>
-                  <td className="usage-table__num">{formatMetric(group.reasoningTokens)}</td>
-                  <td className="usage-table__num">{formatCosts(group.costs)}</td>
+      {records.length > 0 && (
+        <details className="usage-summary__details">
+          <summary>Usage by source</summary>
+          <div className="usage-summary__table-wrap">
+            <table className="usage-table">
+              <thead>
+                <tr>
+                  <th scope="col">Work</th>
+                  <th scope="col">Provider/model</th>
+                  <th scope="col" className="usage-table__num">Total</th>
+                  <th scope="col" className="usage-table__num">Input</th>
+                  <th scope="col" className="usage-table__num">Cached</th>
+                  <th scope="col" className="usage-table__num">Output</th>
+                  <th scope="col" className="usage-table__num">Reasoning</th>
+                  <th scope="col" className="usage-table__num">Cost</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </details>
+              </thead>
+              <tbody>
+                {groups.map((group) => (
+                  <tr key={group.key}>
+                    <td>
+                      <span className="usage-table__subject">{group.subject}</span>
+                      <span className="usage-table__count">
+                        {formatNumber(group.count)} {group.count === 1 ? 'record' : 'records'}
+                      </span>
+                    </td>
+                    <td>
+                      <code>{providerModelLabel(group.provider, group.model)}</code>
+                    </td>
+                    <td className="usage-table__num">{formatMetric(group.totalTokens)}</td>
+                    <td className="usage-table__num">{formatMetric(group.inputTokens)}</td>
+                    <td className="usage-table__num">{formatMetric(group.cachedTokens)}</td>
+                    <td className="usage-table__num">{formatMetric(group.outputTokens)}</td>
+                    <td className="usage-table__num">{formatMetric(group.reasoningTokens)}</td>
+                    <td className="usage-table__num">{formatCosts(group.costs)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
     </section>
   );
 }
@@ -106,6 +118,51 @@ function UsageMetric({ label, value }: { label: string; value: string }) {
 
 function collectConversationUsage(turns: TurnView[]): UsageRecord[] {
   return turns.flatMap(collectTurnUsage);
+}
+
+function currentContextUsage(turns: TurnView[], modelInfo: ModelInfo[]): ContextUsage | null {
+  const infoByModel = modelInfoLookup(modelInfo);
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const turn = turns[turnIndex];
+    for (let usageIndex = turn.usage.length - 1; usageIndex >= 0; usageIndex -= 1) {
+      const record = turn.usage[usageIndex];
+      if (record.subject.kind !== 'model_step') continue;
+      const inputTokens = finiteNumber(record.input_tokens);
+      if (inputTokens == null) continue;
+      const outputTokens = finiteNumber(record.output_tokens) ?? 0;
+      const model = record.model ?? turn.turn.model;
+      if (!model) continue;
+      const info = infoByModel.get(modelInfoKey(record.provider, model));
+      return {
+        provider: record.provider,
+        model,
+        usedTokens: inputTokens + outputTokens,
+        limitTokens: finiteNumber(info?.context_window_tokens) ?? null,
+      };
+    }
+  }
+  return null;
+}
+
+function modelInfoLookup(modelInfo: ModelInfo[]): Map<string, ModelInfo> {
+  const out = new Map<string, ModelInfo>();
+  for (const info of modelInfo) {
+    setModelInfo(out, info.provider, info.requested_model, info);
+    setModelInfo(out, info.provider, info.model, info);
+  }
+  return out;
+}
+
+function setModelInfo(out: Map<string, ModelInfo>, provider: string, model: string, info: ModelInfo) {
+  const key = modelInfoKey(provider, model);
+  const existing = out.get(key);
+  if (!existing || existing.context_window_tokens == null) {
+    out.set(key, info);
+  }
+}
+
+function modelInfoKey(provider: string, model: string): string {
+  return `${provider}\u0000${model}`;
 }
 
 function collectTurnUsage(turn: TurnView): UsageRecord[] {
@@ -201,9 +258,14 @@ function emptyMetric(): Metric {
 }
 
 function addMetric(metric: Metric, value: number | null | undefined) {
-  if (typeof value !== 'number' || !Number.isFinite(value)) return;
+  const numeric = finiteNumber(value);
+  if (numeric == null) return;
   metric.seen = true;
-  metric.value += value;
+  metric.value += numeric;
+}
+
+function finiteNumber(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 function emptyCosts(): CostTotals {
@@ -262,8 +324,34 @@ function formatMetric(metric: Metric): string {
   return metric.seen ? formatNumber(metric.value) : 'n/a';
 }
 
+function formatContextUsage(usage: ContextUsage | null): string {
+  if (!usage) return 'n/a';
+  if (usage.limitTokens == null || usage.limitTokens <= 0) {
+    return `${formatTokenK(usage.usedTokens)} used, limit unknown`;
+  }
+  const percent = usage.usedTokens / usage.limitTokens;
+  return `${formatTokenK(usage.usedTokens)} used of ${formatTokenK(usage.limitTokens)} (${formatPercent(percent)})`;
+}
+
+function formatPercent(value: number): string {
+  return new Intl.NumberFormat(undefined, {
+    style: 'percent',
+    minimumFractionDigits: value > 0 && value < 0.01 ? 1 : 0,
+    maximumFractionDigits: 1,
+  }).format(value);
+}
+
 function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
+}
+
+function formatTokenK(value: number): string {
+  if (Math.abs(value) < 1000) return formatNumber(Math.round(value));
+  const thousands = value / 1000;
+  const formatted = new Intl.NumberFormat(undefined, {
+    maximumFractionDigits: 1,
+  }).format(thousands);
+  return `${formatted}k`;
 }
 
 function providerModelLabel(provider: string, model: string | null): string {

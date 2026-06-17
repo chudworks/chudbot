@@ -1,249 +1,11 @@
-use std::future::Future;
-
 use chudbot_api::{
-    AudioTranscriber, AudioTranscription, AudioTranscriptionRequest, ChannelRef, FetchMessages,
-    GeneratedImage, ImageGenerator, ImageRequest, LlmBackend, MessagePlatform, MessageRef, ModelId,
-    ModelStep, ModelStepRequest, PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent,
-    PlatformMessage, PlatformMessageRelationship, PlatformName, PostedMessage, ProviderName,
-    ReactionKind, SendMessage, UserProfile, VideoGenerator, VideoJobId, VideoJobStatus,
-    VideoRequest,
+    AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
+    GeneratedImage, ImageGenerator, ImageGeneratorRegistry, ImageRequest, LlmBackend,
+    LlmProviderRegistry, ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest,
+    ProviderName, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
 };
 
 use crate::model_step_kind;
-
-/// Registry of named LLM provider services.
-pub trait LlmProviderRegistry: Clone + Send + Sync {
-    /// Registry error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Whether a provider is configured.
-    fn contains_provider(&self, provider: &ProviderName) -> bool;
-
-    /// Execute one model step against a named provider.
-    fn step(
-        &self,
-        provider: &ProviderName,
-        request: ModelStepRequest,
-    ) -> impl Future<Output = Result<ModelStep, Self::Error>> + Send;
-}
-
-/// Registry of named image generation services.
-pub trait ImageGeneratorRegistry: Clone + Send + Sync {
-    /// Registry error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Whether a generator is configured.
-    fn contains_generator(&self, provider: &ProviderName) -> bool;
-
-    /// Generate one image through a named provider.
-    fn generate_image(
-        &self,
-        provider: &ProviderName,
-        request: ImageRequest,
-    ) -> impl Future<Output = Result<GeneratedImage, Self::Error>> + Send;
-}
-
-/// Registry of named video generation services.
-pub trait VideoGeneratorRegistry: Clone + Send + Sync {
-    /// Registry error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Whether a generator is configured.
-    fn contains_generator(&self, provider: &ProviderName) -> bool;
-
-    /// Submit a video generation job through a named provider.
-    fn submit_video(
-        &self,
-        provider: &ProviderName,
-        request: VideoRequest,
-    ) -> impl Future<Output = Result<VideoJobId, Self::Error>> + Send;
-
-    /// Poll a video generation job once through a named provider.
-    fn check_video(
-        &self,
-        provider: &ProviderName,
-        job: VideoJobId,
-    ) -> impl Future<Output = Result<VideoJobStatus, Self::Error>> + Send;
-
-    /// Download a completed video through a named provider.
-    fn download_video(
-        &self,
-        provider: &ProviderName,
-        url: String,
-    ) -> impl Future<Output = Result<Vec<u8>, Self::Error>> + Send;
-}
-
-/// Registry of named audio transcription services.
-pub trait AudioTranscriberRegistry: Clone + Send + Sync {
-    /// Registry error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Whether a transcriber is configured.
-    fn contains_transcriber(&self, provider: &ProviderName) -> bool;
-
-    /// Transcribe one audio file through a named provider.
-    fn transcribe_audio(
-        &self,
-        provider: &ProviderName,
-        request: AudioTranscriptionRequest,
-    ) -> impl Future<Output = Result<AudioTranscription, Self::Error>> + Send;
-}
-
-/// Registry of named message platform services.
-pub trait MessagePlatformRegistry: Clone + Send + Sync {
-    /// Registry error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Fetch the bot user for a platform.
-    fn bot_user(
-        &self,
-        platform: &PlatformName,
-    ) -> impl Future<Output = Result<UserProfile, Self::Error>> + Send;
-
-    /// Register bot commands across configured platforms.
-    fn register_commands(
-        &self,
-        commands: Vec<PlatformCommandDefinition>,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Read the next event from any configured platform.
-    fn next_event(&self) -> impl Future<Output = Result<PlatformEvent, Self::Error>> + Send;
-
-    /// Gracefully stop platform services owned by this registry.
-    fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        async { Ok(()) }
-    }
-
-    /// Respond to a command invocation.
-    fn respond_to_command(
-        &self,
-        response: PlatformCommandResponse,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Send a message through the platform named by `request.channel.platform`.
-    fn send_message(
-        &self,
-        request: SendMessage,
-    ) -> impl Future<Output = Result<PostedMessage, Self::Error>> + Send;
-
-    /// Delete a platform message.
-    fn delete_message(
-        &self,
-        message: MessageRef,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Add a reaction to a platform message.
-    fn add_reaction(
-        &self,
-        message: MessageRef,
-        reaction: ReactionKind,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Remove the bot's own reaction from a platform message.
-    fn remove_own_reaction(
-        &self,
-        message: MessageRef,
-        reaction: ReactionKind,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Trigger a platform typing indicator.
-    fn typing(&self, channel: ChannelRef) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Fetch messages through the platform named by `request.channel.platform`.
-    fn fetch_messages(
-        &self,
-        request: FetchMessages,
-    ) -> impl Future<Output = Result<Vec<PlatformMessage>, Self::Error>> + Send;
-
-    /// Render a platform message for model context.
-    fn message_context(
-        &self,
-        message: &PlatformMessage,
-        relationship: PlatformMessageRelationship,
-    ) -> impl Future<Output = Result<serde_json::Value, Self::Error>> + Send;
-
-    /// Resolve a platform channel's parent channel.
-    fn parent_channel(
-        &self,
-        channel: ChannelRef,
-    ) -> impl Future<Output = Result<ChannelRef, Self::Error>> + Send;
-}
-
-impl<T> MessagePlatformRegistry for T
-where
-    T: MessagePlatform + Clone,
-{
-    type Error = T::Error;
-
-    async fn bot_user(&self, _platform: &PlatformName) -> Result<UserProfile, Self::Error> {
-        MessagePlatform::bot_user(self).await
-    }
-
-    async fn register_commands(
-        &self,
-        commands: Vec<PlatformCommandDefinition>,
-    ) -> Result<(), Self::Error> {
-        MessagePlatform::register_commands(self, commands, None).await
-    }
-
-    async fn next_event(&self) -> Result<PlatformEvent, Self::Error> {
-        MessagePlatform::next_event(self).await
-    }
-
-    async fn respond_to_command(
-        &self,
-        response: PlatformCommandResponse,
-    ) -> Result<(), Self::Error> {
-        MessagePlatform::respond_to_command(self, response).await
-    }
-
-    async fn send_message(&self, request: SendMessage) -> Result<PostedMessage, Self::Error> {
-        MessagePlatform::send_message(self, request).await
-    }
-
-    async fn delete_message(&self, message: MessageRef) -> Result<(), Self::Error> {
-        MessagePlatform::delete_message(self, message).await
-    }
-
-    async fn add_reaction(
-        &self,
-        message: MessageRef,
-        reaction: ReactionKind,
-    ) -> Result<(), Self::Error> {
-        MessagePlatform::add_reaction(self, message, reaction).await
-    }
-
-    async fn remove_own_reaction(
-        &self,
-        message: MessageRef,
-        reaction: ReactionKind,
-    ) -> Result<(), Self::Error> {
-        MessagePlatform::remove_own_reaction(self, message, reaction).await
-    }
-
-    async fn typing(&self, channel: ChannelRef) -> Result<(), Self::Error> {
-        MessagePlatform::typing(self, channel).await
-    }
-
-    async fn fetch_messages(
-        &self,
-        request: FetchMessages,
-    ) -> Result<Vec<PlatformMessage>, Self::Error> {
-        MessagePlatform::fetch_messages(self, request).await
-    }
-
-    async fn message_context(
-        &self,
-        message: &PlatformMessage,
-        relationship: PlatformMessageRelationship,
-    ) -> Result<serde_json::Value, Self::Error> {
-        MessagePlatform::message_context(self, message, relationship).await
-    }
-
-    async fn parent_channel(&self, channel: ChannelRef) -> Result<ChannelRef, Self::Error> {
-        MessagePlatform::parent_channel(self, channel).await
-    }
-}
 
 /// `LlmBackend` adapter for one configured provider inside a registry.
 #[derive(Debug, Clone)]
@@ -289,6 +51,21 @@ where
             Err(error) => tracing::warn!(error = %error, "model step failed"),
         }
         result
+    }
+
+    #[tracing::instrument(
+        name = "llm.routed_model_info",
+        skip_all,
+        fields(provider = %self.provider, model = %request.model)
+    )]
+    async fn fetch_model_info(
+        &self,
+        request: ModelInfoRequest,
+    ) -> Result<Option<ModelInfo>, Self::Error> {
+        tracing::debug!("dispatching model metadata lookup through provider registry");
+        self.registry
+            .fetch_model_info(&self.provider, request)
+            .await
     }
 }
 

@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 use chudbot_api::{
     AssistantStep, ClientToolCall, ClientToolSpec, ContentBlock, CostAmount, GroundingMetadata,
-    LlmBackend, ModelId, ModelStep, ModelStepRequest, ProviderContinuation, ProviderName,
-    ServerToolSet, ServerToolUse, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord,
-    UsageSubject,
+    LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest,
+    ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolName, ToolUseId,
+    Transcript, TurnRole, UsageRecord, UsageSubject,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -100,6 +100,100 @@ impl LlmBackend for XaiClient {
         } else {
             Ok(ModelStep::Final { step })
         }
+    }
+
+    #[tracing::instrument(name = "xai.model_info", skip_all, fields(model = %request.model))]
+    async fn fetch_model_info(
+        &self,
+        request: ModelInfoRequest,
+    ) -> Result<Option<ModelInfo>, Self::Error> {
+        let raw: Value = self.get_json("/models", "model_info[xai]").await?;
+        Ok(model_info_from_models_response(request.model, raw))
+    }
+}
+
+fn model_info_from_models_response(requested_model: ModelId, raw: Value) -> Option<ModelInfo> {
+    let entry = model_entry_from_models_response(&requested_model, &raw)?;
+    model_info_from_api_model(requested_model, entry)
+}
+
+fn model_entry_from_models_response(requested_model: &ModelId, raw: &Value) -> Option<Value> {
+    if model_id_matches(raw, requested_model) {
+        return Some(raw.clone());
+    }
+
+    let data = raw.get("data").and_then(Value::as_array)?;
+    data.iter()
+        .find(|entry| model_id_matches(entry, requested_model))
+        .or_else(|| (data.len() == 1).then(|| &data[0]))
+        .cloned()
+}
+
+fn model_id_matches(value: &Value, requested_model: &ModelId) -> bool {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id == requested_model.as_str())
+}
+
+fn model_info_from_api_model(requested_model: ModelId, raw: Value) -> Option<ModelInfo> {
+    const CONTEXT_FIELDS: &[&str] = &[
+        "context_window_tokens",
+        "context_window",
+        "context_length",
+        "max_context_length",
+        "max_context_len",
+        "max_model_len",
+        "max_sequence_length",
+        "max_position_embeddings",
+    ];
+    const OUTPUT_FIELDS: &[&str] = &[
+        "max_output_tokens",
+        "max_completion_tokens",
+        "output_token_limit",
+        "max_tokens",
+    ];
+
+    let context_window_tokens = find_u64_field(&raw, CONTEXT_FIELDS);
+    let max_output_tokens = find_u64_field(&raw, OUTPUT_FIELDS);
+    if context_window_tokens.is_none() && max_output_tokens.is_none() {
+        return None;
+    }
+
+    let id = raw
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ModelId::new)
+        .unwrap_or(requested_model);
+    Some(ModelInfo {
+        id,
+        context_window_tokens,
+        max_output_tokens,
+        raw: Some(raw),
+    })
+}
+
+fn find_u64_field(value: &Value, fields: &[&str]) -> Option<u64> {
+    let object = value.as_object()?;
+    if let Some(found) = fields
+        .iter()
+        .find_map(|field| object.get(*field).and_then(value_as_u64))
+    {
+        return Some(found);
+    }
+
+    object
+        .values()
+        .filter(|value| value.is_object())
+        .find_map(|value| find_u64_field(value, fields))
+}
+
+fn value_as_u64(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => number.as_u64(),
+        Value::String(text) => text.parse().ok(),
+        _ => None,
     }
 }
 

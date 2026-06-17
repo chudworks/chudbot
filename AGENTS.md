@@ -67,6 +67,9 @@ tmux session.
 ## Configuration
 
 `config.example.toml` is the config reference. Copy it to `config.toml`.
+When changing config schema or semantics, keep `check-config` validation and
+diagnostics compatible so invalid configs report rich, spanned, actionable
+errors.
 
 The config is agent-first:
 

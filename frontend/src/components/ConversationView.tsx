@@ -84,7 +84,7 @@ export default function ConversationView() {
     );
   }
 
-  const { conversation, turns, users } = state.view;
+  const { conversation, turns, users, model_info: modelInfo } = state.view;
   const title = conversation.title ?? 'Untitled conversation';
   const model = `${conversation.provider}/${conversation.initial_model}`;
   const starter = users[userKey(conversation.created_by)]?.label;
@@ -117,7 +117,7 @@ export default function ConversationView() {
             {' '}It won’t reply until the 🛑 reaction is removed.
           </p>
         )}
-        <UsageSummary turns={turns} />
+        <UsageSummary turns={turns} modelInfo={modelInfo} />
       </header>
       <main className="conv">
         {turns.map((tv) => (

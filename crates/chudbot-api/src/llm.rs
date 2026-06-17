@@ -30,6 +30,15 @@ pub trait LlmBackend: Send + Sync {
         &self,
         request: ModelStepRequest,
     ) -> impl Future<Output = Result<ModelStep, Self::Error>> + Send;
+
+    /// Fetch provider-reported metadata for one model, when this backend can
+    /// discover it.
+    fn fetch_model_info(
+        &self,
+        _request: ModelInfoRequest,
+    ) -> impl Future<Output = Result<Option<ModelInfo>, Self::Error>> + Send {
+        async { Ok(None) }
+    }
 }
 
 /// A callable language model: backend code plus static model config.
@@ -76,6 +85,28 @@ pub struct ModelStepRequest {
     pub sampling: SamplingOptions,
     /// Provider-specific options.
     pub provider_options: Option<ProviderOptions>,
+}
+
+/// One model metadata request.
+#[derive(Debug, Clone)]
+pub struct ModelInfoRequest {
+    /// Provider model id.
+    pub model: ModelId,
+    /// Provider-specific options for the already-routed backend.
+    pub provider_options: Option<ProviderOptions>,
+}
+
+/// Provider-reported model metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelInfo {
+    /// Provider model id.
+    pub id: ModelId,
+    /// Maximum input/context tokens accepted by the model.
+    pub context_window_tokens: Option<u64>,
+    /// Maximum output tokens the model can produce, when reported separately.
+    pub max_output_tokens: Option<u64>,
+    /// Raw provider model metadata for auditing and future extraction.
+    pub raw: Option<serde_json::Value>,
 }
 
 /// One model step response.
