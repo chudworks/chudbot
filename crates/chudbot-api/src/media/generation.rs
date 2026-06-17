@@ -43,79 +43,6 @@ use super::BoxedMediaRef;
 // options plus runtime media handles. Configured provider names live in the
 // registry layer, not in these structs.
 
-/// Provider-facing request to transcribe one audio input.
-///
-/// The audio handle may represent stored media or a public URL. The transcriber
-/// chooses whether to call [`crate::media::MediaRef::public_url`] or
-/// [`crate::media::MediaRef::load`] based on what the upstream API accepts.
-#[derive(Debug, Clone)]
-pub struct AudioTranscriptionRequest {
-    /// Audio file to transcribe.
-    pub audio: BoxedMediaRef,
-    /// Optional BCP-47-ish language hint for provider-side recognition or text
-    /// formatting.
-    pub language: Option<String>,
-    /// Optional key terms to bias transcription toward domain vocabulary.
-    pub keyterms: Vec<String>,
-    /// Provider-specific model id when applicable. `None` means use the
-    /// configured provider default.
-    pub model: Option<ModelId>,
-}
-
-// Result types are serializable because they can be stored with traces or usage
-// records after the provider call has completed.
-
-/// One transcribed word with timing metadata.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioTranscriptWord {
-    /// Word text.
-    pub text: String,
-    /// Start timestamp in seconds.
-    #[serde(rename = "start")]
-    pub start_seconds: f64,
-    /// End timestamp in seconds.
-    #[serde(rename = "end")]
-    pub end_seconds: f64,
-    /// Provider confidence when reported.
-    pub confidence: Option<f64>,
-    /// Speaker index when diarization is enabled and reported.
-    pub speaker: Option<u32>,
-}
-
-/// Transcript for one channel when multichannel transcription is enabled.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioTranscriptChannel {
-    /// Channel index.
-    pub index: u32,
-    /// Channel transcript text.
-    pub text: String,
-    /// Word-level timing for this channel.
-    pub words: Vec<AudioTranscriptWord>,
-}
-
-/// Completed audio transcription result.
-///
-/// Providers should preserve the most precise timing and channel information
-/// they receive. Empty `words` or `channels` vectors mean the provider did not
-/// report that level of structure, not that transcription failed.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AudioTranscription {
-    /// Full transcript text.
-    pub text: String,
-    /// Detected or requested language when reported.
-    pub language: Option<String>,
-    /// Audio duration in seconds.
-    pub duration_seconds: f64,
-    /// Word-level timing.
-    pub words: Vec<AudioTranscriptWord>,
-    /// Per-channel transcripts.
-    pub channels: Vec<AudioTranscriptChannel>,
-    /// Actual model used when applicable.
-    pub model: Option<ModelId>,
-    /// Usage/cost reported or estimated for this transcription.
-    pub usage: Vec<UsageRecord>,
-}
-
 /// Provider-facing request to create or edit an image.
 ///
 /// `references` are optional source images for editing, restyling, or other
@@ -133,25 +60,6 @@ pub struct ImageRequest {
     /// Provider-specific model or quality tier. `None` means use the configured
     /// provider default.
     pub model: Option<ModelId>,
-}
-
-/// Complete image artifact returned by a provider.
-///
-/// The API layer keeps this as bytes plus metadata. Bot orchestration can then
-/// decide whether to attach it directly, persist it through
-/// [`crate::media::MediaStore`], or both.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GeneratedImage {
-    /// Raw image bytes.
-    pub bytes: Vec<u8>,
-    /// MIME type, e.g. `image/png`.
-    pub mime_type: String,
-    /// Actual model used.
-    pub model: ModelId,
-    /// Optional provider-revised prompt.
-    pub revised_prompt: Option<String>,
-    /// Usage/cost reported for this image generation.
-    pub usage: Vec<UsageRecord>,
 }
 
 /// Provider-facing request to submit a video generation job.
@@ -174,6 +82,47 @@ pub struct VideoRequest {
     /// Provider-specific model id. `None` means use the configured provider
     /// default.
     pub model: Option<ModelId>,
+}
+
+/// Provider-facing request to transcribe one audio input.
+///
+/// The audio handle may represent stored media or a public URL. The transcriber
+/// chooses whether to call [`crate::media::MediaRef::public_url`] or
+/// [`crate::media::MediaRef::load`] based on what the upstream API accepts.
+#[derive(Debug, Clone)]
+pub struct AudioTranscriptionRequest {
+    /// Audio file to transcribe.
+    pub audio: BoxedMediaRef,
+    /// Optional BCP-47-ish language hint for provider-side recognition or text
+    /// formatting.
+    pub language: Option<String>,
+    /// Optional key terms to bias transcription toward domain vocabulary.
+    pub keyterms: Vec<String>,
+    /// Provider-specific model id when applicable. `None` means use the
+    /// configured provider default.
+    pub model: Option<ModelId>,
+}
+
+// Result types are serializable because they can be stored with traces or usage
+// records after the provider call has completed.
+
+/// Complete image artifact returned by a provider.
+///
+/// The API layer keeps this as bytes plus metadata. Bot orchestration can then
+/// decide whether to attach it directly, persist it through
+/// [`crate::media::MediaStore`], or both.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GeneratedImage {
+    /// Raw image bytes.
+    pub bytes: Vec<u8>,
+    /// MIME type, e.g. `image/png`.
+    pub mime_type: String,
+    /// Actual model used.
+    pub model: ModelId,
+    /// Optional provider-revised prompt.
+    pub revised_prompt: Option<String>,
+    /// Usage/cost reported for this image generation.
+    pub usage: Vec<UsageRecord>,
 }
 
 /// Complete video artifact when a caller has already downloaded final bytes.
@@ -233,6 +182,57 @@ pub enum VideoJobStatus {
     },
     /// Expired upstream before completion.
     Expired,
+}
+
+/// One transcribed word with timing metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptWord {
+    /// Word text.
+    pub text: String,
+    /// Start timestamp in seconds.
+    #[serde(rename = "start")]
+    pub start_seconds: f64,
+    /// End timestamp in seconds.
+    #[serde(rename = "end")]
+    pub end_seconds: f64,
+    /// Provider confidence when reported.
+    pub confidence: Option<f64>,
+    /// Speaker index when diarization is enabled and reported.
+    pub speaker: Option<u32>,
+}
+
+/// Transcript for one channel when multichannel transcription is enabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscriptChannel {
+    /// Channel index.
+    pub index: u32,
+    /// Channel transcript text.
+    pub text: String,
+    /// Word-level timing for this channel.
+    pub words: Vec<AudioTranscriptWord>,
+}
+
+/// Completed audio transcription result.
+///
+/// Providers should preserve the most precise timing and channel information
+/// they receive. Empty `words` or `channels` vectors mean the provider did not
+/// report that level of structure, not that transcription failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioTranscription {
+    /// Full transcript text.
+    pub text: String,
+    /// Detected or requested language when reported.
+    pub language: Option<String>,
+    /// Audio duration in seconds.
+    pub duration_seconds: f64,
+    /// Word-level timing.
+    pub words: Vec<AudioTranscriptWord>,
+    /// Per-channel transcripts.
+    pub channels: Vec<AudioTranscriptChannel>,
+    /// Actual model used when applicable.
+    pub model: Option<ModelId>,
+    /// Usage/cost reported or estimated for this transcription.
+    pub usage: Vec<UsageRecord>,
 }
 
 // Provider traits use native async traits/RPITIT so concrete crates can expose

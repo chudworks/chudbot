@@ -108,27 +108,6 @@ pub struct PlatformMessage {
     pub created_at: OffsetDateTime,
 }
 
-impl PlatformMessage {
-    /// Message id quoted/replied to by this message, if known.
-    ///
-    /// This works for both id-only references and hydrated references.
-    pub fn referenced_message_id(&self) -> Option<&MessageRef> {
-        // Keep the convenience API on PlatformMessage while centralizing the
-        // reference-kind handling in PlatformMessageReference.
-        self.reference.message_id()
-    }
-
-    /// Hydrated message quoted/replied to by this message, if the platform
-    /// supplied it.
-    ///
-    /// This accessor never performs platform I/O; id-only references remain
-    /// id-only.
-    pub fn referenced_message(&self) -> Option<&PlatformMessage> {
-        // Hydration is a payload property, not a lazy fetch operation.
-        self.reference.hydrated_message()
-    }
-}
-
 /// Reference data for a platform message reply/quote.
 ///
 /// Some platforms include the quoted message inline, while others only include
@@ -145,22 +124,6 @@ pub enum PlatformMessageReference {
     Id(MessageRef),
     /// The platform supplied the full referenced message payload.
     Hydrated(Box<PlatformMessage>),
-}
-
-/// Relationship between a platform message and the current model turn.
-///
-/// The runtime passes this into [`MessagePlatform::message_context`] so the
-/// adapter can label the resulting JSON as the initiating message, an explicit
-/// quote/reply target, or fetched background context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlatformMessageRelationship {
-    /// The user message that directly started the current turn.
-    Current,
-    /// A platform message explicitly referenced/quoted by the current turn.
-    Referenced,
-    /// A platform message fetched as recent channel context.
-    Fetched,
 }
 
 impl PlatformMessageReference {
@@ -186,6 +149,43 @@ impl PlatformMessageReference {
             Self::Hydrated(message) => Some(message),
         }
     }
+}
+
+impl PlatformMessage {
+    /// Message id quoted/replied to by this message, if known.
+    ///
+    /// This works for both id-only references and hydrated references.
+    pub fn referenced_message_id(&self) -> Option<&MessageRef> {
+        // Keep the convenience API on PlatformMessage while centralizing the
+        // reference-kind handling in PlatformMessageReference.
+        self.reference.message_id()
+    }
+
+    /// Hydrated message quoted/replied to by this message, if the platform
+    /// supplied it.
+    ///
+    /// This accessor never performs platform I/O; id-only references remain
+    /// id-only.
+    pub fn referenced_message(&self) -> Option<&PlatformMessage> {
+        // Hydration is a payload property, not a lazy fetch operation.
+        self.reference.hydrated_message()
+    }
+}
+
+/// Relationship between a platform message and the current model turn.
+///
+/// The runtime passes this into [`MessagePlatform::message_context`] so the
+/// adapter can label the resulting JSON as the initiating message, an explicit
+/// quote/reply target, or fetched background context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMessageRelationship {
+    /// The user message that directly started the current turn.
+    Current,
+    /// A platform message explicitly referenced/quoted by the current turn.
+    Referenced,
+    /// A platform message fetched as recent channel context.
+    Fetched,
 }
 
 /// Reaction kind.

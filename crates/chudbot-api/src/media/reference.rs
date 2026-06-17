@@ -20,20 +20,6 @@ use thiserror::Error;
 
 use super::LoadedMedia;
 
-/// Boxed media operation future.
-///
-/// [`MediaRef`] methods use this alias because trait-object methods cannot
-/// return `impl Future` directly. All media access failures are normalized to
-/// [`MediaError`] at this contract boundary.
-pub type MediaFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MediaError>> + Send + 'a>>;
-
-/// Runtime media reference handle.
-///
-/// This is the type stored in requests, transcripts, and tool payloads when a
-/// caller needs a cloneable runtime handle without knowing which backend owns
-/// the bytes.
-pub type BoxedMediaRef = Box<dyn MediaRef>;
-
 /// Stable model-facing URI for a media item.
 ///
 /// A media URI is identity, not necessarily a fetch URL. Stored media commonly
@@ -154,6 +140,59 @@ pub struct MediaMetadata {
     /// resource.
     pub size_bytes: u64,
 }
+
+/// Media storage/access error.
+///
+/// These variants describe failures at the media contract boundary. Concrete
+/// backends can preserve detailed diagnostics in logs while returning a stable
+/// API error to callers.
+#[derive(Debug, Error)]
+pub enum MediaError {
+    /// Media category is not supported by a backend.
+    #[error("unsupported media category: {0}")]
+    UnsupportedCategory(String),
+    /// URI scheme or prefix is not owned by a backend.
+    #[error("unsupported media uri: {0}")]
+    UnsupportedUri(String),
+    /// Unsafe storage-local name.
+    #[error("unsafe media name: {0}")]
+    UnsafeName(String),
+    /// No public URL is currently available.
+    #[error("media has no public URL: {uri}")]
+    NoPublicUrl {
+        /// Stable media URI.
+        uri: MediaUri,
+    },
+    /// Bytes cannot be loaded by this handle.
+    #[error("media bytes are unavailable: {uri}")]
+    BytesUnavailable {
+        /// Stable media URI.
+        uri: MediaUri,
+    },
+    /// Filesystem or object-store I/O failed.
+    #[error("io: {0}")]
+    Io(String),
+}
+
+impl From<std::io::Error> for MediaError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+/// Boxed media operation future.
+///
+/// [`MediaRef`] methods use this alias because trait-object methods cannot
+/// return `impl Future` directly. All media access failures are normalized to
+/// [`MediaError`] at this contract boundary.
+pub type MediaFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MediaError>> + Send + 'a>>;
+
+/// Runtime media reference handle.
+///
+/// This is the type stored in requests, transcripts, and tool payloads when a
+/// caller needs a cloneable runtime handle without knowing which backend owns
+/// the bytes.
+pub type BoxedMediaRef = Box<dyn MediaRef>;
 
 /// Runtime media handle.
 ///
@@ -286,44 +325,5 @@ impl MediaRef for UrlMediaRef {
                 uri: self.uri().clone(),
             })
         })
-    }
-}
-
-/// Media storage/access error.
-///
-/// These variants describe failures at the media contract boundary. Concrete
-/// backends can preserve detailed diagnostics in logs while returning a stable
-/// API error to callers.
-#[derive(Debug, Error)]
-pub enum MediaError {
-    /// Media category is not supported by a backend.
-    #[error("unsupported media category: {0}")]
-    UnsupportedCategory(String),
-    /// URI scheme or prefix is not owned by a backend.
-    #[error("unsupported media uri: {0}")]
-    UnsupportedUri(String),
-    /// Unsafe storage-local name.
-    #[error("unsafe media name: {0}")]
-    UnsafeName(String),
-    /// No public URL is currently available.
-    #[error("media has no public URL: {uri}")]
-    NoPublicUrl {
-        /// Stable media URI.
-        uri: MediaUri,
-    },
-    /// Bytes cannot be loaded by this handle.
-    #[error("media bytes are unavailable: {uri}")]
-    BytesUnavailable {
-        /// Stable media URI.
-        uri: MediaUri,
-    },
-    /// Filesystem or object-store I/O failed.
-    #[error("io: {0}")]
-    Io(String),
-}
-
-impl From<std::io::Error> for MediaError {
-    fn from(error: std::io::Error) -> Self {
-        Self::Io(error.to_string())
     }
 }

@@ -100,6 +100,21 @@ impl AgentSpec {
     }
 }
 
+/// Concrete provider-neutral agent runtime.
+///
+/// `Agent` is intentionally small: the model contains provider routing and
+/// model config, the spec contains agent behavior, and the executor contains
+/// local tool implementations. Platform-specific code decides how to build
+/// those pieces before calling [`Self::run`].
+pub struct Agent<B, T = NoClientTools> {
+    /// Callable model.
+    model: Model<B>,
+    /// Agent instructions.
+    spec: AgentSpec,
+    /// Runtime client tool executor available to this agent.
+    tool_executor: T,
+}
+
 impl<B, T> Agent<B, T>
 where
     T: ClientToolExecutor,
@@ -128,21 +143,6 @@ where
             tool_description: tool_description.into(),
         }
     }
-}
-
-/// Concrete provider-neutral agent runtime.
-///
-/// `Agent` is intentionally small: the model contains provider routing and
-/// model config, the spec contains agent behavior, and the executor contains
-/// local tool implementations. Platform-specific code decides how to build
-/// those pieces before calling [`Self::run`].
-pub struct Agent<B, T = NoClientTools> {
-    /// Callable model.
-    model: Model<B>,
-    /// Agent instructions.
-    spec: AgentSpec,
-    /// Runtime client tool executor available to this agent.
-    tool_executor: T,
 }
 
 impl<B, T> fmt::Debug for Agent<B, T>
@@ -870,60 +870,6 @@ where
     B: LlmBackend,
     T: ClientToolExecutor,
 {
-    /// Convert the parent tool input into the nested agent's user message.
-    fn transcript_for_input(&self, input: serde_json::Value) -> Transcript {
-        let mut transcript = Transcript::new();
-        transcript.push(TranscriptTurn::text(TurnRole::User, tool_input_text(input)));
-        transcript
-    }
-
-    /// Convert the nested run into the generic client-tool output contract.
-    ///
-    /// The parent model only receives a text result plus an `is_error` flag.
-    /// Full nested trace/usage detail is packed into `trace_response` and
-    /// `usage` for persistence by the caller.
-    fn output_from_run(&self, run: &AgentRun) -> ClientToolOutput {
-        let (result, is_error) = match &run.outcome {
-            AgentOutcome::Completed { answer } => (
-                ClientToolResultContent::Text {
-                    text: answer.text.clone(),
-                },
-                false,
-            ),
-            AgentOutcome::Failed { error, .. } => (
-                ClientToolResultContent::Text {
-                    text: format!("sub-agent failed: {error}"),
-                },
-                true,
-            ),
-            AgentOutcome::IterationLimit { max_iterations } => (
-                ClientToolResultContent::Text {
-                    text: format!("sub-agent hit iteration limit ({max_iterations})"),
-                },
-                true,
-            ),
-            AgentOutcome::Cancelled { reason } => (
-                ClientToolResultContent::Text {
-                    text: format!("sub-agent was cancelled: {reason}"),
-                },
-                true,
-            ),
-        };
-        ClientToolOutput {
-            result,
-            media: Vec::new(),
-            is_error,
-            trace_response: subagent_trace_response(run),
-            usage: run.all_usage(),
-        }
-    }
-}
-
-impl<B, T> Subagent<B, T>
-where
-    B: LlmBackend,
-    T: ClientToolExecutor,
-{
     /// Build the tool specification shown to a parent model.
     ///
     /// Every subagent accepts the same JSON input shape: an object with a
@@ -975,6 +921,60 @@ where
             .await
         });
         future
+    }
+}
+
+impl<B, T> Subagent<B, T>
+where
+    B: LlmBackend,
+    T: ClientToolExecutor,
+{
+    /// Convert the parent tool input into the nested agent's user message.
+    fn transcript_for_input(&self, input: serde_json::Value) -> Transcript {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::User, tool_input_text(input)));
+        transcript
+    }
+
+    /// Convert the nested run into the generic client-tool output contract.
+    ///
+    /// The parent model only receives a text result plus an `is_error` flag.
+    /// Full nested trace/usage detail is packed into `trace_response` and
+    /// `usage` for persistence by the caller.
+    fn output_from_run(&self, run: &AgentRun) -> ClientToolOutput {
+        let (result, is_error) = match &run.outcome {
+            AgentOutcome::Completed { answer } => (
+                ClientToolResultContent::Text {
+                    text: answer.text.clone(),
+                },
+                false,
+            ),
+            AgentOutcome::Failed { error, .. } => (
+                ClientToolResultContent::Text {
+                    text: format!("sub-agent failed: {error}"),
+                },
+                true,
+            ),
+            AgentOutcome::IterationLimit { max_iterations } => (
+                ClientToolResultContent::Text {
+                    text: format!("sub-agent hit iteration limit ({max_iterations})"),
+                },
+                true,
+            ),
+            AgentOutcome::Cancelled { reason } => (
+                ClientToolResultContent::Text {
+                    text: format!("sub-agent was cancelled: {reason}"),
+                },
+                true,
+            ),
+        };
+        ClientToolOutput {
+            result,
+            media: Vec::new(),
+            is_error,
+            trace_response: subagent_trace_response(run),
+            usage: run.all_usage(),
+        }
     }
 }
 

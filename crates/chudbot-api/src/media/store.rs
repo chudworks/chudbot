@@ -51,19 +51,6 @@ pub struct CreateMedia {
     pub extension: Option<String>,
 }
 
-/// Media bytes loaded from a runtime handle.
-///
-/// [`MediaRef::load`](super::MediaRef::load) returns this shape so callers get
-/// both the bytes and the handle metadata that identifies exactly what was
-/// loaded.
-#[derive(Debug, Clone)]
-pub struct LoadedMedia {
-    /// Media handle used to load these bytes.
-    pub media: BoxedMediaRef,
-    /// Raw bytes returned by the backend.
-    pub bytes: Vec<u8>,
-}
-
 /// Backend that persists media and resolves stored identifiers.
 ///
 /// `MediaStore` is the boundary between durable, model-facing media references
@@ -106,4 +93,17 @@ pub trait MediaStore: Send + Sync {
         category: MediaCategory,
         name: &str,
     ) -> impl Future<Output = Result<BoxedMediaRef, MediaError>> + Send;
+}
+
+/// Media bytes loaded from a runtime handle.
+///
+/// [`MediaRef::load`](super::MediaRef::load) returns this shape so callers get
+/// both the bytes and the handle metadata that identifies exactly what was
+/// loaded.
+#[derive(Debug, Clone)]
+pub struct LoadedMedia {
+    /// Media handle used to load these bytes.
+    pub media: BoxedMediaRef,
+    /// Raw bytes returned by the backend.
+    pub bytes: Vec<u8>,
 }

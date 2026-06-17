@@ -1111,6 +1111,29 @@ pub trait BotStorage: Send + Sync {
         trace: ModelStepTrace,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Complete, fail, or cancel a turn.
+    ///
+    /// Implementations should persist usage with the terminal update. On
+    /// success, they also assign the response ordinal that makes the assistant
+    /// reply replayable for later turns.
+    fn finish_turn(
+        &self,
+        input: FinishTurn,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Atomically prepare a retry for a failed turn. Returns `None` when the
+    /// turn is not failed, cancelled, already running/completed, or unknown.
+    fn prepare_retry(
+        &self,
+        turn_id: TurnId,
+    ) -> impl Future<Output = Result<Option<RetryTurn>, Self::Error>> + Send;
+
+    /// Stop or resume a conversation.
+    fn set_conversation_stop(
+        &self,
+        input: ConversationStop,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+
     // Platform link indexes.
 
     /// Link a platform message to a turn/conversation.
@@ -1136,29 +1159,6 @@ pub trait BotStorage: Send + Sync {
         &self,
         turn_id: TurnId,
     ) -> impl Future<Output = Result<Vec<MessageLink>, Self::Error>> + Send;
-
-    /// Complete, fail, or cancel a turn.
-    ///
-    /// Implementations should persist usage with the terminal update. On
-    /// success, they also assign the response ordinal that makes the assistant
-    /// reply replayable for later turns.
-    fn finish_turn(
-        &self,
-        input: FinishTurn,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Atomically prepare a retry for a failed turn. Returns `None` when the
-    /// turn is not failed, cancelled, already running/completed, or unknown.
-    fn prepare_retry(
-        &self,
-        turn_id: TurnId,
-    ) -> impl Future<Output = Result<Option<RetryTurn>, Self::Error>> + Send;
-
-    /// Stop or resume a conversation.
-    fn set_conversation_stop(
-        &self,
-        input: ConversationStop,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 
     // Runtime policy and user/profile metadata.
 

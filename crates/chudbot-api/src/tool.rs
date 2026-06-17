@@ -36,127 +36,6 @@ use crate::ids::{ProviderName, ToolName, ToolUseId};
 use crate::media::BoxedMediaRef;
 use crate::usage::UsageRecord;
 
-/// One named client-side tool exposed by a [`ClientToolExecutor`].
-///
-/// Definitions are the advertisement half of the client-tool protocol: they
-/// describe names and input schemas that provider crates serialize into their
-/// native "tools" request shape.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientToolDefinition {
-    /// Stable model-visible tool name.
-    pub name: ToolName,
-    /// Model-facing description and input schema.
-    pub spec: ClientToolSpec,
-}
-
-impl ClientToolDefinition {
-    /// Construct a named tool definition.
-    pub fn new(name: impl Into<ToolName>, spec: ClientToolSpec) -> Self {
-        Self {
-            name: name.into(),
-            spec,
-        }
-    }
-}
-
-/// Error produced by a client-side tool executor.
-///
-/// Unknown tools are separated from execution failures because the agent loop
-/// uses the sentinel to diagnose disabled or unregistered tool names. Both
-/// cases are ultimately converted into model-visible error results so the model
-/// can recover in a later step.
-#[derive(Debug, Error)]
-pub enum ClientToolExecutorError<E>
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    /// The executor does not own the requested tool name.
-    #[error("unknown tool `{name}`")]
-    Unknown {
-        /// Unknown or currently disabled model-visible tool name.
-        name: ToolName,
-    },
-    /// The executor owns the tool but execution failed.
-    #[error("execution failed: {source}")]
-    Execution {
-        /// Tool-specific source error.
-        #[source]
-        source: E,
-    },
-}
-
-impl<E> ClientToolExecutorError<E>
-where
-    E: std::error::Error + Send + Sync + 'static,
-{
-    /// Build the unknown-tool sentinel used for name mismatches.
-    pub fn unknown(name: impl Into<ToolName>) -> Self {
-        Self::Unknown { name: name.into() }
-    }
-
-    /// Wrap a tool-owned execution failure.
-    pub fn execution(source: E) -> Self {
-        Self::Execution { source }
-    }
-
-    /// Return true when this is the unknown-tool sentinel.
-    pub fn is_unknown(&self) -> bool {
-        matches!(self, Self::Unknown { .. })
-    }
-}
-
-/// A client-side executor that owns the entire model-visible tool surface for
-/// one agent.
-///
-/// Implementations usually live in runtime crates that have access to storage,
-/// media, platform adapters, and configured subagents. This trait stays in
-/// `chudbot-api` so the agent loop can statically dispatch calls without taking
-/// dependencies on those concrete services.
-pub trait ClientToolExecutor: Send + Sync {
-    /// Tool execution error type.
-    type Error: std::error::Error + Send + Sync + 'static;
-
-    /// Tool specifications shown to the model for one agent run.
-    ///
-    /// The agent may filter this list through static agent config before it is
-    /// passed to a provider adapter.
-    fn tools(&self) -> Vec<ClientToolDefinition>;
-
-    /// Execute one model-requested tool call.
-    ///
-    /// The agent loop is allowed to call this concurrently for independent
-    /// model-emitted calls, so implementations must keep per-call state local or
-    /// protect shared state internally.
-    fn execute(
-        &self,
-        call: ClientToolCall,
-    ) -> impl Future<Output = Result<ClientToolOutput, ClientToolExecutorError<Self::Error>>> + Send;
-}
-
-/// Executor with no client tools.
-///
-/// This is the default tool executor for agents that should only call the model
-/// and any provider-side server tools configured on that model.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoClientTools;
-
-impl ClientToolExecutor for NoClientTools {
-    type Error = Infallible;
-
-    fn tools(&self) -> Vec<ClientToolDefinition> {
-        Vec::new()
-    }
-
-    async fn execute(
-        &self,
-        call: ClientToolCall,
-    ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
-        // With an empty advertised surface, every request is a protocol mismatch
-        // that the agent loop can turn into a model-visible tool error.
-        Err(ClientToolExecutorError::unknown(call.name))
-    }
-}
-
 /// A client-side tool the model may invoke.
 ///
 /// This is only the model-facing shape. The Rust implementation remains behind
@@ -221,6 +100,29 @@ impl From<serde_json::Value> for ToolInputSchema {
     }
 }
 
+/// One named client-side tool exposed by a [`ClientToolExecutor`].
+///
+/// Definitions are the advertisement half of the client-tool protocol: they
+/// describe names and input schemas that provider crates serialize into their
+/// native "tools" request shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientToolDefinition {
+    /// Stable model-visible tool name.
+    pub name: ToolName,
+    /// Model-facing description and input schema.
+    pub spec: ClientToolSpec,
+}
+
+impl ClientToolDefinition {
+    /// Construct a named tool definition.
+    pub fn new(name: impl Into<ToolName>, spec: ClientToolSpec) -> Self {
+        Self {
+            name: name.into(),
+            spec,
+        }
+    }
+}
+
 /// A client-side tool invocation emitted by a model and evaluated by Chudbot.
 ///
 /// Provider adapters parse their native call envelopes into this shape before
@@ -253,6 +155,35 @@ pub enum ClientToolResultContent {
         /// Result text returned to the model.
         text: String,
     },
+}
+
+/// Output from a client-side tool executor.
+///
+/// This is the runtime-only shape returned by tool implementations before the
+/// agent loop splits it into transcript content and a persistable
+/// [`ClientToolTrace`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientToolOutput {
+    /// Result content sent back to the model.
+    pub result: ClientToolResultContent,
+    /// Additional media made visible to the next model step.
+    ///
+    /// This is intentionally not persisted in tool traces. The tool's JSON/text
+    /// result remains the auditable protocol output, while these handles let
+    /// tools such as `read` expose a stored image as native model media.
+    #[serde(skip)]
+    pub media: Vec<BoxedMediaRef>,
+    /// Whether the tool result should be marked as an error when it is
+    /// furnished back to the model.
+    pub is_error: bool,
+    /// Response stored in the trace viewer and database.
+    ///
+    /// This can be more complete than `result`, but should still be safe for an
+    /// unauthenticated trace viewer because conversation UUIDs are the only web
+    /// access control.
+    pub trace_response: serde_json::Value,
+    /// Usage/cost incurred by the tool, including nested agents or generators.
+    pub usage: Vec<UsageRecord>,
 }
 
 /// A result for one model-requested client tool call.
@@ -354,31 +285,100 @@ pub enum ToolTrace {
     },
 }
 
-/// Output from a client-side tool executor.
+/// Error produced by a client-side tool executor.
 ///
-/// This is the runtime-only shape returned by tool implementations before the
-/// agent loop splits it into transcript content and a persistable
-/// [`ClientToolTrace`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientToolOutput {
-    /// Result content sent back to the model.
-    pub result: ClientToolResultContent,
-    /// Additional media made visible to the next model step.
+/// Unknown tools are separated from execution failures because the agent loop
+/// uses the sentinel to diagnose disabled or unregistered tool names. Both
+/// cases are ultimately converted into model-visible error results so the model
+/// can recover in a later step.
+#[derive(Debug, Error)]
+pub enum ClientToolExecutorError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// The executor does not own the requested tool name.
+    #[error("unknown tool `{name}`")]
+    Unknown {
+        /// Unknown or currently disabled model-visible tool name.
+        name: ToolName,
+    },
+    /// The executor owns the tool but execution failed.
+    #[error("execution failed: {source}")]
+    Execution {
+        /// Tool-specific source error.
+        #[source]
+        source: E,
+    },
+}
+
+impl<E> ClientToolExecutorError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// Build the unknown-tool sentinel used for name mismatches.
+    pub fn unknown(name: impl Into<ToolName>) -> Self {
+        Self::Unknown { name: name.into() }
+    }
+
+    /// Wrap a tool-owned execution failure.
+    pub fn execution(source: E) -> Self {
+        Self::Execution { source }
+    }
+
+    /// Return true when this is the unknown-tool sentinel.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown { .. })
+    }
+}
+
+/// A client-side executor that owns the entire model-visible tool surface for
+/// one agent.
+///
+/// Implementations usually live in runtime crates that have access to storage,
+/// media, platform adapters, and configured subagents. This trait stays in
+/// `chudbot-api` so the agent loop can statically dispatch calls without taking
+/// dependencies on those concrete services.
+pub trait ClientToolExecutor: Send + Sync {
+    /// Tool execution error type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Tool specifications shown to the model for one agent run.
     ///
-    /// This is intentionally not persisted in tool traces. The tool's JSON/text
-    /// result remains the auditable protocol output, while these handles let
-    /// tools such as `read` expose a stored image as native model media.
-    #[serde(skip)]
-    pub media: Vec<BoxedMediaRef>,
-    /// Whether the tool result should be marked as an error when it is
-    /// furnished back to the model.
-    pub is_error: bool,
-    /// Response stored in the trace viewer and database.
+    /// The agent may filter this list through static agent config before it is
+    /// passed to a provider adapter.
+    fn tools(&self) -> Vec<ClientToolDefinition>;
+
+    /// Execute one model-requested tool call.
     ///
-    /// This can be more complete than `result`, but should still be safe for an
-    /// unauthenticated trace viewer because conversation UUIDs are the only web
-    /// access control.
-    pub trace_response: serde_json::Value,
-    /// Usage/cost incurred by the tool, including nested agents or generators.
-    pub usage: Vec<UsageRecord>,
+    /// The agent loop is allowed to call this concurrently for independent
+    /// model-emitted calls, so implementations must keep per-call state local or
+    /// protect shared state internally.
+    fn execute(
+        &self,
+        call: ClientToolCall,
+    ) -> impl Future<Output = Result<ClientToolOutput, ClientToolExecutorError<Self::Error>>> + Send;
+}
+
+/// Executor with no client tools.
+///
+/// This is the default tool executor for agents that should only call the model
+/// and any provider-side server tools configured on that model.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoClientTools;
+
+impl ClientToolExecutor for NoClientTools {
+    type Error = Infallible;
+
+    fn tools(&self) -> Vec<ClientToolDefinition> {
+        Vec::new()
+    }
+
+    async fn execute(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
+        // With an empty advertised surface, every request is a protocol mismatch
+        // that the agent loop can turn into a model-visible tool error.
+        Err(ClientToolExecutorError::unknown(call.name))
+    }
 }

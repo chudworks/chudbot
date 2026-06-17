@@ -58,16 +58,6 @@ pub mod tool;
 pub mod transcript;
 pub mod usage;
 
-// Agent loop contracts: static agent config, runtime agent execution, outcomes,
-// subagent adapters, and final assistant answers.
-pub use agent::{
-    Agent, AgentError, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentSpec,
-    AssistantAnswer, Subagent,
-};
-
-// Live event contracts shared by the bot runtime and the web trace viewer.
-pub use events::{ConversationEventKind, EventSink, LiveEvent, NoopEventSink};
-
 // Shared id newtypes keep platform/provider ids explicit without making the API
 // crate depend on any concrete platform SDK.
 pub use ids::{
@@ -75,22 +65,9 @@ pub use ids::{
     ToolName, ToolUseId, TurnId, UserRef, VideoJobId,
 };
 
-// Model contracts cover both static model configuration and one provider
-// round-trip; provider crates translate these shapes to their native APIs.
-pub use llm::{
-    AssistantStep, LlmBackend, Model, ModelInfo, ModelInfoRequest, ModelSpec, ModelStep,
-    ModelStepRequest, ProviderOptions, SamplingOptions, ServerToolSet,
-};
-
-// Media combines three related boundaries: stored media references, media store
-// IO, and provider-side image/video/audio generation.
-pub use media::{
-    AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
-    AudioTranscriptionRequest, BoxedMediaRef, CreateMedia, GeneratedImage, GeneratedVideo,
-    ImageGenerator, ImageRequest, LoadedMedia, MediaCategory, MediaError, MediaFuture,
-    MediaMetadata, MediaRef, MediaStore, MediaUri, PublicMediaUrl, UrlMediaRef, VideoGenerator,
-    VideoJobStatus, VideoMeta, VideoRequest,
-};
+// Transcript types are the provider-neutral model input/output stream, including
+// media blocks, tool call/result blocks, and opaque provider continuations.
+pub use transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptTurn, TurnRole};
 
 // Platform adapters normalize external messaging systems into bot events,
 // messages, commands, replies, reactions, and history fetches.
@@ -101,17 +78,6 @@ pub use platform::{
     PlatformCommandResponseTarget, PlatformCommandValue, PlatformEvent, PlatformMessage,
     PlatformMessageReference, PlatformMessageRelationship, PlatformReaction, PlatformReady,
     PostedMessage, ReactionKind, SendMessage, ThreadRequest, UserProfile,
-};
-
-// Viewer-safe reasoning summaries extracted from provider continuations and
-// associated usage, without exposing replay-only opaque provider state.
-pub use reasoning::{ReasoningItem, ReasoningSummary, ReasoningUsage, TurnReasoning};
-
-// Named service registries are the thin dispatch layer used by config-driven
-// runtime wiring; they route requests to already-constructed providers.
-pub use registries::{
-    AudioTranscriberRegistry, ImageGeneratorRegistry, LlmProviderRegistry, MessagePlatformRegistry,
-    VideoGeneratorRegistry,
 };
 
 // Persistence contracts are intentionally workflow-shaped rather than
@@ -128,6 +94,20 @@ pub use storage::{
     UserMemoryJob, UserMemoryKey, UserMemoryTurn,
 };
 
+// Model contracts cover both static model configuration and one provider
+// round-trip; provider crates translate these shapes to their native APIs.
+pub use llm::{
+    AssistantStep, LlmBackend, Model, ModelInfo, ModelInfoRequest, ModelSpec, ModelStep,
+    ModelStepRequest, ProviderOptions, SamplingOptions, ServerToolSet,
+};
+
+// Agent loop contracts: static agent config, runtime agent execution, outcomes,
+// subagent adapters, and final assistant answers.
+pub use agent::{
+    Agent, AgentError, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentSpec,
+    AssistantAnswer, Subagent,
+};
+
 // Tool protocol shapes cover model-visible client tools, provider-run server
 // tools, grounding metadata, persisted traces, and tool usage.
 pub use tool::{
@@ -136,13 +116,33 @@ pub use tool::{
     GroundingMetadata, NoClientTools, ServerToolUse, ToolInputSchema, ToolTrace,
 };
 
-// Transcript types are the provider-neutral model input/output stream, including
-// media blocks, tool call/result blocks, and opaque provider continuations.
-pub use transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptTurn, TurnRole};
+// Media combines three related boundaries: stored media references, media store
+// IO, and provider-side image/video/audio generation.
+pub use media::{
+    AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
+    AudioTranscriptionRequest, BoxedMediaRef, CreateMedia, GeneratedImage, GeneratedVideo,
+    ImageGenerator, ImageRequest, LoadedMedia, MediaCategory, MediaError, MediaFuture,
+    MediaMetadata, MediaRef, MediaStore, MediaUri, PublicMediaUrl, UrlMediaRef, VideoGenerator,
+    VideoJobStatus, VideoMeta, VideoRequest,
+};
 
 // Usage records and aggregate query shapes let model, tool, media, and nested
 // agent work report cost without forcing every provider into one billing model.
 pub use usage::{
     CostAmount, UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord,
     UsageSubject,
+};
+
+// Viewer-safe reasoning summaries extracted from provider continuations and
+// associated usage, without exposing replay-only opaque provider state.
+pub use reasoning::{ReasoningItem, ReasoningSummary, ReasoningUsage, TurnReasoning};
+
+// Live event contracts shared by the bot runtime and the web trace viewer.
+pub use events::{ConversationEventKind, EventSink, LiveEvent, NoopEventSink};
+
+// Named service registries are the thin dispatch layer used by config-driven
+// runtime wiring; they route requests to already-constructed providers.
+pub use registries::{
+    AudioTranscriberRegistry, ImageGeneratorRegistry, LlmProviderRegistry, MessagePlatformRegistry,
+    VideoGeneratorRegistry,
 };

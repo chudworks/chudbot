@@ -52,59 +52,6 @@ pub struct TurnReasoning {
     pub usage: Vec<ReasoningUsage>,
 }
 
-impl TurnReasoning {
-    /// Extract reasoning metadata from ordered provider model steps and usage.
-    ///
-    /// This is the trace-viewer path for a stored turn snapshot. Each model
-    /// step can carry its own continuation and model id, which lets multi-step
-    /// turns preserve the provider/model label attached to each reasoning item.
-    pub fn from_model_steps_and_usage(
-        model_steps: &[ModelStepTrace],
-        usage: &[UsageRecord],
-    ) -> Self {
-        // Step 1: walk continuations in model-step order so the viewer follows
-        // the same sequence the runtime observed.
-        let items = model_steps
-            .iter()
-            .filter_map(|step| {
-                step.continuation.as_ref().map(|continuation| {
-                    reasoning_items_from_continuation(continuation, Some(&step.model))
-                })
-            })
-            .flatten()
-            .collect();
-        // Step 2: fold token accounting separately because usage records are
-        // produced by accounting code, not by provider continuation parsing.
-        let usage = reasoning_usage_from_records(usage);
-        Self { items, usage }
-    }
-
-    /// Extract reasoning metadata from a single stored continuation and usage.
-    ///
-    /// This helper supports callers that have a final continuation rather than
-    /// an ordered list of [`ModelStepTrace`] records. When a model id is
-    /// supplied, every extracted item is labeled with that model.
-    pub fn from_continuation_and_usage(
-        continuation: Option<&ProviderContinuation>,
-        model: Option<&ModelId>,
-        usage: &[UsageRecord],
-    ) -> Self {
-        // Step 1: normalize the optional provider continuation into zero or
-        // more viewer-safe reasoning items.
-        let items = continuation
-            .map(|continuation| reasoning_items_from_continuation(continuation, model))
-            .unwrap_or_default();
-        // Step 2: attach model-step reasoning-token usage, if any.
-        let usage = reasoning_usage_from_records(usage);
-        Self { items, usage }
-    }
-
-    /// Whether this turn has no viewer-safe reasoning metadata.
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty() && self.usage.is_empty()
-    }
-}
-
 /// One normalized provider reasoning item.
 ///
 /// This is the item-level display shape consumed by the web trace viewer. It
@@ -156,6 +103,59 @@ pub struct ReasoningUsage {
     pub model: Option<ModelId>,
     /// Sum of reported reasoning tokens for model steps in this turn.
     pub reasoning_tokens: u64,
+}
+
+impl TurnReasoning {
+    /// Extract reasoning metadata from ordered provider model steps and usage.
+    ///
+    /// This is the trace-viewer path for a stored turn snapshot. Each model
+    /// step can carry its own continuation and model id, which lets multi-step
+    /// turns preserve the provider/model label attached to each reasoning item.
+    pub fn from_model_steps_and_usage(
+        model_steps: &[ModelStepTrace],
+        usage: &[UsageRecord],
+    ) -> Self {
+        // Step 1: walk continuations in model-step order so the viewer follows
+        // the same sequence the runtime observed.
+        let items = model_steps
+            .iter()
+            .filter_map(|step| {
+                step.continuation.as_ref().map(|continuation| {
+                    reasoning_items_from_continuation(continuation, Some(&step.model))
+                })
+            })
+            .flatten()
+            .collect();
+        // Step 2: fold token accounting separately because usage records are
+        // produced by accounting code, not by provider continuation parsing.
+        let usage = reasoning_usage_from_records(usage);
+        Self { items, usage }
+    }
+
+    /// Extract reasoning metadata from a single stored continuation and usage.
+    ///
+    /// This helper supports callers that have a final continuation rather than
+    /// an ordered list of [`ModelStepTrace`] records. When a model id is
+    /// supplied, every extracted item is labeled with that model.
+    pub fn from_continuation_and_usage(
+        continuation: Option<&ProviderContinuation>,
+        model: Option<&ModelId>,
+        usage: &[UsageRecord],
+    ) -> Self {
+        // Step 1: normalize the optional provider continuation into zero or
+        // more viewer-safe reasoning items.
+        let items = continuation
+            .map(|continuation| reasoning_items_from_continuation(continuation, model))
+            .unwrap_or_default();
+        // Step 2: attach model-step reasoning-token usage, if any.
+        let usage = reasoning_usage_from_records(usage);
+        Self { items, usage }
+    }
+
+    /// Whether this turn has no viewer-safe reasoning metadata.
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty() && self.usage.is_empty()
+    }
 }
 
 /// Extract reasoning items from the array-or-object continuation shapes used by
