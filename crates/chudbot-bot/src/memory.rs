@@ -4,15 +4,15 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::Duration;
 
 use chudbot_api::{
-    AgentLimits, AgentOutcome, AgentRun, BotStorage, ClientTool, ClientToolCall, ClientToolOutput,
+    Agent, AgentLimits, AgentOutcome, AgentRun, BotStorage, ClientToolCall, ClientToolOutput,
     ClientToolResultContent, ClientToolSpec, ContentBlock, ConversationId, ExternalId,
     LlmProviderRegistry, MediaCategory, MediaStore, MemoryJobCompletion, MemoryJobKind,
     MemoryJobSchedule, MemoryTurnWindow, Model, ModelId, ModelSpec, NewUserMemoryDiaryEntry,
-    NewUserMemoryDocumentRevision, NewUserMemoryEvent, ProviderName, ProviderOptions,
-    SamplingOptions, ToolInputSchema, Transcript, TranscriptTurn, TurnId, TurnRole, UsageRecord,
-    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
-    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
-    UserProfile, UserRef,
+    NewUserMemoryDocumentRevision, NewUserMemoryEvent, NoClientTools, ProviderName,
+    ProviderOptions, SamplingOptions, ToolInputSchema, Transcript, TranscriptTurn, TurnId,
+    TurnRole, UsageRecord, UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument,
+    UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey,
+    UserMemoryTurn, UserProfile, UserRef,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -393,22 +393,9 @@ fn memory_profile_display_name(profile: &UserProfile, user_key: &str) -> Option<
     (!name.is_empty() && name != user_key).then(|| name.to_string())
 }
 
-/// Runtime client tool kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MemoryToolKind {
-    /// Lookup profile/events.
-    Lookup,
-    /// Append remember event.
-    Remember,
-    /// Append forget event.
-    Forget,
-}
-
-/// Client tool for user-memory lookup/write operations.
+/// Shared context for user-memory client tools during one turn.
 #[derive(Debug, Clone)]
-pub struct MemoryClientTool<S> {
-    storage: S,
-    kind: MemoryToolKind,
+pub(crate) struct MemoryToolContext {
     base_key: UserMemoryKey,
     actor_user_key: String,
     actor_display_name: String,
@@ -416,19 +403,14 @@ pub struct MemoryClientTool<S> {
     turn_id: TurnId,
 }
 
-impl<S> MemoryClientTool<S> {
-    /// Construct a memory client tool.
-    pub fn new(
-        storage: S,
-        kind: MemoryToolKind,
+impl MemoryToolContext {
+    pub(crate) fn new(
         base_key: UserMemoryKey,
         actor_display_name: String,
         conversation_id: ConversationId,
         turn_id: TurnId,
     ) -> Self {
         Self {
-            storage,
-            kind,
             actor_user_key: base_key.user_key.clone(),
             base_key,
             actor_display_name,
@@ -453,188 +435,199 @@ impl<S> MemoryClientTool<S> {
     }
 }
 
-impl<S> ClientTool for MemoryClientTool<S>
-where
-    S: BotStorage,
-{
-    type Error = MemoryToolError;
-
-    fn spec(&self) -> ClientToolSpec {
-        match self.kind {
-            MemoryToolKind::Lookup => ClientToolSpec {
-                description: "Look up the compact remembered profile and recent un-compacted memory events for the current user or another user id in this server.".to_string(),
-                input_schema: lookup_schema(),
-            },
-            MemoryToolKind::Remember => ClientToolSpec {
-                description: "Remember a stable preference, relationship, project, correction, recurring fact, or running joke for the current user or a target user id in this server.".to_string(),
-                input_schema: remember_schema(),
-            },
-            MemoryToolKind::Forget => ClientToolSpec {
-                description: "Record that a remembered fact should be forgotten or no longer used for the current user or a target user id in this server.".to_string(),
-                input_schema: forget_schema(),
-            },
-        }
-    }
-
-    #[tracing::instrument(
-        name = "tool.user_memory",
-        skip_all,
-        fields(kind = ?self.kind, tool_call = %call.id)
-    )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
-        match self.kind {
-            MemoryToolKind::Lookup => self.lookup(call.input).await,
-            MemoryToolKind::Remember => self.remember(call.input).await,
-            MemoryToolKind::Forget => self.forget(call.input).await,
-        }
+pub(crate) fn lookup_user_memory_spec() -> ClientToolSpec {
+    ClientToolSpec {
+        description: "Look up the compact remembered profile and recent un-compacted memory events for the current user or another user id in this server.".to_string(),
+        input_schema: lookup_schema(),
     }
 }
 
-impl<S> MemoryClientTool<S>
+pub(crate) fn remember_user_memory_spec() -> ClientToolSpec {
+    ClientToolSpec {
+        description: "Remember a stable preference, relationship, project, correction, recurring fact, or running joke for the current user or a target user id in this server.".to_string(),
+        input_schema: remember_schema(),
+    }
+}
+
+pub(crate) fn forget_user_memory_spec() -> ClientToolSpec {
+    ClientToolSpec {
+        description: "Record that a remembered fact should be forgotten or no longer used for the current user or a target user id in this server.".to_string(),
+        input_schema: forget_schema(),
+    }
+}
+
+#[tracing::instrument(
+    name = "tool.user_memory.lookup",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+pub(crate) async fn lookup_user_memory<S>(
+    storage: &S,
+    context: &MemoryToolContext,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, MemoryToolError>
 where
     S: BotStorage,
 {
-    async fn lookup(&self, input: serde_json::Value) -> Result<ClientToolOutput, MemoryToolError> {
-        let key = self.target_key(&input)?;
-        let document = self
-            .storage
-            .load_user_memory_document(key.clone())
-            .await
-            .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
-        let since = document
+    let key = context.target_key(&call.input)?;
+    let document = storage
+        .load_user_memory_document(key.clone())
+        .await
+        .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
+    let since = document
+        .as_ref()
+        .and_then(|document| document.source_event_cutoff);
+    let events = storage
+        .list_pending_memory_events(key.clone(), since)
+        .await
+        .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
+    let diary_entries = storage
+        .list_recent_memory_diary_entries(key.clone(), LOOKUP_DIARY_ENTRY_LIMIT)
+        .await
+        .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
+    tracing::debug!(
+        message_provider = %key.platform,
+        scope_key = %key.scope_key,
+        target_user_id = %key.user_key,
+        found_profile = document.is_some(),
+        recent_events = events.len(),
+        recent_diary_entries = diary_entries.len(),
+        "looked up user memory"
+    );
+    let value = json!({
+        "message_provider": key.platform,
+        "target_user_id": key.user_key,
+        "scope_key": key.scope_key,
+        "profile_found": document.is_some(),
+        "profile_revision": document.as_ref().map(|document| document.revision),
+        "profile": document
             .as_ref()
-            .and_then(|document| document.source_event_cutoff);
-        let events = self
-            .storage
-            .list_pending_memory_events(key.clone(), since)
-            .await
-            .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
-        let diary_entries = self
-            .storage
-            .list_recent_memory_diary_entries(key.clone(), LOOKUP_DIARY_ENTRY_LIMIT)
-            .await
-            .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
-        tracing::debug!(
-            message_provider = %key.platform,
-            scope_key = %key.scope_key,
-            target_user_id = %key.user_key,
-            found_profile = document.is_some(),
-            recent_events = events.len(),
-            recent_diary_entries = diary_entries.len(),
-            "looked up user memory"
-        );
-        let value = json!({
-            "message_provider": key.platform,
-            "target_user_id": key.user_key,
-            "scope_key": key.scope_key,
-            "profile_found": document.is_some(),
-            "profile_revision": document.as_ref().map(|document| document.revision),
-            "profile": document
-                .as_ref()
-                .map(|document| document.markdown.as_str())
-                .unwrap_or(EMPTY_MEMORY),
-            "recent_events": events.iter().map(memory_event_trace).collect::<Vec<_>>(),
-            "recent_diary_entries": diary_entries
-                .iter()
-                .map(memory_diary_entry_trace)
-                .collect::<Vec<_>>(),
-        });
-        Ok(ClientToolOutput {
-            result: ClientToolResultContent::Json {
-                value: value.clone(),
-            },
-            media: Vec::new(),
-            is_error: false,
-            trace_response: value,
-            usage: Vec::new(),
-        })
-    }
+            .map(|document| document.markdown.as_str())
+            .unwrap_or(EMPTY_MEMORY),
+        "recent_events": events.iter().map(memory_event_trace).collect::<Vec<_>>(),
+        "recent_diary_entries": diary_entries
+            .iter()
+            .map(memory_diary_entry_trace)
+            .collect::<Vec<_>>(),
+    });
+    Ok(ClientToolOutput {
+        result: ClientToolResultContent::Json {
+            value: value.clone(),
+        },
+        media: Vec::new(),
+        is_error: false,
+        trace_response: value,
+        usage: Vec::new(),
+    })
+}
 
-    async fn remember(
-        &self,
-        input: serde_json::Value,
-    ) -> Result<ClientToolOutput, MemoryToolError> {
-        let key = self.target_key(&input)?;
-        let memory = required_string(&input, "memory")?;
-        let tags = optional_string_array(&input, "tags")?;
-        let confidence = optional_f32(&input, "confidence")?;
-        let event = self
-            .storage
-            .append_user_memory_event(NewUserMemoryEvent {
-                key: key.clone(),
-                actor_user_key: Some(self.actor_user_key.clone()),
-                kind: UserMemoryEventKind::Remember,
-                body: memory,
-                tags,
-                confidence,
-                source_conversation_id: Some(self.conversation_id),
-                source_turn_id: Some(self.turn_id),
-                source_tool_trace_id: None,
-                supersedes_event_id: None,
-            })
-            .await
-            .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
-        let text = if key.user_key == self.actor_user_key {
-            format!("Remembered for {} in this server.", self.actor_display_name)
-        } else {
-            format!("Remembered for user `{}` in this server.", key.user_key)
-        };
-        Ok(ClientToolOutput {
-            result: ClientToolResultContent::Text { text },
-            media: Vec::new(),
-            is_error: false,
-            trace_response: memory_event_trace(&event),
-            usage: Vec::new(),
+#[tracing::instrument(
+    name = "tool.user_memory.remember",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+pub(crate) async fn remember_user_memory<S>(
+    storage: &S,
+    context: &MemoryToolContext,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, MemoryToolError>
+where
+    S: BotStorage,
+{
+    let key = context.target_key(&call.input)?;
+    let memory = required_string(&call.input, "memory")?;
+    let tags = optional_string_array(&call.input, "tags")?;
+    let confidence = optional_f32(&call.input, "confidence")?;
+    let event = storage
+        .append_user_memory_event(NewUserMemoryEvent {
+            key: key.clone(),
+            actor_user_key: Some(context.actor_user_key.clone()),
+            kind: UserMemoryEventKind::Remember,
+            body: memory,
+            tags,
+            confidence,
+            source_conversation_id: Some(context.conversation_id),
+            source_turn_id: Some(context.turn_id),
+            source_tool_trace_id: None,
+            supersedes_event_id: None,
         })
-    }
+        .await
+        .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
+    let text = if key.user_key == context.actor_user_key {
+        format!(
+            "Remembered for {} in this server.",
+            context.actor_display_name
+        )
+    } else {
+        format!("Remembered for user `{}` in this server.", key.user_key)
+    };
+    Ok(ClientToolOutput {
+        result: ClientToolResultContent::Text { text },
+        media: Vec::new(),
+        is_error: false,
+        trace_response: memory_event_trace(&event),
+        usage: Vec::new(),
+    })
+}
 
-    async fn forget(&self, input: serde_json::Value) -> Result<ClientToolOutput, MemoryToolError> {
-        let key = self.target_key(&input)?;
-        let query = required_string(&input, "query")?;
-        let reason = input
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let body = match reason {
-            Some(reason) => format!("{query}\n\nReason: {reason}"),
-            None => query,
-        };
-        let event = self
-            .storage
-            .append_user_memory_event(NewUserMemoryEvent {
-                key: key.clone(),
-                actor_user_key: Some(self.actor_user_key.clone()),
-                kind: UserMemoryEventKind::Forget,
-                body,
-                tags: Vec::new(),
-                confidence: None,
-                source_conversation_id: Some(self.conversation_id),
-                source_turn_id: Some(self.turn_id),
-                source_tool_trace_id: None,
-                supersedes_event_id: None,
-            })
-            .await
-            .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
-        let text = if key.user_key == self.actor_user_key {
-            format!(
-                "Recorded a forget request for {} in this server.",
-                self.actor_display_name
-            )
-        } else {
-            format!(
-                "Recorded a forget request for user `{}` in this server.",
-                key.user_key
-            )
-        };
-        Ok(ClientToolOutput {
-            result: ClientToolResultContent::Text { text },
-            media: Vec::new(),
-            is_error: false,
-            trace_response: memory_event_trace(&event),
-            usage: Vec::new(),
+#[tracing::instrument(
+    name = "tool.user_memory.forget",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+pub(crate) async fn forget_user_memory<S>(
+    storage: &S,
+    context: &MemoryToolContext,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, MemoryToolError>
+where
+    S: BotStorage,
+{
+    let key = context.target_key(&call.input)?;
+    let query = required_string(&call.input, "query")?;
+    let reason = call
+        .input
+        .get("reason")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let body = match reason {
+        Some(reason) => format!("{query}\n\nReason: {reason}"),
+        None => query,
+    };
+    let event = storage
+        .append_user_memory_event(NewUserMemoryEvent {
+            key: key.clone(),
+            actor_user_key: Some(context.actor_user_key.clone()),
+            kind: UserMemoryEventKind::Forget,
+            body,
+            tags: Vec::new(),
+            confidence: None,
+            source_conversation_id: Some(context.conversation_id),
+            source_turn_id: Some(context.turn_id),
+            source_tool_trace_id: None,
+            supersedes_event_id: None,
         })
-    }
+        .await
+        .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
+    let text = if key.user_key == context.actor_user_key {
+        format!(
+            "Recorded a forget request for {} in this server.",
+            context.actor_display_name
+        )
+    } else {
+        format!(
+            "Recorded a forget request for user `{}` in this server.",
+            key.user_key
+        )
+    };
+    Ok(ClientToolOutput {
+        result: ClientToolResultContent::Text { text },
+        media: Vec::new(),
+        is_error: false,
+        trace_response: memory_event_trace(&event),
+        usage: Vec::new(),
+    })
 }
 
 /// Errors from memory client tools.
@@ -1225,10 +1218,14 @@ where
         agent_config: &SystemAgentConfig,
         transcript: Transcript,
     ) -> Result<MemoryModelOutput, MemoryError> {
-        let agent = agent_config.spec.clone().into_agent(Model {
-            backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
-            spec: agent_config.model.clone(),
-        });
+        let agent = Agent::new(
+            Model {
+                backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
+                spec: agent_config.model.clone(),
+            },
+            agent_config.spec.clone(),
+            NoClientTools,
+        );
         let run = agent
             .run(transcript)
             .await

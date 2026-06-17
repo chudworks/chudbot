@@ -14,8 +14,9 @@ use crate::ids::{ModelId, ProviderName, ToolName};
 use crate::llm::{AssistantStep, LlmBackend, Model, ModelStep, ServerToolSet};
 use crate::storage::{ModelStepKind, ModelStepTrace};
 use crate::tool::{
-    ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,
-    ClientToolSpec, ClientToolTrace, ToolInputSchema, ToolTrace,
+    ClientToolCall, ClientToolDefinition, ClientToolExecutor, ClientToolExecutorError,
+    ClientToolOutput, ClientToolResult, ClientToolResultContent, ClientToolSpec, ClientToolTrace,
+    NoClientTools, ToolInputSchema, ToolTrace,
 };
 use crate::transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptTurn, TurnRole};
 use crate::usage::UsageRecord;
@@ -62,89 +63,23 @@ impl AgentSpec {
         self.limits = limits;
         self
     }
-
-    /// Add one runtime client tool and continue building an agent.
-    pub fn with_tool<T>(self, name: impl Into<ToolName>, tool: T) -> AgentBuilder
-    where
-        T: ClientTool + 'static,
-    {
-        AgentBuilder::new(self).with_tool(name, tool)
-    }
-
-    /// Combine this spec with a model into a runnable agent.
-    pub fn into_agent<B>(self, model: Model<B>) -> Agent<B> {
-        AgentBuilder::new(self).into_agent(model)
-    }
 }
 
-/// Builder for attaching runtime client tools before creating an [`Agent`].
-pub struct AgentBuilder {
-    spec: AgentSpec,
-    tools: BTreeMap<ToolName, Box<dyn DynClientTool>>,
-}
-
-impl fmt::Debug for AgentBuilder {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AgentBuilder")
-            .field("spec", &self.spec)
-            .field("client_tools", &tool_specs(&self.tools))
-            .finish()
-    }
-}
-
-impl AgentBuilder {
-    fn new(spec: AgentSpec) -> Self {
-        Self {
-            spec,
-            tools: BTreeMap::new(),
-        }
-    }
-
-    /// Add one runtime client tool.
-    pub fn with_tool<T>(mut self, name: impl Into<ToolName>, tool: T) -> Self
-    where
-        T: ClientTool + 'static,
-    {
-        self.tools.insert(name.into(), Box::new(tool));
-        self
-    }
-
-    /// Combine the configured spec/tools with a model into a runnable agent.
-    pub fn into_agent<B>(self, model: Model<B>) -> Agent<B> {
-        Agent {
-            model,
-            spec: self.spec,
-            tools: self.tools,
-        }
-    }
-}
-
-/// Concrete agent built from a model, an agent spec, and runtime client tools.
-pub struct Agent<B> {
-    /// Callable model.
-    model: Model<B>,
-    /// Agent instructions.
-    spec: AgentSpec,
-    /// Runtime client tools available to this agent.
-    tools: BTreeMap<ToolName, Box<dyn DynClientTool>>,
-}
-
-impl<B> fmt::Debug for Agent<B>
+impl<B, T> Agent<B, T>
 where
-    B: fmt::Debug,
+    T: ClientToolExecutor,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Agent")
-            .field("model", &self.model)
-            .field("spec", &self.spec)
-            .field("client_tools", &tool_specs(&self.tools))
-            .finish()
+    /// Construct an agent with one runtime client tool executor.
+    pub fn new(model: Model<B>, spec: AgentSpec, tool_executor: T) -> Self {
+        Self {
+            model,
+            spec,
+            tool_executor,
+        }
     }
-}
 
-impl<B> Agent<B> {
     /// Convert this agent into a client-side tool.
-    pub fn into_subagent(self, tool_description: impl Into<String>) -> Subagent<B> {
+    pub fn into_subagent(self, tool_description: impl Into<String>) -> Subagent<B, T> {
         Subagent {
             agent: self,
             tool_description: tool_description.into(),
@@ -152,37 +87,27 @@ impl<B> Agent<B> {
     }
 }
 
-type ClientToolFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<ClientToolOutput, ToolDispatchError>> + Send + 'a>>;
-
-/// Error produced while dispatching a model-requested tool call.
-#[derive(Debug, Error)]
-enum ToolDispatchError {
-    #[error("unknown tool `{0}`")]
-    Unknown(String),
-    #[error("execution failed: {0}")]
-    Execution(String),
+/// Concrete agent built from a model, an agent spec, and runtime client tools.
+pub struct Agent<B, T = NoClientTools> {
+    /// Callable model.
+    model: Model<B>,
+    /// Agent instructions.
+    spec: AgentSpec,
+    /// Runtime client tool executor available to this agent.
+    tool_executor: T,
 }
 
-trait DynClientTool: Send + Sync {
-    fn spec(&self) -> ClientToolSpec;
-    fn call_dyn<'a>(&'a self, call: ClientToolCall) -> ClientToolFuture<'a>;
-}
-
-impl<T> DynClientTool for T
+impl<B, T> fmt::Debug for Agent<B, T>
 where
-    T: ClientTool,
+    B: fmt::Debug,
+    T: ClientToolExecutor,
 {
-    fn spec(&self) -> ClientToolSpec {
-        ClientTool::spec(self)
-    }
-
-    fn call_dyn<'a>(&'a self, call: ClientToolCall) -> ClientToolFuture<'a> {
-        Box::pin(async move {
-            ClientTool::call(self, call)
-                .await
-                .map_err(|e| ToolDispatchError::Execution(e.to_string()))
-        })
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Agent")
+            .field("model", &self.model)
+            .field("spec", &self.spec)
+            .field("client_tools", &tool_specs(self.tool_executor.tools()))
+            .finish()
     }
 }
 
@@ -299,9 +224,10 @@ pub enum AgentError {
     },
 }
 
-impl<B> Agent<B>
+impl<B, T> Agent<B, T>
 where
     B: LlmBackend,
+    T: ClientToolExecutor,
 {
     /// Run this agent against one transcript.
     #[tracing::instrument(
@@ -326,7 +252,7 @@ where
             turns,
         };
 
-        let client_tools = enabled_tool_specs(&self.spec, &self.tools);
+        let client_tools = enabled_tool_specs(&self.spec, &self.tool_executor);
         let server_tools = enabled_server_tools(
             &self.model.spec.server_tools,
             self.spec.server_tools.as_ref(),
@@ -480,7 +406,7 @@ where
                     append_assistant_step(&mut transcript, step);
 
                     let tool_results =
-                        execute_client_tool_calls(&client_tools, &self.tools, calls).await;
+                        execute_client_tool_calls(&client_tools, &self.tool_executor, calls).await;
                     let mut result_blocks = Vec::with_capacity(tool_results.len());
                     for (result, tool_trace, media) in tool_results {
                         result_blocks.push(ContentBlock::ClientToolResult(result));
@@ -555,9 +481,9 @@ fn append_step_trace(trace: &mut Vec<ToolTrace>, step: &AssistantStep) {
 
 fn enabled_tool_specs(
     spec: &AgentSpec,
-    tools: &BTreeMap<ToolName, Box<dyn DynClientTool>>,
+    tool_executor: &impl ClientToolExecutor,
 ) -> BTreeMap<ToolName, ClientToolSpec> {
-    let tool_specs = tool_specs(tools);
+    let tool_specs = tool_specs(tool_executor.tools());
     let Some(enabled) = &spec.client_tools else {
         return tool_specs;
     };
@@ -595,7 +521,7 @@ fn normalize_server_tool(tool: &str) -> Option<String> {
 
 async fn execute_client_tool_calls(
     enabled_tools: &BTreeMap<ToolName, ClientToolSpec>,
-    tools: &BTreeMap<ToolName, Box<dyn DynClientTool>>,
+    tool_executor: &impl ClientToolExecutor,
     calls: Vec<ClientToolCall>,
 ) -> Vec<(
     ClientToolResult,
@@ -609,7 +535,7 @@ async fn execute_client_tool_calls(
         let tool_use_id = call.id.to_string();
         pending.push(
             async move {
-                let output = call_client_tool(enabled_tools, tools, call.clone()).await;
+                let output = call_client_tool(enabled_tools, tool_executor, call.clone()).await;
                 (index, call, output)
             }
             .instrument(tracing::debug_span!(
@@ -676,45 +602,56 @@ async fn execute_client_tool_calls(
     completed
 }
 
-fn tool_specs(
-    tools: &BTreeMap<ToolName, Box<dyn DynClientTool>>,
-) -> BTreeMap<ToolName, ClientToolSpec> {
-    tools
-        .iter()
-        .map(|(name, tool)| (name.clone(), tool.spec()))
-        .collect()
+fn tool_specs(definitions: Vec<ClientToolDefinition>) -> BTreeMap<ToolName, ClientToolSpec> {
+    let mut specs = BTreeMap::new();
+    for definition in definitions {
+        if specs.contains_key(&definition.name) {
+            tracing::warn!(
+                tool = %definition.name,
+                "duplicate client tool definition ignored"
+            );
+            continue;
+        }
+        specs.insert(definition.name, definition.spec);
+    }
+    specs
 }
 
-fn call_client_tool<'a>(
-    enabled_tools: &'a BTreeMap<ToolName, ClientToolSpec>,
-    tools: &'a BTreeMap<ToolName, Box<dyn DynClientTool>>,
+async fn call_client_tool<T>(
+    enabled_tools: &BTreeMap<ToolName, ClientToolSpec>,
+    tool_executor: &T,
     call: ClientToolCall,
-) -> ClientToolFuture<'a> {
-    Box::pin(async move {
-        tracing::trace!(
-            tool = %call.name,
-            tool_use_id = %call.id,
-            "dispatching client tool"
+) -> Result<ClientToolOutput, ClientToolExecutorError<T::Error>>
+where
+    T: ClientToolExecutor,
+{
+    let tool_name = call.name.clone();
+    let tool_use_id = call.id.clone();
+    tracing::trace!(
+        tool = %tool_name,
+        tool_use_id = %tool_use_id,
+        "dispatching client tool"
+    );
+    if !enabled_tools.contains_key(&tool_name) {
+        tracing::warn!(
+            tool = %tool_name,
+            tool_use_id = %tool_use_id,
+            "disabled client tool requested"
         );
-        if !enabled_tools.contains_key(&call.name) {
-            tracing::warn!(
-                tool = %call.name,
-                tool_use_id = %call.id,
-                "disabled client tool requested"
-            );
-            return Err(ToolDispatchError::Unknown(call.name.to_string()));
-        }
-        let Some(tool) = tools.get(&call.name) else {
-            tracing::warn!(
-                tool = %call.name,
-                tool_use_id = %call.id,
-                "unknown client tool requested"
-            );
-            return Err(ToolDispatchError::Unknown(call.name.to_string()));
-        };
+        return Err(ClientToolExecutorError::unknown(call.name));
+    }
 
-        tool.call_dyn(call).await
-    })
+    let output = tool_executor.execute(call).await;
+    if let Err(error) = &output
+        && error.is_unknown()
+    {
+        tracing::warn!(
+            tool = %tool_name,
+            tool_use_id = %tool_use_id,
+            "unknown client tool requested"
+        );
+    }
+    output
 }
 
 fn append_assistant_step(transcript: &mut Transcript, step: AssistantStep) {
@@ -759,16 +696,17 @@ fn answer_from_content(content: Vec<ContentBlock>) -> AssistantAnswer {
 /// `Subagent` owns an agent and turns a parent model's tool call into
 /// a nested [`Transcript`].
 #[derive(Debug)]
-pub struct Subagent<B> {
+pub struct Subagent<B, T: ClientToolExecutor = NoClientTools> {
     /// Nested agent runtime.
-    agent: Agent<B>,
+    agent: Agent<B, T>,
     /// Tool description exposed to the parent model.
     tool_description: String,
 }
 
-impl<B> Subagent<B>
+impl<B, T> Subagent<B, T>
 where
     B: LlmBackend,
+    T: ClientToolExecutor,
 {
     fn transcript_for_input(&self, input: serde_json::Value) -> Transcript {
         let mut transcript = Transcript::new();
@@ -813,37 +751,51 @@ where
     }
 }
 
-impl<B> ClientTool for Subagent<B>
+impl<B, T> Subagent<B, T>
 where
     B: LlmBackend,
+    T: ClientToolExecutor,
 {
-    type Error = AgentRunError<B::Error>;
-
-    fn spec(&self) -> ClientToolSpec {
+    /// Tool specification shown to a parent model.
+    pub fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.tool_description.clone(),
             input_schema: prompt_input_schema(),
         }
     }
 
-    #[tracing::instrument(
-        name = "subagent.call",
-        skip_all,
-        fields(tool = %call.name, tool_use_id = %call.id)
-    )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
-        tracing::debug!("starting subagent tool call");
-        let run = self
-            .agent
-            .run(self.transcript_for_input(call.input))
-            .await?;
-        tracing::debug!(
-            outcome = agent_outcome_kind(&run.outcome),
-            usage_records = run.all_usage().len(),
-            trace_records = run.trace.len(),
-            "subagent tool call finished"
-        );
-        Ok(self.output_from_run(&run))
+    /// Execute one parent-model tool call by running the nested agent.
+    pub fn call(
+        &self,
+        call: ClientToolCall,
+    ) -> Pin<Box<dyn Future<Output = Result<ClientToolOutput, AgentRunError<B::Error>>> + Send + '_>>
+    {
+        let future: Pin<
+            Box<dyn Future<Output = Result<ClientToolOutput, AgentRunError<B::Error>>> + Send + '_>,
+        > = Box::pin(async move {
+            let span = tracing::debug_span!(
+                "subagent.call",
+                tool = %call.name,
+                tool_use_id = %call.id
+            );
+            async move {
+                tracing::debug!("starting subagent tool call");
+                let run = self
+                    .agent
+                    .run(self.transcript_for_input(call.input))
+                    .await?;
+                tracing::debug!(
+                    outcome = agent_outcome_kind(&run.outcome),
+                    usage_records = run.all_usage().len(),
+                    trace_records = run.trace.len(),
+                    "subagent tool call finished"
+                );
+                Ok(self.output_from_run(&run))
+            }
+            .instrument(span)
+            .await
+        });
+        future
     }
 }
 
@@ -941,6 +893,80 @@ mod tests {
         }
     }
 
+    fn test_tool_spec(description: impl Into<String>) -> ClientToolSpec {
+        ClientToolSpec {
+            description: description.into(),
+            input_schema: ToolInputSchema::new(json!({ "type": "object" })),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct EchoExecutor;
+
+    impl ClientToolExecutor for EchoExecutor {
+        type Error = TestError;
+
+        fn tools(&self) -> Vec<ClientToolDefinition> {
+            vec![ClientToolDefinition::new(
+                "echo",
+                test_tool_spec("Echo input."),
+            )]
+        }
+
+        async fn execute(
+            &self,
+            call: ClientToolCall,
+        ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
+            if call.name.as_str() != "echo" {
+                return Err(ClientToolExecutorError::unknown(call.name));
+            }
+            Ok(ClientToolOutput {
+                result: ClientToolResultContent::Json { value: call.input },
+                media: Vec::new(),
+                is_error: false,
+                trace_response: json!({ "ok": true }),
+                usage: Vec::new(),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct NamedToolsExecutor {
+        names: Vec<&'static str>,
+    }
+
+    impl ClientToolExecutor for NamedToolsExecutor {
+        type Error = TestError;
+
+        fn tools(&self) -> Vec<ClientToolDefinition> {
+            self.names
+                .iter()
+                .map(|name| {
+                    ClientToolDefinition::new(*name, test_tool_spec(format!("{name} tool.")))
+                })
+                .collect()
+        }
+
+        async fn execute(
+            &self,
+            call: ClientToolCall,
+        ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
+            let name = call.name.as_str();
+            if !self.names.contains(&name) {
+                return Err(ClientToolExecutorError::unknown(call.name));
+            }
+            Ok(ClientToolOutput {
+                result: ClientToolResultContent::Text {
+                    text: name.to_string(),
+                },
+                media: Vec::new(),
+                is_error: false,
+                trace_response: json!({ "tool": name }),
+                usage: Vec::new(),
+            })
+        }
+    }
+
     #[derive(Debug, Clone)]
     struct RecordingBackend {
         name: ProviderName,
@@ -996,10 +1022,10 @@ mod tests {
                 usage: vec![usage],
             },
         };
-        let agent = AgentSpec::new("expert").into_agent(test_model(backend));
+        let agent = Agent::new(test_model(backend), AgentSpec::new("expert"), NoClientTools);
 
         let subagent = agent.into_subagent("Ask the OpenAI expert for a second opinion.");
-        let spec = ClientTool::spec(&subagent);
+        let spec = subagent.spec();
         assert_eq!(
             spec.description,
             "Ask the OpenAI expert for a second opinion."
@@ -1040,40 +1066,13 @@ mod tests {
 
     #[tokio::test]
     async fn client_tools_dispatches_by_tool_name() {
-        #[derive(Debug)]
-        struct EchoTool;
-
-        impl ClientTool for EchoTool {
-            type Error = TestError;
-
-            fn spec(&self) -> ClientToolSpec {
-                ClientToolSpec {
-                    description: "Echo input.".to_string(),
-                    input_schema: ToolInputSchema::new(json!({ "type": "object" })),
-                }
-            }
-
-            async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
-                Ok(ClientToolOutput {
-                    result: ClientToolResultContent::Json { value: call.input },
-                    media: Vec::new(),
-                    is_error: false,
-                    trace_response: json!({ "ok": true }),
-                    usage: Vec::new(),
-                })
-            }
-        }
-
-        let tools: BTreeMap<ToolName, Box<dyn DynClientTool>> = BTreeMap::from([(
-            ToolName::new("echo"),
-            Box::new(EchoTool) as Box<dyn DynClientTool>,
-        )]);
-        let enabled = tool_specs(&tools);
-        assert_eq!(tool_specs(&tools).len(), 1);
+        let tool_executor = EchoExecutor;
+        let enabled = tool_specs(tool_executor.tools());
+        assert_eq!(tool_specs(tool_executor.tools()).len(), 1);
 
         let output = call_client_tool(
             &enabled,
-            &tools,
+            &tool_executor,
             ClientToolCall {
                 id: ToolUseId::new("call-1"),
                 name: ToolName::new("echo"),
@@ -1093,39 +1092,12 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_client_tools_are_not_callable() {
-        #[derive(Debug)]
-        struct EchoTool;
-
-        impl ClientTool for EchoTool {
-            type Error = TestError;
-
-            fn spec(&self) -> ClientToolSpec {
-                ClientToolSpec {
-                    description: "Echo input.".to_string(),
-                    input_schema: ToolInputSchema::new(json!({ "type": "object" })),
-                }
-            }
-
-            async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
-                Ok(ClientToolOutput {
-                    result: ClientToolResultContent::Json { value: call.input },
-                    media: Vec::new(),
-                    is_error: false,
-                    trace_response: json!({ "ok": true }),
-                    usage: Vec::new(),
-                })
-            }
-        }
-
-        let tools: BTreeMap<ToolName, Box<dyn DynClientTool>> = BTreeMap::from([(
-            ToolName::new("echo"),
-            Box::new(EchoTool) as Box<dyn DynClientTool>,
-        )]);
+        let tool_executor = EchoExecutor;
         let enabled = BTreeMap::new();
 
         let output = call_client_tool(
             &enabled,
-            &tools,
+            &tool_executor,
             ClientToolCall {
                 id: ToolUseId::new("call-1"),
                 name: ToolName::new("echo"),
@@ -1134,37 +1106,14 @@ mod tests {
         )
         .await;
 
-        assert!(matches!(output, Err(ToolDispatchError::Unknown(_))));
+        assert!(matches!(
+            output,
+            Err(ClientToolExecutorError::Unknown { .. })
+        ));
     }
 
     #[tokio::test]
-    async fn agent_with_tool_accumulates_registered_tools() {
-        #[derive(Debug)]
-        struct NoopTool;
-
-        impl ClientTool for NoopTool {
-            type Error = TestError;
-
-            fn spec(&self) -> ClientToolSpec {
-                ClientToolSpec {
-                    description: "No-op tool.".to_string(),
-                    input_schema: ToolInputSchema::new(json!({ "type": "object" })),
-                }
-            }
-
-            async fn call(&self, _call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
-                Ok(ClientToolOutput {
-                    result: ClientToolResultContent::Text {
-                        text: String::new(),
-                    },
-                    media: Vec::new(),
-                    is_error: false,
-                    trace_response: json!({ "ok": true }),
-                    usage: Vec::new(),
-                })
-            }
-        }
-
+    async fn agent_accumulates_registered_tool_executor_specs() {
         #[derive(Debug, Clone)]
         struct ToolListingBackend {
             name: ProviderName,
@@ -1208,10 +1157,11 @@ mod tests {
             name: ProviderName::new("test"),
             seen_tools: seen_tools.clone(),
         };
-        let agent = AgentSpec::new("system")
-            .with_tool("alpha", NoopTool)
-            .with_tool("beta", NoopTool)
-            .into_agent(test_model(backend));
+        let spec = AgentSpec::new("system");
+        let tools = NamedToolsExecutor {
+            names: vec!["alpha", "beta"],
+        };
+        let agent = Agent::new(test_model(backend), spec, tools);
 
         let run = agent
             .run(Transcript::from_user_text("list tools"))
@@ -1270,11 +1220,14 @@ mod tests {
         input.id = Some("conversation-1".to_string());
         input.instructions = Some("old saved system prompt".to_string());
 
-        let run = AgentSpec::new("new system prompt")
-            .into_agent(test_model(backend))
-            .run(input)
-            .await
-            .unwrap();
+        let run = Agent::new(
+            test_model(backend),
+            AgentSpec::new("new system prompt"),
+            NoClientTools,
+        )
+        .run(input)
+        .await
+        .unwrap();
 
         assert!(matches!(run.outcome, AgentOutcome::Completed { .. }));
         let seen = seen.lock().unwrap().clone().unwrap();
@@ -1338,8 +1291,7 @@ mod tests {
             "X_SEARCH".to_string(),
         ]));
 
-        let run = spec
-            .into_agent(model)
+        let run = Agent::new(model, spec, NoClientTools)
             .run(Transcript::from_user_text("use server tools"))
             .await
             .unwrap();
@@ -1396,8 +1348,7 @@ mod tests {
         model.spec.server_tools =
             ServerToolSet::from(["WEB_SEARCH".to_string(), "x_search".to_string()]);
 
-        let run = AgentSpec::new("system")
-            .into_agent(model)
+        let run = Agent::new(model, AgentSpec::new("system"), NoClientTools)
             .run(Transcript::from_user_text("use server tools"))
             .await
             .unwrap();
@@ -1497,21 +1448,27 @@ mod tests {
         }
 
         #[derive(Debug)]
-        struct WaitingTool {
+        struct WaitingExecutor {
             barrier: Arc<Barrier>,
         }
 
-        impl ClientTool for WaitingTool {
+        impl ClientToolExecutor for WaitingExecutor {
             type Error = TestError;
 
-            fn spec(&self) -> ClientToolSpec {
-                ClientToolSpec {
-                    description: "Wait until both calls are running.".to_string(),
-                    input_schema: ToolInputSchema::new(json!({ "type": "object" })),
-                }
+            fn tools(&self) -> Vec<ClientToolDefinition> {
+                vec![ClientToolDefinition::new(
+                    "wait",
+                    test_tool_spec("Wait until both calls are running."),
+                )]
             }
 
-            async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+            async fn execute(
+                &self,
+                call: ClientToolCall,
+            ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
+                if call.name.as_str() != "wait" {
+                    return Err(ClientToolExecutorError::unknown(call.name));
+                }
                 self.barrier.wait().await;
                 Ok(ClientToolOutput {
                     result: ClientToolResultContent::Text {
@@ -1531,15 +1488,11 @@ mod tests {
             calls: Arc::new(Mutex::new(0)),
             result_order: result_order.clone(),
         };
-        let agent = AgentSpec::new("system")
-            .with_limits(AgentLimits { max_iterations: 4 })
-            .with_tool(
-                "wait",
-                WaitingTool {
-                    barrier: Arc::new(Barrier::new(2)),
-                },
-            )
-            .into_agent(test_model(backend));
+        let spec = AgentSpec::new("system").with_limits(AgentLimits { max_iterations: 4 });
+        let tools = WaitingExecutor {
+            barrier: Arc::new(Barrier::new(2)),
+        };
+        let agent = Agent::new(test_model(backend), spec, tools);
 
         let run = timeout(
             Duration::from_secs(1),
@@ -1572,7 +1525,7 @@ mod tests {
                 usage: Vec::new(),
             },
         };
-        let agent = AgentSpec::new("expert").into_agent(test_model(backend));
+        let agent = Agent::new(test_model(backend), AgentSpec::new("expert"), NoClientTools);
         let subagent = agent.into_subagent("Ask the OpenAI expert.");
 
         let output = subagent

@@ -22,7 +22,7 @@ pub mod transcript;
 pub mod usage;
 
 pub use agent::{
-    Agent, AgentBuilder, AgentError, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentSpec,
+    Agent, AgentError, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentSpec,
     AssistantAnswer, Subagent,
 };
 pub use events::{ConversationEventKind, EventSink, LiveEvent, NoopEventSink};
@@ -67,8 +67,9 @@ pub use storage::{
     UserMemoryJob, UserMemoryKey, UserMemoryTurn,
 };
 pub use tool::{
-    ClientTool, ClientToolCall, ClientToolOutput, ClientToolResult, ClientToolResultContent,
-    ClientToolSpec, ClientToolTrace, GroundingMetadata, ServerToolUse, ToolInputSchema, ToolTrace,
+    ClientToolCall, ClientToolDefinition, ClientToolExecutor, ClientToolExecutorError,
+    ClientToolOutput, ClientToolResult, ClientToolResultContent, ClientToolSpec, ClientToolTrace,
+    GroundingMetadata, NoClientTools, ServerToolUse, ToolInputSchema, ToolTrace,
 };
 pub use transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptTurn, TurnRole};
 pub use usage::{

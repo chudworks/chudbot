@@ -1,26 +1,108 @@
 //! Model-facing tool protocol contracts.
 
+use std::convert::Infallible;
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 use crate::ids::{ProviderName, ToolName, ToolUseId};
 use crate::media::BoxedMediaRef;
 use crate::usage::UsageRecord;
 
-/// One client-side tool.
-pub trait ClientTool: Send + Sync {
-    /// Tool error type.
-    type Error: std::error::Error + Send + Sync;
+/// One named client-side tool exposed by a [`ClientToolExecutor`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientToolDefinition {
+    /// Tool name.
+    pub name: ToolName,
+    /// Model-facing tool specification.
+    pub spec: ClientToolSpec,
+}
 
-    /// Tool specification shown to the model.
-    fn spec(&self) -> ClientToolSpec;
+impl ClientToolDefinition {
+    /// Construct a named tool definition.
+    pub fn new(name: impl Into<ToolName>, spec: ClientToolSpec) -> Self {
+        Self {
+            name: name.into(),
+            spec,
+        }
+    }
+}
 
-    /// Execute one call to this tool.
-    fn call(
+/// Error produced by a client-side tool executor.
+#[derive(Debug, Error)]
+pub enum ClientToolExecutorError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// The executor does not own the requested tool name.
+    #[error("unknown tool `{name}`")]
+    Unknown {
+        /// Unknown tool name.
+        name: ToolName,
+    },
+    /// The executor owns the tool but execution failed.
+    #[error("execution failed: {source}")]
+    Execution {
+        /// Source execution error.
+        #[source]
+        source: E,
+    },
+}
+
+impl<E> ClientToolExecutorError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// Build an unknown-tool sentinel.
+    pub fn unknown(name: impl Into<ToolName>) -> Self {
+        Self::Unknown { name: name.into() }
+    }
+
+    /// Build an execution failure.
+    pub fn execution(source: E) -> Self {
+        Self::Execution { source }
+    }
+
+    /// Return true when this is the unknown-tool sentinel.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown { .. })
+    }
+}
+
+/// A client-side executor that owns the entire model-visible tool surface for
+/// one agent.
+pub trait ClientToolExecutor: Send + Sync {
+    /// Tool execution error type.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Tool specifications shown to the model.
+    fn tools(&self) -> Vec<ClientToolDefinition>;
+
+    /// Execute one model-requested tool call.
+    fn execute(
         &self,
         call: ClientToolCall,
-    ) -> impl Future<Output = Result<ClientToolOutput, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<ClientToolOutput, ClientToolExecutorError<Self::Error>>> + Send;
+}
+
+/// Executor with no tools.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoClientTools;
+
+impl ClientToolExecutor for NoClientTools {
+    type Error = Infallible;
+
+    fn tools(&self) -> Vec<ClientToolDefinition> {
+        Vec::new()
+    }
+
+    async fn execute(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
+        Err(ClientToolExecutorError::unknown(call.name))
+    }
 }
 
 /// A client-side tool the model may invoke.

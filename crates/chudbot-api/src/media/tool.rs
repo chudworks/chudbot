@@ -6,8 +6,7 @@ use thiserror::Error;
 
 use crate::ids::{ModelId, VideoJobId};
 use crate::tool::{
-    ClientTool, ClientToolCall, ClientToolOutput, ClientToolResultContent, ClientToolSpec,
-    ToolInputSchema,
+    ClientToolCall, ClientToolOutput, ClientToolResultContent, ClientToolSpec, ToolInputSchema,
 };
 
 use super::{
@@ -48,26 +47,29 @@ impl<G, S> ImageGeneratorTool<G, S> {
     }
 }
 
-impl<G, S> ClientTool for ImageGeneratorTool<G, S>
+impl<G, S> ImageGeneratorTool<G, S>
 where
     G: ImageGenerator,
     S: MediaStore,
 {
-    type Error = MediaToolError<G::Error>;
-
-    fn spec(&self) -> ClientToolSpec {
+    /// Tool specification shown to the model.
+    pub fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.description.clone(),
             input_schema: image_tool_schema(),
         }
     }
 
+    /// Execute one image-generation call.
     #[tracing::instrument(
         name = "media_tool.generate_image",
         skip_all,
         fields(tool = %call.name, tool_use_id = %call.id)
     )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+    pub async fn call(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, MediaToolError<G::Error>> {
         let request = image_request_from_tool_input(&self.media_store, call.input).await?;
         tracing::debug!(
             prompt_chars = request.prompt.chars().count(),
@@ -201,26 +203,29 @@ impl<G, S> VideoGeneratorTool<G, S> {
     }
 }
 
-impl<G, S> ClientTool for VideoGeneratorTool<G, S>
+impl<G, S> VideoGeneratorTool<G, S>
 where
     G: VideoGenerator,
     S: MediaStore,
 {
-    type Error = MediaToolError<G::Error>;
-
-    fn spec(&self) -> ClientToolSpec {
+    /// Tool specification shown to the model.
+    pub fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.description.clone(),
             input_schema: video_tool_schema(),
         }
     }
 
+    /// Execute one video-generation call.
     #[tracing::instrument(
         name = "media_tool.generate_video",
         skip_all,
         fields(tool = %call.name, tool_use_id = %call.id, max_polls = self.max_polls)
     )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+    pub async fn call(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, MediaToolError<G::Error>> {
         let request = video_request_from_tool_input(&self.media_store, call.input).await?;
         tracing::debug!(
             prompt_chars = request.prompt.chars().count(),
@@ -715,7 +720,7 @@ mod tests {
     use super::*;
     use crate::ids::{ProviderName, ToolUseId};
     use crate::media::{LoadedMedia, MediaFuture, MediaMetadata, VideoMeta};
-    use crate::tool::{ClientTool, ClientToolCall, ClientToolResultContent};
+    use crate::tool::{ClientToolCall, ClientToolResultContent};
     use crate::usage::UsageRecord;
 
     #[derive(Debug)]

@@ -31,26 +31,26 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use chudbot_api::{
-    Agent, AgentBuilder, AgentLimits, AgentOutcome, AgentSelection, AgentSpec, AttachmentRef,
-    AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
-    BeginTurn, BotStorage, ChannelLink, ChannelRef, ClientTool, ClientToolCall, ClientToolOutput,
-    ClientToolResult, ClientToolResultContent, ClientToolSpec, ClientToolTrace, ContentBlock,
-    Conversation, ConversationEventKind, ConversationId, ConversationLookup, ConversationSnapshot,
-    ConversationStop, CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink,
-    ExternalId, FetchMessages, FinishTurn, ImageGeneratorRegistry, ImageGeneratorTool, LiveEvent,
-    LlmProviderRegistry, MediaCategory, MediaRef, MediaStore, MediaUri, MessageLink,
-    MessagePlatformRegistry, MessageRef, Model, ModelId, ModelSpec, ModelStep, ModelStepKind,
-    ModelStepTrace, OpenConversation, OutgoingAttachment, PlatformCommand,
-    PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
-    PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
-    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
-    PlatformMessageRelationship, PlatformName, PlatformReaction, PrivacyMode, ProviderName,
-    ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput, SendMessage,
-    StoredVideoJob, Subagent, ThreadRequest, ToolInputSchema, ToolName, ToolTrace, ToolUseId,
-    Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob,
-    UrlMediaRef, UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord,
-    UserProfile, UserRef, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus,
-    VideoRequest,
+    Agent, AgentLimits, AgentOutcome, AgentSelection, AttachmentRef, AudioTranscriber,
+    AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest, BeginTurn, BotStorage,
+    ChannelLink, ChannelRef, ClientToolCall, ClientToolDefinition, ClientToolExecutor,
+    ClientToolExecutorError, ClientToolOutput, ClientToolResult, ClientToolResultContent,
+    ClientToolSpec, ClientToolTrace, ContentBlock, Conversation, ConversationEventKind,
+    ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
+    CountActiveVideoGenerations, CreateMedia, CreateVideoJob, EventSink, ExternalId, FetchMessages,
+    FinishTurn, ImageGeneratorRegistry, ImageGeneratorTool, LiveEvent, LlmProviderRegistry,
+    MediaCategory, MediaRef, MediaStore, MediaUri, MessageLink, MessagePlatformRegistry,
+    MessageRef, Model, ModelId, ModelSpec, ModelStep, ModelStepKind, ModelStepTrace, NoClientTools,
+    OpenConversation, OutgoingAttachment, PlatformCommand, PlatformCommandDefinition,
+    PlatformCommandInput, PlatformCommandOption, PlatformCommandOptionChoice,
+    PlatformCommandOptionKind, PlatformCommandResponse, PlatformCommandValue, PlatformEvent,
+    PlatformMessage, PlatformMessageReference, PlatformMessageRelationship, PlatformName,
+    PlatformReaction, PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings,
+    SamplingOptions, SaveTurnInput, SendMessage, StoredVideoJob, Subagent, ThreadRequest,
+    ToolInputSchema, ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset,
+    TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageCostGrouping, UsageCostQuery,
+    UsageCostRow, UsageCostScope, UsageRecord, UserProfile, UserRef, VideoGenerator,
+    VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -1647,7 +1647,7 @@ where
         turn_id: TurnId,
         top_level: bool,
         stack: &mut Vec<String>,
-    ) -> Result<Agent<RoutedLlmBackend<R::Llms>>, BotError> {
+    ) -> Result<RuntimeAgent<R>, BotError> {
         self.ensure_agent_services_exist(agent_name, agent_config)?;
         if stack.iter().any(|name| name == agent_name) {
             tracing::warn!("recursive agent reference detected");
@@ -1665,85 +1665,46 @@ where
             ensure_client_tool_enabled(&mut spec.client_tools, memory::FORGET_USER_MEMORY_TOOL);
         }
 
-        let mut tools: Vec<RuntimeTool<R>> = Vec::new();
+        let mut tool_executor = RuntimeToolExecutor::new(
+            RuntimeToolDeps {
+                platforms: self.platforms.clone(),
+                storage: self.storage.clone(),
+                media_store: self.media_store.clone(),
+                images: self.images.clone(),
+                videos: self.videos.clone(),
+                audio: self.audio.clone(),
+                video_rate_limit_locks: self.video_rate_limit_locks.clone(),
+            },
+            RuntimeToolContext {
+                default_channel: channel_from_message(reply_to),
+                reply_to: reply_to.clone(),
+                conversation_id,
+                turn_id,
+                turn_user: turn_user.clone(),
+                privacy: settings.privacy.clone(),
+            },
+        );
         if top_level {
             if !matches!(settings.privacy, PrivacyMode::ConversationOnly) {
                 tracing::debug!(tool = FETCH_MESSAGES_TOOL, "attaching runtime tool");
-                tools.push(RuntimeTool::Fetch {
-                    name: ToolName::new(FETCH_MESSAGES_TOOL),
-                    tool: FetchMessagesTool {
-                        platforms: self.platforms.clone(),
-                        storage: self.storage.clone(),
-                        default_channel: channel_from_message(reply_to),
-                        privacy: settings.privacy.clone(),
-                    },
-                });
+                tool_executor.enabled.fetch_messages = true;
             }
             if self.agent_memory_enabled(agent_config) {
                 let base_key = memory::key_from_user_ref(turn_user);
                 tracing::debug!("attaching user memory tools");
-                tools.push(RuntimeTool::Memory {
-                    name: ToolName::new(memory::LOOKUP_USER_MEMORY_TOOL),
-                    tool: memory::MemoryClientTool::new(
-                        self.storage.clone(),
-                        memory::MemoryToolKind::Lookup,
-                        base_key.clone(),
-                        turn_user_display_name.to_string(),
-                        conversation_id,
-                        turn_id,
-                    ),
-                });
-                tools.push(RuntimeTool::Memory {
-                    name: ToolName::new(memory::REMEMBER_USER_MEMORY_TOOL),
-                    tool: memory::MemoryClientTool::new(
-                        self.storage.clone(),
-                        memory::MemoryToolKind::Remember,
-                        base_key.clone(),
-                        turn_user_display_name.to_string(),
-                        conversation_id,
-                        turn_id,
-                    ),
-                });
-                tools.push(RuntimeTool::Memory {
-                    name: ToolName::new(memory::FORGET_USER_MEMORY_TOOL),
-                    tool: memory::MemoryClientTool::new(
-                        self.storage.clone(),
-                        memory::MemoryToolKind::Forget,
-                        base_key,
-                        turn_user_display_name.to_string(),
-                        conversation_id,
-                        turn_id,
-                    ),
-                });
-            }
-            tracing::debug!(tool = POST_STATUS_TOOL, "attaching runtime tool");
-            tools.push(RuntimeTool::Status {
-                name: ToolName::new(POST_STATUS_TOOL),
-                tool: PostStatusTool {
-                    platforms: self.platforms.clone(),
-                    storage: self.storage.clone(),
-                    channel: channel_from_message(reply_to),
-                    reply_to: reply_to.clone(),
+                tool_executor.enable_memory(memory::MemoryToolContext::new(
+                    base_key,
+                    turn_user_display_name.to_string(),
                     conversation_id,
                     turn_id,
-                },
-            });
+                ));
+            }
+            tracing::debug!(tool = POST_STATUS_TOOL, "attaching runtime tool");
+            tool_executor.enabled.post_status = true;
             tracing::debug!(tool = ADD_REACTION_TOOL, "attaching runtime tool");
-            tools.push(RuntimeTool::Reaction {
-                name: ToolName::new(ADD_REACTION_TOOL),
-                tool: AddReactionTool {
-                    platforms: self.platforms.clone(),
-                    message: reply_to.clone(),
-                },
-            });
+            tool_executor.enabled.add_reaction = true;
             tracing::debug!(tool = USAGE_REPORT_TOOL, "attaching runtime tool");
-            tools.push(RuntimeTool::UsageReport {
-                name: ToolName::new(USAGE_REPORT_TOOL),
-                tool: UsageReportTool {
-                    storage: self.storage.clone(),
-                    channel: channel_from_message(reply_to),
-                },
-            });
+            tool_executor.enabled.usage_report = true;
         }
 
         if let Some(binding) = &agent_config.image_generation {
@@ -1753,21 +1714,7 @@ where
                 model = %binding.model,
                 "attaching image generation tool"
             );
-            tools.push(RuntimeTool::Image {
-                name: ToolName::new(GENERATE_IMAGE_TOOL),
-                tool: ImageGeneratorTool::new(
-                    RoutedImageGenerator::new(
-                        self.images.clone(),
-                        binding.provider.clone(),
-                        binding.model.clone(),
-                    ),
-                    self.media_store.clone(),
-                )
-                .with_description(image_generation_tool_description(
-                    &binding.provider,
-                    &binding.model,
-                )),
-            });
+            tool_executor.image_generation = Some(binding.clone());
         }
 
         if let Some(binding) = &agent_config.video_generation {
@@ -1777,24 +1724,7 @@ where
                 model = %binding.model,
                 "attaching video generation tool"
             );
-            tools.push(RuntimeTool::Video {
-                name: ToolName::new(GENERATE_VIDEO_TOOL),
-                tool: PersistentVideoGeneratorTool::new(
-                    RoutedVideoGenerator::new(
-                        self.videos.clone(),
-                        binding.provider.clone(),
-                        binding.model.clone(),
-                    ),
-                    self.media_store.clone(),
-                    self.storage.clone(),
-                    self.video_rate_limit_locks.clone(),
-                    turn_id,
-                    turn_user.clone(),
-                    binding.provider.clone(),
-                    binding.rate_limit.clone(),
-                )
-                .with_description(video_generation_tool_description(binding)),
-            });
+            tool_executor.video_generation = Some(binding.clone());
         }
 
         if let Some(binding) = &agent_config.audio_transcription {
@@ -1804,49 +1734,17 @@ where
                 model = ?binding.model.as_ref(),
                 "attaching audio transcription tool"
             );
-            tools.push(RuntimeTool::Audio {
-                name: ToolName::new(TRANSCRIBE_AUDIO_TOOL),
-                tool: AudioTranscriptionTool::new(
-                    RoutedAudioTranscriber::new(
-                        self.audio.clone(),
-                        binding.provider.clone(),
-                        binding.model.clone(),
-                    ),
-                    self.media_store.clone(),
-                )
-                .with_default_keyterms(audio_transcription_default_keyterms(binding))
-                .with_description(format!(
-                    "Transcribe a stored audio attachment with the configured `{}` audio provider{} and return the speech as text.",
-                    binding.provider,
-                    binding
-                        .model
-                        .as_ref()
-                        .map(|model| format!(" and `{model}` model"))
-                        .unwrap_or_default()
-                )),
-            });
+            tool_executor.audio_transcription = Some(binding.clone());
         }
 
         tracing::debug!(tool = READ_ASSET_TOOL, "attaching media access tool");
-        tools.push(RuntimeTool::Asset {
-            name: ToolName::new(READ_ASSET_TOOL),
-            tool: MediaAccessTool::new(self.media_store.clone(), MediaAccessKind::Read),
-        });
+        tool_executor.enabled.media_access.read = true;
         tracing::debug!(tool = STAT_ASSET_TOOL, "attaching media access tool");
-        tools.push(RuntimeTool::Asset {
-            name: ToolName::new(STAT_ASSET_TOOL),
-            tool: MediaAccessTool::new(self.media_store.clone(), MediaAccessKind::Stat),
-        });
+        tool_executor.enabled.media_access.stat = true;
         tracing::debug!(tool = PUBLIC_URL_ASSET_TOOL, "attaching media access tool");
-        tools.push(RuntimeTool::Asset {
-            name: ToolName::new(PUBLIC_URL_ASSET_TOOL),
-            tool: MediaAccessTool::new(self.media_store.clone(), MediaAccessKind::PublicUrl),
-        });
+        tool_executor.enabled.media_access.public_url = true;
         tracing::debug!(tool = ATTACH_ASSET_TOOL, "attaching media access tool");
-        tools.push(RuntimeTool::Asset {
-            name: ToolName::new(ATTACH_ASSET_TOOL),
-            tool: MediaAccessTool::new(self.media_store.clone(), MediaAccessKind::Attach),
-        });
+        tool_executor.enabled.media_access.attach = true;
 
         for (tool_name, binding) in &agent_config.subagents {
             let (subagent_name, subagent_config) = self
@@ -1874,9 +1772,9 @@ where
                 false,
                 stack,
             )?;
-            tools.push(RuntimeTool::Subagent {
+            tool_executor.subagents.push(RuntimeSubagent {
                 name: tool_name.clone(),
-                tool: nested.into_subagent(binding.description.clone()),
+                tool: Box::new(nested.into_subagent(binding.description.clone())),
             });
         }
 
@@ -1885,26 +1783,20 @@ where
             backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
             spec: agent_config.model.clone(),
         };
-        let mut iter = tools.into_iter();
-        let Some(first) = iter.next() else {
-            tracing::debug!("built agent without client tools");
-            return Ok(spec.into_agent(model));
-        };
-        let mut builder = first.start(spec);
-        let mut tool_count = 1usize;
-        for tool in iter {
-            builder = tool.append(builder);
-            tool_count += 1;
-        }
+        let tool_count = tool_executor.tools().len();
         tracing::debug!(client_tools = tool_count, "built agent with client tools");
-        Ok(builder.into_agent(model))
+        Ok(Agent::new(model, spec, tool_executor))
     }
 
     fn system_agent(&self, agent_config: &SystemAgentConfig) -> Agent<RoutedLlmBackend<R::Llms>> {
-        agent_config.spec.clone().into_agent(Model {
-            backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
-            spec: agent_config.model.clone(),
-        })
+        Agent::new(
+            Model {
+                backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
+                spec: agent_config.model.clone(),
+            },
+            agent_config.spec.clone(),
+            NoClientTools,
+        )
     }
 
     #[tracing::instrument(
@@ -4175,328 +4067,789 @@ struct StoredAttachmentMedia {
 }
 
 #[derive(Debug)]
-enum RuntimeTool<R: BotRuntimeTypes> {
-    Fetch {
-        name: ToolName,
-        tool: FetchMessagesTool<R::Platforms, R::Storage>,
-    },
-    Status {
-        name: ToolName,
-        tool: PostStatusTool<R::Platforms, R::Storage>,
-    },
-    Reaction {
-        name: ToolName,
-        tool: AddReactionTool<R::Platforms>,
-    },
-    UsageReport {
-        name: ToolName,
-        tool: UsageReportTool<R::Storage>,
-    },
-    Image {
-        name: ToolName,
-        tool: ImageGeneratorTool<RoutedImageGenerator<R::Images>, R::Media>,
-    },
-    Video {
-        name: ToolName,
-        tool: PersistentVideoGeneratorTool<RoutedVideoGenerator<R::Videos>, R::Media, R::Storage>,
-    },
-    Audio {
-        name: ToolName,
-        tool: AudioTranscriptionTool<RoutedAudioTranscriber<R::Audio>, R::Media>,
-    },
-    Asset {
-        name: ToolName,
-        tool: MediaAccessTool<R::Media>,
-    },
-    Memory {
-        name: ToolName,
-        tool: memory::MemoryClientTool<R::Storage>,
-    },
-    Subagent {
-        name: ToolName,
-        tool: Subagent<RoutedLlmBackend<R::Llms>>,
-    },
+struct RuntimeToolError(String);
+
+impl std::fmt::Display for RuntimeToolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
-impl<R> RuntimeTool<R>
+impl std::error::Error for RuntimeToolError {}
+
+type RuntimeAgent<R> =
+    Agent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
+
+type RuntimeSubagentTool<R> =
+    Subagent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
+
+struct RuntimeSubagent<R: BotRuntimeTypes> {
+    name: ToolName,
+    tool: Box<RuntimeSubagentTool<R>>,
+}
+
+struct RuntimeToolDeps<R: BotRuntimeTypes> {
+    platforms: R::Platforms,
+    storage: R::Storage,
+    media_store: R::Media,
+    images: R::Images,
+    videos: R::Videos,
+    audio: R::Audio,
+    video_rate_limit_locks: VideoRateLimitLocks,
+}
+
+struct RuntimeToolContext {
+    default_channel: ChannelRef,
+    reply_to: MessageRef,
+    conversation_id: ConversationId,
+    turn_id: TurnId,
+    turn_user: UserRef,
+    privacy: PrivacyMode,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeToolFlags {
+    fetch_messages: bool,
+    post_status: bool,
+    add_reaction: bool,
+    usage_report: bool,
+    media_access: RuntimeMediaAccessFlags,
+    memory: RuntimeMemoryFlags,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeMediaAccessFlags {
+    read: bool,
+    stat: bool,
+    public_url: bool,
+    attach: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RuntimeMemoryFlags {
+    lookup: bool,
+    remember: bool,
+    forget: bool,
+}
+
+impl RuntimeMemoryFlags {
+    fn all() -> Self {
+        Self {
+            lookup: true,
+            remember: true,
+            forget: true,
+        }
+    }
+}
+
+struct RuntimeToolExecutor<R: BotRuntimeTypes> {
+    deps: RuntimeToolDeps<R>,
+    context: RuntimeToolContext,
+    enabled: RuntimeToolFlags,
+    memory: Option<memory::MemoryToolContext>,
+    image_generation: Option<GenerationBinding>,
+    video_generation: Option<GenerationBinding>,
+    audio_transcription: Option<TranscriptionBinding>,
+    subagents: Vec<RuntimeSubagent<R>>,
+}
+
+impl<R> std::fmt::Debug for RuntimeSubagent<R>
 where
     R: BotRuntimeTypes,
 {
-    fn start(self, spec: AgentSpec) -> AgentBuilder {
-        match self {
-            Self::Fetch { name, tool } => spec.with_tool(name, tool),
-            Self::Status { name, tool } => spec.with_tool(name, tool),
-            Self::Reaction { name, tool } => spec.with_tool(name, tool),
-            Self::UsageReport { name, tool } => spec.with_tool(name, tool),
-            Self::Image { name, tool } => spec.with_tool(name, tool),
-            Self::Video { name, tool } => spec.with_tool(name, tool),
-            Self::Audio { name, tool } => spec.with_tool(name, tool),
-            Self::Asset { name, tool } => spec.with_tool(name, tool),
-            Self::Memory { name, tool } => spec.with_tool(name, tool),
-            Self::Subagent { name, tool } => spec.with_tool(name, tool),
-        }
-    }
-
-    fn append(self, builder: AgentBuilder) -> AgentBuilder {
-        match self {
-            Self::Fetch { name, tool } => builder.with_tool(name, tool),
-            Self::Status { name, tool } => builder.with_tool(name, tool),
-            Self::Reaction { name, tool } => builder.with_tool(name, tool),
-            Self::UsageReport { name, tool } => builder.with_tool(name, tool),
-            Self::Image { name, tool } => builder.with_tool(name, tool),
-            Self::Video { name, tool } => builder.with_tool(name, tool),
-            Self::Audio { name, tool } => builder.with_tool(name, tool),
-            Self::Asset { name, tool } => builder.with_tool(name, tool),
-            Self::Memory { name, tool } => builder.with_tool(name, tool),
-            Self::Subagent { name, tool } => builder.with_tool(name, tool),
-        }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeSubagent")
+            .field("name", &self.name)
+            .finish_non_exhaustive()
     }
 }
 
-#[derive(Debug, Clone)]
-struct MediaAccessTool<M> {
-    media_store: M,
-    kind: MediaAccessKind,
-}
-
-impl<M> MediaAccessTool<M> {
-    fn new(media_store: M, kind: MediaAccessKind) -> Self {
-        Self { media_store, kind }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum MediaAccessKind {
-    Read,
-    Stat,
-    PublicUrl,
-    Attach,
-}
-
-impl MediaAccessKind {
-    fn description(self) -> &'static str {
-        match self {
-            Self::Read => {
-                "Read a stored Chudbot image asset by file:// URI. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, and arbitrary filesystem paths are rejected. The tool returns metadata and makes the image visible to the next model step, but never returns raw bytes."
-            }
-            Self::Stat => {
-                "Validate a stored Chudbot media URI and return whether it exists with MIME type and size metadata. This only checks media storage; it does not read or return file bytes."
-            }
-            Self::PublicUrl => {
-                "Resolve a supported stored Chudbot media URI to its configured public URL when one is available. Images, videos, audio, and avatars are supported; unknown/non-media MIME types are rejected. This only returns metadata and a URL; it does not read or return file bytes."
-            }
-            Self::Attach => {
-                "Attach an existing stored Chudbot image asset to the final platform reply. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, public URLs, and arbitrary filesystem paths are rejected. The tool queues the image for final delivery and never returns raw bytes."
-            }
-        }
-    }
-}
-
-impl<M> ClientTool for MediaAccessTool<M>
+impl<R> std::fmt::Debug for RuntimeToolExecutor<R>
 where
-    M: MediaStore,
+    R: BotRuntimeTypes,
 {
-    type Error = BotToolError;
-
-    fn spec(&self) -> ClientToolSpec {
-        ClientToolSpec {
-            description: self.kind.description().to_string(),
-            input_schema: asset_uri_tool_schema(),
-        }
-    }
-
-    #[tracing::instrument(
-        name = "tool.media_access",
-        skip_all,
-        fields(tool_call = %call.id, kind = ?self.kind)
-    )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
-        let uri = media_uri_from_tool_input(&call.input)?;
-        match self.kind {
-            MediaAccessKind::Read => self.read(uri).await,
-            MediaAccessKind::Stat => Ok(self.stat(uri).await),
-            MediaAccessKind::PublicUrl => Ok(self.public_url(uri).await),
-            MediaAccessKind::Attach => self.attach(uri).await,
-        }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeToolExecutor")
+            .field("enabled", &self.enabled)
+            .field("memory", &self.memory.is_some())
+            .field("image_generation", &self.image_generation.is_some())
+            .field("video_generation", &self.video_generation.is_some())
+            .field("audio_transcription", &self.audio_transcription.is_some())
+            .field("subagents", &self.subagents)
+            .finish()
     }
 }
 
-impl<M> MediaAccessTool<M>
+impl<R> RuntimeToolExecutor<R>
 where
-    M: MediaStore,
+    R: BotRuntimeTypes,
 {
-    async fn read(&self, uri: MediaUri) -> Result<ClientToolOutput, BotToolError> {
-        let media = self
-            .media_store
-            .media_from_uri(&uri)
-            .await
-            .map_err(|error| BotToolError::Media(error.to_string()))?;
-        if !model_transcript_supports_media(media.as_ref()) {
-            tracing::warn!(
-                uri = %media.uri(),
-                category = ?media.category(),
-                mime_type = %media.mime_type(),
-                "read rejected unsupported media asset"
-            );
-            return Err(BotToolError::InvalidInput(format!(
-                "`read` only supports stored image assets with supported image MIME types; `{}` resolved as category `{:?}` with MIME type `{}`",
-                media.uri(),
-                media.category(),
-                media.mime_type()
-            )));
+    fn new(deps: RuntimeToolDeps<R>, context: RuntimeToolContext) -> Self {
+        Self {
+            deps,
+            context,
+            enabled: RuntimeToolFlags::default(),
+            memory: None,
+            image_generation: None,
+            video_generation: None,
+            audio_transcription: None,
+            subagents: Vec::new(),
         }
+    }
 
-        let value = media_access_metadata_json(
-            media.as_ref(),
-            serde_json::json!({
-                "exists": true,
-                "visible_to_model": true,
-                "content": {
-                    "kind": "image",
-                    "delivery": "attached_to_next_model_step",
-                    "bytes_returned": false
-                }
-            }),
-        );
-        tracing::info!(
-            uri = %media.uri(),
-            mime_type = %media.mime_type(),
-            size_bytes = media.size_bytes(),
-            "read exposed stored image asset to model"
-        );
-        Ok(ClientToolOutput {
-            result: ClientToolResultContent::Json {
-                value: value.clone(),
-            },
-            media: vec![media],
-            is_error: false,
-            trace_response: value,
-            usage: Vec::new(),
+    fn enable_memory(&mut self, context: memory::MemoryToolContext) {
+        self.memory = Some(context);
+        self.enabled.memory = RuntimeMemoryFlags::all();
+    }
+
+    fn fetch_messages_tool(&self) -> FetchMessagesTool<R::Platforms, R::Storage> {
+        FetchMessagesTool {
+            platforms: self.deps.platforms.clone(),
+            storage: self.deps.storage.clone(),
+            default_channel: self.context.default_channel.clone(),
+            privacy: self.context.privacy.clone(),
+        }
+    }
+
+    fn post_status_tool(&self) -> PostStatusTool<R::Platforms, R::Storage> {
+        PostStatusTool {
+            platforms: self.deps.platforms.clone(),
+            storage: self.deps.storage.clone(),
+            channel: self.context.default_channel.clone(),
+            reply_to: self.context.reply_to.clone(),
+            conversation_id: self.context.conversation_id,
+            turn_id: self.context.turn_id,
+        }
+    }
+
+    fn add_reaction_tool(&self) -> AddReactionTool<R::Platforms> {
+        AddReactionTool {
+            platforms: self.deps.platforms.clone(),
+            message: self.context.reply_to.clone(),
+        }
+    }
+
+    fn usage_report_tool(&self) -> UsageReportTool<R::Storage> {
+        UsageReportTool {
+            storage: self.deps.storage.clone(),
+            channel: self.context.default_channel.clone(),
+        }
+    }
+
+    fn image_generation_tool(
+        &self,
+    ) -> Option<ImageGeneratorTool<RoutedImageGenerator<R::Images>, R::Media>> {
+        self.image_generation.as_ref().map(|binding| {
+            ImageGeneratorTool::new(
+                RoutedImageGenerator::new(
+                    self.deps.images.clone(),
+                    binding.provider.clone(),
+                    binding.model.clone(),
+                ),
+                self.deps.media_store.clone(),
+            )
+            .with_description(image_generation_tool_description(
+                &binding.provider,
+                &binding.model,
+            ))
         })
     }
 
-    async fn attach(&self, uri: MediaUri) -> Result<ClientToolOutput, BotToolError> {
-        let media = self
-            .media_store
-            .media_from_uri(&uri)
-            .await
-            .map_err(|error| BotToolError::Media(error.to_string()))?;
-        if !attach_supports_media(media.as_ref()) {
-            tracing::warn!(
-                uri = %media.uri(),
-                category = ?media.category(),
-                mime_type = %media.mime_type(),
-                "attach rejected unsupported media asset"
-            );
-            return Err(BotToolError::InvalidInput(format!(
-                "`attach` only supports stored image assets; `{}` resolved as category `{:?}` with MIME type `{}`",
-                media.uri(),
-                media.category(),
-                media.mime_type()
-            )));
-        }
-
-        let value = media_access_metadata_json(
-            media.as_ref(),
-            serde_json::json!({
-                "exists": true,
-                "attached": true,
-                "delivery": {
-                    "platform_reply": "The image will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown image links in user-facing text.",
-                    "deduplication": "If this URI is already queued by generated media or another attach call, it will only be sent once."
-                }
-            }),
-        );
-        tracing::info!(
-            uri = %media.uri(),
-            mime_type = %media.mime_type(),
-            size_bytes = media.size_bytes(),
-            "queued stored image asset for final reply attachment"
-        );
-        Ok(ClientToolOutput {
-            result: ClientToolResultContent::Json {
-                value: value.clone(),
-            },
-            media: Vec::new(),
-            is_error: false,
-            trace_response: value,
-            usage: Vec::new(),
+    fn video_generation_tool(
+        &self,
+    ) -> Option<PersistentVideoGeneratorTool<RoutedVideoGenerator<R::Videos>, R::Media, R::Storage>>
+    {
+        self.video_generation.as_ref().map(|binding| {
+            PersistentVideoGeneratorTool::new(
+                RoutedVideoGenerator::new(
+                    self.deps.videos.clone(),
+                    binding.provider.clone(),
+                    binding.model.clone(),
+                ),
+                self.deps.media_store.clone(),
+                self.deps.storage.clone(),
+                self.deps.video_rate_limit_locks.clone(),
+                self.context.turn_id,
+                self.context.turn_user.clone(),
+                binding.provider.clone(),
+                binding.rate_limit.clone(),
+            )
+            .with_description(video_generation_tool_description(binding))
         })
     }
 
-    async fn stat(&self, uri: MediaUri) -> ClientToolOutput {
-        let value = match self.media_store.media_from_uri(&uri).await {
-            Ok(media) => media_access_metadata_json(
+    fn audio_transcription_tool(
+        &self,
+    ) -> Option<AudioTranscriptionTool<RoutedAudioTranscriber<R::Audio>, R::Media>> {
+        self.audio_transcription.as_ref().map(|binding| {
+            AudioTranscriptionTool::new(
+                RoutedAudioTranscriber::new(
+                    self.deps.audio.clone(),
+                    binding.provider.clone(),
+                    binding.model.clone(),
+                ),
+                self.deps.media_store.clone(),
+            )
+            .with_default_keyterms(audio_transcription_default_keyterms(binding))
+            .with_description(format!(
+                "Transcribe a stored audio attachment with the configured `{}` audio provider{} and return the speech as text.",
+                binding.provider,
+                binding
+                    .model
+                    .as_ref()
+                    .map(|model| format!(" and `{model}` model"))
+                    .unwrap_or_default()
+            ))
+        })
+    }
+
+    async fn fetch_messages(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        self.fetch_messages_tool()
+            .call(call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn post_status(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        self.post_status_tool()
+            .call(call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn add_reaction(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        self.add_reaction_tool()
+            .call(call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn usage_report(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        self.usage_report_tool()
+            .call(call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn generate_image(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let Some(tool) = self.image_generation_tool() else {
+            return Err(ClientToolExecutorError::unknown(call.name));
+        };
+        tool.call(call).await.map_err(runtime_tool_execution_error)
+    }
+
+    async fn generate_video(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let Some(tool) = self.video_generation_tool() else {
+            return Err(ClientToolExecutorError::unknown(call.name));
+        };
+        tool.call(call).await.map_err(runtime_tool_execution_error)
+    }
+
+    async fn transcribe_audio(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let Some(tool) = self.audio_transcription_tool() else {
+            return Err(ClientToolExecutorError::unknown(call.name));
+        };
+        tool.call(call).await.map_err(runtime_tool_execution_error)
+    }
+
+    async fn read_asset(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        read_asset(&self.deps.media_store, call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn stat_asset(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        stat_asset(&self.deps.media_store, call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn public_url_asset(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        public_url_asset(&self.deps.media_store, call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn attach_asset(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        attach_asset(&self.deps.media_store, call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn lookup_user_memory(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let Some(context) = &self.memory else {
+            return Err(ClientToolExecutorError::unknown(call.name));
+        };
+        memory::lookup_user_memory(&self.deps.storage, context, call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn remember_user_memory(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let Some(context) = &self.memory else {
+            return Err(ClientToolExecutorError::unknown(call.name));
+        };
+        memory::remember_user_memory(&self.deps.storage, context, call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn forget_user_memory(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let Some(context) = &self.memory else {
+            return Err(ClientToolExecutorError::unknown(call.name));
+        };
+        memory::forget_user_memory(&self.deps.storage, context, call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
+    async fn execute_subagent_or_unknown(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let name = call.name.clone();
+        let Some(subagent) = self
+            .subagents
+            .iter()
+            .find(|subagent| subagent.name.as_str() == name.as_str())
+        else {
+            return Err(ClientToolExecutorError::unknown(name));
+        };
+        subagent
+            .tool
+            .call(call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+}
+
+impl<R> ClientToolExecutor for RuntimeToolExecutor<R>
+where
+    R: BotRuntimeTypes,
+{
+    type Error = RuntimeToolError;
+
+    fn tools(&self) -> Vec<ClientToolDefinition> {
+        let mut definitions = Vec::new();
+        if self.enabled.fetch_messages {
+            definitions.push(ClientToolDefinition::new(
+                FETCH_MESSAGES_TOOL,
+                self.fetch_messages_tool().spec(),
+            ));
+        }
+        if self.enabled.post_status {
+            definitions.push(ClientToolDefinition::new(
+                POST_STATUS_TOOL,
+                self.post_status_tool().spec(),
+            ));
+        }
+        if self.enabled.add_reaction {
+            definitions.push(ClientToolDefinition::new(
+                ADD_REACTION_TOOL,
+                self.add_reaction_tool().spec(),
+            ));
+        }
+        if self.enabled.usage_report {
+            definitions.push(ClientToolDefinition::new(
+                USAGE_REPORT_TOOL,
+                self.usage_report_tool().spec(),
+            ));
+        }
+        if let Some(tool) = self.image_generation_tool() {
+            definitions.push(ClientToolDefinition::new(GENERATE_IMAGE_TOOL, tool.spec()));
+        }
+        if let Some(tool) = self.video_generation_tool() {
+            definitions.push(ClientToolDefinition::new(GENERATE_VIDEO_TOOL, tool.spec()));
+        }
+        if let Some(tool) = self.audio_transcription_tool() {
+            definitions.push(ClientToolDefinition::new(
+                TRANSCRIBE_AUDIO_TOOL,
+                tool.spec(),
+            ));
+        }
+        if self.enabled.media_access.read {
+            definitions.push(ClientToolDefinition::new(
+                READ_ASSET_TOOL,
+                read_asset_spec(),
+            ));
+        }
+        if self.enabled.media_access.stat {
+            definitions.push(ClientToolDefinition::new(
+                STAT_ASSET_TOOL,
+                stat_asset_spec(),
+            ));
+        }
+        if self.enabled.media_access.public_url {
+            definitions.push(ClientToolDefinition::new(
+                PUBLIC_URL_ASSET_TOOL,
+                public_url_asset_spec(),
+            ));
+        }
+        if self.enabled.media_access.attach {
+            definitions.push(ClientToolDefinition::new(
+                ATTACH_ASSET_TOOL,
+                attach_asset_spec(),
+            ));
+        }
+        if self.enabled.memory.lookup {
+            definitions.push(ClientToolDefinition::new(
+                memory::LOOKUP_USER_MEMORY_TOOL,
+                memory::lookup_user_memory_spec(),
+            ));
+        }
+        if self.enabled.memory.remember {
+            definitions.push(ClientToolDefinition::new(
+                memory::REMEMBER_USER_MEMORY_TOOL,
+                memory::remember_user_memory_spec(),
+            ));
+        }
+        if self.enabled.memory.forget {
+            definitions.push(ClientToolDefinition::new(
+                memory::FORGET_USER_MEMORY_TOOL,
+                memory::forget_user_memory_spec(),
+            ));
+        }
+        for subagent in &self.subagents {
+            definitions.push(ClientToolDefinition::new(
+                subagent.name.clone(),
+                subagent.tool.spec(),
+            ));
+        }
+        definitions
+    }
+
+    async fn execute(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
+        let name = call.name.clone();
+        match name.as_str() {
+            FETCH_MESSAGES_TOOL if self.enabled.fetch_messages => self.fetch_messages(call).await,
+            POST_STATUS_TOOL if self.enabled.post_status => self.post_status(call).await,
+            ADD_REACTION_TOOL if self.enabled.add_reaction => self.add_reaction(call).await,
+            USAGE_REPORT_TOOL if self.enabled.usage_report => self.usage_report(call).await,
+            GENERATE_IMAGE_TOOL if self.image_generation.is_some() => {
+                self.generate_image(call).await
+            }
+            GENERATE_VIDEO_TOOL if self.video_generation.is_some() => {
+                self.generate_video(call).await
+            }
+            TRANSCRIBE_AUDIO_TOOL if self.audio_transcription.is_some() => {
+                self.transcribe_audio(call).await
+            }
+            READ_ASSET_TOOL if self.enabled.media_access.read => self.read_asset(call).await,
+            STAT_ASSET_TOOL if self.enabled.media_access.stat => self.stat_asset(call).await,
+            PUBLIC_URL_ASSET_TOOL if self.enabled.media_access.public_url => {
+                self.public_url_asset(call).await
+            }
+            ATTACH_ASSET_TOOL if self.enabled.media_access.attach => self.attach_asset(call).await,
+            memory::LOOKUP_USER_MEMORY_TOOL if self.enabled.memory.lookup => {
+                self.lookup_user_memory(call).await
+            }
+            memory::REMEMBER_USER_MEMORY_TOOL if self.enabled.memory.remember => {
+                self.remember_user_memory(call).await
+            }
+            memory::FORGET_USER_MEMORY_TOOL if self.enabled.memory.forget => {
+                self.forget_user_memory(call).await
+            }
+            _ => self.execute_subagent_or_unknown(call).await,
+        }
+    }
+}
+
+fn runtime_tool_execution_error(
+    error: impl std::fmt::Display,
+) -> ClientToolExecutorError<RuntimeToolError> {
+    ClientToolExecutorError::execution(RuntimeToolError(error.to_string()))
+}
+
+fn read_asset_spec() -> ClientToolSpec {
+    ClientToolSpec {
+        description: "Read a stored Chudbot image asset by file:// URI. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, and arbitrary filesystem paths are rejected. The tool returns metadata and makes the image visible to the next model step, but never returns raw bytes.".to_string(),
+        input_schema: asset_uri_tool_schema(),
+    }
+}
+
+fn stat_asset_spec() -> ClientToolSpec {
+    ClientToolSpec {
+        description: "Validate a stored Chudbot media URI and return whether it exists with MIME type and size metadata. This only checks media storage; it does not read or return file bytes.".to_string(),
+        input_schema: asset_uri_tool_schema(),
+    }
+}
+
+fn public_url_asset_spec() -> ClientToolSpec {
+    ClientToolSpec {
+        description: "Resolve a supported stored Chudbot media URI to its configured public URL when one is available. Images, videos, audio, and avatars are supported; unknown/non-media MIME types are rejected. This only returns metadata and a URL; it does not read or return file bytes.".to_string(),
+        input_schema: asset_uri_tool_schema(),
+    }
+}
+
+fn attach_asset_spec() -> ClientToolSpec {
+    ClientToolSpec {
+        description: "Attach an existing stored Chudbot image asset to the final platform reply. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, public URLs, and arbitrary filesystem paths are rejected. The tool queues the image for final delivery and never returns raw bytes.".to_string(),
+        input_schema: asset_uri_tool_schema(),
+    }
+}
+
+#[tracing::instrument(
+    name = "tool.media_access.read",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+async fn read_asset<M>(
+    media_store: &M,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, BotToolError>
+where
+    M: MediaStore,
+{
+    let uri = media_uri_from_tool_input(&call.input)?;
+    let media = media_store
+        .media_from_uri(&uri)
+        .await
+        .map_err(|error| BotToolError::Media(error.to_string()))?;
+    if !model_transcript_supports_media(media.as_ref()) {
+        tracing::warn!(
+            uri = %media.uri(),
+            category = ?media.category(),
+            mime_type = %media.mime_type(),
+            "read rejected unsupported media asset"
+        );
+        return Err(BotToolError::InvalidInput(format!(
+            "`read` only supports stored image assets with supported image MIME types; `{}` resolved as category `{:?}` with MIME type `{}`",
+            media.uri(),
+            media.category(),
+            media.mime_type()
+        )));
+    }
+
+    let value = media_access_metadata_json(
+        media.as_ref(),
+        serde_json::json!({
+            "exists": true,
+            "visible_to_model": true,
+            "content": {
+                "kind": "image",
+                "delivery": "attached_to_next_model_step",
+                "bytes_returned": false
+            }
+        }),
+    );
+    tracing::info!(
+        uri = %media.uri(),
+        mime_type = %media.mime_type(),
+        size_bytes = media.size_bytes(),
+        "read exposed stored image asset to model"
+    );
+    Ok(ClientToolOutput {
+        result: ClientToolResultContent::Json {
+            value: value.clone(),
+        },
+        media: vec![media],
+        is_error: false,
+        trace_response: value,
+        usage: Vec::new(),
+    })
+}
+
+#[tracing::instrument(
+    name = "tool.media_access.attach",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+async fn attach_asset<M>(
+    media_store: &M,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, BotToolError>
+where
+    M: MediaStore,
+{
+    let uri = media_uri_from_tool_input(&call.input)?;
+    let media = media_store
+        .media_from_uri(&uri)
+        .await
+        .map_err(|error| BotToolError::Media(error.to_string()))?;
+    if !attach_supports_media(media.as_ref()) {
+        tracing::warn!(
+            uri = %media.uri(),
+            category = ?media.category(),
+            mime_type = %media.mime_type(),
+            "attach rejected unsupported media asset"
+        );
+        return Err(BotToolError::InvalidInput(format!(
+            "`attach` only supports stored image assets; `{}` resolved as category `{:?}` with MIME type `{}`",
+            media.uri(),
+            media.category(),
+            media.mime_type()
+        )));
+    }
+
+    let value = media_access_metadata_json(
+        media.as_ref(),
+        serde_json::json!({
+            "exists": true,
+            "attached": true,
+            "delivery": {
+                "platform_reply": "The image will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown image links in user-facing text.",
+                "deduplication": "If this URI is already queued by generated media or another attach call, it will only be sent once."
+            }
+        }),
+    );
+    tracing::info!(
+        uri = %media.uri(),
+        mime_type = %media.mime_type(),
+        size_bytes = media.size_bytes(),
+        "queued stored image asset for final reply attachment"
+    );
+    Ok(ClientToolOutput {
+        result: ClientToolResultContent::Json {
+            value: value.clone(),
+        },
+        media: Vec::new(),
+        is_error: false,
+        trace_response: value,
+        usage: Vec::new(),
+    })
+}
+
+#[tracing::instrument(
+    name = "tool.media_access.stat",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+async fn stat_asset<M>(
+    media_store: &M,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, BotToolError>
+where
+    M: MediaStore,
+{
+    let uri = media_uri_from_tool_input(&call.input)?;
+    let value = match media_store.media_from_uri(&uri).await {
+        Ok(media) => media_access_metadata_json(
+            media.as_ref(),
+            serde_json::json!({
+                "exists": true,
+            }),
+        ),
+        Err(error) => serde_json::json!({
+            "uri": uri.as_str(),
+            "exists": false,
+            "error": error.to_string(),
+        }),
+    };
+    Ok(ClientToolOutput {
+        result: ClientToolResultContent::Json {
+            value: value.clone(),
+        },
+        media: Vec::new(),
+        is_error: false,
+        trace_response: value,
+        usage: Vec::new(),
+    })
+}
+
+#[tracing::instrument(
+    name = "tool.media_access.public_url",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+async fn public_url_asset<M>(
+    media_store: &M,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, BotToolError>
+where
+    M: MediaStore,
+{
+    let uri = media_uri_from_tool_input(&call.input)?;
+    let value = match media_store.media_from_uri(&uri).await {
+        Ok(media) if !public_url_supports_media(media.as_ref()) => media_access_metadata_json(
+            media.as_ref(),
+            serde_json::json!({
+                "exists": true,
+                "available": false,
+                "public_url": null,
+                "error": "unsupported media type for public_url",
+            }),
+        ),
+        Ok(media) => match media.public_url().await {
+            Ok(public_url) => media_access_metadata_json(
                 media.as_ref(),
                 serde_json::json!({
                     "exists": true,
+                    "available": true,
+                    "public_url": public_url.as_str(),
                 }),
             ),
-            Err(error) => serde_json::json!({
-                "uri": uri.as_str(),
-                "exists": false,
-                "error": error.to_string(),
-            }),
-        };
-        ClientToolOutput {
-            result: ClientToolResultContent::Json {
-                value: value.clone(),
-            },
-            media: Vec::new(),
-            is_error: false,
-            trace_response: value,
-            usage: Vec::new(),
-        }
-    }
-
-    async fn public_url(&self, uri: MediaUri) -> ClientToolOutput {
-        let value = match self.media_store.media_from_uri(&uri).await {
-            Ok(media) if !public_url_supports_media(media.as_ref()) => media_access_metadata_json(
+            Err(error) => media_access_metadata_json(
                 media.as_ref(),
                 serde_json::json!({
                     "exists": true,
                     "available": false,
                     "public_url": null,
-                    "error": "unsupported media type for public_url",
+                    "error": error.to_string(),
                 }),
             ),
-            Ok(media) => match media.public_url().await {
-                Ok(public_url) => media_access_metadata_json(
-                    media.as_ref(),
-                    serde_json::json!({
-                        "exists": true,
-                        "available": true,
-                        "public_url": public_url.as_str(),
-                    }),
-                ),
-                Err(error) => media_access_metadata_json(
-                    media.as_ref(),
-                    serde_json::json!({
-                        "exists": true,
-                        "available": false,
-                        "public_url": null,
-                        "error": error.to_string(),
-                    }),
-                ),
-            },
-            Err(error) => serde_json::json!({
-                "uri": uri.as_str(),
-                "exists": false,
-                "available": false,
-                "public_url": null,
-                "error": error.to_string(),
-            }),
-        };
-        ClientToolOutput {
-            result: ClientToolResultContent::Json {
-                value: value.clone(),
-            },
-            media: Vec::new(),
-            is_error: false,
-            trace_response: value,
-            usage: Vec::new(),
-        }
-    }
+        },
+        Err(error) => serde_json::json!({
+            "uri": uri.as_str(),
+            "exists": false,
+            "available": false,
+            "public_url": null,
+            "error": error.to_string(),
+        }),
+    };
+    Ok(ClientToolOutput {
+        result: ClientToolResultContent::Json {
+            value: value.clone(),
+        },
+        media: Vec::new(),
+        is_error: false,
+        trace_response: value,
+        usage: Vec::new(),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -4529,13 +4882,11 @@ impl<T, M> AudioTranscriptionTool<T, M> {
     }
 }
 
-impl<T, M> ClientTool for AudioTranscriptionTool<T, M>
+impl<T, M> AudioTranscriptionTool<T, M>
 where
     T: AudioTranscriber,
     M: MediaStore,
 {
-    type Error = BotToolError;
-
     fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.description.clone(),
@@ -4548,7 +4899,7 @@ where
         skip_all,
         fields(tool_call = %call.id)
     )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, BotToolError> {
         let mut request =
             audio_transcription_request_from_tool_input(&self.media_store, call.input).await?;
         append_default_audio_keyterms(&mut request.keyterms, &self.default_keyterms);
@@ -4794,14 +5145,12 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
     }
 }
 
-impl<G, M, S> ClientTool for PersistentVideoGeneratorTool<G, M, S>
+impl<G, M, S> PersistentVideoGeneratorTool<G, M, S>
 where
     G: VideoGenerator,
     M: MediaStore,
     S: PersistentVideoStorage,
 {
-    type Error = BotToolError;
-
     fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.description.clone(),
@@ -4820,7 +5169,7 @@ where
             tool_call = %call.id
         )
     )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, BotToolError> {
         let request = video_request_from_tool_input(&self.media_store, call.input).await?;
         let prompt = request.prompt.clone();
         let job_id = if let Some(rate_limit) = &self.rate_limit
@@ -4959,13 +5308,11 @@ struct FetchMessagesTool<P, S> {
     privacy: PrivacyMode,
 }
 
-impl<P, S> ClientTool for FetchMessagesTool<P, S>
+impl<P, S> FetchMessagesTool<P, S>
 where
     P: MessagePlatformRegistry + Clone,
     S: BotStorage + Clone,
 {
-    type Error = BotToolError;
-
     fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: "Fetch recent messages from the current channel for context.".to_string(),
@@ -5002,7 +5349,7 @@ where
             privacy = privacy_mode_kind(&self.privacy),
         )
     )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, BotToolError> {
         let channel = requested_channel(&self.default_channel, &call.input)?;
         if let PrivacyMode::ChannelOnly {
             channel: allowed, ..
@@ -5121,13 +5468,11 @@ struct PostStatusTool<P, S> {
     turn_id: TurnId,
 }
 
-impl<P, S> ClientTool for PostStatusTool<P, S>
+impl<P, S> PostStatusTool<P, S>
 where
     P: MessagePlatformRegistry + Clone,
     S: BotStorage + Clone,
 {
-    type Error = BotToolError;
-
     fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: "Post a short interim status reply before slow work.".to_string(),
@@ -5157,7 +5502,7 @@ where
             reply_to = %self.reply_to.message_id,
         )
     )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, BotToolError> {
         let text = call
             .input
             .get("text")
@@ -5225,12 +5570,10 @@ struct AddReactionTool<P> {
     message: MessageRef,
 }
 
-impl<P> ClientTool for AddReactionTool<P>
+impl<P> AddReactionTool<P>
 where
     P: MessagePlatformRegistry + Clone,
 {
-    type Error = BotToolError;
-
     fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: concat!(
@@ -5269,7 +5612,7 @@ where
             message = %self.message.message_id,
         )
     )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, BotToolError> {
         let emoji = reaction_emoji_from_tool_input(&call.input)?;
         tracing::debug!(emoji = %emoji, "adding reaction to current user message");
         self.platforms
@@ -5304,12 +5647,10 @@ struct UsageReportTool<S> {
     channel: ChannelRef,
 }
 
-impl<S> ClientTool for UsageReportTool<S>
+impl<S> UsageReportTool<S>
 where
     S: BotStorage + Clone,
 {
-    type Error = BotToolError;
-
     fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: concat!(
@@ -5362,7 +5703,7 @@ where
             channel = %self.channel.channel_id,
         )
     )]
-    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, Self::Error> {
+    async fn call(&self, call: ClientToolCall) -> Result<ClientToolOutput, BotToolError> {
         let request = usage_report_request(&call.input, &self.channel, OffsetDateTime::now_utc())?;
         let mut groups = self
             .storage
@@ -8845,16 +9186,17 @@ mod tests {
             uri,
             "https://chud.example/images/generated.jpg",
         ));
-        let tool = MediaAccessTool::new(store, MediaAccessKind::Read);
 
-        let output = tool
-            .call(ClientToolCall {
+        let output = read_asset(
+            &store,
+            ClientToolCall {
                 id: ToolUseId::new("call-1"),
                 name: ToolName::new(READ_ASSET_TOOL),
                 input: json!({ "uri": uri }),
-            })
-            .await
-            .expect("stored image should be readable");
+            },
+        )
+        .await
+        .expect("stored image should be readable");
 
         assert!(!output.is_error);
         assert_eq!(output.media.len(), 1);
@@ -8876,14 +9218,12 @@ mod tests {
             uri,
             "https://chud.example/images/generated.jpg",
         ));
-        let tool = MediaAccessTool::new(store.clone(), MediaAccessKind::Read);
         let call = ClientToolCall {
             id: ToolUseId::new("call-1"),
             name: ToolName::new(READ_ASSET_TOOL),
             input: json!({ "uri": uri }),
         };
-        let output = tool
-            .call(call.clone())
+        let output = read_asset(&store, call.clone())
             .await
             .expect("stored image should be readable");
         let result = chudbot_api::ClientToolResult {
@@ -8914,16 +9254,17 @@ mod tests {
             42,
             "https://chud.example/videos/generated.mp4",
         ));
-        let tool = MediaAccessTool::new(store, MediaAccessKind::Read);
 
-        let error = tool
-            .call(ClientToolCall {
+        let error = read_asset(
+            &store,
+            ClientToolCall {
                 id: ToolUseId::new("call-1"),
                 name: ToolName::new(READ_ASSET_TOOL),
                 input: json!({ "uri": uri }),
-            })
-            .await
-            .expect_err("videos should not be exposed through read");
+            },
+        )
+        .await
+        .expect_err("videos should not be exposed through read");
 
         assert!(
             matches!(error, BotToolError::InvalidInput(message) if message.contains("only supports stored image assets"))
@@ -8938,29 +9279,31 @@ mod tests {
             "application/pdf",
             "https://chud.example/images/upload.pdf",
         ));
-        let read = MediaAccessTool::new(store.clone(), MediaAccessKind::Read);
-        let public_url = MediaAccessTool::new(store, MediaAccessKind::PublicUrl);
 
-        let error = read
-            .call(ClientToolCall {
+        let error = read_asset(
+            &store,
+            ClientToolCall {
                 id: ToolUseId::new("call-1"),
                 name: ToolName::new(READ_ASSET_TOOL),
                 input: json!({ "uri": uri }),
-            })
-            .await
-            .expect_err("unsupported image MIME should not be exposed through read");
+            },
+        )
+        .await
+        .expect_err("unsupported image MIME should not be exposed through read");
         assert!(
             matches!(error, BotToolError::InvalidInput(message) if message.contains("only supports stored image assets"))
         );
 
-        let output = public_url
-            .call(ClientToolCall {
+        let output = public_url_asset(
+            &store,
+            ClientToolCall {
                 id: ToolUseId::new("call-2"),
                 name: ToolName::new(PUBLIC_URL_ASSET_TOOL),
                 input: json!({ "uri": uri }),
-            })
-            .await
-            .expect("public_url should return an availability payload");
+            },
+        )
+        .await
+        .expect("public_url should return an availability payload");
         let ClientToolResultContent::Json { value } = &output.result else {
             panic!("expected json result");
         };
@@ -8976,16 +9319,17 @@ mod tests {
             uri,
             "https://chud.example/images/generated.jpg",
         ));
-        let tool = MediaAccessTool::new(store, MediaAccessKind::Attach);
 
-        let output = tool
-            .call(ClientToolCall {
+        let output = attach_asset(
+            &store,
+            ClientToolCall {
                 id: ToolUseId::new("call-1"),
                 name: ToolName::new(ATTACH_ASSET_TOOL),
                 input: json!({ "uri": uri }),
-            })
-            .await
-            .expect("stored image should be attachable");
+            },
+        )
+        .await
+        .expect("stored image should be attachable");
 
         assert!(!output.is_error);
         assert!(output.media.is_empty());
@@ -9007,16 +9351,17 @@ mod tests {
             42,
             "https://chud.example/videos/generated.mp4",
         ));
-        let tool = MediaAccessTool::new(store, MediaAccessKind::Attach);
 
-        let error = tool
-            .call(ClientToolCall {
+        let error = attach_asset(
+            &store,
+            ClientToolCall {
                 id: ToolUseId::new("call-1"),
                 name: ToolName::new(ATTACH_ASSET_TOOL),
                 input: json!({ "uri": uri }),
-            })
-            .await
-            .expect_err("videos should not be attachable through attach");
+            },
+        )
+        .await
+        .expect_err("videos should not be attachable through attach");
 
         assert!(
             matches!(error, BotToolError::InvalidInput(message) if message.contains("only supports stored image assets"))
@@ -9043,16 +9388,17 @@ mod tests {
             "file://images/generated.jpg",
             "https://chud.example/images/generated.jpg",
         ));
-        let tool = MediaAccessTool::new(store, MediaAccessKind::Stat);
 
-        let output = tool
-            .call(ClientToolCall {
+        let output = stat_asset(
+            &store,
+            ClientToolCall {
                 id: ToolUseId::new("call-1"),
                 name: ToolName::new(STAT_ASSET_TOOL),
                 input: json!({ "uri": "file://images/missing.jpg" }),
-            })
-            .await
-            .expect("stat should return a pass/fail payload");
+            },
+        )
+        .await
+        .expect("stat should return a pass/fail payload");
 
         assert!(!output.is_error);
         assert!(output.media.is_empty());
