@@ -106,9 +106,11 @@ guessable conversation discovery.
 ## Engineering Rules
 
 - Follow [docs/rust-style.md](docs/rust-style.md).
-- Never use `serenity` or any crate that requires `async-trait`.
+- Never use `serenity`.
 - Use native async traits/RPITIT (`impl Future + Send` where crossing spawned
-  task or Axum boundaries needs it).
+  task or Axum boundaries needs it) for statically dispatched traits.
+- Avoid `async-trait` by default. It is allowed for deliberate trait-object
+  boundaries where the alternative is hand-written boxed future plumbing.
 - Keep `chudbot-api` free of Twilight, SQLx, Reqwest, Axum, and concrete
   provider config.
 - Prefer static dispatch and named registries over broad trait-object service

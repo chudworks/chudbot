@@ -121,9 +121,9 @@ pub use tool::{
 pub use media::{
     AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
     AudioTranscriptionRequest, BoxedMediaRef, CreateMedia, GeneratedImage, GeneratedVideo,
-    ImageGenerator, ImageRequest, LoadedMedia, MediaCategory, MediaError, MediaFuture,
-    MediaMetadata, MediaRef, MediaStore, MediaUri, PublicMediaUrl, UrlMediaRef, VideoGenerator,
-    VideoJobStatus, VideoMeta, VideoRequest,
+    ImageGenerator, ImageRequest, LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef,
+    MediaStore, MediaUri, PublicMediaUrl, UrlMediaRef, VideoGenerator, VideoJobStatus, VideoMeta,
+    VideoRequest,
 };
 
 // Usage records and aggregate query shapes let model, tool, media, and nested

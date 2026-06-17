@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chudbot_api::{
-    BoxedMediaRef, CreateMedia, LoadedMedia, MediaCategory, MediaError, MediaFuture, MediaMetadata,
-    MediaRef, MediaStore, MediaUri, PublicMediaUrl,
+    BoxedMediaRef, CreateMedia, LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef,
+    MediaStore, MediaUri, PublicMediaUrl,
 };
 use uuid::Uuid;
 
@@ -247,6 +247,7 @@ struct LocalMediaRef {
     metadata: MediaMetadata,
 }
 
+#[async_trait::async_trait]
 impl MediaRef for LocalMediaRef {
     fn metadata(&self) -> &MediaMetadata {
         &self.metadata
@@ -256,12 +257,12 @@ impl MediaRef for LocalMediaRef {
         Box::new(self.clone())
     }
 
-    fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
-        Box::pin(async move { self.store.public_url_for_uri(&self.metadata.uri).await })
+    async fn public_url(&self) -> Result<PublicMediaUrl, MediaError> {
+        self.store.public_url_for_uri(&self.metadata.uri).await
     }
 
-    fn load(&self) -> MediaFuture<'_, LoadedMedia> {
-        Box::pin(async move { self.store.load_local_media(&self.metadata).await })
+    async fn load(&self) -> Result<LoadedMedia, MediaError> {
+        self.store.load_local_media(&self.metadata).await
     }
 }
 

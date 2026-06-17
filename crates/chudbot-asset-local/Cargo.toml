@@ -6,6 +6,7 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 chudbot-api = { path = "../chudbot-api" }
 thiserror.workspace = true
 tokio.workspace = true

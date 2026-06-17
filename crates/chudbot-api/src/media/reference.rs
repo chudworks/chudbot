@@ -12,9 +12,6 @@
 //! [`super::MediaStore`] owns persistence and URI resolution, while provider
 //! crates consume only [`BoxedMediaRef`] values.
 
-use std::future::Future;
-use std::pin::Pin;
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -180,13 +177,6 @@ impl From<std::io::Error> for MediaError {
     }
 }
 
-/// Boxed media operation future.
-///
-/// [`MediaRef`] methods use this alias because trait-object methods cannot
-/// return `impl Future` directly. All media access failures are normalized to
-/// [`MediaError`] at this contract boundary.
-pub type MediaFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, MediaError>> + Send + 'a>>;
-
 /// Runtime media reference handle.
 ///
 /// This is the type stored in requests, transcripts, and tool payloads when a
@@ -200,6 +190,7 @@ pub type BoxedMediaRef = Box<dyn MediaRef>;
 /// Provider crates should depend only on this trait, not on a separate media
 /// storage service. This keeps media storage decisions out of provider
 /// contracts while still allowing providers to choose the access mode they need.
+#[async_trait::async_trait]
 pub trait MediaRef: std::fmt::Debug + Send + Sync {
     /// Static metadata for this media item.
     ///
@@ -218,13 +209,13 @@ pub trait MediaRef: std::fmt::Debug + Send + Sync {
     /// Implementations may mint signed or temporary URLs. Returning
     /// [`MediaError::NoPublicUrl`] is valid when the backend only supports byte
     /// loading.
-    fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl>;
+    async fn public_url(&self) -> Result<PublicMediaUrl, MediaError>;
 
     /// Load raw bytes.
     ///
     /// Returning [`MediaError::BytesUnavailable`] is valid for handles that are
     /// already public URLs or otherwise cannot load bytes inside this process.
-    fn load(&self) -> MediaFuture<'_, LoadedMedia>;
+    async fn load(&self) -> Result<LoadedMedia, MediaError>;
 
     /// Media category.
     fn category(&self) -> &MediaCategory {
@@ -304,6 +295,7 @@ impl UrlMediaRef {
     }
 }
 
+#[async_trait::async_trait]
 impl MediaRef for UrlMediaRef {
     fn metadata(&self) -> &MediaMetadata {
         &self.metadata
@@ -313,17 +305,15 @@ impl MediaRef for UrlMediaRef {
         Box::new(self.clone())
     }
 
-    fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
-        Box::pin(async move { Ok(self.url.clone()) })
+    async fn public_url(&self) -> Result<PublicMediaUrl, MediaError> {
+        Ok(self.url.clone())
     }
 
-    fn load(&self) -> MediaFuture<'_, LoadedMedia> {
-        Box::pin(async move {
-            // URL-backed refs intentionally do not fetch bytes in chudbot-api;
-            // provider or storage crates decide whether HTTP access is needed.
-            Err(MediaError::BytesUnavailable {
-                uri: self.uri().clone(),
-            })
+    async fn load(&self) -> Result<LoadedMedia, MediaError> {
+        // URL-backed refs intentionally do not fetch bytes in chudbot-api;
+        // provider or storage crates decide whether HTTP access is needed.
+        Err(MediaError::BytesUnavailable {
+            uri: self.uri().clone(),
         })
     }
 }

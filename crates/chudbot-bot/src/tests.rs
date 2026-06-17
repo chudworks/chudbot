@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chudbot_api::{
-    BoxedMediaRef, CreateMedia, ExternalId, LoadedMedia, MediaError, MediaFuture, MediaMetadata,
-    MediaRef, MediaStore, MediaUri, PlatformName, PostedMessage, PublicMediaUrl, VideoJobId,
+    BoxedMediaRef, CreateMedia, ExternalId, LoadedMedia, MediaError, MediaMetadata, MediaRef,
+    MediaStore, MediaUri, PlatformName, PostedMessage, PublicMediaUrl, VideoJobId,
 };
 use serde_json::json;
 use test_case::test_case;
@@ -307,6 +307,7 @@ struct RecordingMediaRef {
     public_url: Option<PublicMediaUrl>,
 }
 
+#[async_trait::async_trait]
 impl MediaRef for RecordingMediaRef {
     fn metadata(&self) -> &MediaMetadata {
         &self.metadata
@@ -316,22 +317,18 @@ impl MediaRef for RecordingMediaRef {
         Box::new(self.clone())
     }
 
-    fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
-        Box::pin(async move {
-            self.public_url
-                .clone()
-                .ok_or_else(|| MediaError::NoPublicUrl {
-                    uri: self.uri().clone(),
-                })
-        })
+    async fn public_url(&self) -> Result<PublicMediaUrl, MediaError> {
+        self.public_url
+            .clone()
+            .ok_or_else(|| MediaError::NoPublicUrl {
+                uri: self.uri().clone(),
+            })
     }
 
-    fn load(&self) -> MediaFuture<'_, LoadedMedia> {
-        Box::pin(async move {
-            Ok(LoadedMedia {
-                media: self.clone_box(),
-                bytes: self.bytes.clone(),
-            })
+    async fn load(&self) -> Result<LoadedMedia, MediaError> {
+        Ok(LoadedMedia {
+            media: self.clone_box(),
+            bytes: self.bytes.clone(),
         })
     }
 }
@@ -1293,6 +1290,7 @@ impl PromptMediaRef {
     }
 }
 
+#[async_trait::async_trait]
 impl MediaRef for PromptMediaRef {
     fn metadata(&self) -> &MediaMetadata {
         &self.metadata
@@ -1302,15 +1300,13 @@ impl MediaRef for PromptMediaRef {
         Box::new(self.clone())
     }
 
-    fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
-        Box::pin(async move { Ok(self.public_url.clone()) })
+    async fn public_url(&self) -> Result<PublicMediaUrl, MediaError> {
+        Ok(self.public_url.clone())
     }
 
-    fn load(&self) -> MediaFuture<'_, chudbot_api::LoadedMedia> {
-        Box::pin(async move {
-            Err(MediaError::BytesUnavailable {
-                uri: self.metadata.uri.clone(),
-            })
+    async fn load(&self) -> Result<chudbot_api::LoadedMedia, MediaError> {
+        Err(MediaError::BytesUnavailable {
+            uri: self.metadata.uri.clone(),
         })
     }
 }
@@ -1356,6 +1352,7 @@ impl ReplyMediaRef {
     }
 }
 
+#[async_trait::async_trait]
 impl MediaRef for ReplyMediaRef {
     fn metadata(&self) -> &MediaMetadata {
         &self.metadata
@@ -1365,22 +1362,18 @@ impl MediaRef for ReplyMediaRef {
         Box::new(self.clone())
     }
 
-    fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
-        Box::pin(async move {
-            self.public_url
-                .clone()
-                .ok_or_else(|| MediaError::NoPublicUrl {
-                    uri: self.uri().clone(),
-                })
-        })
+    async fn public_url(&self) -> Result<PublicMediaUrl, MediaError> {
+        self.public_url
+            .clone()
+            .ok_or_else(|| MediaError::NoPublicUrl {
+                uri: self.uri().clone(),
+            })
     }
 
-    fn load(&self) -> MediaFuture<'_, LoadedMedia> {
-        Box::pin(async move {
-            Ok(LoadedMedia {
-                media: self.clone_box(),
-                bytes: self.bytes.clone(),
-            })
+    async fn load(&self) -> Result<LoadedMedia, MediaError> {
+        Ok(LoadedMedia {
+            media: self.clone_box(),
+            bytes: self.bytes.clone(),
         })
     }
 }

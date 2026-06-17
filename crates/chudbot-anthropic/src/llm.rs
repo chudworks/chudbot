@@ -694,9 +694,9 @@ impl CacheCreationUsage {
 #[cfg(test)]
 mod tests {
     use chudbot_api::{
-        ClientToolResult, ClientToolResultContent, LoadedMedia, MediaCategory, MediaFuture,
-        MediaMetadata, MediaRef, MediaUri, ProviderName, PublicMediaUrl, ToolUseId, TranscriptTurn,
-        TurnRole, UrlMediaRef,
+        ClientToolResult, ClientToolResultContent, LoadedMedia, MediaCategory, MediaMetadata,
+        MediaRef, MediaUri, ProviderName, PublicMediaUrl, ToolUseId, TranscriptTurn, TurnRole,
+        UrlMediaRef,
     };
     use serde_json::json;
 
@@ -725,6 +725,7 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl MediaRef for LoadablePublicMediaRef {
         fn metadata(&self) -> &MediaMetadata {
             &self.metadata
@@ -734,15 +735,15 @@ mod tests {
             Box::new(self.clone())
         }
 
-        fn public_url(&self) -> MediaFuture<'_, PublicMediaUrl> {
-            let public_url = self.public_url.clone();
-            Box::pin(async move { Ok(public_url) })
+        async fn public_url(&self) -> Result<PublicMediaUrl, chudbot_api::MediaError> {
+            Ok(self.public_url.clone())
         }
 
-        fn load(&self) -> MediaFuture<'_, LoadedMedia> {
-            let media = self.clone_box();
-            let bytes = self.bytes.clone();
-            Box::pin(async move { Ok(LoadedMedia { media, bytes }) })
+        async fn load(&self) -> Result<LoadedMedia, chudbot_api::MediaError> {
+            Ok(LoadedMedia {
+                media: self.clone_box(),
+                bytes: self.bytes.clone(),
+            })
         }
     }
 

@@ -18,4 +18,5 @@ tracing.workspace = true
 unicode-properties.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 test-case.workspace = true

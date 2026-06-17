@@ -119,6 +119,8 @@ fn get_names(users: &[User]) -> impl Iterator<Item = &str> {
 
 **Avoid boxing futures and streams.** Use `impl Future` / `impl Stream` instead of `Box<dyn Future>` / `Box<dyn Stream>`.
 
+**Avoid `async-trait` by default.** Native async traits/RPITIT are preferred for statically dispatched traits. Use `async-trait` only at deliberate trait-object boundaries where the design already needs `dyn Trait` and the alternative is hand-written `Pin<Box<dyn Future<...>>>` plumbing.
+
 **Use lifetime elision** whenever the compiler can infer them. Don't write explicit lifetimes unless required.
 
 **Use `where` clauses instead of inline bounds.**
