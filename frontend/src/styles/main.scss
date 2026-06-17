@@ -143,7 +143,7 @@ header.conv-header {
 
     &__metrics {
         display: grid;
-        grid-template-columns: repeat(5, minmax(0, 1fr));
+        grid-template-columns: repeat(auto-fit, minmax(8.5rem, 1fr));
         gap: 0.55rem;
     }
 
@@ -154,7 +154,7 @@ header.conv-header {
         background: var(--card);
         padding: 0.55rem 0.65rem;
 
-        span {
+        &-label {
             display: block;
             color: var(--muted);
             font-size: 0.75rem;
@@ -169,6 +169,10 @@ header.conv-header {
             line-height: 1.25;
             font-variant-numeric: tabular-nums;
         }
+    }
+
+    &__context-separator {
+        color: #555;
     }
 
     &__details {

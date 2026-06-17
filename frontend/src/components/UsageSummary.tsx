@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { CostAmount, ModelInfo, ToolTrace, TurnView, UsageRecord, UsageSubject } from '../types';
 
 interface Props {
@@ -36,10 +37,8 @@ type UsageGroup = {
 };
 
 type ContextUsage = {
-  provider: string;
-  model: string;
   usedTokens: number;
-  limitTokens: number | null;
+  limitTokens: number;
 };
 
 const USD_TICKS_PER_DOLLAR = 10_000_000_000;
@@ -56,7 +55,7 @@ export default function UsageSummary({ turns, modelInfo }: Props) {
     <section className="usage-summary" aria-label="Conversation usage">
       <div className="usage-summary__metrics">
         <UsageMetric label="Cost" value={formatCosts(summary.costs)} />
-        <UsageMetric label="Context" value={formatContextUsage(contextUsage)} />
+        {contextUsage && <UsageMetric label="Context" value={<ContextUsageValue usage={contextUsage} />} />}
         <UsageMetric label="Total tokens" value={formatMetric(summary.totalTokens)} />
         <UsageMetric label="Reasoning" value={formatMetric(summary.reasoningTokens)} />
         <UsageMetric label="Cached input" value={formatMetric(summary.cachedTokens)} />
@@ -107,12 +106,22 @@ export default function UsageSummary({ turns, modelInfo }: Props) {
   );
 }
 
-function UsageMetric({ label, value }: { label: string; value: string }) {
+function UsageMetric({ label, value }: { label: string; value: ReactNode }) {
   return (
     <div className="usage-summary__metric">
-      <span>{label}</span>
+      <span className="usage-summary__metric-label">{label}</span>
       <strong>{value}</strong>
     </div>
+  );
+}
+
+function ContextUsageValue({ usage }: { usage: ContextUsage }) {
+  return (
+    <>
+      {formatCompactTokens(usage.usedTokens)}
+      <span className="usage-summary__context-separator"> / </span>
+      {formatCompactTokens(usage.limitTokens)}
+    </>
   );
 }
 
@@ -133,11 +142,11 @@ function currentContextUsage(turns: TurnView[], modelInfo: ModelInfo[]): Context
       const model = record.model ?? turn.turn.model;
       if (!model) continue;
       const info = infoByModel.get(modelInfoKey(record.provider, model));
+      const limitTokens = finiteNumber(info?.context_window_tokens);
+      if (limitTokens == null || limitTokens <= 0) return null;
       return {
-        provider: record.provider,
-        model,
         usedTokens: inputTokens + outputTokens,
-        limitTokens: finiteNumber(info?.context_window_tokens) ?? null,
+        limitTokens,
       };
     }
   }
@@ -324,34 +333,22 @@ function formatMetric(metric: Metric): string {
   return metric.seen ? formatNumber(metric.value) : 'n/a';
 }
 
-function formatContextUsage(usage: ContextUsage | null): string {
-  if (!usage) return 'n/a';
-  if (usage.limitTokens == null || usage.limitTokens <= 0) {
-    return `${formatTokenK(usage.usedTokens)} used, limit unknown`;
-  }
-  const percent = usage.usedTokens / usage.limitTokens;
-  return `${formatTokenK(usage.usedTokens)} used of ${formatTokenK(usage.limitTokens)} (${formatPercent(percent)})`;
-}
-
-function formatPercent(value: number): string {
-  return new Intl.NumberFormat(undefined, {
-    style: 'percent',
-    minimumFractionDigits: value > 0 && value < 0.01 ? 1 : 0,
-    maximumFractionDigits: 1,
-  }).format(value);
-}
-
 function formatNumber(value: number): string {
   return new Intl.NumberFormat().format(value);
 }
 
-function formatTokenK(value: number): string {
-  if (Math.abs(value) < 1000) return formatNumber(Math.round(value));
-  const thousands = value / 1000;
-  const formatted = new Intl.NumberFormat(undefined, {
+function formatCompactTokens(value: number): string {
+  const abs = Math.abs(value);
+  if (abs < 1000) return formatNumber(Math.round(value));
+  if (abs < 999_950) return `${formatCompactDecimal(value / 1000)}k`;
+  if (abs < 999_950_000) return `${formatCompactDecimal(value / 1_000_000)}M`;
+  return `${formatCompactDecimal(value / 1_000_000_000)}B`;
+}
+
+function formatCompactDecimal(value: number): string {
+  return new Intl.NumberFormat(undefined, {
     maximumFractionDigits: 1,
-  }).format(thousands);
-  return `${formatted}k`;
+  }).format(value);
 }
 
 function providerModelLabel(provider: string, model: string | null): string {
