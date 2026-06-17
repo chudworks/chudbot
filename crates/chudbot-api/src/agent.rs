@@ -1,4 +1,4 @@
-//! Provider-neutral agent runtime and sub-agent adapters.
+//! Provider-neutral agent runtime.
 //!
 //! This module is the orchestration contract between a configured model,
 //! provider-neutral transcripts, and locally executed client tools. It does not
@@ -19,14 +19,9 @@
 //! 4. The final [`AgentRun`] returns the completed transcript, provider
 //!    continuation data, trace records, and usage records that higher layers can
 //!    persist.
-//!
-//! [`Subagent`] reuses the same runner contract to expose one configured agent
-//! as a client-side tool for another agent.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::future::Future;
-use std::pin::Pin;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -39,7 +34,7 @@ use crate::storage::{ModelStepKind, ModelStepTrace};
 use crate::tool::{
     ClientToolCall, ClientToolDefinition, ClientToolExecutor, ClientToolExecutorError,
     ClientToolOutput, ClientToolResult, ClientToolResultContent, ClientToolSpec, ClientToolTrace,
-    NoClientTools, ToolInputSchema, ToolTrace,
+    NoClientTools, ToolTrace,
 };
 use crate::transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptTurn, TurnRole};
 use crate::usage::UsageRecord;
@@ -129,18 +124,6 @@ where
             model,
             spec,
             tool_executor,
-        }
-    }
-
-    /// Convert this agent into a client-side tool for another agent.
-    ///
-    /// The returned [`Subagent`] contains the nested runtime and its model-facing
-    /// description. The outer executor still chooses the actual tool name when
-    /// registering it.
-    pub fn into_subagent(self, tool_description: impl Into<String>) -> Subagent<B, T> {
-        Subagent {
-            agent: self,
-            tool_description: tool_description.into(),
         }
     }
 }
@@ -850,197 +833,6 @@ fn answer_from_content(content: Vec<ContentBlock>) -> AssistantAnswer {
     }
 }
 
-/// An agent exposed as one client-side tool.
-///
-/// `Subagent` owns a full nested [`Agent`] and turns a parent model's tool call
-/// into a one-turn [`Transcript`] for that nested agent. It deliberately does
-/// not store the tool name: the outer [`ClientToolExecutor`] owns registration
-/// and dispatch, while this type owns only the model-facing description and the
-/// nested run behavior.
-#[derive(Debug)]
-pub struct Subagent<B, T: ClientToolExecutor = NoClientTools> {
-    /// Nested agent runtime.
-    agent: Agent<B, T>,
-    /// Tool description exposed to the parent model.
-    tool_description: String,
-}
-
-impl<B, T> Subagent<B, T>
-where
-    B: LlmBackend,
-    T: ClientToolExecutor,
-{
-    /// Build the tool specification shown to a parent model.
-    ///
-    /// Every subagent accepts the same JSON input shape: an object with a
-    /// `prompt` string. The configured description tells the parent model when
-    /// this nested agent is useful.
-    pub fn spec(&self) -> ClientToolSpec {
-        ClientToolSpec {
-            description: self.tool_description.clone(),
-            input_schema: prompt_input_schema(),
-        }
-    }
-
-    /// Execute one parent-model tool call by running the nested agent.
-    ///
-    /// This returns a boxed future so the runtime executor can store
-    /// heterogeneous subagents behind one wrapper, while the nested agent itself
-    /// still uses the generic [`LlmBackend`] and [`ClientToolExecutor`]
-    /// contracts internally.
-    pub fn call(
-        &self,
-        call: ClientToolCall,
-    ) -> Pin<Box<dyn Future<Output = Result<ClientToolOutput, AgentRunError<B::Error>>> + Send + '_>>
-    {
-        let future: Pin<
-            Box<dyn Future<Output = Result<ClientToolOutput, AgentRunError<B::Error>>> + Send + '_>,
-        > = Box::pin(async move {
-            let span = tracing::debug_span!(
-                "subagent.call",
-                tool = %call.name,
-                tool_use_id = %call.id
-            );
-            async move {
-                tracing::debug!("starting subagent tool call");
-                // The registration name has already selected this subagent.
-                // Only the parent-provided input becomes nested model context.
-                let run = self
-                    .agent
-                    .run(self.transcript_for_input(call.input))
-                    .await?;
-                tracing::debug!(
-                    outcome = agent_outcome_kind(&run.outcome),
-                    usage_records = run.all_usage().len(),
-                    trace_records = run.trace.len(),
-                    "subagent tool call finished"
-                );
-                Ok(self.output_from_run(&run))
-            }
-            .instrument(span)
-            .await
-        });
-        future
-    }
-}
-
-impl<B, T> Subagent<B, T>
-where
-    B: LlmBackend,
-    T: ClientToolExecutor,
-{
-    /// Convert the parent tool input into the nested agent's user message.
-    fn transcript_for_input(&self, input: serde_json::Value) -> Transcript {
-        let mut transcript = Transcript::new();
-        transcript.push(TranscriptTurn::text(TurnRole::User, tool_input_text(input)));
-        transcript
-    }
-
-    /// Convert the nested run into the generic client-tool output contract.
-    ///
-    /// The parent model only receives a text result plus an `is_error` flag.
-    /// Full nested trace/usage detail is packed into `trace_response` and
-    /// `usage` for persistence by the caller.
-    fn output_from_run(&self, run: &AgentRun) -> ClientToolOutput {
-        let (result, is_error) = match &run.outcome {
-            AgentOutcome::Completed { answer } => (
-                ClientToolResultContent::Text {
-                    text: answer.text.clone(),
-                },
-                false,
-            ),
-            AgentOutcome::Failed { error, .. } => (
-                ClientToolResultContent::Text {
-                    text: format!("sub-agent failed: {error}"),
-                },
-                true,
-            ),
-            AgentOutcome::IterationLimit { max_iterations } => (
-                ClientToolResultContent::Text {
-                    text: format!("sub-agent hit iteration limit ({max_iterations})"),
-                },
-                true,
-            ),
-            AgentOutcome::Cancelled { reason } => (
-                ClientToolResultContent::Text {
-                    text: format!("sub-agent was cancelled: {reason}"),
-                },
-                true,
-            ),
-        };
-        ClientToolOutput {
-            result,
-            media: Vec::new(),
-            is_error,
-            trace_response: subagent_trace_response(run),
-            usage: run.all_usage(),
-        }
-    }
-}
-
-/// JSON Schema for all subagent tool inputs.
-fn prompt_input_schema() -> ToolInputSchema {
-    ToolInputSchema::new(serde_json::json!({
-        "type": "object",
-        "required": ["prompt"],
-        "properties": {
-            "prompt": {
-                "type": "string",
-                "description": "The task or question for the sub-agent."
-            }
-        },
-        "additionalProperties": false
-    }))
-}
-
-/// Extract the prompt string from a subagent call input.
-///
-/// Falling back to the whole JSON value keeps malformed inputs observable to
-/// the nested model instead of dropping context on the floor.
-fn tool_input_text(input: serde_json::Value) -> String {
-    input
-        .get("prompt")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| input.to_string())
-}
-
-/// Serialize the nested run summary into one trace payload.
-fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
-    match &run.outcome {
-        AgentOutcome::Completed { answer } => serde_json::json!({
-            "outcome": "completed",
-            "text": answer.text,
-            "usage": run.all_usage(),
-        }),
-        AgentOutcome::Failed { error, .. } => serde_json::json!({
-            "outcome": "failed",
-            "error": error.to_string(),
-            "usage": run.all_usage(),
-        }),
-        AgentOutcome::IterationLimit { max_iterations } => serde_json::json!({
-            "outcome": "iteration_limit",
-            "max_iterations": max_iterations,
-            "usage": run.all_usage(),
-        }),
-        AgentOutcome::Cancelled { reason } => serde_json::json!({
-            "outcome": "cancelled",
-            "reason": reason,
-            "usage": run.all_usage(),
-        }),
-    }
-}
-
-/// Low-cardinality outcome label for structured logs.
-fn agent_outcome_kind(outcome: &AgentOutcome) -> &'static str {
-    match outcome {
-        AgentOutcome::Completed { .. } => "completed",
-        AgentOutcome::Failed { .. } => "failed",
-        AgentOutcome::IterationLimit { .. } => "iteration_limit",
-        AgentOutcome::Cancelled { .. } => "cancelled",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -1052,7 +844,7 @@ mod tests {
 
     use crate::ids::{ProviderName, ToolUseId};
     use crate::llm::{ModelSpec, SamplingOptions};
-    use crate::usage::UsageSubject;
+    use crate::tool::ToolInputSchema;
 
     use super::*;
 
@@ -1151,103 +943,6 @@ mod tests {
                 usage: Vec::new(),
             })
         }
-    }
-
-    #[derive(Debug, Clone)]
-    struct RecordingBackend {
-        name: ProviderName,
-        requests: Arc<Mutex<Vec<crate::llm::ModelStepRequest>>>,
-        step: AssistantStep,
-    }
-
-    impl LlmBackend for RecordingBackend {
-        type Error = TestError;
-
-        fn backend_name(&self) -> &ProviderName {
-            &self.name
-        }
-
-        async fn step(
-            &self,
-            request: crate::llm::ModelStepRequest,
-        ) -> Result<ModelStep, Self::Error> {
-            self.requests.lock().unwrap().push(request);
-            Ok(ModelStep::Final {
-                step: self.step.clone(),
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn subagent_exposes_spec_and_executes_nested_agent() {
-        let usage = UsageRecord {
-            provider: ProviderName::new("openai"),
-            model: Some(ModelId::new("gpt-5")),
-            subject: UsageSubject::ModelStep,
-            input_tokens: Some(100),
-            cached_input_tokens: Some(25),
-            output_tokens: Some(40),
-            reasoning_tokens: Some(10),
-            total_tokens: Some(140),
-            cost: None,
-            raw: None,
-        };
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let backend = RecordingBackend {
-            name: ProviderName::new("openai"),
-            requests: requests.clone(),
-            step: AssistantStep {
-                content: vec![ContentBlock::Text {
-                    text: "use VTI".to_string(),
-                }],
-                client_tool_calls: Vec::new(),
-                server_tool_uses: Vec::new(),
-                grounding: Vec::new(),
-                model_id: ModelId::new("gpt-5"),
-                continuation: None,
-                usage: vec![usage],
-            },
-        };
-        let agent = Agent::new(test_model(backend), AgentSpec::new("expert"), NoClientTools);
-
-        let subagent = agent.into_subagent("Ask the OpenAI expert for a second opinion.");
-        let spec = subagent.spec();
-        assert_eq!(
-            spec.description,
-            "Ask the OpenAI expert for a second opinion."
-        );
-        assert!(
-            spec.input_schema
-                .as_json_schema()
-                .get("properties")
-                .is_some()
-        );
-
-        let output = subagent
-            .call(ClientToolCall {
-                id: ToolUseId::new("call-1"),
-                name: ToolName::new("ask_openai_expert"),
-                input: json!({ "prompt": "Which total-market ETF is best?" }),
-            })
-            .await
-            .unwrap();
-
-        assert!(!output.is_error);
-        assert_eq!(output.usage.len(), 1);
-        match output.result {
-            ClientToolResultContent::Text { text } => assert_eq!(text, "use VTI"),
-            ClientToolResultContent::Json { .. } => panic!("expected text output"),
-        }
-
-        let inputs = requests.lock().unwrap();
-        assert_eq!(inputs.len(), 1);
-        assert_eq!(inputs[0].transcript.instructions.as_deref(), Some("expert"));
-        assert_eq!(inputs[0].transcript.turns.len(), 1);
-        assert_text_block(
-            &inputs[0].transcript.turns[0],
-            TurnRole::User,
-            "Which total-market ETF is best?",
-        );
     }
 
     #[tokio::test]
@@ -1692,38 +1387,6 @@ mod tests {
         let mut observed = result_order.lock().unwrap().clone();
         observed.sort();
         assert_eq!(observed, vec!["call-1".to_string(), "call-2".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn subagent_ignores_registration_name() {
-        let backend = RecordingBackend {
-            name: ProviderName::new("openai"),
-            requests: Arc::new(Mutex::new(Vec::new())),
-            step: AssistantStep {
-                content: vec![ContentBlock::Text {
-                    text: "ok".to_string(),
-                }],
-                client_tool_calls: Vec::new(),
-                server_tool_uses: Vec::new(),
-                grounding: Vec::new(),
-                model_id: ModelId::new("gpt-5"),
-                continuation: None,
-                usage: Vec::new(),
-            },
-        };
-        let agent = Agent::new(test_model(backend), AgentSpec::new("expert"), NoClientTools);
-        let subagent = agent.into_subagent("Ask the OpenAI expert.");
-
-        let output = subagent
-            .call(ClientToolCall {
-                id: ToolUseId::new("call-1"),
-                name: ToolName::new("registered_elsewhere"),
-                input: json!({ "prompt": "hello" }),
-            })
-            .await
-            .unwrap();
-
-        assert!(!output.is_error);
     }
 
     fn assert_text_block(message: &TranscriptTurn, role: TurnRole, text: &str) {

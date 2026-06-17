@@ -8,6 +8,10 @@
 use crate::prelude::*;
 use crate::*;
 
+/// Concrete agent assembled for conversation turns and recursive subagent calls.
+type ConversationAgent<R> =
+    Agent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
+
 impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
@@ -31,7 +35,7 @@ where
         turn_id: TurnId,
         top_level: bool,
         stack: &mut Vec<String>,
-    ) -> Result<RuntimeAgent<R>, BotError> {
+    ) -> Result<ConversationAgent<R>, BotError> {
         self.ensure_agent_services_exist(agent_name, agent_config)?;
 
         // Only the active expansion path is recursive. Sibling subagents may
@@ -144,8 +148,6 @@ where
         tool_executor.enabled.media_access.attach = true;
 
         for (tool_name, binding) in &agent_config.subagents {
-            // Subagents are recursively built with their own executor. Boxing only hides
-            // the nested agent/tool-executor type; tool dispatch remains static inside it.
             let (subagent_name, subagent_config) = self
                 .config
                 .agent_or_platform_default(Some(&binding.agent), &reply_to.platform)?;
@@ -171,10 +173,10 @@ where
                 false,
                 stack,
             )?;
-            tool_executor.subagents.push(RuntimeSubagent {
-                name: tool_name.clone(),
-                tool: Box::new(nested.into_subagent(binding.description.clone())),
-            });
+            tool_executor.subagents.insert(
+                tool_name.clone(),
+                Subagent::new(binding.description.clone(), nested),
+            );
         }
 
         // Successful expansion removes this node from the active path before

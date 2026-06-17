@@ -7,6 +7,7 @@
 //! results into transcript blocks, and recording client tool traces for storage.
 
 use super::*;
+use tracing::Instrument;
 
 /// Runtime tool execution error after tool-specific errors are stringified.
 ///
@@ -24,30 +25,73 @@ impl std::fmt::Display for RuntimeToolError {
 
 impl std::error::Error for RuntimeToolError {}
 
-/// Runtime agent type wired to routed LLM providers and Chudbot client tools.
-pub(crate) type RuntimeAgent<R> =
-    Agent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
-
-/// Boxed subagent tool type used when config creates recursive agent graphs.
-pub(crate) type RuntimeSubagentTool<R> =
-    Subagent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
-
-/// One configured subagent exposed as a named client tool.
-pub(crate) struct RuntimeSubagent<R: BotRuntimeTypes> {
-    /// Tool name advertised to the parent model.
-    pub(crate) name: ToolName,
-    /// Nested agent tool. Boxed so recursive config graphs have a finite size.
-    pub(crate) tool: Box<RuntimeSubagentTool<R>>,
+/// One configured agent exposed as a named client tool by its parent executor.
+pub(crate) struct Subagent<B, T = NoClientTools> {
+    /// Model-facing tool description.
+    description: String,
+    /// Nested agent runtime.
+    agent: Agent<B, T>,
 }
 
-impl<R> std::fmt::Debug for RuntimeSubagent<R>
-where
-    R: BotRuntimeTypes,
-{
+impl<B, T> std::fmt::Debug for Subagent<B, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RuntimeSubagent")
-            .field("name", &self.name)
+        f.debug_struct("Subagent")
+            .field("description", &self.description)
             .finish_non_exhaustive()
+    }
+}
+
+impl<B, T> Subagent<B, T> {
+    /// Build a configured subagent tool from a nested agent.
+    pub(crate) fn new(description: impl Into<String>, agent: Agent<B, T>) -> Self {
+        Self {
+            description: description.into(),
+            agent,
+        }
+    }
+}
+
+impl<B, T> Subagent<B, T>
+where
+    B: chudbot_api::LlmBackend,
+    T: ClientToolExecutor,
+{
+    /// Build the tool specification shown to a parent model.
+    pub(crate) fn spec(&self) -> ClientToolSpec {
+        ClientToolSpec {
+            description: self.description.clone(),
+            input_schema: subagent_input_schema(),
+        }
+    }
+
+    /// Execute a parent-model tool call by running the nested agent.
+    pub(crate) fn call(
+        &self,
+        call: ClientToolCall,
+    ) -> impl Future<Output = Result<ClientToolOutput, AgentRunError<B::Error>>> + Send + '_ {
+        async move {
+            let span = tracing::debug_span!(
+                "subagent.call",
+                tool = %call.name,
+                tool_use_id = %call.id
+            );
+            async move {
+                tracing::debug!("starting subagent tool call");
+                let run = self
+                    .agent
+                    .run(subagent_transcript_for_input(call.input))
+                    .await?;
+                tracing::debug!(
+                    outcome = subagent_outcome_kind(&run.outcome),
+                    usage_records = run.all_usage().len(),
+                    trace_records = run.trace.len(),
+                    "subagent tool call finished"
+                );
+                Ok(subagent_output_from_run(&run))
+            }
+            .instrument(span)
+            .await
+        }
     }
 }
 
@@ -169,7 +213,8 @@ pub(crate) struct RuntimeToolExecutor<R: BotRuntimeTypes> {
     /// Configured audio-transcription binding exposed as `transcribe_audio`.
     pub(crate) audio_transcription: Option<TranscriptionBinding>,
     /// Configured subagents exposed as additional named client tools.
-    pub(crate) subagents: Vec<RuntimeSubagent<R>>,
+    pub(crate) subagents:
+        BTreeMap<ToolName, Subagent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, Self>>,
 }
 
 impl<R> std::fmt::Debug for RuntimeToolExecutor<R>
@@ -317,11 +362,8 @@ where
                 forget_user_memory_spec(),
             ));
         }
-        for subagent in &self.subagents {
-            definitions.push(ClientToolDefinition::new(
-                subagent.name.clone(),
-                subagent.tool.spec(),
-            ));
+        for (name, subagent) in &self.subagents {
+            definitions.push(ClientToolDefinition::new(name.clone(), subagent.spec()));
         }
         definitions
     }
@@ -341,7 +383,7 @@ where
             image_generation: None,
             video_generation: None,
             audio_transcription: None,
-            subagents: Vec::new(),
+            subagents: BTreeMap::new(),
         }
     }
 
@@ -614,21 +656,125 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
-        let name = call.name.clone();
-        let Some(subagent) = self
-            .subagents
-            .iter()
-            .find(|subagent| subagent.name.as_str() == name.as_str())
-        else {
-            return Err(ClientToolExecutorError::unknown(name));
-        };
-        // Subagents use the same client-tool output contract. Their nested
-        // trace is packed into `trace_response` by `Subagent::call`.
-        subagent
-            .tool
-            .call(call)
-            .await
-            .map_err(runtime_tool_execution_error)
+        if let Some(subagent) = self.subagents.get(&call.name) {
+            // Subagents use the same client-tool output contract. Their nested
+            // trace is packed into `trace_response` by `Subagent::call`.
+            return subagent
+                .call(call)
+                .await
+                .map_err(runtime_tool_execution_error);
+        }
+        Err(ClientToolExecutorError::unknown(call.name))
+    }
+}
+
+/// JSON Schema for all subagent tool inputs.
+fn subagent_input_schema() -> ToolInputSchema {
+    ToolInputSchema::new(serde_json::json!({
+        "type": "object",
+        "required": ["prompt"],
+        "properties": {
+            "prompt": {
+                "type": "string",
+                "description": "The task or question for the sub-agent."
+            }
+        },
+        "additionalProperties": false
+    }))
+}
+
+/// Convert the parent tool input into the nested agent's user message.
+fn subagent_transcript_for_input(input: serde_json::Value) -> Transcript {
+    let mut transcript = Transcript::new();
+    transcript.push(TranscriptTurn::text(
+        TurnRole::User,
+        subagent_input_text(input),
+    ));
+    transcript
+}
+
+/// Extract the prompt string from a subagent call input.
+///
+/// Falling back to the whole JSON value keeps malformed inputs observable to
+/// the nested model instead of dropping context on the floor.
+fn subagent_input_text(input: serde_json::Value) -> String {
+    input
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| input.to_string())
+}
+
+/// Convert the nested run into the generic client-tool output contract.
+fn subagent_output_from_run(run: &AgentRun) -> ClientToolOutput {
+    let (result, is_error) = match &run.outcome {
+        AgentOutcome::Completed { answer } => (
+            ClientToolResultContent::Text {
+                text: answer.text.clone(),
+            },
+            false,
+        ),
+        AgentOutcome::Failed { error, .. } => (
+            ClientToolResultContent::Text {
+                text: format!("sub-agent failed: {error}"),
+            },
+            true,
+        ),
+        AgentOutcome::IterationLimit { max_iterations } => (
+            ClientToolResultContent::Text {
+                text: format!("sub-agent hit iteration limit ({max_iterations})"),
+            },
+            true,
+        ),
+        AgentOutcome::Cancelled { reason } => (
+            ClientToolResultContent::Text {
+                text: format!("sub-agent was cancelled: {reason}"),
+            },
+            true,
+        ),
+    };
+    ClientToolOutput {
+        result,
+        media: Vec::new(),
+        is_error,
+        trace_response: subagent_trace_response(run),
+        usage: run.all_usage(),
+    }
+}
+
+/// Serialize the nested run summary into one trace payload.
+fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
+    match &run.outcome {
+        AgentOutcome::Completed { answer } => serde_json::json!({
+            "outcome": "completed",
+            "text": answer.text,
+            "usage": run.all_usage(),
+        }),
+        AgentOutcome::Failed { error, .. } => serde_json::json!({
+            "outcome": "failed",
+            "error": error.to_string(),
+            "usage": run.all_usage(),
+        }),
+        AgentOutcome::IterationLimit { max_iterations } => serde_json::json!({
+            "outcome": "iteration_limit",
+            "max_iterations": max_iterations,
+            "usage": run.all_usage(),
+        }),
+        AgentOutcome::Cancelled { reason } => serde_json::json!({
+            "outcome": "cancelled",
+            "reason": reason,
+            "usage": run.all_usage(),
+        }),
+    }
+}
+
+/// Low-cardinality nested-agent outcome label for structured logs.
+fn subagent_outcome_kind(outcome: &AgentOutcome) -> &'static str {
+    match outcome {
+        AgentOutcome::Completed { .. } => "completed",
+        AgentOutcome::Failed { .. } => "failed",
+        AgentOutcome::IterationLimit { .. } => "iteration_limit",
+        AgentOutcome::Cancelled { .. } => "cancelled",
     }
 }
 

@@ -102,10 +102,10 @@ pub use llm::{
 };
 
 // Agent loop contracts: static agent config, runtime agent execution, outcomes,
-// subagent adapters, and final assistant answers.
+// and final assistant answers.
 pub use agent::{
     Agent, AgentError, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentSpec,
-    AssistantAnswer, Subagent,
+    AssistantAnswer,
 };
 
 // Tool protocol shapes cover model-visible client tools, provider-run server

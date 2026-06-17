@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chudbot_api::{
-    BoxedMediaRef, CreateMedia, ExternalId, LoadedMedia, MediaError, MediaMetadata, MediaRef,
-    MediaStore, MediaUri, PlatformName, PostedMessage, PublicMediaUrl, VideoJobId,
+    AgentSpec, AssistantStep, BoxedMediaRef, CreateMedia, ExternalId, LlmBackend, LoadedMedia,
+    MediaError, MediaMetadata, MediaRef, MediaStore, MediaUri, ModelStep, PlatformName,
+    PostedMessage, PublicMediaUrl, ServerToolSet, UsageSubject, VideoJobId,
 };
 use serde_json::json;
 use test_case::test_case;
@@ -933,6 +934,171 @@ fn test_bot_config() -> BotConfig {
         limits: AgentLimits::default(),
         thread_threshold_chars: DEFAULT_THREAD_THRESHOLD_CHARS,
         thread_threshold_lines: DEFAULT_THREAD_THRESHOLD_LINES,
+    }
+}
+
+#[derive(Debug)]
+struct TestLlmError;
+
+impl std::fmt::Display for TestLlmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("test llm error")
+    }
+}
+
+impl std::error::Error for TestLlmError {}
+
+fn test_llm_model<B>(backend: B) -> Model<B> {
+    Model {
+        backend,
+        spec: ModelSpec {
+            id: ModelId::new("test-model"),
+            server_tools: ServerToolSet::default(),
+            sampling: SamplingOptions::default(),
+            provider_options: None,
+        },
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RecordingLlmBackend {
+    name: ProviderName,
+    requests: Arc<Mutex<Vec<chudbot_api::ModelStepRequest>>>,
+    step: AssistantStep,
+}
+
+impl LlmBackend for RecordingLlmBackend {
+    type Error = TestLlmError;
+
+    fn backend_name(&self) -> &ProviderName {
+        &self.name
+    }
+
+    async fn step(&self, request: chudbot_api::ModelStepRequest) -> Result<ModelStep, Self::Error> {
+        self.requests.lock().unwrap().push(request);
+        Ok(ModelStep::Final {
+            step: self.step.clone(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn subagent_exposes_spec_and_executes_nested_agent() {
+    let usage = UsageRecord {
+        provider: ProviderName::new("openai"),
+        model: Some(ModelId::new("gpt-5")),
+        subject: UsageSubject::ModelStep,
+        input_tokens: Some(100),
+        cached_input_tokens: Some(25),
+        output_tokens: Some(40),
+        reasoning_tokens: Some(10),
+        total_tokens: Some(140),
+        cost: None,
+        raw: None,
+    };
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let backend = RecordingLlmBackend {
+        name: ProviderName::new("openai"),
+        requests: requests.clone(),
+        step: AssistantStep {
+            content: vec![ContentBlock::Text {
+                text: "use VTI".to_string(),
+            }],
+            client_tool_calls: Vec::new(),
+            server_tool_uses: Vec::new(),
+            grounding: Vec::new(),
+            model_id: ModelId::new("gpt-5"),
+            continuation: None,
+            usage: vec![usage],
+        },
+    };
+    let agent = Agent::new(
+        test_llm_model(backend),
+        AgentSpec::new("expert"),
+        NoClientTools,
+    );
+
+    let subagent = Subagent::new("Ask the OpenAI expert for a second opinion.", agent);
+    let spec = subagent.spec();
+    assert_eq!(
+        spec.description,
+        "Ask the OpenAI expert for a second opinion."
+    );
+    assert!(
+        spec.input_schema
+            .as_json_schema()
+            .get("properties")
+            .is_some()
+    );
+
+    let output = subagent
+        .call(ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new("ask_openai_expert"),
+            input: json!({ "prompt": "Which total-market ETF is best?" }),
+        })
+        .await
+        .unwrap();
+
+    assert!(!output.is_error);
+    assert_eq!(output.usage.len(), 1);
+    match output.result {
+        ClientToolResultContent::Text { text } => assert_eq!(text, "use VTI"),
+        ClientToolResultContent::Json { .. } => panic!("expected text output"),
+    }
+
+    let inputs = requests.lock().unwrap();
+    assert_eq!(inputs.len(), 1);
+    assert_eq!(inputs[0].transcript.instructions.as_deref(), Some("expert"));
+    assert_eq!(inputs[0].transcript.turns.len(), 1);
+    assert_text_block(
+        &inputs[0].transcript.turns[0],
+        TurnRole::User,
+        "Which total-market ETF is best?",
+    );
+}
+
+#[tokio::test]
+async fn subagent_ignores_registration_name() {
+    let backend = RecordingLlmBackend {
+        name: ProviderName::new("openai"),
+        requests: Arc::new(Mutex::new(Vec::new())),
+        step: AssistantStep {
+            content: vec![ContentBlock::Text {
+                text: "ok".to_string(),
+            }],
+            client_tool_calls: Vec::new(),
+            server_tool_uses: Vec::new(),
+            grounding: Vec::new(),
+            model_id: ModelId::new("gpt-5"),
+            continuation: None,
+            usage: Vec::new(),
+        },
+    };
+    let agent = Agent::new(
+        test_llm_model(backend),
+        AgentSpec::new("expert"),
+        NoClientTools,
+    );
+    let subagent = Subagent::new("Ask the OpenAI expert.", agent);
+
+    let output = subagent
+        .call(ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new("registered_elsewhere"),
+            input: json!({ "prompt": "hello" }),
+        })
+        .await
+        .unwrap();
+
+    assert!(!output.is_error);
+}
+
+fn assert_text_block(message: &TranscriptTurn, role: TurnRole, text: &str) {
+    assert_eq!(message.role, role);
+    match message.blocks.as_slice() {
+        [ContentBlock::Text { text: actual }] => assert_eq!(actual, text),
+        blocks => panic!("expected one text block, got {blocks:?}"),
     }
 }
 
