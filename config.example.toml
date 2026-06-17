@@ -2,7 +2,9 @@
 #
 # Copy this file to config.toml and replace placeholder secrets. The runtime
 # reads only this TOML file plus CLI flags; it does not read environment
-# variables for bot, provider, database, or web settings.
+# variables for bot, provider, database, or web settings. The S3 storage
+# backend is the exception: when enabled, AWS SDK credentials and region can be
+# loaded from the normal AWS environment/profile chain.
 #
 # Validate without opening Discord or the web listener:
 #
@@ -51,6 +53,7 @@ frontend_dir = "frontend-build"
 # Local media directories. The database stores stable URIs such as
 # file://images/<name>, file://videos/<name>, file://audio/<name>, and
 # file://avatars/<name>.
+kind = "local"
 images_dir = "images"
 videos_dir = "videos"
 audio_dir = "audio"
@@ -58,6 +61,26 @@ avatars_dir = "avatars"
 # Public URL used when providers need to fetch stored media server-side. If this
 # is omitted, the runtime falls back to [bot].web_base_url.
 public_base_url = "http://localhost:1860"
+
+# S3-compatible media storage. The stored URIs still use the same
+# file://images/<name> shape; only the configured backend changes where bytes
+# are persisted and loaded. Credentials are loaded by the AWS SDK, so set
+# AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, IAM role credentials, or
+# another standard AWS provider before running Chudbot.
+#
+# [storage]
+# kind = "s3"
+# bucket = "assets.chudbot.example.com"
+# region = "us-east-1"
+# Optional endpoint override for S3-compatible APIs such as MinIO, R2, or
+# LocalStack.
+# endpoint_url = "https://s3.us-east-1.amazonaws.com"
+# force_path_style = false
+# Public URL base for bucket-hosted assets. With the object key
+# images/abc.png, Chudbot reports https://assets.chudbot.example.com/images/abc.png.
+# If omitted, the runtime falls back to [bot].web_base_url and serves media
+# through the web routes.
+# public_base_url = "https://assets.chudbot.example.com"
 
 [memory]
 # Global memory switch. Per-agent `memory = true` below opts an agent into

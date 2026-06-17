@@ -13,6 +13,7 @@ path = "src/main.rs"
 chudbot-api = { path = "../chudbot-api" }
 chudbot-anthropic = { path = "../chudbot-anthropic" }
 chudbot-asset-local = { path = "../chudbot-asset-local" }
+chudbot-asset-s3 = { path = "../chudbot-asset-s3" }
 chudbot-bot = { path = "../chudbot-bot" }
 chudbot-discord = { path = "../chudbot-discord" }
 chudbot-gemini = { path = "../chudbot-gemini" }

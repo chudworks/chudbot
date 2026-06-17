@@ -25,7 +25,7 @@ use serde::{Deserialize, Deserializer};
 
 use crate::config::{
     AudioProviderConfig, ImageProviderConfig, LlmProviderConfig, MessagePlatformConfig,
-    RuntimeConfig, VideoProviderConfig,
+    RuntimeConfig, StorageConfig, VideoProviderConfig,
 };
 
 const DATETIME_FIELD: &str = "$__toml_private_datetime";
@@ -697,11 +697,20 @@ const WEB_KEYS: &[&str] = &[
     "og_image_path",
     "trust_forwarded_for",
 ];
-const STORAGE_KEYS: &[&str] = &[
+const STORAGE_LOCAL_KEYS: &[&str] = &[
+    "kind",
     "images_dir",
     "videos_dir",
     "audio_dir",
     "avatars_dir",
+    "public_base_url",
+];
+const STORAGE_S3_KEYS: &[&str] = &[
+    "kind",
+    "bucket",
+    "region",
+    "endpoint_url",
+    "force_path_style",
     "public_base_url",
 ];
 const MEMORY_KEYS: &[&str] = &[
@@ -808,6 +817,7 @@ pub(crate) fn validate_runtime_config(
     // TOML has deserialized into the typed runtime config.
     validate_database(config, source, &mut diagnostics);
     validate_logging(config, source, &mut diagnostics);
+    validate_storage(config, source, &mut diagnostics);
     validate_bot_config(config, source, &mut diagnostics);
     validate_memory_durations(config, source, &mut diagnostics);
     validate_runtime_references(config, source, &mut diagnostics);
@@ -836,7 +846,14 @@ fn validate_unexpected_keys(
     validate_known_keys(source, diagnostics, &[key("database")], DATABASE_KEYS);
     validate_known_keys(source, diagnostics, &[key("logging")], LOGGING_KEYS);
     validate_known_keys(source, diagnostics, &[key("web")], WEB_KEYS);
-    validate_known_keys(source, diagnostics, &[key("storage")], STORAGE_KEYS);
+    match &config.storage {
+        StorageConfig::Local(_) => {
+            validate_known_keys(source, diagnostics, &[key("storage")], STORAGE_LOCAL_KEYS);
+        }
+        StorageConfig::S3(_) => {
+            validate_known_keys(source, diagnostics, &[key("storage")], STORAGE_S3_KEYS);
+        }
+    }
     validate_known_keys(source, diagnostics, &[key("memory")], MEMORY_KEYS);
     validate_default_privacy_unexpected_keys(&config.default_privacy, source, diagnostics);
     validate_bot_unexpected_keys(config, source, diagnostics);
@@ -1311,6 +1328,87 @@ fn validate_logging(
             .with_help("use tracing-subscriber EnvFilter syntax, for example `info,chudbot=debug`"),
         );
     }
+}
+
+fn validate_storage(
+    config: &RuntimeConfig,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let StorageConfig::S3(storage) = &config.storage else {
+        return;
+    };
+
+    let bucket = storage.bucket.trim();
+    if bucket.is_empty() {
+        diagnostics.push(
+            ConfigDiagnostic::new("storage.bucket must not be empty when storage.kind is `s3`")
+                .with_label(source.primary_label(
+                    &[key("storage"), key("bucket")],
+                    &[key("storage")],
+                    "missing S3 bucket name",
+                ))
+                .with_help("set `bucket` to the S3 bucket that will store media objects"),
+        );
+    } else if bucket.contains('/') || bucket.contains("://") {
+        diagnostics.push(
+            ConfigDiagnostic::new("storage.bucket must be an S3 bucket name, not a URL or path")
+                .with_label(source.primary_label(
+                    &[key("storage"), key("bucket")],
+                    &[key("storage")],
+                    "bucket names cannot contain `/` or `://`",
+                ))
+                .with_help(
+                    "put the bucket host override in `endpoint_url`; keep `bucket` as the bucket name",
+                ),
+        );
+    }
+
+    if storage
+        .region
+        .as_deref()
+        .is_some_and(|region| region.trim().is_empty())
+    {
+        diagnostics.push(invalid_storage_string_diagnostic(
+            source,
+            "region",
+            "storage.region must not be empty when set",
+        ));
+    }
+    if storage
+        .endpoint_url
+        .as_deref()
+        .is_some_and(|endpoint_url| endpoint_url.trim().is_empty())
+    {
+        diagnostics.push(invalid_storage_string_diagnostic(
+            source,
+            "endpoint_url",
+            "storage.endpoint_url must not be empty when set",
+        ));
+    }
+    if storage
+        .public_base_url
+        .as_deref()
+        .is_some_and(|public_base_url| public_base_url.trim().is_empty())
+    {
+        diagnostics.push(invalid_storage_string_diagnostic(
+            source,
+            "public_base_url",
+            "storage.public_base_url must not be empty when set",
+        ));
+    }
+}
+
+fn invalid_storage_string_diagnostic(
+    source: &ConfigSource,
+    field: &'static str,
+    message: &'static str,
+) -> ConfigDiagnostic {
+    ConfigDiagnostic::new(message).with_label(source.primary_label(
+        &[key("storage"), key(field)],
+        &[key("storage")],
+        "empty storage setting",
+    ))
 }
 
 fn validate_memory_durations(
@@ -2361,6 +2459,82 @@ model = { id = "gpt-test" }
 
         assert!(rendered.contains("provider = \"missing\""));
         assert!(rendered.contains("[llm.missing]"));
+    }
+
+    #[test]
+    fn s3_storage_reports_missing_bucket_and_local_keys() {
+        let input = r#"
+[database]
+url = "postgres://localhost/db"
+
+[web]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[storage]
+kind = "s3"
+region = ""
+endpoint_url = ""
+images_dir = "images"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+
+[bot.agents.default]
+provider = "openai"
+system_prompt = "hi"
+model = { id = "gpt-test" }
+
+[llm.openai]
+kind = "openai"
+api_key = "key"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
+        let report = validate_runtime_config(&config, &source).unwrap_err();
+        let rendered = report.render();
+
+        assert!(rendered.contains("unexpected config key `storage.images_dir`"));
+        assert!(rendered.contains("storage.bucket must not be empty"));
+        assert!(rendered.contains("storage.region must not be empty when set"));
+        assert!(rendered.contains("storage.endpoint_url must not be empty when set"));
+    }
+
+    #[test]
+    fn local_storage_defaults_without_kind_and_rejects_s3_keys() {
+        let input = r#"
+[database]
+url = "postgres://localhost/db"
+
+[web]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[storage]
+images_dir = "images"
+bucket = "assets"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+
+[bot.agents.default]
+provider = "openai"
+system_prompt = "hi"
+model = { id = "gpt-test" }
+
+[llm.openai]
+kind = "openai"
+api_key = "key"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
+        let report = validate_runtime_config(&config, &source).unwrap_err();
+        let rendered = report.render();
+
+        assert!(matches!(config.storage, StorageConfig::Local(_)));
+        assert!(rendered.contains("unexpected config key `storage.bucket`"));
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use chudbot_api::{ModelId, PrivacyMode, ProviderName};
 use chudbot_bot::{BotConfig, MemoryConfig};
 use chudbot_web::WebConfig;
+use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing_subscriber::EnvFilter;
@@ -67,9 +68,9 @@ pub struct RuntimeConfig {
     pub platforms: BTreeMap<chudbot_api::PlatformName, MessagePlatformConfig>,
     /// Web viewer config.
     pub web: WebRuntimeConfig,
-    /// Local media storage config.
+    /// Media storage backend config.
     #[serde(default)]
-    pub storage: LocalStorageConfig,
+    pub storage: StorageConfig,
 }
 
 /// Parsed runtime config paired with the source text used for diagnostics.
@@ -284,6 +285,85 @@ fn default_trust_forwarded_for() -> bool {
     true
 }
 
+/// Media storage backend config.
+///
+/// Existing configs omit `kind` and continue to use local filesystem storage.
+/// S3 is selected with `kind = "s3"` and keeps the same `file://...` media URI
+/// surface while persisting bytes in the configured bucket.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StorageConfig {
+    /// Local filesystem storage.
+    Local(LocalStorageConfig),
+    /// S3-compatible object storage.
+    S3(S3StorageConfig),
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self::Local(LocalStorageConfig::default())
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawStorageConfig::deserialize(deserializer)?;
+        match raw.kind {
+            StorageKind::Local => Ok(Self::Local(LocalStorageConfig {
+                images_dir: raw.images_dir,
+                videos_dir: raw.videos_dir,
+                audio_dir: raw.audio_dir,
+                avatars_dir: raw.avatars_dir,
+                public_base_url: raw.public_base_url,
+            })),
+            StorageKind::S3 => Ok(Self::S3(S3StorageConfig {
+                bucket: raw.bucket.unwrap_or_default(),
+                region: raw.region,
+                endpoint_url: raw.endpoint_url,
+                force_path_style: raw.force_path_style,
+                public_base_url: raw.public_base_url,
+            })),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageKind {
+    /// Local filesystem storage.
+    #[default]
+    Local,
+    /// S3-compatible object storage.
+    S3,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawStorageConfig {
+    #[serde(default)]
+    kind: StorageKind,
+    #[serde(default = "default_images_dir")]
+    images_dir: PathBuf,
+    #[serde(default = "default_videos_dir")]
+    videos_dir: PathBuf,
+    #[serde(default = "default_audio_dir")]
+    audio_dir: PathBuf,
+    #[serde(default = "default_avatars_dir")]
+    avatars_dir: PathBuf,
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    endpoint_url: Option<String>,
+    #[serde(default)]
+    force_path_style: bool,
+    #[serde(default)]
+    public_base_url: Option<String>,
+}
+
 /// Local media storage directories and public URL base.
 ///
 /// The filesystem-backed media store keeps each media class in a separate
@@ -333,6 +413,30 @@ fn default_audio_dir() -> PathBuf {
 
 fn default_avatars_dir() -> PathBuf {
     PathBuf::from("avatars")
+}
+
+/// S3-compatible media storage config.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct S3StorageConfig {
+    /// Bucket that stores chudbot media objects.
+    #[serde(default)]
+    pub bucket: String,
+    /// Optional AWS region override. When omitted, the AWS SDK region provider
+    /// chain uses `AWS_REGION`, shared config profiles, or runtime metadata.
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Optional S3 endpoint URL for compatible APIs such as MinIO, R2, or
+    /// LocalStack.
+    #[serde(default)]
+    pub endpoint_url: Option<String>,
+    /// Force path-style addressing for S3-compatible APIs that do not support
+    /// virtual-hosted bucket names.
+    #[serde(default)]
+    pub force_path_style: bool,
+    /// Public URL base for media. If omitted, runtime wiring falls back to
+    /// `[bot].web_base_url` so the web server can proxy stored media.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
 }
 
 /// Concrete LLM service config for one entry in `[llm.<name>]`.

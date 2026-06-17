@@ -11,11 +11,13 @@ use std::time::Duration;
 
 use chudbot_api::{
     AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
-    GeneratedImage, ImageGenerator, ImageGeneratorRegistry, ImageRequest, LlmBackend,
-    LlmProviderRegistry, ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest,
-    ProviderName, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
+    BoxedMediaRef, CreateMedia, GeneratedImage, ImageGenerator, ImageGeneratorRegistry,
+    ImageRequest, LlmBackend, LlmProviderRegistry, MediaCategory, MediaError, MediaStore, MediaUri,
+    ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest, ProviderName,
+    VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
+use chudbot_asset_s3::S3MediaStore;
 use chudbot_bot::BotRuntimeTypes;
 use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::{EventBus, WebConfig, WebRuntimeTypes};
@@ -24,7 +26,7 @@ use serde_json::json;
 
 use crate::config::{
     AudioProviderConfig, ImageProviderConfig, LlmModelInfoConfig, LlmProviderConfig, RuntimeConfig,
-    VideoProviderConfig,
+    StorageConfig, VideoProviderConfig,
 };
 use crate::errors::{
     BinError, ConfiguredAudioError, ConfiguredImageError, ConfiguredLlmError, ConfiguredVideoError,
@@ -47,8 +49,8 @@ pub struct BootstrapServices {
     pub videos: ConfiguredVideoGenerators,
     /// Audio transcription registry used by configured agent transcription tools.
     pub audio: ConfiguredAudioTranscribers,
-    /// Local filesystem media store shared by bot tools and web routes.
-    pub media_store: LocalMediaStore,
+    /// Media store shared by bot tools and web routes.
+    pub media_store: ConfiguredMediaStore,
     /// In-process event bus for trace-viewer live updates.
     pub events: EventBus,
     /// Viewer-facing web configuration derived from runtime settings.
@@ -67,7 +69,7 @@ pub(crate) struct ConfiguredBotRuntime;
 impl BotRuntimeTypes for ConfiguredBotRuntime {
     type Platforms = ConfiguredMessagePlatforms;
     type Storage = SqlxStorage;
-    type Media = LocalMediaStore;
+    type Media = ConfiguredMediaStore;
     type Llms = ConfiguredLlmProviders;
     type Images = ConfiguredImageGenerators;
     type Videos = ConfiguredVideoGenerators;
@@ -90,27 +92,15 @@ impl BootstrapServices {
         name = "services.build",
         skip_all,
         fields(
-            images_dir = %config.storage.images_dir.display(),
-            videos_dir = %config.storage.videos_dir.display(),
-            audio_dir = %config.storage.audio_dir.display(),
-            avatars_dir = %config.storage.avatars_dir.display(),
+            storage_kind = storage_kind(config),
             frontend_dir = %config.web.frontend_dir.display(),
         )
     )]
     pub(crate) fn build(config: &RuntimeConfig) -> Result<Self, BinError> {
         // Media links should resolve through the public web surface. A storage
         // override wins, otherwise generated links point at the bot web base URL.
-        let media_store = LocalMediaStore::new(
-            config.storage.images_dir.clone(),
-            config.storage.videos_dir.clone(),
-            config.storage.audio_dir.clone(),
-            config.storage.avatars_dir.clone(),
-            config
-                .storage
-                .public_base_url
-                .clone()
-                .or_else(|| Some(config.bot.web_base_url.clone())),
-        );
+        let media_store =
+            ConfiguredMediaStore::from_config(&config.storage, config.bot.web_base_url.clone());
 
         // Provider names come from the TOML table keys. Agent assembly later
         // routes model and tool calls through these registries by that name.
@@ -135,6 +125,76 @@ impl BootstrapServices {
             events: EventBus::new(256),
             web: config.web.viewer_config(&config.bot.web_base_url),
         })
+    }
+}
+
+/// Runtime-selected media store backend.
+#[derive(Debug, Clone)]
+pub enum ConfiguredMediaStore {
+    /// Local filesystem media store.
+    Local(LocalMediaStore),
+    /// S3-compatible media store.
+    S3(S3MediaStore),
+}
+
+impl ConfiguredMediaStore {
+    fn from_config(config: &StorageConfig, fallback_public_base_url: String) -> Self {
+        match config {
+            StorageConfig::Local(config) => Self::Local(LocalMediaStore::new(
+                config.images_dir.clone(),
+                config.videos_dir.clone(),
+                config.audio_dir.clone(),
+                config.avatars_dir.clone(),
+                config
+                    .public_base_url
+                    .clone()
+                    .or(Some(fallback_public_base_url)),
+            )),
+            StorageConfig::S3(config) => Self::S3(S3MediaStore::new(
+                config.bucket.clone(),
+                config.region.clone(),
+                config.endpoint_url.clone(),
+                config.force_path_style,
+                config
+                    .public_base_url
+                    .clone()
+                    .or(Some(fallback_public_base_url)),
+            )),
+        }
+    }
+}
+
+impl MediaStore for ConfiguredMediaStore {
+    async fn create_media(&self, input: CreateMedia) -> Result<BoxedMediaRef, MediaError> {
+        match self {
+            Self::Local(store) => store.create_media(input).await,
+            Self::S3(store) => store.create_media(input).await,
+        }
+    }
+
+    async fn media_from_uri(&self, uri: &MediaUri) -> Result<BoxedMediaRef, MediaError> {
+        match self {
+            Self::Local(store) => store.media_from_uri(uri).await,
+            Self::S3(store) => store.media_from_uri(uri).await,
+        }
+    }
+
+    async fn media_from_name(
+        &self,
+        category: MediaCategory,
+        name: &str,
+    ) -> Result<BoxedMediaRef, MediaError> {
+        match self {
+            Self::Local(store) => store.media_from_name(category, name).await,
+            Self::S3(store) => store.media_from_name(category, name).await,
+        }
+    }
+}
+
+fn storage_kind(config: &RuntimeConfig) -> &'static str {
+    match &config.storage {
+        StorageConfig::Local(_) => "local",
+        StorageConfig::S3(_) => "s3",
     }
 }
 

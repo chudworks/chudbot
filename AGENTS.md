@@ -23,6 +23,7 @@ Workspace crates:
 - `chudbot-storage-sqlx`: Postgres `BotStorage` implementation and embedded
   migrations.
 - `chudbot-asset-local`: local filesystem `MediaStore`.
+- `chudbot-asset-s3`: S3-compatible object storage `MediaStore`.
 - `chudbot-xai`: xAI LLM, image, and video providers.
 - `chudbot-gemini`: Google Gemini LLM, Nano Banana image, and Veo video
   providers.

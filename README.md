@@ -48,7 +48,7 @@ specs; provider credentials live under `[llm.*]`, `[image.*]`, and `[video.*]`.
 - `chudbot-discord`: Twilight platform adapter.
 - `chudbot-web`: Axum viewer/API/SSE server.
 - `chudbot-storage-sqlx`: Postgres storage.
-- `chudbot-asset-local`: local media storage.
+- `chudbot-asset-local`, `chudbot-asset-s3`: media storage backends.
 - `chudbot-xai`, `chudbot-gemini`, `chudbot-openai`,
   `chudbot-openai-compat`, `chudbot-anthropic`: provider crates.
 - `chudbot-bin`: process launcher.
