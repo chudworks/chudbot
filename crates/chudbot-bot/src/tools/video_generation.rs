@@ -1,21 +1,35 @@
-//! Persistent `generate_video` client tool with stored job status.
+//! Persistent `generate_video` client tool.
+//!
+//! This module owns the client-tool boundary for async video generation. It
+//! validates model JSON into a provider-neutral request, delegates submission,
+//! polling, and download to the configured video provider route, persists
+//! provider job state, stores completed bytes in the media store, and returns
+//! separate JSON shapes for the model transcript and durable trace.
 
 use super::*;
 
-/// Storage operations needed to persist provider video jobs.
+/// Storage operations needed by the video-generation tool.
+///
+/// The trait mirrors the `BotStorage` subset used here so tests can exercise
+/// persistence and rate-limit behavior without depending on the full storage
+/// surface.
 pub(crate) trait PersistentVideoStorage: Clone + Send + Sync {
+    /// Storage backend error type.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Insert the local row for a provider job after upstream submission.
     fn create_video_job(
         &self,
         input: CreateVideoJob,
     ) -> impl Future<Output = Result<StoredVideoJob, Self::Error>> + Send;
 
+    /// Record a provider job status transition and optional output URI/error.
     fn update_video_job(
         &self,
         input: UpdateVideoJob,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Count pending plus completed video jobs inside the rolling quota window.
     fn count_active_video_generations(
         &self,
         input: CountActiveVideoGenerations,
@@ -51,13 +65,20 @@ where
 }
 
 /// Single-node rate-limit lock scope.
+///
+/// Video quotas are scoped to the platform workspace/server when one exists.
+/// Platform-only scopes use `None`, which still serializes all calls on that
+/// platform together.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct VideoRateLimitLockKey {
+    /// Messaging platform that owns the video-generation scope.
     pub(crate) platform: PlatformName,
+    /// Optional platform workspace/server/guild id.
     pub(crate) scope_id: Option<ExternalId>,
 }
 
 impl VideoRateLimitLockKey {
+    /// Build the quota key for the user that issued the current turn.
     pub(crate) fn from_user(user: &UserRef) -> Self {
         Self {
             platform: user.platform.clone(),
@@ -66,13 +87,19 @@ impl VideoRateLimitLockKey {
     }
 }
 
-/// Per-scope async locks that serialize video quota checks and submits.
+/// Shared per-scope async locks for video quota checks and submissions.
+///
+/// A video tool value is created per turn, so the lock map must be supplied by
+/// the runtime and cloned into each tool instance. The lock is intentionally
+/// in-process because Chudbot runs as a single node.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VideoRateLimitLocks {
+    /// Lazily-created async mutexes keyed by platform scope.
     pub(crate) inner: Arc<Mutex<BTreeMap<VideoRateLimitLockKey, Arc<AsyncMutex<()>>>>>,
 }
 
 impl VideoRateLimitLocks {
+    /// Acquire the async mutex for the caller's platform scope.
     pub(crate) async fn lock(&self, user: &UserRef) -> OwnedMutexGuard<()> {
         let lock = {
             let mut locks = self
@@ -88,23 +115,39 @@ impl VideoRateLimitLocks {
     }
 }
 
-/// Video generation tool that submits, persists, polls, downloads, and stores output media.
+/// Runtime client tool for configured video generation.
+///
+/// `generator` is already routed to the agent's configured provider and default
+/// model. This tool owns the rest of the lifecycle: input parsing, quota
+/// enforcement, job persistence, polling, media storage, and result shaping.
 #[derive(Debug, Clone)]
 pub(crate) struct PersistentVideoGeneratorTool<G, M, S> {
+    /// Provider route selected by the agent's video-generation binding.
     pub(crate) generator: G,
+    /// Media store where completed video bytes are imported.
     pub(crate) media_store: M,
+    /// Bot storage used for provider job rows and active-count queries.
     pub(crate) storage: S,
+    /// Runtime-shared locks that close same-scope parallel submit races.
     pub(crate) rate_limit_locks: VideoRateLimitLocks,
+    /// Turn that requested the provider job.
     pub(crate) turn_id: TurnId,
+    /// User and platform scope used for quota checks.
     pub(crate) turn_user: UserRef,
+    /// Provider name stored with job rows and status updates.
     pub(crate) provider: ProviderName,
+    /// Optional active-job quota for this agent binding.
     pub(crate) rate_limit: Option<VideoGenerationRateLimit>,
+    /// Model-facing tool description advertised in the tool spec.
     pub(crate) description: String,
+    /// Delay between provider job polls.
     pub(crate) poll_interval: Duration,
+    /// Maximum number of provider polls before the tool returns a timeout.
     pub(crate) max_polls: u32,
 }
 
 impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
+    /// Build a video tool from a configured provider route and turn context.
     pub(crate) fn new(
         generator: G,
         media_store: M,
@@ -131,11 +174,17 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
         }
     }
 
+    /// Override the model-facing tool description for a specific binding.
     pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
     }
 
+    /// Enforce the configured active-video quota for the current platform scope.
+    ///
+    /// The caller is expected to hold the matching `VideoRateLimitLocks` guard
+    /// unless the user is bypassed. The storage count includes jobs still
+    /// pending plus completed jobs inside the rolling interval.
     pub(crate) async fn enforce_video_rate_limit(
         &self,
         rate_limit: &VideoGenerationRateLimit,
@@ -172,6 +221,11 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
         Ok(())
     }
 
+    /// Submit a provider job and create its local pending row.
+    ///
+    /// In the rate-limited path this runs inside the per-scope critical section
+    /// so another call cannot observe the same active count before this row
+    /// exists.
     pub(crate) async fn submit_and_persist_video_job(
         &self,
         request: VideoRequest,
@@ -206,6 +260,10 @@ where
     M: MediaStore,
     S: PersistentVideoStorage,
 {
+    /// Return the model-facing tool declaration.
+    ///
+    /// Runtime parsing repeats the constraints that affect behavior because
+    /// provider schema enforcement can vary.
     pub(crate) fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.description.clone(),
@@ -228,6 +286,8 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, BotToolError> {
+        // Validate JSON and resolve optional input media before touching quota
+        // or provider state; malformed calls should not consume capacity.
         let request = video_request_from_tool_input(&self.media_store, call.input).await?;
         let prompt = request.prompt.clone();
         let job_id = if let Some(rate_limit) = &self.rate_limit
@@ -257,6 +317,8 @@ where
                     }
                 }
                 VideoJobStatus::Done { meta } => {
+                    // Import the finished bytes before marking the job done so
+                    // persisted output URIs always point at servable media.
                     let bytes = self
                         .generator
                         .download_video(meta.url.clone())
@@ -284,6 +346,9 @@ where
                         .await
                         .map_err(|error| BotToolError::Storage(error.to_string()))?;
                     let public_url = media.public_url().await.ok();
+                    // Trace keeps provider/download details for debugging; the
+                    // model result omits direct download URLs and focuses on
+                    // the stored media reference and delivery instruction.
                     let trace_response = media_tool_trace_json(
                         media.as_ref(),
                         public_url.as_ref().map(|url| url.as_str()),
@@ -301,6 +366,8 @@ where
                         }),
                     );
                     tracing::info!(job = %job_id, uri = %media.uri(), "video job completed");
+                    // `media` stays empty because final platform delivery
+                    // reloads generated media from successful tool traces.
                     return Ok(ClientToolOutput {
                         result: ClientToolResultContent::Json {
                             value: result.clone(),
@@ -344,6 +411,8 @@ where
             }
         }
 
+        // The upstream job may still finish later. Keep the status pending but
+        // store the timeout message so the trace explains why this tool ended.
         let message = format!(
             "video generation still pending after {} polls: {}",
             self.max_polls, job_id
@@ -362,6 +431,12 @@ where
     }
 }
 
+/// Convert model-supplied tool JSON into a provider-neutral video request.
+///
+/// The parser requires a non-empty `prompt`, accepts `image` or `image_url` as
+/// a single optional image reference, bounds `duration_seconds` to the schema's
+/// maximum, and passes provider-specific `aspect_ratio`, `resolution`, and
+/// `model` strings through unchanged.
 pub(crate) async fn video_request_from_tool_input<M>(
     media_store: &M,
     input: serde_json::Value,
@@ -372,6 +447,8 @@ where
     let prompt = tool_required_string(&input, "prompt")?;
     let image = match input.get("image").or_else(|| input.get("image_url")) {
         Some(value) => {
+            // Stored media references and direct HTTP(S) URLs are resolved by
+            // the shared helper using image semantics before provider submit.
             Some(resolve_tool_media_arg(media_store, MediaCategory::Image, value).await?)
         }
         None => None,
@@ -386,6 +463,11 @@ where
     })
 }
 
+/// Build the durable trace payload for generated media.
+///
+/// Trace JSON includes store metadata plus optional public URL and provider
+/// extras that are useful in the viewer or debugging, but not necessarily safe
+/// or useful for the model to repeat.
 pub(crate) fn media_tool_trace_json(
     media: &dyn chudbot_api::MediaRef,
     public_url: Option<&str>,
@@ -402,6 +484,10 @@ pub(crate) fn media_tool_trace_json(
     })
 }
 
+/// Build the model-facing JSON result for generated media.
+///
+/// The result exposes the stored media URI and a delivery note, while keeping
+/// provider-only download URLs out of the model transcript.
 pub(crate) fn media_tool_model_result_json(
     media: &dyn chudbot_api::MediaRef,
     extra: serde_json::Value,
@@ -418,6 +504,10 @@ pub(crate) fn media_tool_model_result_json(
     })
 }
 
+/// Return the JSON schema advertised for the `generate_video` tool.
+///
+/// The schema is deliberately stricter than many provider APIs: it rejects
+/// unknown fields and caps requested duration before provider routing.
 pub(crate) fn video_tool_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",

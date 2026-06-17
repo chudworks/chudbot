@@ -1,4 +1,12 @@
 //! Runtime client tools exposed to model agents.
+//!
+//! This module is the crate-private facade for Chudbot's built-in client-tool
+//! surface. Individual submodules own each tool contract, input validation, and
+//! call implementation; [`RuntimeToolExecutor`] combines those tools with
+//! per-turn context, configured provider bindings, and feature flags.
+//!
+//! Keeping tool specs and name-based dispatch behind the same wrapper lets
+//! agent construction advertise exactly the tools the runtime can execute.
 
 use crate::config::{
     GenerationBinding, TranscriptionBinding, VideoGenerationRateLimit,

@@ -1,3 +1,10 @@
+//! Binary-owned service construction.
+//!
+//! This module is the launcher-side bridge from TOML-shaped `RuntimeConfig` to
+//! concrete runtime services. Startup builds local media/web plumbing and named
+//! provider registries here; `chudbot-bot` later assembles conversation agents
+//! from those registries through [`ConfiguredBotRuntime`].
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,26 +33,34 @@ use crate::platforms::ConfiguredMessagePlatforms;
 
 const MODEL_INFO_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Services built during process bootstrap before storage/platforms connect.
+/// Config-derived services built before storage and platform sockets connect.
+///
+/// Postgres and platform clients are opened later in `main`; this bundle covers
+/// the pure/local services that can be constructed directly from configuration.
 #[derive(Debug)]
 pub struct BootstrapServices {
-    /// LLM provider registry.
+    /// LLM provider registry used when building agent model backends.
     pub llms: ConfiguredLlmProviders,
-    /// Image generation registry.
+    /// Image generation registry used by configured agent image tools.
     pub images: ConfiguredImageGenerators,
-    /// Video generation registry.
+    /// Video generation registry used by configured agent video tools.
     pub videos: ConfiguredVideoGenerators,
-    /// Audio transcription registry.
+    /// Audio transcription registry used by configured agent transcription tools.
     pub audio: ConfiguredAudioTranscribers,
-    /// Local media store.
+    /// Local filesystem media store shared by bot tools and web routes.
     pub media_store: LocalMediaStore,
-    /// Web event bus.
+    /// In-process event bus for trace-viewer live updates.
     pub events: EventBus,
-    /// Web config.
+    /// Viewer-facing web configuration derived from runtime settings.
     pub web: WebConfig,
 }
 
-/// Concrete bot runtime service type set built by this binary.
+/// Concrete runtime type bundle used by the bot and web generic code.
+///
+/// This associates the binary's concrete registries, storage implementation,
+/// media store, and event bus with the provider-neutral runtime traits. Agent
+/// assembly happens in `chudbot-bot`; these associated types tell it which
+/// concrete services it will receive.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ConfiguredBotRuntime;
 
@@ -67,6 +82,10 @@ impl WebRuntimeTypes for ConfiguredBotRuntime {
 }
 
 impl BootstrapServices {
+    /// Build the config-owned services used by both the bot runtime and web viewer.
+    ///
+    /// The flow is intentionally shallow: wire local media paths, turn provider
+    /// tables into named registries, then create the in-process web support.
     #[tracing::instrument(
         name = "services.build",
         skip_all,
@@ -79,6 +98,8 @@ impl BootstrapServices {
         )
     )]
     pub(crate) fn build(config: &RuntimeConfig) -> Result<Self, BinError> {
+        // Media links should resolve through the public web surface. A storage
+        // override wins, otherwise generated links point at the bot web base URL.
         let media_store = LocalMediaStore::new(
             config.storage.images_dir.clone(),
             config.storage.videos_dir.clone(),
@@ -90,6 +111,9 @@ impl BootstrapServices {
                 .clone()
                 .or_else(|| Some(config.bot.web_base_url.clone())),
         );
+
+        // Provider names come from the TOML table keys. Agent assembly later
+        // routes model and tool calls through these registries by that name.
         let llms = ConfiguredLlmProviders::from_config(&config.llm);
         let images = ConfiguredImageGenerators::from_config(&config.image);
         let videos = ConfiguredVideoGenerators::from_config(&config.video);
@@ -114,7 +138,11 @@ impl BootstrapServices {
     }
 }
 
-/// Concrete named LLM provider registry for implemented providers.
+/// Concrete named LLM provider registry for all implemented LLM backends.
+///
+/// Each configured `[llm.<name>]` entry becomes one concrete client stored under
+/// `<name>`. `RoutedLlmBackend` in `chudbot-bot` carries the selected name for
+/// an agent and calls this registry for each model step.
 #[derive(Debug, Clone)]
 pub struct ConfiguredLlmProviders {
     inner: Arc<ConfiguredLlmProvidersInner>,
@@ -122,12 +150,15 @@ pub struct ConfiguredLlmProviders {
 
 #[derive(Debug, Default)]
 struct ConfiguredLlmProvidersInner {
+    /// Provider clients grouped by backend crate so dispatch can call concrete implementations.
     anthropic: BTreeMap<ProviderName, chudbot_anthropic::AnthropicClient>,
     gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
     openai: BTreeMap<ProviderName, chudbot_openai::OpenAiClient>,
     openai_compat: BTreeMap<ProviderName, chudbot_openai_compat::OpenAiCompatClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
+    /// Operator-supplied model metadata used before provider discovery.
     model_info: BTreeMap<ProviderName, BTreeMap<ModelId, ModelInfo>>,
+    /// Short-lived cache for provider-discovered metadata and provider misses.
     model_info_cache: ModelInfoCache,
 }
 
@@ -140,6 +171,11 @@ impl Default for ConfiguredLlmProviders {
 }
 
 impl ConfiguredLlmProviders {
+    /// Convert named LLM config entries into concrete clients and metadata fallbacks.
+    ///
+    /// The match arms are the boundary where generic TOML knobs become
+    /// provider-specific builder calls such as base URL overrides, pricing
+    /// tables, and optional API keys.
     #[tracing::instrument(
         name = "llm_registry.from_config",
         skip_all,
@@ -148,6 +184,8 @@ impl ConfiguredLlmProviders {
     fn from_config(config: &BTreeMap<ProviderName, LlmProviderConfig>) -> Self {
         let mut providers = ConfiguredLlmProvidersInner::default();
         for (name, provider) in config {
+            // Model metadata has the same shape for every backend, so extract it
+            // before branching into provider-specific client construction.
             let model_info = configured_model_info(provider);
             let model_info_fallbacks = model_info.len();
             match provider {
@@ -202,6 +240,8 @@ impl ConfiguredLlmProviders {
                 LlmProviderConfig::OpenAiCompat {
                     base_url, api_key, ..
                 } => {
+                    // OpenAI-compatible gateways are often local or self-hosted:
+                    // the API root is required, while authentication is optional.
                     let mut client = chudbot_openai_compat::OpenAiCompatClient::new(
                         name.clone(),
                         base_url.clone(),
@@ -269,6 +309,7 @@ impl ConfiguredLlmProviders {
             + self.inner.xai.len()
     }
 
+    /// Fetch metadata from the named backend after config overrides and cache lookup miss.
     async fn fetch_remote_model_info(
         &self,
         provider: &ProviderName,
@@ -332,6 +373,8 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
         provider: &ProviderName,
         request: ModelStepRequest,
     ) -> Result<ModelStep, Self::Error> {
+        // Agents call through `RoutedLlmBackend`; by this point the provider
+        // name is the route key and the request shape is already final.
         if let Some(client) = self.inner.anthropic.get(provider) {
             tracing::debug!(kind = "anthropic", "dispatching model step");
             return LlmBackend::step(client, request)
@@ -376,11 +419,15 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
         provider: &ProviderName,
         request: ModelInfoRequest,
     ) -> Result<Option<ModelInfo>, Self::Error> {
+        // Configured metadata wins over provider discovery so operators can
+        // patch missing or inaccurate provider-reported limits.
         if let Some(info) = self.configured_model_info(provider, &request.model) {
             tracing::debug!("using configured model metadata");
             return Ok(Some(info));
         }
 
+        // Cache both hits and misses; some providers cannot report metadata and
+        // should not be asked again on every agent construction path.
         let cache_key = ModelInfoCacheKey::new(provider, &request);
         if let Some(info) = self.inner.model_info_cache.get(&cache_key).await {
             tracing::debug!(
@@ -406,6 +453,7 @@ impl ConfiguredLlmProviders {
     }
 }
 
+/// Collect configured metadata entries that contain at least one usable limit.
 fn configured_model_info(provider: &LlmProviderConfig) -> BTreeMap<ModelId, ModelInfo> {
     provider
         .model_info()
@@ -416,7 +464,10 @@ fn configured_model_info(provider: &LlmProviderConfig) -> BTreeMap<ModelId, Mode
         .collect()
 }
 
+/// Convert one config entry into provider-neutral model metadata.
 fn configured_model_info_entry(model: &ModelId, info: &LlmModelInfoConfig) -> Option<ModelInfo> {
+    // Empty entries are ignored so partially prepared config tables do not
+    // mask provider discovery with an all-`None` override.
     if info.context_window_tokens.is_none() && info.max_output_tokens.is_none() {
         return None;
     }
@@ -433,6 +484,7 @@ fn configured_model_info_entry(model: &ModelId, info: &LlmModelInfoConfig) -> Op
     })
 }
 
+/// Cache for provider-discovered model metadata, including unsupported models.
 struct ModelInfoCache {
     entries: Cache<ModelInfoCacheKey, Option<ModelInfo>>,
 }
@@ -471,6 +523,7 @@ impl std::fmt::Debug for ModelInfoCache {
 struct ModelInfoCacheKey {
     provider: ProviderName,
     model: ModelId,
+    /// Serialized provider options that can affect metadata, such as gateway routing.
     provider_options: Option<String>,
 }
 
@@ -488,6 +541,9 @@ impl ModelInfoCacheKey {
 }
 
 /// Concrete named image-generation provider registry.
+///
+/// Agent image bindings name one of these providers and a default model; the
+/// routed tool adapter applies that model before calling this registry.
 #[derive(Debug, Clone)]
 pub struct ConfiguredImageGenerators {
     inner: Arc<ConfiguredImageGeneratorsInner>,
@@ -495,6 +551,7 @@ pub struct ConfiguredImageGenerators {
 
 #[derive(Debug, Default)]
 struct ConfiguredImageGeneratorsInner {
+    /// Provider clients grouped by backend crate for direct generator dispatch.
     gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
     openai: BTreeMap<ProviderName, chudbot_openai::OpenAiClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
@@ -509,6 +566,10 @@ impl Default for ConfiguredImageGenerators {
 }
 
 impl ConfiguredImageGenerators {
+    /// Convert named image provider config into concrete generator clients.
+    ///
+    /// This is the option-mapping boundary for image-specific knobs such as
+    /// base URL overrides and OpenAI image pricing overrides.
     #[tracing::instrument(
         name = "image_registry.from_config",
         skip_all,
@@ -600,6 +661,8 @@ impl ImageGeneratorRegistry for ConfiguredImageGenerators {
         provider: &ProviderName,
         request: ImageRequest,
     ) -> Result<GeneratedImage, Self::Error> {
+        // The routed image tool already applied any binding-level default
+        // model; this registry only selects the named concrete provider.
         if let Some(client) = self.inner.openai.get(provider) {
             tracing::debug!(kind = "openai", "dispatching image generation");
             return ImageGenerator::generate_image(client, request)
@@ -624,6 +687,9 @@ impl ImageGeneratorRegistry for ConfiguredImageGenerators {
 }
 
 /// Concrete named video-generation provider registry.
+///
+/// Video tools route submit, poll, and download operations through the same
+/// provider name so async provider job IDs stay attached to their backend.
 #[derive(Debug, Clone)]
 pub struct ConfiguredVideoGenerators {
     inner: Arc<ConfiguredVideoGeneratorsInner>,
@@ -631,6 +697,7 @@ pub struct ConfiguredVideoGenerators {
 
 #[derive(Debug, Default)]
 struct ConfiguredVideoGeneratorsInner {
+    /// Provider clients grouped by backend crate for direct video dispatch.
     gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
 }
@@ -644,6 +711,10 @@ impl Default for ConfiguredVideoGenerators {
 }
 
 impl ConfiguredVideoGenerators {
+    /// Convert named video provider config into concrete generator clients.
+    ///
+    /// Video providers currently share the same option shape: API key plus an
+    /// optional base URL override.
     #[tracing::instrument(
         name = "video_registry.from_config",
         skip_all,
@@ -712,6 +783,8 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
         provider: &ProviderName,
         request: VideoRequest,
     ) -> Result<VideoJobId, Self::Error> {
+        // The returned job ID is opaque; callers keep using this provider name
+        // for later status checks and downloads.
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching video submit");
             return VideoGenerator::submit_video(client, request)
@@ -770,6 +843,9 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
 }
 
 /// Concrete named audio transcription provider registry.
+///
+/// The registry shape mirrors image/video even though xAI is the only current
+/// audio backend, keeping agent transcription bindings provider-neutral.
 #[derive(Debug, Clone)]
 pub struct ConfiguredAudioTranscribers {
     inner: Arc<ConfiguredAudioTranscribersInner>,
@@ -777,6 +853,7 @@ pub struct ConfiguredAudioTranscribers {
 
 #[derive(Debug, Default)]
 struct ConfiguredAudioTranscribersInner {
+    /// Provider clients grouped by backend crate for direct transcription dispatch.
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
 }
 
@@ -789,6 +866,7 @@ impl Default for ConfiguredAudioTranscribers {
 }
 
 impl ConfiguredAudioTranscribers {
+    /// Convert named audio transcription config into concrete transcriber clients.
     #[tracing::instrument(
         name = "audio_registry.from_config",
         skip_all,
@@ -842,6 +920,8 @@ impl AudioTranscriberRegistry for ConfiguredAudioTranscribers {
         provider: &ProviderName,
         request: AudioTranscriptionRequest,
     ) -> Result<AudioTranscription, Self::Error> {
+        // Agent bindings have already chosen the provider and optional model;
+        // this layer only fans out to the concrete transcriber implementation.
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching audio transcription");
             return AudioTranscriber::transcribe_audio(client, request)

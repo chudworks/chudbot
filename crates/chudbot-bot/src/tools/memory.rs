@@ -1,4 +1,14 @@
 //! User-memory client tools.
+//!
+//! The model sees these as ordinary client tools, but they are append-only
+//! inputs to the memory system. Lookup reads the compact profile plus recent
+//! unfused context. Remember and forget append events that the background
+//! memory runtime later folds into profile revisions.
+//!
+//! `crate::memory::PROMPT_GUIDANCE` tells memory-enabled agents to look up the
+//! author and mentioned users proactively, to remember durable facts, and to
+//! record explicit forget requests. The schemas and descriptions in this module
+//! are the provider-neutral tool contract backing that guidance.
 
 use super::*;
 
@@ -11,10 +21,17 @@ pub(crate) use crate::memory::{
     FORGET_USER_MEMORY_TOOL, LOOKUP_USER_MEMORY_TOOL, REMEMBER_USER_MEMORY_TOOL,
 };
 
+/// Number of most-recent diary entries returned by `lookup_user_memory`.
 const LOOKUP_DIARY_ENTRY_LIMIT: u32 = 3;
+/// Sentinel profile text used when no compact memory document exists yet.
 const EMPTY_MEMORY: &str = "(no stored memory)";
 
 /// Shared context for user-memory client tools during one turn.
+///
+/// The base key points at the current message author in the current platform
+/// scope. Tool input may override only the target user id; platform and scope
+/// stay fixed so a model cannot write memory outside the current server/global
+/// memory namespace.
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryToolContext {
     base_key: UserMemoryKey,
@@ -25,6 +42,7 @@ pub(crate) struct MemoryToolContext {
 }
 
 impl MemoryToolContext {
+    /// Capture the actor, turn, and default memory target for one agent turn.
     pub(crate) fn new(
         base_key: UserMemoryKey,
         actor_display_name: String,
@@ -40,6 +58,11 @@ impl MemoryToolContext {
         }
     }
 
+    /// Resolve the input target into the exact storage key for this call.
+    ///
+    /// Missing `target_user_id` means "the current author." Discord mention
+    /// syntax is accepted for convenience, but only the user component is
+    /// replaced; the current platform and scope are preserved.
     fn target_key(&self, input: &serde_json::Value) -> Result<UserMemoryKey, MemoryToolError> {
         let Some(target) = input
             .get("target_user_id")
@@ -56,6 +79,12 @@ impl MemoryToolContext {
     }
 }
 
+/// Model-facing spec for reading a user's memory state.
+///
+/// The prompt guidance tells agents to call this before responding to authors
+/// and newly mentioned users. The result payload is JSON with identity fields,
+/// compact profile metadata/content, pending memory events, and the latest diary
+/// entries.
 pub(crate) fn lookup_user_memory_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: "Look up the compact remembered profile and recent un-compacted memory events for the current user or another user id in this server.".to_string(),
@@ -63,6 +92,11 @@ pub(crate) fn lookup_user_memory_spec() -> ClientToolSpec {
     }
 }
 
+/// Model-facing spec for appending a durable memory event.
+///
+/// This does not rewrite the compact profile immediately. It records a
+/// `remember` event with optional tags and confidence so the memory compactor can
+/// merge it into a later profile revision.
 pub(crate) fn remember_user_memory_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: "Remember a stable preference, relationship, project, correction, recurring fact, or running joke for the current user or a target user id in this server.".to_string(),
@@ -70,6 +104,10 @@ pub(crate) fn remember_user_memory_spec() -> ClientToolSpec {
     }
 }
 
+/// Model-facing spec for appending a forget/tombstone event.
+///
+/// Forget requests are stored as events too. The compactor interprets them when
+/// deciding what should be removed or no longer trusted in the compact profile.
 pub(crate) fn forget_user_memory_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: "Record that a remembered fact should be forgotten or no longer used for the current user or a target user id in this server.".to_string(),
@@ -77,6 +115,21 @@ pub(crate) fn forget_user_memory_spec() -> ClientToolSpec {
     }
 }
 
+/// Load the compact memory document plus recent unfused context for one user.
+///
+/// Successful outputs are JSON and are mirrored into `trace_response`. The
+/// payload shape is:
+///
+/// - `message_provider`, `scope_key`, and `target_user_id`: resolved storage key.
+/// - `profile_found` and `profile_revision`: compact document state.
+/// - `profile`: compact markdown or `(no stored memory)`.
+/// - `recent_events`: pending events after the document cutoff, serialized with
+///   RFC3339 `created_at`.
+/// - `recent_diary_entries`: latest diary summaries, oldest-to-newest within the
+///   bounded slice returned by storage.
+///
+/// Invalid input and storage failures are returned as `Err`; the runtime
+/// executor converts them into model-facing tool errors with `is_error = true`.
 #[tracing::instrument(
     name = "tool.user_memory.lookup",
     skip_all,
@@ -95,6 +148,7 @@ where
         .load_user_memory_document(key.clone())
         .await
         .map_err(|error| MemoryToolError::Storage(error.to_string()))?;
+    // Pending events are those not yet represented by the compact document.
     let since = document
         .as_ref()
         .and_then(|document| document.source_event_cutoff);
@@ -142,6 +196,12 @@ where
     })
 }
 
+/// Append a `remember` event for the current or targeted user.
+///
+/// The model receives a short text confirmation. The persisted trace stores the
+/// event JSON, including tags, confidence, and creation time. Successful memory
+/// tools do not attach media or emit usage records; failures leave this function
+/// as `Err` and are converted by the executor into tool errors.
 #[tracing::instrument(
     name = "tool.user_memory.remember",
     skip_all,
@@ -159,6 +219,7 @@ where
     let memory = required_string(&call.input, "memory")?;
     let tags = optional_string_array(&call.input, "tags")?;
     let confidence = optional_f32(&call.input, "confidence")?;
+    // The event preserves provenance so compaction can explain where it came from.
     let event = storage
         .append_user_memory_event(NewUserMemoryEvent {
             key: key.clone(),
@@ -191,6 +252,11 @@ where
     })
 }
 
+/// Append a forget request for the current or targeted user.
+///
+/// The request body is the model/user-facing query, optionally followed by a
+/// reason paragraph. Like `remember_user_memory`, this records an event for the
+/// compactor rather than directly editing the compact profile.
 #[tracing::instrument(
     name = "tool.user_memory.forget",
     skip_all,
@@ -252,6 +318,11 @@ where
 }
 
 /// Errors from memory client tools.
+///
+/// These are execution failures, not successful tool results with
+/// `is_error = true`. `RuntimeToolExecutor` stringifies them through
+/// `runtime_tool_execution_error`, and the agent loop wraps the error text into
+/// the model-facing failed tool result and trace JSON.
 #[derive(Debug, Error)]
 pub(crate) enum MemoryToolError {
     /// Tool input was invalid.
@@ -262,6 +333,10 @@ pub(crate) enum MemoryToolError {
     Storage(String),
 }
 
+/// JSON Schema for the lookup tool input.
+///
+/// The only accepted field is optional `target_user_id`; absent input reads the
+/// current author captured in `MemoryToolContext`.
 fn lookup_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",
@@ -275,6 +350,10 @@ fn lookup_schema() -> ToolInputSchema {
     }))
 }
 
+/// JSON Schema for appending a `remember` event.
+///
+/// `memory` is required and must be non-empty after trimming. `tags` and
+/// `confidence` are optional metadata that pass through to the event record.
 fn remember_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",
@@ -302,6 +381,10 @@ fn remember_schema() -> ToolInputSchema {
     }))
 }
 
+/// JSON Schema for appending a `forget` event.
+///
+/// `query` names what should stop being used. `reason`, when present, is folded
+/// into the event body as explanatory text for later compaction.
 fn forget_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",
@@ -323,6 +406,7 @@ fn forget_schema() -> ToolInputSchema {
     }))
 }
 
+/// Read a required, trimmed, non-empty string field from provider JSON.
 fn required_string(input: &serde_json::Value, field: &str) -> Result<String, MemoryToolError> {
     input
         .get(field)
@@ -333,6 +417,7 @@ fn required_string(input: &serde_json::Value, field: &str) -> Result<String, Mem
         .ok_or_else(|| MemoryToolError::InvalidInput(format!("`{field}` is required")))
 }
 
+/// Read an optional string-array field, rejecting empty or non-string members.
 fn optional_string_array(
     input: &serde_json::Value,
     field: &str,
@@ -362,6 +447,7 @@ fn optional_string_array(
         .collect()
 }
 
+/// Read an optional confidence value in the inclusive `0..=1` range.
 fn optional_f32(input: &serde_json::Value, field: &str) -> Result<Option<f32>, MemoryToolError> {
     let Some(value) = input.get(field) else {
         return Ok(None);
@@ -379,6 +465,10 @@ fn optional_f32(input: &serde_json::Value, field: &str) -> Result<Option<f32>, M
     Ok(Some(value as f32))
 }
 
+/// Normalize the optional target id accepted by model-facing schemas.
+///
+/// Discord `<@id>` and `<@!id>` mentions are unwrapped because models often copy
+/// mention text from message context into tool arguments.
 fn normalize_target_user_id(input: &str) -> Result<String, MemoryToolError> {
     let trimmed = input.trim();
     let unwrapped = trimmed
@@ -399,6 +489,7 @@ fn normalize_target_user_id(input: &str) -> Result<String, MemoryToolError> {
     Ok(unwrapped.to_string())
 }
 
+/// Serialize a memory event into the lookup payload and trace response shape.
 fn memory_event_trace(event: &UserMemoryEvent) -> serde_json::Value {
     serde_json::json!({
         "id": event.id,
@@ -413,6 +504,11 @@ fn memory_event_trace(event: &UserMemoryEvent) -> serde_json::Value {
     })
 }
 
+/// Serialize a diary entry into the compact lookup payload shape.
+///
+/// The storage record includes provenance and usage fields that are intentionally
+/// omitted here; the model only needs the window bounds, creation time, and
+/// markdown summary.
 fn memory_diary_entry_trace(entry: &UserMemoryDiaryEntry) -> serde_json::Value {
     serde_json::json!({
         "id": entry.id,
@@ -423,12 +519,14 @@ fn memory_diary_entry_trace(entry: &UserMemoryDiaryEntry) -> serde_json::Value {
     })
 }
 
+/// Format timestamps for stable JSON payloads and trace assertions.
 fn timestamp_rfc3339(timestamp: OffsetDateTime) -> String {
     timestamp
         .format(&Rfc3339)
         .unwrap_or_else(|_| timestamp.to_string())
 }
 
+/// Stable string labels used in model-visible event JSON.
 fn event_kind_label(kind: UserMemoryEventKind) -> &'static str {
     match kind {
         UserMemoryEventKind::Remember => "remember",

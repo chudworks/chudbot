@@ -1,3 +1,12 @@
+//! Span-aware config diagnostics for `check-config`.
+//!
+//! Syntax, type, and missing-field failures are emitted by the TOML
+//! parser/deserializer before a `RuntimeConfig` exists. Once deserialization
+//! succeeds, this module aggregates semantic failures and stale/unknown config
+//! keys into one compiler-style report. Keeping unknown-key checks here instead
+//! of `#[serde(deny_unknown_fields)]` preserves the richer diagnostic path:
+//! users can see all related config problems, with source labels, in one run.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error as _;
@@ -28,6 +37,11 @@ const ANSI_BLUE: &str = "\x1b[34m";
 const ANSI_GREEN: &str = "\x1b[32m";
 const ANSI_BOLD: &str = "\x1b[1m";
 
+/// Original TOML plus a shape-only, spanned tree used for diagnostic labels.
+///
+/// Runtime code reads the typed `RuntimeConfig`; validators use this companion
+/// tree only to find related source ranges for keys, tables, arrays, and array
+/// items.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigSource {
     path: PathBuf,
@@ -38,6 +52,9 @@ pub(crate) struct ConfigSource {
 
 impl ConfigSource {
     pub(crate) fn new(path: PathBuf, input: String) -> Self {
+        // Best effort: parse/type errors are reported through the normal TOML
+        // path. If this tree is unavailable, semantic validation can still fall
+        // back to broad source ranges instead of changing config behavior.
         let root = toml::from_str::<toml::Spanned<SourceNode>>(&input).ok();
         let lines = LineIndex::new(&input);
         Self {
@@ -56,6 +73,8 @@ impl ConfigSource {
         &self.input
     }
 
+    // Walk a logical config path through the spanned source tree. Quoted TOML
+    // keys that contain dots remain one `PathPart::Key`.
     fn node_for(&self, path: &[PathPart<'_>]) -> Option<&toml::Spanned<SourceNode>> {
         let mut value = self.root.as_ref()?;
         for part in path {
@@ -83,6 +102,9 @@ impl ConfigSource {
         self.node_for(path).map(toml::Spanned::span)
     }
 
+    // TOML and serde do not always expose the exact key token that caused a
+    // semantic error. Prefer the requested value span, then walk outward until a
+    // related table/array span is available.
     fn nearest_span_for(&self, path: &[PathPart<'_>]) -> Option<Range<usize>> {
         for len in (0..=path.len()).rev() {
             if let Some(span) = self.span_for(&path[..len]) {
@@ -98,6 +120,9 @@ impl ConfigSource {
         fallback_path: &[PathPart<'_>],
         message: impl Into<String>,
     ) -> DiagnosticLabel {
+        // Most validators know the ideal field path plus a containing table
+        // that is still useful when the field is absent or represented through
+        // an inline table.
         let span = self
             .span_for(path)
             .or_else(|| self.nearest_span_for(fallback_path))
@@ -109,6 +134,11 @@ impl ConfigSource {
     }
 }
 
+/// Minimal TOML shape preserved solely for source-span lookup.
+///
+/// Scalars collapse to one variant because validation uses the typed
+/// `RuntimeConfig` for values. The tree keeps only container boundaries and
+/// child names so diagnostics can point back into the user's file.
 #[derive(Debug, Clone)]
 enum SourceNode {
     Scalar,
@@ -200,6 +230,9 @@ impl<'de> Visitor<'de> for SourceNodeVisitor {
         let mut entries = BTreeMap::new();
         while let Some(key) = map.next_key::<String>()? {
             if key == DATETIME_FIELD {
+                // `toml` exposes datetime values to `deserialize_any` as a
+                // private one-field map. Treat that implementation detail as a
+                // scalar so datetime-like settings do not look like tables.
                 let _ = map.next_value::<IgnoredAny>()?;
                 return Ok(SourceNode::Scalar);
             }
@@ -210,6 +243,7 @@ impl<'de> Visitor<'de> for SourceNodeVisitor {
     }
 }
 
+/// One segment in a diagnostic path through `ConfigSource`.
 #[derive(Debug, Clone, Copy)]
 enum PathPart<'a> {
     Key(&'a str),
@@ -224,6 +258,7 @@ fn index(value: usize) -> PathPart<'static> {
     PathPart::Index(value)
 }
 
+/// Aggregated semantic config errors rendered in a compiler-style format.
 #[derive(Debug, Clone)]
 pub(crate) struct ConfigValidationReport {
     path: PathBuf,
@@ -258,6 +293,9 @@ impl ConfigValidationReport {
     }
 
     fn render_with_style(&self, style: DiagnosticStyle) -> String {
+        // Every collected error gets its own `error: ...` block. The trailing
+        // summary mirrors rustc-style multi-error output and makes automation
+        // logs easier to scan.
         let mut out = String::new();
         for (index, diagnostic) in self.diagnostics.iter().enumerate() {
             if index > 0 {
@@ -290,6 +328,7 @@ impl fmt::Display for ConfigValidationReport {
 
 impl std::error::Error for ConfigValidationReport {}
 
+/// One rendered config error, with optional notes and a single help message.
 #[derive(Debug, Clone)]
 struct ConfigDiagnostic {
     message: String,
@@ -373,6 +412,7 @@ impl ConfigDiagnostic {
     }
 }
 
+/// A source range and label text for one highlighted diagnostic span.
 #[derive(Debug, Clone)]
 struct DiagnosticLabel {
     span: Range<usize>,
@@ -431,12 +471,14 @@ impl DiagnosticStyle {
     }
 }
 
+/// Whether stderr should receive ANSI color for diagnostic rendering.
 pub(crate) fn stderr_supports_color() -> bool {
     std::io::stderr().is_terminal()
         && env::var_os("NO_COLOR").is_none()
         && env::var("TERM").map_or(true, |term| term != "dumb")
 }
 
+/// Byte line starts used to translate TOML byte spans into display positions.
 #[derive(Debug, Clone)]
 struct LineIndex {
     starts: Vec<usize>,
@@ -513,6 +555,8 @@ fn render_label(
                 } else {
                     line_range.len()
                 };
+                // Spans are byte offsets, but gutters and carets are rendered
+                // in character columns so UTF-8 input stays aligned.
                 let start_col = byte_to_char_col(line_text, highlight_start_byte);
                 let end_col = byte_to_char_col(line_text, highlight_end_byte).max(start_col + 1);
                 let window = SourceLineWindow::new(line_text, start_col, end_col);
@@ -598,6 +642,9 @@ impl SourceLineWindow {
         }
 
         let highlight_end = end_col.min(chars.len()).max(start_col + 1);
+        // Long inline arrays/tables can be much wider than a terminal. Keep the
+        // highlighted region visible and add ellipses only around the clipped
+        // source text.
         let mut window_start = start_col.saturating_sub(48);
         let mut window_end = highlight_end.saturating_add(72).min(chars.len());
         if window_end.saturating_sub(window_start) < SOURCE_WINDOW_CHARS {
@@ -622,6 +669,9 @@ impl SourceLineWindow {
     }
 }
 
+// Allowed-key schemas for config-owned TOML surfaces. Dynamic maps stay open at
+// the map-key level; validators apply the relevant entry schema after serde has
+// identified each configured agent, provider, platform, or pricing model.
 const ROOT_KEYS: &[&str] = &[
     "database",
     "logging",
@@ -740,12 +790,22 @@ const ANTHROPIC_TOKEN_PRICING_KEYS: &[&str] = &[
 ];
 const LLM_MODEL_INFO_KEYS: &[&str] = &["context_window_tokens", "max_output_tokens"];
 
+/// Runs post-deserialization validation and returns every semantic/stale-key
+/// problem found in the config.
+///
+/// This is intentionally separate from serde's unknown-field handling. Serde
+/// can stop at the first stale key and often lacks the path-specific rendering
+/// context this layer has.
 pub(crate) fn validate_runtime_config(
     config: &RuntimeConfig,
     source: &ConfigSource,
 ) -> Result<(), ConfigValidationReport> {
     let mut diagnostics = Vec::new();
+    // Report stale keys first so renamed/removed settings are visible before
+    // follow-on semantic errors caused by the surviving config values.
     validate_unexpected_keys(config, source, &mut diagnostics);
+    // The remaining passes validate relationships that only make sense after
+    // TOML has deserialized into the typed runtime config.
     validate_database(config, source, &mut diagnostics);
     validate_logging(config, source, &mut diagnostics);
     validate_bot_config(config, source, &mut diagnostics);
@@ -769,6 +829,9 @@ fn validate_unexpected_keys(
     source: &ConfigSource,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
+    // Variant-specific sections use the deserialized config to choose the
+    // correct allowed-key set. That keeps one diagnostics path for stale keys
+    // without making unrelated provider/agent names closed.
     validate_known_keys(source, diagnostics, &[], ROOT_KEYS);
     validate_known_keys(source, diagnostics, &[key("database")], DATABASE_KEYS);
     validate_known_keys(source, diagnostics, &[key("logging")], LOGGING_KEYS);
@@ -870,6 +933,8 @@ fn validate_agent_unexpected_keys(
         &child_path(&model_path, "provider_options"),
         PROVIDER_OPTIONS_KEYS,
     );
+    // `provider_options.value` is provider-owned and intentionally opaque here;
+    // this layer only catches stale keys in the config-owned envelope.
     validate_generation_binding_unexpected_keys(
         source,
         diagnostics,
@@ -927,6 +992,8 @@ fn validate_runtime_provider_unexpected_keys(
     source: &ConfigSource,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
+    // Provider and platform names are user-defined map keys. Iterate the typed
+    // config so each provider variant gets the correct inner schema.
     for (provider_name, provider) in &config.llm {
         validate_llm_provider_unexpected_keys(
             source,
@@ -1082,6 +1149,8 @@ fn validate_known_keys(
     path: &[PathPart<'_>],
     allowed: &[&str],
 ) {
+    // Core stale-key check. If the path is absent or is not a table, serde's
+    // syntax/type path owns that failure and this pass stays silent.
     let Some(entries) = source.table_at(path) else {
         return;
     };
@@ -1100,6 +1169,8 @@ fn validate_map_entry_keys(
     map_path: &[PathPart<'_>],
     entry_allowed: &[&str],
 ) {
+    // The table's direct keys are names such as agents, providers, or models;
+    // each named child gets checked against the schema for one entry.
     let Some(entries) = source.table_at(map_path) else {
         return;
     };
@@ -1119,6 +1190,7 @@ fn validate_array_item_keys(
     array_path: &[PathPart<'_>],
     item_allowed: &[&str],
 ) {
+    // Arrays are closed at the item shape, not at the array length.
     let Some(items) = source.array_at(array_path) else {
         return;
     };
@@ -1158,6 +1230,8 @@ fn unexpected_key_diagnostic(
     } else {
         "key"
     };
+    // Prefer a direct path lookup so inline tables and arrays get consistent
+    // path formatting; otherwise use the span already carried by the entry.
     let span = source
         .span_for(&full_path)
         .unwrap_or_else(|| entry.span())
@@ -1196,6 +1270,8 @@ fn unexpected_key_help(entry_name: &str, allowed: &[&str]) -> Option<String> {
     }
 }
 
+// Semantic validators below operate on a successfully deserialized
+// `RuntimeConfig` and use `ConfigSource` only to attach useful source labels.
 fn validate_database(
     config: &RuntimeConfig,
     source: &ConfigSource,
@@ -1285,6 +1361,8 @@ fn validate_bot_config(
     source: &ConfigSource,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
+    // Agent names form a local registry. Validate the registry itself first,
+    // then every place that refers back into it.
     let agents = config.bot.agents.keys().cloned().collect::<BTreeSet<_>>();
     if !config.bot.agents.contains_key(&config.bot.default_agent) {
         diagnostics.push(
@@ -1643,6 +1721,8 @@ fn validate_runtime_references(
     source: &ConfigSource,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
+    // Provider/platform references cross top-level registries. Snapshot the
+    // available names once so every diagnostic can suggest the same choices.
     let llm_names = provider_names(&config.llm);
     let image_names = provider_names(&config.image);
     let video_names = provider_names(&config.video);
@@ -2014,6 +2094,8 @@ fn toml_key(value: &str) -> String {
     quoted
 }
 
+/// Renders TOML parser/deserializer failures that occur before semantic
+/// validation can run.
 pub(crate) fn render_toml_error_for_stderr(
     path: &Path,
     input: &str,
@@ -2038,6 +2120,8 @@ fn render_toml_error_with_style(
         ConfigDiagnostic::new(format!("could not parse config file `{}`", path.display()))
             .with_note(error.message().to_string());
     if let Some(span) = error.span() {
+        // Parser errors already carry their own span, so reuse the same
+        // diagnostic renderer instead of special-casing TOML errors elsewhere.
         diagnostic.labels.push(DiagnosticLabel {
             span,
             message: "TOML could not be decoded here".to_string(),

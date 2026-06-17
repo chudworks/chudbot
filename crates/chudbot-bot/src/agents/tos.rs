@@ -1,17 +1,36 @@
-//! Safety preflight agent resolution and execution.
+//! ToS and moderation preflight resolution.
+//!
+//! The preflight runs before the normal conversation turn. It asks a reserved
+//! system agent to classify the incoming platform message as allowed or refused,
+//! while still letting deployments override that agent through normal config.
+//! Operational failures fail open so the bot does not go silent because a
+//! moderation model is unavailable; provider-level safety refusals fail closed
+//! because they indicate the submitted content tripped the provider's policy.
 
 use crate::prelude::*;
 use crate::*;
 
-/// Resolver for the safety preflight agent.
+/// Cached resolver for the ToS preflight system agent.
+///
+/// A configured `tos_preflight` agent wins exactly. When it is absent, startup
+/// resolution synthesizes moderation agents from the configured default agent
+/// and any platform-specific default agents so each platform inherits the model
+/// family it would otherwise talk to.
 #[derive(Debug, Clone)]
 pub(crate) struct TosPreflightSystemAgents {
+    /// Exact `tos_preflight` entry loaded from normal agent config.
     pub(crate) configured: Option<SystemAgentConfig>,
+    /// Inherited defaults keyed by platform for non-global platform agents.
     pub(crate) platform_defaults: BTreeMap<PlatformName, SystemAgentConfig>,
+    /// Inherited default built from the global default agent.
     pub(crate) default: Option<SystemAgentConfig>,
 }
 
 impl TosPreflightSystemAgents {
+    /// Resolve the preflight agent set once from bot config.
+    ///
+    /// The result is stored on `BotRuntime` and borrowed for each message, so
+    /// per-message moderation does not re-run config inheritance or logging.
     pub(crate) fn from_config(config: &BotConfig) -> Self {
         if let Some(configured) = configured_system_agent(config, TOS_PREFLIGHT_AGENT) {
             return Self {
@@ -69,6 +88,11 @@ impl TosPreflightSystemAgents {
     }
 }
 
+/// Build the implicit preflight agent inherited from a normal chat agent.
+///
+/// The moderation prompt is fixed, but provider, model, and loop limits follow
+/// the source agent. Sampling is deterministic and capped tightly because the
+/// caller only needs a short `ALLOW` or `REFUSE` verdict.
 pub(crate) fn default_tos_preflight_agent(
     source: &AgentConfig,
     default_limits: AgentLimits,
@@ -95,6 +119,7 @@ impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
 {
+    /// Return the cached preflight agent for a platform.
     pub(crate) fn tos_preflight_agent(
         &self,
         platform: &PlatformName,
@@ -104,6 +129,11 @@ where
             .get(platform, &self.config.default_agent)
     }
 
+    /// Run the ToS/moderation preflight for an inbound platform message.
+    ///
+    /// Missing providers and ordinary model/runtime failures fail open. Errors
+    /// that look like provider safety refusals fail closed, matching completed
+    /// model output that begins with or contains a `REFUSE` verdict.
     pub(crate) async fn moderation_allows(
         &self,
         message: &PlatformMessage,
@@ -120,6 +150,8 @@ where
         }
 
         let mut transcript = Transcript::new();
+        // Include the display name in the classified text so the moderation
+        // model sees the same speaker attribution the chat agent will see.
         transcript.push(TranscriptTurn::text(
             TurnRole::User,
             format!(
@@ -145,6 +177,9 @@ where
         };
         match run.outcome {
             AgentOutcome::Completed { answer } => {
+                // The prompt asks for a compact verdict, but providers may add
+                // casing or surrounding prose. Treat `REFUSE` at the start or
+                // after whitespace as a refusal without parsing arbitrary text.
                 let verdict = answer.text.trim().to_ascii_uppercase();
                 let allowed = !verdict.starts_with("REFUSE")
                     && !verdict.contains(" REFUSE")
@@ -178,11 +213,17 @@ where
     }
 }
 
+/// Detect provider safety refusals returned as model or tool errors.
+///
+/// These strings come from provider/tool surfaces that do not produce a normal
+/// moderation answer. Matching them keeps policy refusals fail-closed while
+/// preserving fail-open behavior for ordinary outages.
 pub(crate) fn error_indicates_safety_refusal(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("safety_check") || lower.contains("violates usage guidelines")
 }
 
+/// Return whether any client-tool trace contains a provider safety refusal.
 pub(crate) fn safety_refusal_in_tool_trace(trace: &[ToolTrace]) -> bool {
     trace.iter().any(|trace| {
         let ToolTrace::Client { trace } = trace else {
@@ -194,6 +235,8 @@ pub(crate) fn safety_refusal_in_tool_trace(trace: &[ToolTrace]) -> bool {
         match &trace.result.content {
             ClientToolResultContent::Text { text } => error_indicates_safety_refusal(text),
             ClientToolResultContent::Json { value } => error_indicates_safety_refusal(
+                // Tool errors are inconsistently shaped: some wrap a string in
+                // `error`, while others are themselves a JSON string.
                 value
                     .get("error")
                     .and_then(serde_json::Value::as_str)

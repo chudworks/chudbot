@@ -1,3 +1,18 @@
+//! TOML-facing runtime configuration for the `chudbot-bin` process.
+//!
+//! This module is the boundary between `config.toml` and runtime construction.
+//! It owns the root process sections and concrete provider/platform service
+//! registries, while `chudbot-bot` owns the agent-first config that routes
+//! turns to those registries. Loading deliberately keeps the original TOML
+//! source text beside the deserialized values so `check-config` can report
+//! aggregated, span-aware diagnostics instead of stopping at the first semantic
+//! error.
+//!
+//! Provider-specific per-model knobs, such as OpenAI reasoning settings or
+//! local gateway `extra_body` payloads, are not decoded by this module. They
+//! live under `bot.agents.<name>.model.provider_options.value` as an opaque
+//! JSON value and are interpreted by the already-routed provider backend.
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -12,7 +27,14 @@ use crate::VERSION;
 use crate::diagnostics::{ConfigSource, ConfigValidationReport, validate_runtime_config};
 use crate::errors::{BinError, ConfigError};
 
-/// Full process configuration.
+/// Full process configuration deserialized from `config.toml`.
+///
+/// The root shape is part of the public operator contract documented in
+/// `config.example.toml`: `[bot]` defines agents and their bindings, while
+/// `[llm]`, `[image]`, `[video]`, `[audio]`, and `[platforms]` define named
+/// runtime services those agents can reference. Keep this type broadly
+/// deserializable; stale and unknown config keys are reported by the diagnostics
+/// validator so operators get all actionable errors in one run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     /// Postgres database connection config.
@@ -28,19 +50,19 @@ pub struct RuntimeConfig {
     /// Deployment fallback privacy mode before a guild stores an override.
     #[serde(default = "default_privacy")]
     pub default_privacy: PrivacyMode,
-    /// Named LLM provider configs.
+    /// Named LLM provider configs keyed by provider registry name.
     #[serde(default)]
     pub llm: BTreeMap<ProviderName, LlmProviderConfig>,
-    /// Named image-generation provider configs.
+    /// Named image-generation provider configs keyed by provider registry name.
     #[serde(default)]
     pub image: BTreeMap<ProviderName, ImageProviderConfig>,
-    /// Named video-generation provider configs.
+    /// Named video-generation provider configs keyed by provider registry name.
     #[serde(default)]
     pub video: BTreeMap<ProviderName, VideoProviderConfig>,
-    /// Named audio transcription provider configs.
+    /// Named audio transcription provider configs keyed by provider registry name.
     #[serde(default)]
     pub audio: BTreeMap<ProviderName, AudioProviderConfig>,
-    /// Named message platform configs.
+    /// Named message platform configs keyed by platform registry name.
     #[serde(default)]
     pub platforms: BTreeMap<chudbot_api::PlatformName, MessagePlatformConfig>,
     /// Web viewer config.
@@ -50,7 +72,11 @@ pub struct RuntimeConfig {
     pub storage: LocalStorageConfig,
 }
 
-/// Runtime config plus source text used for diagnostics.
+/// Parsed runtime config paired with the source text used for diagnostics.
+///
+/// `serve`, `migrate`, and `check-config` all start from the same parse path.
+/// Keeping the source here lets validation report errors against the exact TOML
+/// the operator supplied, including nested tables owned by other crates.
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedRuntimeConfig {
     /// Deserialized runtime config.
@@ -85,6 +111,7 @@ impl Default for LoggingConfig {
 }
 
 impl LoggingConfig {
+    /// Parse the configured tracing filter after TOML validation.
     pub(crate) fn filter(&self) -> Result<EnvFilter, LoggingFilterError> {
         EnvFilter::try_new(&self.filter).map_err(|source| LoggingFilterError {
             filter: self.filter.clone(),
@@ -128,23 +155,38 @@ fn default_privacy() -> PrivacyMode {
 
 impl RuntimeConfig {
     /// Load config from TOML and retain source text for diagnostics.
+    ///
+    /// This only performs file I/O, TOML parsing, and default normalization that
+    /// needs process state. Semantic checks are deferred to [`Self::validate_all`]
+    /// so commands can render one aggregated diagnostics report.
     #[tracing::instrument(name = "config.load", skip_all, fields(path = %path.display()))]
     pub(crate) fn load_with_source(path: &Path) -> Result<LoadedRuntimeConfig, ConfigError> {
+        // Read the source once and keep it alive for both parse errors and the
+        // later span-aware semantic validator.
         tracing::debug!("reading config file");
         let content = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path.to_path_buf(),
             source,
         })?;
         tracing::debug!(bytes = content.len(), "read config file");
+
+        // Serde owns syntax and type-shape failures. Unknown/stale keys remain
+        // on the diagnostics path so `check-config` can report them together
+        // with cross-reference and semantic errors.
         let mut config: Self = toml::from_str(&content).map_err(|source| ConfigError::Parse {
             path: path.to_path_buf(),
             content: content.clone().into_boxed_str(),
             source: Box::new(source),
         })?;
+
+        // The bot prompt includes a version label. If config omits it, use the
+        // binary build version without making operators duplicate deployment
+        // metadata in TOML.
         if config.bot.version.is_empty() {
             config.bot.version = VERSION.to_string();
             tracing::debug!(version = VERSION, "defaulted bot version from binary");
         }
+
         tracing::info!(
             agents = config.bot.agents.len(),
             llm_providers = config.llm.len(),
@@ -159,10 +201,15 @@ impl RuntimeConfig {
     }
 
     /// Validate config and return all static diagnostics with TOML spans.
+    ///
+    /// The validator checks root keys, nested bot config owned by
+    /// `chudbot-bot`, provider/platform service maps, cross-references, and
+    /// simple value constraints before any runtime services are constructed.
     pub(crate) fn validate_all(&self, source: &ConfigSource) -> Result<(), ConfigValidationReport> {
         validate_runtime_config(self, source)
     }
 
+    /// Check the database URL immediately before commands that need Postgres.
     pub(crate) fn validate_database(&self) -> Result<(), BinError> {
         if self.database.url.trim().is_empty() {
             tracing::warn!("database URL is empty");
@@ -179,7 +226,11 @@ pub struct DatabaseConfig {
     pub url: String,
 }
 
-/// Web listener plus viewer config.
+/// Web listener plus trace-viewer presentation config.
+///
+/// This is the TOML shape. [`WebRuntimeConfig::viewer_config`] converts it into
+/// the narrower `chudbot-web` config after process defaults such as `VERSION`
+/// and `[bot].web_base_url` are available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebRuntimeConfig {
     /// Socket address to listen on.
@@ -205,12 +256,16 @@ pub struct WebRuntimeConfig {
 }
 
 impl WebRuntimeConfig {
+    /// Convert TOML config into the web crate's runtime view.
     pub(crate) fn viewer_config(&self, fallback_public_base_url: &str) -> WebConfig {
         WebConfig {
             title_prefix: self.title_prefix.clone(),
             version: VERSION.to_string(),
             frontend_dir: self.frontend_dir.clone(),
             favicon_path: self.favicon_path.clone(),
+            // Link-preview metadata needs an absolute public origin. Let the
+            // web section override it, otherwise reuse the bot's viewer URL so
+            // older configs keep working.
             public_base_url: self
                 .public_base_url
                 .clone()
@@ -229,7 +284,10 @@ fn default_trust_forwarded_for() -> bool {
     true
 }
 
-/// Local storage directories.
+/// Local media storage directories and public URL base.
+///
+/// The filesystem-backed media store keeps each media class in a separate
+/// directory but exposes one optional public origin for generated viewer links.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalStorageConfig {
     /// Image directory.
@@ -277,7 +335,12 @@ fn default_avatars_dir() -> PathBuf {
     PathBuf::from("avatars")
 }
 
-/// Named LLM provider config.
+/// Concrete LLM service config for one entry in `[llm.<name>]`.
+///
+/// The map key is the runtime provider name referenced by agents; the `kind`
+/// tag selects which backend implementation to construct. Multiple entries may
+/// use the same kind with different credentials, base URLs, pricing overrides,
+/// or model metadata fallbacks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LlmProviderConfig {
@@ -321,7 +384,7 @@ pub enum LlmProviderConfig {
         #[serde(default)]
         model_info: BTreeMap<ModelId, LlmModelInfoConfig>,
     },
-    /// OpenAI-compatible provider placeholder.
+    /// OpenAI-compatible chat-completions provider, usually a local gateway.
     #[serde(rename = "openai_compat")]
     OpenAiCompat {
         /// Base URL.
@@ -347,6 +410,11 @@ pub enum LlmProviderConfig {
 }
 
 impl LlmProviderConfig {
+    /// Return static model metadata fallbacks independent of provider kind.
+    ///
+    /// Services use these entries before asking the remote provider, which is
+    /// useful for local gateways or models whose context limits are not exposed
+    /// by the upstream API.
     pub(crate) fn model_info(&self) -> &BTreeMap<ModelId, LlmModelInfoConfig> {
         match self {
             Self::Xai { model_info, .. }
@@ -359,6 +427,9 @@ impl LlmProviderConfig {
 }
 
 /// Configured fallback metadata for one LLM model id.
+///
+/// These values are optional because some providers can fetch equivalent model
+/// metadata remotely. Configured values take precedence when present.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmModelInfoConfig {
     /// Maximum context-window tokens accepted by the model.
@@ -369,7 +440,10 @@ pub struct LlmModelInfoConfig {
     pub max_output_tokens: Option<u64>,
 }
 
-/// Named image-generation provider config.
+/// Concrete image-generation service config for one entry in `[image.<name>]`.
+///
+/// Agent image-generation bindings reference the map key, not the provider
+/// kind, so deployments can expose several image services at once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ImageProviderConfig {
@@ -403,7 +477,10 @@ pub enum ImageProviderConfig {
     },
 }
 
-/// Named video-generation provider config.
+/// Concrete video-generation service config for one entry in `[video.<name>]`.
+///
+/// Video rate limits live on agent tool bindings because the same provider can
+/// be exposed with different policy to different agents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum VideoProviderConfig {
@@ -425,7 +502,10 @@ pub enum VideoProviderConfig {
     },
 }
 
-/// Named audio transcription provider config.
+/// Concrete audio transcription service config for one entry in `[audio.<name>]`.
+///
+/// Agent transcription bindings reference these names and may optionally supply
+/// model and wake-word behavior.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AudioProviderConfig {
@@ -439,11 +519,15 @@ pub enum AudioProviderConfig {
     },
 }
 
-/// Named message platform config.
+/// Concrete message-platform service config for one entry in `[platforms.<name>]`.
+///
+/// `[bot.platforms.<name>]` binds these platform services to default agents.
+/// The platform map stays separate from bot routing so future platform adapters
+/// can be added without changing the agent config contract.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum MessagePlatformConfig {
-    /// Discord platform placeholder.
+    /// Discord platform backed by the `chudbot-discord` Twilight adapter.
     Discord {
         /// Bot token.
         token: String,

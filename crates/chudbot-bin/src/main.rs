@@ -1,3 +1,10 @@
+//! Thin process entrypoint for Chudbot.
+//!
+//! This crate owns CLI parsing, TOML loading, concrete provider/platform
+//! registries, database migrations, and process startup. Bot behavior, Discord
+//! I/O, storage, and the web viewer live in the workspace crates that this file
+//! wires together.
+
 mod config;
 mod diagnostics;
 mod errors;
@@ -22,8 +29,11 @@ use platforms::ConfiguredMessagePlatforms;
 use runtime::run_runtime_services;
 use services::{BootstrapServices, ConfiguredBotRuntime};
 
+/// Git version injected by `build.rs`.
 const VERSION: &str = env!("GIT_VERSION");
+/// Time allowed for bot work to drain after process shutdown is requested.
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(30);
+/// Time allowed for platform event pumps to stop after platforms are asked to shut down.
 const PLATFORM_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Parser)]
@@ -42,19 +52,25 @@ struct Args {
 enum Command {
     /// Load the configuration and verify static references.
     CheckConfig,
-    /// Apply pending database migrations.
+    /// Apply pending database migrations without starting providers or platforms.
     Migrate,
-    /// Build configured services and start the process.
+    /// Build configured services and run the bot plus web viewer until shutdown.
     Serve,
 }
 
+/// Parse CLI input, load the config, and dispatch the selected command.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Install the rustls backend before any provider or platform client can be
+    // constructed.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
 
     let args = Args::parse();
+
+    // Loading happens before tracing because parse errors need access to the
+    // original TOML text for compiler-style diagnostics.
     let loaded = match RuntimeConfig::load_with_source(&args.config) {
         Ok(loaded) => loaded,
         Err(error) => {
@@ -65,6 +81,10 @@ async fn main() -> ExitCode {
     };
     let check_config = matches!(args.command, Command::CheckConfig);
     if !check_config {
+        // Runtime commands install logging immediately so startup failures are
+        // visible through the configured tracing sink. `check-config` delays
+        // this until validation succeeds so invalid configs print only the
+        // diagnostic renderer.
         if let Err(error) = init_tracing(&loaded.config.logging) {
             let error = BinError::from(error);
             report_error(&error);
@@ -75,6 +95,9 @@ async fn main() -> ExitCode {
     match run(args.command, args.config, loaded).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            // Validation reports are already rendered below with TOML spans;
+            // logging them again would duplicate the same errors without the
+            // source context.
             if !matches!(error, BinError::ConfigValidation(_)) {
                 tracing::error!(error = %error, "chudbot failed");
             }
@@ -97,9 +120,16 @@ async fn run(
     let LoadedRuntimeConfig { config, source } = loaded;
     match command {
         Command::CheckConfig => {
+            // Static validation walks the full config graph and keeps all
+            // errors on the span-aware diagnostics path before constructing any
+            // runtime services.
             config.validate_all(&source)?;
             init_tracing(&config.logging)?;
             log_start(&config_path, &Command::CheckConfig, &config);
+
+            // Provider/media registries and the media store are still built as
+            // a bootstrap smoke test, but storage and platform network
+            // connections are intentionally left untouched.
             let services = BootstrapServices::build(&config)?;
             tracing::info!(
                 llm_providers = services.llms.configured_count(),
@@ -113,6 +143,9 @@ async fn run(
             Ok(())
         }
         Command::Migrate => {
+            // Migrations need only a usable database URL. They do not require
+            // provider credentials, platform tokens, or agent references to be
+            // runnable.
             config.validate_database()?;
             let storage = SqlxStorage::connect(&config.database.url).await?;
             storage.run_migrations().await?;
@@ -121,10 +154,19 @@ async fn run(
         }
         Command::Serve => {
             let mut config = config;
+
+            // Serve is the full runtime path: validate every static reference
+            // before opening durable connections or spawning long-lived tasks.
             config.validate_all(&source)?;
+
+            // Storage is shared by the bot and web viewer. The default privacy
+            // fallback is attached before the runtime starts handling turns.
             let storage = SqlxStorage::connect(&config.database.url)
                 .await?
                 .with_default_privacy(config.default_privacy.clone());
+
+            // Register the git build once per deployment and expose the
+            // monotonic app-version id to bot replies, traces, and viewer UI.
             let app_version = storage.register_app_version(VERSION).await?;
             let version_label = format!("v{}", app_version.id);
             tracing::info!(
@@ -134,12 +176,22 @@ async fn run(
                 "resolved build version"
             );
             config.bot.version = version_label.clone();
+
+            // Build concrete provider/media registries from named config
+            // entries. These are cheap Arc-backed registries until individual
+            // requests call a provider.
             let mut services = BootstrapServices::build(&config)?;
             services.web.version = format!("{version_label} ({VERSION})");
             let storage = storage.with_app_version_id(app_version.id);
+
+            // Platforms connect after validation and storage setup so incoming
+            // events cannot race ahead of a usable runtime.
             let platforms =
                 ConfiguredMessagePlatforms::connect_from_config(&config.platforms).await?;
             let listen = SocketAddr::from_str(&config.web.listen)?;
+
+            // The web API also needs the LLM registry for model metadata, so
+            // keep a clone before moving the concrete registries into the bot.
             let llms = services.llms.clone();
             let bot = BotRuntime::<ConfiguredBotRuntime>::new(
                 BotRuntimeParts::<ConfiguredBotRuntime> {
@@ -162,11 +214,16 @@ async fn run(
                 services.events,
                 services.web,
             );
+
+            // `runtime.rs` owns the select loop that runs bot and web tasks,
+            // fans out cancellation, drains in-flight bot work, and joins both
+            // services before returning.
             run_runtime_services(bot, web, listen).await
         }
     }
 }
 
+/// Emit the common startup record once tracing is installed.
 fn log_start(config_path: &Path, command: &Command, config: &RuntimeConfig) {
     tracing::info!(
         version = VERSION,
@@ -183,6 +240,8 @@ fn log_start(config_path: &Path, command: &Command, config: &RuntimeConfig) {
     );
 }
 
+/// Print rich config diagnostics when possible, then fall back to a plain error
+/// plus source chain for operational failures.
 fn report_error(error: &BinError) {
     match error {
         BinError::ConfigValidation(report) => {
@@ -215,6 +274,7 @@ fn report_error(error: &BinError) {
     }
 }
 
+/// Install the process tracing subscriber from `[logging]` config.
 fn init_tracing(config: &LoggingConfig) -> Result<(), LoggingFilterError> {
     use tracing_subscriber::fmt;
     let filter = config.filter()?;

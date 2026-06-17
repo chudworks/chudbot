@@ -1,21 +1,37 @@
-//! Transcript reconstruction for live turns, retries, and stored turn replay.
+//! Model-facing transcript reconstruction for live turns, retries, and stored
+//! turn replay.
+//!
+//! This module translates stored conversation state and freshly fetched context
+//! into the ordered `Transcript` consumed by LLM providers. It keeps platform
+//! and storage details at the edge: context items become text/media blocks,
+//! provider continuations are replayed when available, legacy tool traces are
+//! used as a fallback, and generated assistant media is reintroduced as
+//! synthetic user context so later image-edit requests can reference it.
 
 use crate::prelude::*;
 use crate::*;
 
+/// Build stable metadata for model-facing messages reconstructed from a turn.
 pub(crate) fn transcript_message_metadata(id: String) -> serde_json::Value {
     serde_json::json!({ "id": id })
 }
 
+/// Return the stable synthetic message id used for a turn/role pair.
 pub(crate) fn turn_transcript_message_id(turn_id: TurnId, role: &str) -> String {
     format!("chudbot_turn_{turn_id}_{role}")
 }
 
-/// Transcript assembly methods on the runtime.
+/// Transcript assembly methods that need runtime services such as the media
+/// store.
 impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
 {
+    /// Build the transcript for a normal live model call.
+    ///
+    /// Completed history up to the turn's cutoff is replayed first, then the
+    /// freshly gathered current-turn context is appended as the final user
+    /// message.
     pub(crate) async fn transcript_for_turn(
         &self,
         snapshot: &ConversationSnapshot,
@@ -33,6 +49,12 @@ where
         Ok(transcript)
     }
 
+    /// Build the transcript for retrying a stored turn.
+    ///
+    /// Retries use the same completed-history replay as live turns, then append
+    /// the retried user turn. When the original stored context is unavailable,
+    /// the fallback preserves the user-visible text and appends any supplied
+    /// context blocks after it.
     #[tracing::instrument(
         name = "bot.transcript_for_retry",
         skip_all,
@@ -53,6 +75,8 @@ where
         let mut transcript = self
             .transcript_from_snapshot(snapshot, retry_turn.turn.history_cutoff)
             .await?;
+        // Prefer the context captured with the original attempt; older turns
+        // may only have the stored display text plus newly supplied context.
         if has_stored_context {
             transcript.push(
                 self.transcript_turn_from_context(retry_turn.turn.id, context)
@@ -79,6 +103,10 @@ where
         Ok(transcript)
     }
 
+    /// Convert context items for one user turn into a transcript turn.
+    ///
+    /// Empty context still becomes an explicit text block so providers receive a
+    /// well-formed user message instead of an empty block list.
     pub(crate) async fn transcript_turn_from_context(
         &self,
         turn_id: TurnId,
@@ -97,6 +125,11 @@ where
         }
     }
 
+    /// Convert context items into provider-ready content blocks.
+    ///
+    /// Stored `file://` handles are resolved through the media store and only
+    /// model-supported media is passed through; unsupported or missing media is
+    /// skipped with logging instead of failing the whole transcript assembly.
     pub(crate) async fn context_blocks_from_items(
         &self,
         context: &[chudbot_api::ContextItem],
@@ -135,6 +168,13 @@ where
         blocks
     }
 
+    /// Rebuild model-visible history from a stored conversation snapshot.
+    ///
+    /// Only completed turns at or before `history_cutoff` are replayed. A
+    /// missing cutoff intentionally means no prior history should be included.
+    /// For each replayed turn, the function reconstructs the user message,
+    /// provider/tool continuation sequence, final assistant text, and any
+    /// generated media needed for future reference-image edits.
     pub(crate) async fn transcript_from_snapshot(
         &self,
         snapshot: &ConversationSnapshot,
@@ -143,6 +183,9 @@ where
         let mut transcript = Transcript::new();
         transcript.id = Some(snapshot.conversation.id.to_string());
 
+        // Step 1: select only completed responses the next model call is
+        // allowed to see, then sort by response order with turn order as a
+        // deterministic tie-breaker.
         let mut replay_turns = snapshot
             .turns
             .iter()
@@ -164,6 +207,9 @@ where
         });
 
         for turn in replay_turns {
+            // Step 2: rebuild the prior user message. Memory context is
+            // prompt scaffolding for the original call, not durable chat
+            // history, so it is dropped when replaying completed turns.
             let replay_context = replayable_context_items(&turn.context);
             let mut user_turn = if replay_context.is_empty() {
                 TranscriptTurn {
@@ -183,6 +229,8 @@ where
                 self.transcript_turn_from_context(turn.turn.id, &replay_context)
                     .await
             };
+            // Track media already present in context so replay assets do not
+            // duplicate the same model-visible attachment.
             let mut replayed_media = replay_context
                 .iter()
                 .filter(|item| item.content.starts_with("file://"))
@@ -213,8 +261,9 @@ where
                         if replay_asset_belongs_to_user_turn(asset) {
                             user_turn.blocks.push(ContentBlock::Media { media });
                         } else {
-                            // Generated media is replayed as a follow-up user turn so later
-                            // image-edit requests can reference prior assistant outputs.
+                            // Generated media is replayed as a follow-up user
+                            // turn so later image-edit requests can reference
+                            // prior assistant outputs.
                             generated_media_refs.push(asset.uri.as_str().to_string());
                             generated_media_blocks.push(ContentBlock::Media { media });
                         }
@@ -233,6 +282,10 @@ where
                 "added prior user turn to transcript"
             );
             transcript.push(user_turn);
+            // Step 3: prefer provider model-step replay because it preserves
+            // opaque continuation state such as reasoning ids and tool-call
+            // ids. Legacy client-tool replay is only used when no model steps
+            // were stored for the turn.
             let replayed_from_model_steps = append_model_step_replay(
                 &mut transcript,
                 &turn.model_steps,
@@ -261,6 +314,8 @@ where
                     "added prior assistant turn to transcript"
                 );
             }
+            // Step 4: attach generated assistant media after the assistant
+            // answer, as synthetic user context with stable reference ids.
             append_generated_media_replay(
                 &mut transcript,
                 turn.turn.id,
@@ -277,6 +332,12 @@ where
     }
 }
 
+/// Append a synthetic user turn containing media produced by the previous
+/// assistant response.
+///
+/// The text block exposes the exact stored media ids that image tools should
+/// use as `reference_images`. Keeping this as a user turn makes prior generated
+/// images available to providers that only accept media in user messages.
 pub(crate) fn append_generated_media_replay(
     transcript: &mut Transcript,
     turn_id: TurnId,
@@ -310,6 +371,12 @@ pub(crate) fn append_generated_media_replay(
     });
 }
 
+/// Replay legacy client-tool traces as assistant calls followed by user
+/// results.
+///
+/// Newer transcripts prefer stored model-step continuations because they carry
+/// provider-specific call state; this helper remains for turns captured before
+/// model steps were recorded.
 pub(crate) fn append_client_tool_replay(transcript: &mut Transcript, traces: &[ToolTrace]) {
     let mut call_blocks = Vec::new();
     let mut result_blocks = Vec::new();
@@ -335,6 +402,11 @@ pub(crate) fn append_client_tool_replay(transcript: &mut Transcript, traces: &[T
     });
 }
 
+/// Collect media references already visible in a transcript.
+///
+/// The returned values are stored URIs and public URLs that the next model call
+/// may echo in its answer. Callers merge them with media references from the
+/// current run before removing redundant links from user-facing reply text.
 pub(crate) async fn media_reply_refs_from_transcript(transcript: &Transcript) -> Vec<String> {
     let mut out = Vec::new();
     for turn in &transcript.turns {
@@ -356,6 +428,7 @@ pub(crate) async fn media_reply_refs_from_transcript(transcript: &Transcript) ->
     out
 }
 
+/// Append a nonempty string once while preserving first-seen order.
 pub(crate) fn push_unique_string(out: &mut Vec<String>, value: &str) {
     if value.is_empty() || out.iter().any(|seen| seen == value) {
         return;
@@ -363,6 +436,12 @@ pub(crate) fn push_unique_string(out: &mut Vec<String>, value: &str) {
     out.push(value.to_string());
 }
 
+/// Replay stored provider model steps into transcript turns.
+///
+/// Returns `true` when model-step data was present and consumed. Each stored
+/// assistant continuation is emitted as an assistant turn, matching client-tool
+/// results are emitted as the next user turn, and the final assistant text is
+/// appended to the last step when available.
 pub(crate) fn append_model_step_replay(
     transcript: &mut Transcript,
     model_steps: &[ModelStepTrace],
@@ -376,8 +455,8 @@ pub(crate) fn append_model_step_replay(
     let client_results = client_tool_results_by_id(traces);
     let mut consumed_results = BTreeSet::new();
     for (index, step) in model_steps.iter().enumerate() {
-        // Provider continuations preserve the assistant-side tool call state.
-        // Matching tool results are replayed as the following user turn.
+        // Step 1: replay assistant-side provider state. Continuations preserve
+        // tool-call ids and opaque reasoning state needed by the same provider.
         let is_final_step = index + 1 == model_steps.len();
         let mut assistant_blocks = Vec::new();
         if let Some(continuation) = &step.continuation {
@@ -399,6 +478,8 @@ pub(crate) fn append_model_step_replay(
             });
         }
 
+        // Step 2: pair this assistant step with the stored client-tool results
+        // whose ids were named by the provider continuation.
         let call_ids = step
             .continuation
             .as_ref()
@@ -415,6 +496,8 @@ pub(crate) fn append_model_step_replay(
             }
         }
 
+        // Step 3: preserve replay for older client-tool steps that lack
+        // provider continuation data and therefore cannot name call ids.
         if step.kind == ModelStepKind::ClientTools
             && step.continuation.is_none()
             && result_blocks.is_empty()
@@ -440,6 +523,7 @@ pub(crate) fn append_model_step_replay(
     true
 }
 
+/// Index stored client-tool results by provider-visible tool-call id.
 pub(crate) fn client_tool_results_by_id(
     traces: &[ToolTrace],
 ) -> BTreeMap<String, ClientToolResult> {
@@ -456,6 +540,7 @@ pub(crate) fn client_tool_results_by_id(
     results
 }
 
+/// Extract provider-visible client-tool call ids from a continuation payload.
 pub(crate) fn provider_client_tool_call_ids(
     continuation: &chudbot_api::ProviderContinuation,
 ) -> Vec<String> {
@@ -464,6 +549,10 @@ pub(crate) fn provider_client_tool_call_ids(
     ids
 }
 
+/// Recursively collect client-tool call ids from provider continuation JSON.
+///
+/// The shapes covered here match the provider payloads Chudbot stores today:
+/// OpenAI-compatible `function_call` objects and Anthropic `tool_use` blocks.
 pub(crate) fn collect_provider_client_tool_call_ids(
     value: &serde_json::Value,
     out: &mut Vec<String>,
@@ -493,6 +582,12 @@ pub(crate) fn collect_provider_client_tool_call_ids(
     }
 }
 
+/// Remove generated-media references from assistant text before display.
+///
+/// Tool outputs and replay media can make the model include raw media ids or
+/// public URLs in its final answer. This strips only the known generated-media
+/// references, including full Markdown links/images when the reference is the
+/// link target.
 pub(crate) fn strip_generated_media_refs(text: &str, refs: &[String]) -> String {
     if refs.is_empty() {
         return text.to_string();
@@ -504,6 +599,9 @@ pub(crate) fn strip_generated_media_refs(text: &str, refs: &[String]) -> String 
             continue;
         }
         while let Some(index) = out.find(reference) {
+            // Prefer removing the whole Markdown link/image wrapper when the
+            // generated media URL is the target; otherwise remove just the raw
+            // reference text.
             let (start, end) = markdown_link_bounds(&out, index, reference.len())
                 .unwrap_or((index, index + reference.len()));
             out.replace_range(start..end, "");
@@ -512,11 +610,13 @@ pub(crate) fn strip_generated_media_refs(text: &str, refs: &[String]) -> String 
     normalize_stripped_reply(&out)
 }
 
+/// Return the bounds of a Markdown link or image whose target is a reference.
 pub(crate) fn markdown_link_bounds(
     text: &str,
     reference_start: usize,
     reference_len: usize,
 ) -> Option<(usize, usize)> {
+    // The reference must be exactly inside `(reference)`.
     let open_paren = reference_start.checked_sub(1)?;
     if text.as_bytes().get(open_paren) != Some(&b'(') {
         return None;
@@ -529,6 +629,7 @@ pub(crate) fn markdown_link_bounds(
     if !before_open.ends_with(']') {
         return None;
     }
+    // Walk back to the link label and include a leading `!` for images.
     let close_bracket = before_open.len().checked_sub(1)?;
     let open_bracket = before_open[..close_bracket].rfind('[')?;
     let start = if open_bracket > 0 && text.as_bytes().get(open_bracket - 1) == Some(&b'!') {
@@ -539,6 +640,11 @@ pub(crate) fn markdown_link_bounds(
     Some((start, close_paren + 1))
 }
 
+/// Normalize whitespace left after media-reference stripping.
+///
+/// This trims trailing spaces, collapses runs of blank lines, and removes blank
+/// lines at the start or end so the user-facing reply remains clean after
+/// generated media links are removed.
 pub(crate) fn normalize_stripped_reply(text: &str) -> String {
     let mut lines = Vec::new();
     let mut previous_blank = true;
@@ -560,6 +666,11 @@ pub(crate) fn normalize_stripped_reply(text: &str) -> String {
     lines.join("\n")
 }
 
+/// Return context items that should be carried forward when replaying history.
+///
+/// Memory items are omitted because they are prompt-time context, not durable
+/// chat messages or attachments that should appear again in completed-history
+/// replay.
 pub(crate) fn replayable_context_items(
     context: &[chudbot_api::ContextItem],
 ) -> Vec<chudbot_api::ContextItem> {
@@ -570,6 +681,7 @@ pub(crate) fn replayable_context_items(
         .collect()
 }
 
+/// Identify context supplied by the memory system.
 pub(crate) fn is_memory_context_item(item: &chudbot_api::ContextItem) -> bool {
     item.source.starts_with("memory:")
 }

@@ -1,7 +1,19 @@
-//! Stored-media access tools: read, stat, public URL, and attach.
+//! Stored-media access tools: `read`, `stat`, `public_url`, and `attach`.
+//!
+//! These tools accept model-facing `file://...` media URIs, not filesystem
+//! paths or arbitrary network URLs. The prefix check keeps the input shape
+//! scoped to stored media, and `MediaStore::media_from_uri` remains the
+//! authority for validating supported storage prefixes, existence, metadata,
+//! and access handles.
 
 use super::*;
 
+/// Describe the `read` tool exposed to model providers.
+///
+/// `read` is intentionally narrower than a general media fetcher: it accepts
+/// only stored images that can be represented in a model transcript. The tool
+/// returns JSON metadata plus a media handle for the next provider request; it
+/// never serializes file bytes into the tool result.
 pub(crate) fn read_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: "Read a stored Chudbot image asset by file:// URI. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, and arbitrary filesystem paths are rejected. The tool returns metadata and makes the image visible to the next model step, but never returns raw bytes.".to_string(),
@@ -9,6 +21,11 @@ pub(crate) fn read_asset_spec() -> ClientToolSpec {
     }
 }
 
+/// Describe the `stat` tool exposed to model providers.
+///
+/// `stat` checks whether a stored media URI resolves and reports metadata when
+/// it does. It does not require an image MIME type because callers use it to
+/// inspect any stored media category without loading bytes.
 pub(crate) fn stat_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: "Validate a stored Chudbot media URI and return whether it exists with MIME type and size metadata. This only checks media storage; it does not read or return file bytes.".to_string(),
@@ -16,6 +33,12 @@ pub(crate) fn stat_asset_spec() -> ClientToolSpec {
     }
 }
 
+/// Describe the `public_url` tool exposed to model providers.
+///
+/// `public_url` resolves the same stored-media handle into a configured public
+/// URL for media categories that are safe to expose outside the bot runtime. A
+/// missing public URL is shaped as an unavailable JSON result, not as a raw file
+/// read or attachment.
 pub(crate) fn public_url_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: "Resolve a supported stored Chudbot media URI to its configured public URL when one is available. Images, videos, audio, and avatars are supported; unknown/non-media MIME types are rejected. This only returns metadata and a URL; it does not read or return file bytes.".to_string(),
@@ -23,6 +46,12 @@ pub(crate) fn public_url_asset_spec() -> ClientToolSpec {
     }
 }
 
+/// Describe the `attach` tool exposed to model providers.
+///
+/// `attach` validates an existing stored image and marks its URI for final
+/// platform delivery. It does not expose the image to the next model step; the
+/// send path later resolves the URI, deduplicates it with generated media, and
+/// loads bytes only when preparing the platform reply.
 pub(crate) fn attach_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: "Attach an existing stored Chudbot image asset to the final platform reply. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, public URLs, and arbitrary filesystem paths are rejected. The tool queues the image for final delivery and never returns raw bytes.".to_string(),
@@ -43,6 +72,8 @@ where
     M: MediaStore,
 {
     let uri = media_uri_from_tool_input(&call.input)?;
+    // The store lookup is the trust boundary between a syntactic file:// URI
+    // and a real, supported media object.
     let media = media_store
         .media_from_uri(&uri)
         .await
@@ -62,6 +93,8 @@ where
         )));
     }
 
+    // The JSON result is for traceability and model instructions; the media
+    // vector is what actually makes the image available to the provider.
     let value = media_access_metadata_json(
         media.as_ref(),
         serde_json::json!({
@@ -104,6 +137,8 @@ where
     M: MediaStore,
 {
     let uri = media_uri_from_tool_input(&call.input)?;
+    // Validate now, but leave byte loading and final attachment sizing to the
+    // reply-delivery path that consumes the successful tool trace.
     let media = media_store
         .media_from_uri(&uri)
         .await
@@ -123,6 +158,8 @@ where
         )));
     }
 
+    // `attach` communicates through trace JSON only. Keeping `media` empty
+    // prevents provider adapters from treating this as model-visible input.
     let value = media_access_metadata_json(
         media.as_ref(),
         serde_json::json!({
@@ -164,6 +201,9 @@ where
     M: MediaStore,
 {
     let uri = media_uri_from_tool_input(&call.input)?;
+    // Missing media is a successful stat result with `exists: false`, which
+    // lets the model recover without turning an inspection miss into a tool
+    // execution failure.
     let value = match media_store.media_from_uri(&uri).await {
         Ok(media) => media_access_metadata_json(
             media.as_ref(),
@@ -201,6 +241,8 @@ where
     M: MediaStore,
 {
     let uri = media_uri_from_tool_input(&call.input)?;
+    // Resolve availability as data. Unsupported MIME/category values and
+    // unconfigured public URLs both return `available: false`.
     let value = match media_store.media_from_uri(&uri).await {
         Ok(media) if !public_url_supports_media(media.as_ref()) => media_access_metadata_json(
             media.as_ref(),
@@ -249,6 +291,11 @@ where
     })
 }
 
+/// Parse the shared `uri` argument and reject non-stored URI forms early.
+///
+/// This is only a coarse scope check. It prevents public URLs and local path
+/// strings from entering the tool flow, while the media store decides whether a
+/// `file://...` value names a supported Chudbot media asset.
 pub(crate) fn media_uri_from_tool_input(
     input: &serde_json::Value,
 ) -> Result<MediaUri, BotToolError> {
@@ -261,6 +308,11 @@ pub(crate) fn media_uri_from_tool_input(
     Ok(MediaUri::new(uri))
 }
 
+/// Build the common JSON result shape for media access tools.
+///
+/// The base fields identify the resolved stored object. Tool-specific fields
+/// such as `exists`, `visible_to_model`, `available`, or `attached` are merged
+/// into the same object so `result` and `trace_response` can stay identical.
 pub(crate) fn media_access_metadata_json(
     media: &dyn chudbot_api::MediaRef,
     extra: serde_json::Value,
@@ -280,6 +332,10 @@ pub(crate) fn media_access_metadata_json(
     value
 }
 
+/// Shared JSON schema for tools that accept one stored media URI.
+///
+/// Tool implementations still perform the security checks; the schema exists
+/// to guide model arguments and reject unrelated JSON fields before execution.
 pub(crate) fn asset_uri_tool_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",

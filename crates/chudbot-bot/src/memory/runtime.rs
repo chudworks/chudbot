@@ -1,4 +1,12 @@
 //! Background user-memory scheduler and job worker.
+//!
+//! The runtime is intentionally small and storage-driven: each tick asks
+//! storage to enqueue due diary/compaction work, leases a bounded batch of
+//! runnable jobs, executes the claimed jobs in-process, and records a terminal
+//! or retry completion for every claimed row. Cross-process ownership,
+//! duplicate-window suppression, and persisted retry state live behind
+//! [`BotStorage`]; this module keeps the in-process worker loop and model-run
+//! lifecycle explicit.
 
 use std::collections::{BTreeSet, VecDeque};
 
@@ -23,6 +31,11 @@ use super::diary::diary_transcript;
 use super::{memory_guild_id, memory_profile_display_name, memory_scope_id, memory_user_ref};
 
 /// In-process memory scheduler and worker.
+///
+/// A `MemoryRuntime` owns no durable state beyond its configured services.
+/// Scheduling, lease ownership, attempt counts, and source cutoffs are stored
+/// in `BotStorage`, which lets multiple bot processes poll concurrently
+/// without sharing memory.
 #[derive(Debug, Clone)]
 pub struct MemoryRuntime<S, L, M> {
     storage: S,
@@ -33,7 +46,8 @@ pub struct MemoryRuntime<S, L, M> {
 }
 
 impl<S, L, M> MemoryRuntime<S, L, M> {
-    /// Construct a memory runtime.
+    /// Construct a memory runtime from storage, provider registries, and the
+    /// resolved memory-agent configuration.
     pub(crate) fn new(
         storage: S,
         llms: L,
@@ -51,6 +65,10 @@ impl<S, L, M> MemoryRuntime<S, L, M> {
     }
 }
 
+/// Build the parent tracing span for a claimed memory job.
+///
+/// Provider and agent logs inherit the subject/scope fields from this span, so
+/// nested model spans do not need to repeat the same identifiers.
 fn memory_job_span(
     job: &UserMemoryJob,
     agent: &SystemAgentConfig,
@@ -89,6 +107,12 @@ where
     M: MediaStore + Clone + Send + Sync + 'static,
 {
     /// Run the memory scheduler until shutdown.
+    ///
+    /// The loop runs one storage-backed tick at a time, then sleeps for the
+    /// configured poll interval. Shutdown is biased in both waits so a process
+    /// stop can interrupt idle polling promptly. If cancellation interrupts an
+    /// in-flight tick, any unfinished claimed jobs rely on their storage lease
+    /// expiring before another worker can claim them.
     pub async fn run_until_shutdown(&self, shutdown: CancellationToken) -> Result<(), MemoryError> {
         if !self.config.enabled {
             tracing::debug!("memory runtime disabled");
@@ -138,6 +162,12 @@ where
         }
     }
 
+    /// Enqueue due work, claim a bounded batch, and run that claimed batch.
+    ///
+    /// `enqueue_due_memory_jobs` computes durable diary/compaction work from
+    /// source cutoffs and retry state. `claim_memory_jobs` then leases at most
+    /// `max_jobs_per_tick` rows until `lease_until`; the worker id only needs to
+    /// be unique enough to identify this process tick in storage.
     async fn run_tick(&self) -> Result<(), MemoryError> {
         let now = OffsetDateTime::now_utc();
         let compaction_interval = self.config.compaction_interval_seconds()?;
@@ -182,6 +212,14 @@ where
         self.run_claimed_jobs(jobs).await
     }
 
+    /// Execute a claimed batch with global and per-memory-key concurrency
+    /// limits.
+    ///
+    /// At most `max_concurrent_jobs` tasks run in this process. Within that
+    /// window, only one job for a given `memory_key` is active at a time so a
+    /// diary write and compaction for the same subject cannot race each other
+    /// locally. Other processes still rely on the storage lease/claim contract
+    /// for cross-process exclusion.
     async fn run_claimed_jobs(&self, jobs: Vec<UserMemoryJob>) -> Result<(), MemoryError> {
         let mut pending = VecDeque::from(jobs);
         let mut active_keys = BTreeSet::new();
@@ -189,6 +227,9 @@ where
         let max_concurrent = self.config.max_concurrent_jobs.max(1) as usize;
 
         while !pending.is_empty() || !running.is_empty() {
+            // Fill available worker slots without starting two tasks for the
+            // same memory key; blocked same-key jobs stay pending until the
+            // active task reports completion.
             while running.len() < max_concurrent {
                 let Some(index) = pending
                     .iter()
@@ -214,6 +255,9 @@ where
             };
             match result {
                 Ok((memory_key, result)) => {
+                    // Releasing the key happens after durable completion is
+                    // attempted, so a following same-key job sees the latest
+                    // diary/document state whenever completion succeeded.
                     active_keys.remove(&memory_key);
                     if let Err(error) = result {
                         tracing::warn!(memory_key, error = %error, "memory job failed");
@@ -227,6 +271,8 @@ where
         Ok(())
     }
 
+    /// Best-effort lookup for a readable memory subject label on the outer job
+    /// span.
     async fn load_memory_job_user_name(&self, job: &UserMemoryJob) -> Option<String> {
         let user = memory_user_ref(&job.key);
         let profiles = match self.storage.load_user_profiles(vec![user]).await {
@@ -249,6 +295,13 @@ where
             .and_then(|profile| memory_profile_display_name(&profile.profile, &job.key.user_key))
     }
 
+    /// Run one claimed job and persist its completion state.
+    ///
+    /// Successful jobs are marked completed. Failed jobs become terminal once
+    /// their persisted attempt count has reached `max_job_attempts`; otherwise
+    /// they are rescheduled after `retry_backoff(attempts)`. The backoff is
+    /// computed only after the model/storage failure, which keeps retry timing
+    /// tied to the actual worker outcome rather than to claim time.
     async fn run_job_with_completion(&self, job: UserMemoryJob) -> Result<(), MemoryError> {
         let result = self.run_job(&job).await;
         let completion = match result {
@@ -271,6 +324,7 @@ where
             .map_err(|error| MemoryError::Storage(error.to_string()))
     }
 
+    /// Dispatch a claimed job to the diary or compaction worker.
     async fn run_job(&self, job: &UserMemoryJob) -> Result<(), MemoryError> {
         tracing::debug!(
             job = %job.id,
@@ -285,6 +339,12 @@ where
         }
     }
 
+    /// Build and store a diary entry for one scheduled conversation window.
+    ///
+    /// Empty or malformed windows are treated as successful no-ops so the
+    /// scheduler can advance past them. Non-empty windows load the current
+    /// memory document, ask the diary agent for a markdown entry, and persist
+    /// both the text and provider usage as the durable job side effect.
     async fn run_diary_job(&self, job: &UserMemoryJob) -> Result<(), MemoryError> {
         let (Some(window_start), Some(window_end)) = (job.window_start, job.window_end) else {
             tracing::warn!(job = %job.id, "diary job has no window");
@@ -330,6 +390,14 @@ where
         Ok(())
     }
 
+    /// Compact pending memory events and diary entries into the user's memory
+    /// document.
+    ///
+    /// The source cutoffs are derived from the newest material included in the
+    /// revision, or preserved from the existing document when a source class is
+    /// absent. That makes a completed compaction idempotent from the
+    /// scheduler's point of view: the next enqueue pass can skip everything
+    /// already folded into the saved revision.
     async fn run_compact_job(&self, job: &UserMemoryJob) -> Result<(), MemoryError> {
         let document = self
             .storage
@@ -417,6 +485,12 @@ where
         Ok(())
     }
 
+    /// Run a memory system agent and normalize the provider result for storage.
+    ///
+    /// Memory agents do not expose client tools. The routed LLM backend records
+    /// the configured provider/model, while `memory_model_output` validates the
+    /// agent outcome, captures usage, and falls back to the configured model id
+    /// when the provider did not report a concrete model.
     async fn run_memory_model(
         &self,
         agent_config: &SystemAgentConfig,
@@ -438,6 +512,7 @@ where
     }
 }
 
+/// Text, model identity, and usage extracted from a completed memory-agent run.
 #[derive(Debug, Clone)]
 struct MemoryModelOutput {
     text: String,
@@ -445,6 +520,12 @@ struct MemoryModelOutput {
     usage: Vec<UsageRecord>,
 }
 
+/// Convert an `AgentRun` into the durable output shape expected by memory
+/// storage.
+///
+/// Only a non-empty completed answer is a successful memory result. Iteration
+/// limits, provider failures, and cancellations become model errors so the job
+/// completion path can either retry with backoff or mark the job terminal.
 fn memory_model_output(
     run: AgentRun,
     fallback_model_id: &ModelId,

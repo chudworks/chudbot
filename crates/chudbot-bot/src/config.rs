@@ -1,3 +1,10 @@
+//! Bot-facing configuration types and runtime conversion helpers.
+//!
+//! `chudbot-bin` owns TOML loading and rich diagnostics; this module owns the
+//! provider-neutral bot view after deserialization. It validates references
+//! between named agents, turns agent config into `AgentSpec` values, and keeps
+//! tool-facing descriptions close to the config that enables those tools.
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -13,6 +20,12 @@ use crate::{
     DEFAULT_THREAD_THRESHOLD_LINES,
 };
 
+/// Bot-level configuration consumed by the platform-neutral runtime.
+///
+/// This is the agent-first portion of the deployment config: named agents,
+/// platform-to-agent defaults, global operator policy, and runtime limits. It
+/// deliberately stores provider and platform references by registry key so this
+/// crate does not depend on concrete provider or Discord implementations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotConfig {
     /// Public viewer base URL used in the first reply for a conversation.
@@ -48,7 +61,8 @@ pub struct BotConfig {
 }
 
 impl BotConfig {
-    /// Validate static agent references.
+    /// Validate references and local invariants that can be checked before the
+    /// runtime builds providers, tools, or platform adapters.
     #[tracing::instrument(
         name = "bot.config.validate",
         skip_all,
@@ -61,6 +75,9 @@ impl BotConfig {
     )]
     pub fn validate(&self) -> Result<(), BotError> {
         tracing::debug!("validating bot config");
+
+        // Establish the global fallback first; several later paths assume it
+        // exists when a platform or request does not name a valid agent.
         if !self.agents.contains_key(&self.default_agent) {
             tracing::warn!(
                 missing_agent = %self.default_agent,
@@ -70,6 +87,9 @@ impl BotConfig {
                 name: self.default_agent.clone(),
             });
         }
+
+        // Platform defaults are optional, but every configured override must
+        // still resolve to one of the named agents in this map.
         for binding in self.platforms.values() {
             if !self.agents.contains_key(&binding.agent) {
                 tracing::warn!(
@@ -81,6 +101,10 @@ impl BotConfig {
                 });
             }
         }
+
+        // Agent-local bindings are turned into runtime tools. Validate them
+        // here so missing names or malformed media/audio bindings fail before
+        // the bot starts accepting events.
         for (agent_name, agent) in &self.agents {
             if let Some(binding) = &agent.image_generation {
                 validate_generation_binding(agent_name, "image_generation", binding)?;
@@ -109,13 +133,18 @@ impl BotConfig {
         Ok(())
     }
 
-    /// Resolve an agent name with fallback to the platform binding and default
-    /// agent.
+    /// Resolve the agent for an incoming turn.
+    ///
+    /// A valid explicit request wins. Unknown requests are treated like "no
+    /// request" so platform/default routing remains usable when a user-provided
+    /// agent name is stale or unavailable.
     pub fn agent_or_platform_default(
         &self,
         requested: Option<&str>,
         platform: &PlatformName,
     ) -> Result<(String, &AgentConfig), BotError> {
+        // Prefer the user or platform command selection only when it names a
+        // configured agent.
         if let Some(name) = requested
             && let Some(agent) = self.agents.get(name)
         {
@@ -129,6 +158,8 @@ impl BotConfig {
             return Ok((name.to_string(), agent));
         }
 
+        // Then fall back through the platform binding and finally the global
+        // default. `validate` normally guarantees this lookup succeeds.
         let platform_default = self
             .platforms
             .get(platform)
@@ -161,10 +192,17 @@ fn default_thread_threshold_lines() -> usize {
     DEFAULT_THREAD_THRESHOLD_LINES
 }
 
+/// Build the model-facing description for an agent's image generation tool.
+///
+/// The text explains the media reference contract because generated and
+/// uploaded images are addressed by internal `file://images/...` URIs, not by
+/// public URLs or guessed filenames.
 pub(crate) fn image_generation_tool_description(
     provider: &ProviderName,
     model: &ModelId,
 ) -> String {
+    // Keep the reference-image rules in the tool description itself; the model
+    // sees this on every tool call decision, while config docs are not in-band.
     format!(
         concat!(
             "Generate an image with the configured `{}` image provider and `{}` model, ",
@@ -189,12 +227,15 @@ pub(crate) fn image_generation_tool_description(
     )
 }
 
+/// Build the model-facing description for an agent's video generation tool.
 pub(crate) fn video_generation_tool_description(binding: &GenerationBinding) -> String {
     let mut description = format!(
         "Generate a video with the configured `{}` video provider and `{}` model, save it to media storage, and return its media URI.",
         binding.provider, binding.model
     );
     if let Some(limit) = &binding.rate_limit {
+        // The runtime enforces the limit; this hint helps the model avoid
+        // surprising users with retries that cannot run yet.
         description.push_str(&format!(
             "\n\nThis tool is limited to {} active video generation{} per {} for each non-bypassed platform scope.",
             limit.limit,
@@ -205,11 +246,17 @@ pub(crate) fn video_generation_tool_description(binding: &GenerationBinding) -> 
     description
 }
 
+/// Validate a media generation binding shared by image and video tools.
+///
+/// Image and video bindings intentionally share the same config shape, but only
+/// video generation accepts the optional active-job rate limit.
 pub(crate) fn validate_generation_binding(
     agent_name: &str,
     field: &'static str,
     binding: &GenerationBinding,
 ) -> Result<(), BotError> {
+    // Registry lookups happen later, so catch empty registry keys here while the
+    // error can still name the owning agent and config field.
     if binding.provider.as_str().trim().is_empty() {
         tracing::warn!(agent = %agent_name, field, "media generation provider is empty");
         return Err(BotError::InvalidGenerationBinding {
@@ -227,6 +274,8 @@ pub(crate) fn validate_generation_binding(
         });
     }
     if let Some(rate_limit) = &binding.rate_limit {
+        // Keep the shared config struct narrow at runtime: image bindings can
+        // deserialize the field for diagnostics, but validation rejects it.
         if field != "video_generation" {
             tracing::warn!(agent = %agent_name, field, "rate limit configured on non-video generation binding");
             return Err(BotError::InvalidGenerationBinding {
@@ -240,11 +289,14 @@ pub(crate) fn validate_generation_binding(
     Ok(())
 }
 
+/// Validate the video-specific portion of a generation binding.
 fn validate_video_generation_rate_limit(
     agent_name: &str,
     field: &'static str,
     rate_limit: &VideoGenerationRateLimit,
 ) -> Result<(), BotError> {
+    // A zero limit would permanently disable the tool while still advertising
+    // it to the model, so fail configuration instead.
     if rate_limit.limit == 0 {
         tracing::warn!(agent = %agent_name, field, "video generation rate limit is zero");
         return Err(BotError::InvalidGenerationBinding {
@@ -266,6 +318,9 @@ fn validate_video_generation_rate_limit(
             message,
         });
     }
+
+    // Bypass scopes are matched at runtime against platform and guild/scope id;
+    // empty components would otherwise silently never match.
     for scope in &rate_limit.bypass_scopes {
         if scope.platform.as_str().trim().is_empty() {
             tracing::warn!(agent = %agent_name, field, "video generation rate limit bypass platform is empty");
@@ -292,6 +347,7 @@ fn validate_video_generation_rate_limit(
     Ok(())
 }
 
+/// Validate the audio transcription binding that enables the transcription tool.
 fn validate_transcription_binding(
     agent_name: &str,
     field: &'static str,
@@ -366,6 +422,11 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    /// Convert this configured agent into the provider-neutral runtime spec.
+    ///
+    /// Provider/model selection stays outside `AgentSpec`; the spec contains the
+    /// instructions, loop limits, and tool exposure that are common to all LLM
+    /// backends.
     pub(crate) fn agent_spec(&self, default_limits: AgentLimits) -> AgentSpec {
         let mut spec = AgentSpec::new(self.system_prompt.clone())
             .with_limits(self.limits.unwrap_or(default_limits));
@@ -375,15 +436,26 @@ impl AgentConfig {
     }
 }
 
+/// Effective configuration for a reserved system agent.
+///
+/// Reserved agents such as title generation and TOS preflight can be configured
+/// directly or inherited from normal agents. This snapshot keeps the resolved
+/// provider, model, and common `AgentSpec` together so runtime code can build a
+/// routed agent without re-reading the full bot config.
 #[derive(Debug, Clone)]
 pub(crate) struct SystemAgentConfig {
+    /// Reserved agent name used in logs and config lookup.
     pub(crate) name: String,
+    /// LLM provider registry key.
     pub(crate) provider: ProviderName,
+    /// Provider-neutral prompt, limits, and tool exposure.
     pub(crate) spec: AgentSpec,
+    /// Model config paired with the provider.
     pub(crate) model: ModelSpec,
 }
 
 impl SystemAgentConfig {
+    /// Build a reserved-agent snapshot from an ordinary configured agent.
     pub(crate) fn from_agent_config(
         name: String,
         agent: &AgentConfig,
@@ -397,6 +469,7 @@ impl SystemAgentConfig {
         }
     }
 
+    /// Build a reserved-agent snapshot from built-in defaults.
     pub(crate) fn from_parts(
         name: impl Into<String>,
         provider: ProviderName,
@@ -412,14 +485,18 @@ impl SystemAgentConfig {
         }
     }
 
+    /// Log that this reserved agent came from an explicit config entry.
     pub(crate) fn log_loaded_from_config(&self) {
         self.log_effective_config("config", "loaded system agent from config");
     }
 
+    /// Log that this reserved agent used its built-in default settings.
     pub(crate) fn log_using_default(&self) {
         self.log_effective_config("default", "using default system agent");
     }
 
+    /// Log that a reserved agent inherited provider/model settings from a
+    /// configured normal agent.
     pub(crate) fn log_using_default_inherited(
         &self,
         inherited_agent: &str,
@@ -446,6 +523,7 @@ impl SystemAgentConfig {
         );
     }
 
+    /// Emit a consistent structured view of the effective reserved-agent config.
     fn log_effective_config(&self, source: &'static str, message: &'static str) {
         tracing::debug!(
             system_agent = %self.name,
@@ -468,6 +546,10 @@ impl SystemAgentConfig {
 }
 
 /// Binding from an agent to a media-generation provider and default model.
+///
+/// The same binding type is reused for image and video generation. Validation
+/// keeps video-only options, such as rate limits, out of image bindings while
+/// preserving one config shape for diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationBinding {
     /// Media-generation provider registry key.
@@ -480,6 +562,9 @@ pub struct GenerationBinding {
 }
 
 /// Active-video rate limit for a video-generation binding.
+///
+/// Limits are scoped by platform workspace/server, with explicit bypasses for
+/// trusted or operational scopes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoGenerationRateLimit {
     /// Maximum pending plus successful video generations per interval.
@@ -502,12 +587,13 @@ pub struct PlatformScopeBypass {
 }
 
 impl VideoGenerationRateLimit {
-    /// Parse the configured rolling interval.
+    /// Parse the configured rolling interval into seconds.
     pub fn interval_seconds(&self) -> Result<u64, String> {
         memory::parse_duration_seconds(&self.interval)
             .map_err(|_| format!("rate_limit.interval `{}` is invalid", self.interval))
     }
 
+    /// Return whether this user's platform scope is exempt from the limit.
     pub(crate) fn bypasses(&self, user: &UserRef) -> bool {
         let Some(scope_id) = &user.guild_id else {
             return false;
@@ -537,6 +623,7 @@ pub struct TranscriptionBinding {
 }
 
 impl TranscriptionBinding {
+    /// Return the normalized wake word when one is configured.
     pub(crate) fn wake_word(&self) -> Option<&str> {
         self.wake_word
             .as_deref()
@@ -545,6 +632,7 @@ impl TranscriptionBinding {
     }
 }
 
+/// Derive transcription keyterms that should always include the wake word.
 pub(crate) fn audio_transcription_default_keyterms(binding: &TranscriptionBinding) -> Vec<String> {
     binding
         .wake_word()
@@ -552,12 +640,16 @@ pub(crate) fn audio_transcription_default_keyterms(binding: &TranscriptionBindin
         .unwrap_or_default()
 }
 
+/// Append default transcription keyterms without duplicating existing entries.
 pub(crate) fn append_default_audio_keyterms(keyterms: &mut Vec<String>, defaults: &[String]) {
     for default in defaults {
         let default = default.trim();
         if default.is_empty() {
             continue;
         }
+
+        // User-supplied provider keyterms keep their original spelling, but
+        // duplicate detection ignores case and surrounding whitespace.
         let already_present = keyterms
             .iter()
             .any(|keyterm| keyterm.trim().eq_ignore_ascii_case(default));

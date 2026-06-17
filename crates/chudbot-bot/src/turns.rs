@@ -1,4 +1,14 @@
 //! Message-to-turn orchestration: privacy checks, context preparation, execution, and retries.
+//!
+//! This module is the platform-neutral path from an incoming platform event to
+//! a stored conversation turn. It decides whether a message should wake the
+//! bot, resolves privacy and agent configuration, records the durable turn
+//! input, runs the selected agent, and posts the terminal platform reply.
+//!
+//! Reaction handlers live here too because retry and stop/resume requests share
+//! the same invariants: retries replay the original turn instead of creating a
+//! sibling turn, while stop requests update the conversation and cancel any
+//! matching in-flight execution through the runtime cancellation registry.
 
 use crate::prelude::*;
 use crate::*;
@@ -7,6 +17,12 @@ impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
 {
+    /// Handle one platform message and, when eligible, turn it into model work.
+    ///
+    /// The handler performs all cheap wake-up gates before mutating storage or
+    /// showing user-visible reactions. Once a message passes those gates, it is
+    /// normalized into the text shape used by transcripts, the author profile is
+    /// cached, and `process_mentioned_message` owns the durable turn lifecycle.
     pub async fn handle_message(
         &self,
         mut message: PlatformMessage,
@@ -47,6 +63,8 @@ where
             return Ok(BotAction::Ignored);
         }
 
+        // Load runtime policy before deciding whether this message may bind to
+        // a conversation or expose surrounding channel context.
         let settings = self.runtime_settings(&message).await?;
         tracing::debug!(
             privacy = privacy_mode_kind(&settings.privacy),
@@ -54,6 +72,9 @@ where
             "loaded runtime settings"
         );
 
+        // Existing conversation state is part of the privacy decision: a
+        // thread or quoted reply can be valid even when the literal event
+        // channel differs from the configured channel-only scope.
         let existing = self.lookup_existing_conversation(&message).await?;
         if !self
             .privacy_allows_message_channel(
@@ -150,6 +171,8 @@ where
         self.spawn_avatar_download(message.author.clone());
         self.publish_user(message.author.id.clone());
 
+        // From this point the bot has accepted responsibility for a turn, so
+        // the user gets a working reaction until the terminal action is known.
         let user_message = message.id.clone();
         self.add_unicode_reaction(&user_message, WORKING_REACTION, "turn_working")
             .await;
@@ -168,6 +191,12 @@ where
         action
     }
 
+    /// Resolve the agent configuration that should handle this message.
+    ///
+    /// Stored per-conversation, guild, channel, or user overrides are resolved
+    /// first. The runtime config then supplies the concrete agent and validates
+    /// that its referenced provider services exist before turn construction
+    /// proceeds.
     pub(crate) async fn resolve_turn_agent(
         &self,
         message: &PlatformMessage,
@@ -204,6 +233,12 @@ where
         Ok((agent_name, agent_config))
     }
 
+    /// Create or continue a conversation and persist the complete turn input.
+    ///
+    /// This is the durable boundary for a message that has already passed the
+    /// wake-up and privacy gates. It runs moderation, opens a conversation when
+    /// needed, begins the user turn, records platform context and transcript
+    /// input, then delegates terminal execution to `execute_turn`.
     pub(crate) async fn process_mentioned_message(
         &self,
         message: PlatformMessage,
@@ -212,12 +247,16 @@ where
         resolved_agent: Option<(String, AgentConfig)>,
         incoming_audio: IncomingAudioContext,
     ) -> Result<BotAction, BotError> {
+        // Moderation happens before a turn exists so refused messages do not
+        // create empty conversations or persisted user-turn rows.
         let user_display_name = display_name(&message);
         if !self.moderation_allows(&message, &user_display_name).await? {
             tracing::info!("message refused by moderation preflight");
             return Ok(BotAction::RefusedMessage);
         }
 
+        // Audio preflight may already have resolved the agent so transcription
+        // wake-word settings and the final model turn cannot diverge.
         let (agent_name, agent_config) = match resolved_agent {
             Some(resolved) => resolved,
             None => self.resolve_turn_agent(&message, existing.as_ref()).await?,
@@ -233,6 +272,9 @@ where
             "resolved agent for turn"
         );
 
+        // Conversation identity must exist before the final system prompt is
+        // composed, because new conversations get a concrete trace URL only
+        // after storage assigns the UUID.
         let (snapshot, is_new) = match existing {
             Some(snapshot) => (snapshot, false),
             None => {
@@ -271,6 +313,8 @@ where
             Some(snapshot.conversation.id),
         );
 
+        // Begin the durable turn before assembling context so every saved
+        // context item, transcript, trace, and platform reply has one owner.
         let turn = self
             .storage
             .begin_turn(BeginTurn {
@@ -305,6 +349,8 @@ where
             .map_err(storage_error)?;
         tracing::debug!("linked user message to turn");
 
+        // Prepare model-visible context from quoted/current messages, including
+        // any audio work already performed during wake-up preflight.
         let preflight_tool_traces = incoming_audio.tool_traces();
         let preflight_usage = incoming_audio.usage_records();
         let turn_context = self
@@ -328,6 +374,8 @@ where
             system_instructions_chars = system_instructions.chars().count(),
             "assembled model transcript"
         );
+        // Persist the exact prompt input before model execution so the trace
+        // viewer can inspect failed, cancelled, and successful turns uniformly.
         self.storage
             .save_turn_input(SaveTurnInput {
                 turn_id: turn.id,
@@ -374,6 +422,12 @@ where
             removed,
         )
     )]
+    /// Handle one platform reaction that may request retry or conversation stop.
+    ///
+    /// The reaction glyph is a user-facing control surface, but only retry and
+    /// stop are interpreted here. Stop/resume is admin-only; retry is resolved
+    /// through the stored message link so either a failed reply or its turn can
+    /// locate the correct conversation.
     pub(crate) async fn handle_reaction(
         &self,
         reaction: PlatformReaction,
@@ -424,6 +478,13 @@ where
             agent = tracing::field::Empty,
         )
     )]
+    /// Replay an eligible failed turn from a platform message link.
+    ///
+    /// A retry reuses the original turn id and stored conversation history
+    /// instead of creating a new turn. Stored context is replayed when present,
+    /// prior assistant/error messages for that turn are best-effort deleted, and
+    /// the turn then follows the same `execute_turn` terminal path as a fresh
+    /// message.
     pub(crate) async fn retry_from_message(
         &self,
         message: MessageRef,
@@ -442,6 +503,9 @@ where
             tracing::field::display(link.conversation_id),
         );
         tracing::Span::current().record("turn", tracing::field::display(link.turn_id));
+        // Existing assistant links are captured before prepare_retry mutates
+        // turn state so failed platform replies can be removed after the retry
+        // is known to be eligible.
         let prior_links = self
             .storage
             .load_message_links_for_turn(link.turn_id)
@@ -460,6 +524,8 @@ where
             tracing::info!("retry ignored because conversation is stopped");
             return Ok(BotAction::Ignored);
         }
+        // Storage owns retry eligibility and state reset. If it declines, the
+        // reaction was valid but the turn should not be run again.
         let Some(retry) = self
             .storage
             .prepare_retry(link.turn_id)
@@ -495,6 +561,8 @@ where
             model = %agent_config.model.id,
             "prepared turn retry"
         );
+        // Retry transcripts come from the stored conversation, not a new fetch
+        // of channel history, so privacy is narrowed to the conversation itself.
         let settings = RuntimeSettings {
             privacy: PrivacyMode::ConversationOnly,
             user_opted_in: true,
@@ -519,6 +587,8 @@ where
                 has_stored_context,
             )
             .await?;
+        // Save the replayed prompt input before deleting visible failure
+        // messages; even a retry that later fails should have inspectable input.
         self.storage
             .save_turn_input(SaveTurnInput {
                 turn_id: turn.id,
@@ -536,6 +606,8 @@ where
             ConversationEventKind::ContextRecorded,
         );
 
+        // Platform cleanup is best-effort. Storage state is already prepared for
+        // retry, so inability to delete an old error message must not block it.
         for link in prior_links
             .iter()
             .filter(|link| link.role.starts_with("assistant"))
@@ -588,6 +660,11 @@ where
             conversation = tracing::field::Empty,
         )
     )]
+    /// Stop or resume the conversation associated with a message or channel.
+    ///
+    /// Stopping a conversation prevents new work from starting and cooperatively
+    /// cancels matching in-flight turns. Resuming only clears the stored stop
+    /// marker; it does not restart cancelled work.
     pub(crate) async fn set_stop(
         &self,
         message: MessageRef,
@@ -617,6 +694,8 @@ where
         };
         let conversation_id = snapshot.conversation.id;
         tracing::Span::current().record("conversation", tracing::field::display(conversation_id));
+        // The durable stop flag is the source of truth. In-memory cancellation
+        // is only a follow-up signal for turns currently running in this process.
         let changed = self
             .storage
             .set_conversation_stop(if stop {
@@ -667,10 +746,18 @@ where
             is_new = execution.is_new,
         )
     )]
+    /// Run the agent for a prepared turn and drive it to one terminal state.
+    ///
+    /// Execution appends preflight traces, rechecks conversation stop state,
+    /// registers cooperative cancellation, records model/tool traces, posts the
+    /// platform reply or error message, and finally marks the turn completed,
+    /// failed, refused, or cancelled in storage.
     pub(crate) async fn execute_turn(
         &self,
         mut execution: TurnExecution,
     ) -> Result<BotAction, BotError> {
+        // Audio preflight traces belong at the front of the turn trace because
+        // they happened before the model transcript was assembled.
         for (ordinal, trace) in execution.preflight_tool_traces.iter().cloned().enumerate() {
             let trace_kind = tool_trace_kind(&trace);
             self.storage
@@ -688,6 +775,8 @@ where
             tracing::trace!(ordinal, trace_kind, "recorded preflight tool trace");
         }
         let preflight_trace_count = execution.preflight_tool_traces.len();
+        // Stop can be requested after the turn was prepared but before the
+        // agent is built. Recheck storage to avoid launching new provider work.
         if self
             .storage
             .load_conversation(ConversationLookup::Id {
@@ -738,6 +827,8 @@ where
             .register(execution.conversation.id, execution.turn.id);
         let cancel_token = cancel_guard.token();
         let typing = self.spawn_typing_indicator(channel_from_message(&execution.reply_to));
+        // Registration ties this concrete turn to admin stop requests. Dropping
+        // the guard unregisters the turn once the provider run is done.
         let run = tokio::select! {
             biased;
             () = cancel_token.cancelled() => {
@@ -765,6 +856,8 @@ where
                 turn_id: execution.turn.id,
             });
         };
+        // Provider errors before an `AgentRun` still need a terminal storage
+        // state so retry controls and the trace viewer remain consistent.
         let run = match run {
             Ok(run) => run,
             Err(error) => {
@@ -791,6 +884,8 @@ where
             "agent run completed"
         );
 
+        // Model-step and tool traces are persisted before outcome handling so
+        // failed or refused turns still expose the full execution trail.
         for step in run.model_steps.iter().cloned() {
             self.storage
                 .append_model_step_trace(execution.turn.id, step)
@@ -823,6 +918,9 @@ where
                 .await;
         }
 
+        // Media emitted in this run and media replayed from prior assistant
+        // messages share the same de-duplication path before final reply text is
+        // cleaned and attachments are loaded.
         let mut generated_media_refs = generated_media_reply_refs(&run.trace);
         for reference in replayed_media_refs {
             if !generated_media_refs.iter().any(|seen| seen == &reference) {
@@ -831,6 +929,8 @@ where
         }
         let generated_media = generated_reply_media(&self.media_store, &run.trace).await;
 
+        // Only this match writes terminal turn state. Every branch publishes a
+        // viewer update after storage reaches its final status for the turn.
         match &run.outcome {
             AgentOutcome::Completed { answer } => {
                 let text = strip_generated_media_refs(&answer.text, &generated_media_refs);
@@ -978,6 +1078,10 @@ where
         }
     }
 
+    /// Mark a turn failed, post a visible error reply, and expose retry affordance.
+    ///
+    /// The failure reply is linked with an `assistant_error` role so a later
+    /// retry can remove it without confusing it for successful assistant output.
     pub(crate) async fn fail_turn(
         &self,
         execution: &TurnExecution,
@@ -1063,6 +1167,11 @@ where
             agent = %execution.agent_name,
         )
     )]
+    /// Mark a turn as refused without posting an assistant error message.
+    ///
+    /// Safety refusals can occur after a durable turn exists. They are stored as
+    /// failed turns for trace visibility, but return the same high-level action
+    /// as moderation refusals so reaction handling uses the refusal status.
     pub(crate) async fn refuse_turn(
         &self,
         execution: &TurnExecution,
@@ -1085,6 +1194,7 @@ where
         Ok(BotAction::RefusedMessage)
     }
 
+    /// Start a background typing indicator that refreshes until explicitly stopped.
     pub(crate) fn spawn_typing_indicator(&self, channel: ChannelRef) -> TypingIndicator {
         let platforms = self.platforms.clone();
         let stop = CancellationToken::new();
@@ -1108,6 +1218,7 @@ where
         TypingIndicator { stop, task }
     }
 
+    /// Load the privacy mode and opt-in flag that apply to this message author.
     pub(crate) async fn runtime_settings(
         &self,
         message: &PlatformMessage,
@@ -1132,6 +1243,10 @@ where
         Ok(settings)
     }
 
+    /// Resolve the channel key used by channel-scoped agent overrides.
+    ///
+    /// Platform threads inherit their parent channel's agent setting. If the
+    /// platform lookup fails, the event channel remains the conservative scope.
     pub(crate) async fn agent_scope_channel(&self, message: &MessageRef) -> ChannelRef {
         let channel = channel_from_message(message);
         match self.platforms.parent_channel(channel.clone()).await {
@@ -1148,6 +1263,11 @@ where
         }
     }
 
+    /// Check whether the message channel is allowed under the active privacy mode.
+    ///
+    /// Only `channel_only` constrains the channel here. Existing conversations
+    /// are allowed to continue from linked thread/reply surfaces, while new work
+    /// must match either the configured channel or its platform parent.
     pub(crate) async fn privacy_allows_message_channel(
         &self,
         mode: &PrivacyMode,
@@ -1191,10 +1311,17 @@ where
             has_reference = message.referenced_message_id().is_some(),
         )
     )]
+    /// Locate the conversation, if any, that an incoming message should continue.
+    ///
+    /// Lookup order is intentional: current channel first for thread-style
+    /// continuations, referenced message second for replies, and the current
+    /// message link last for idempotent reprocessing of an already-linked event.
     pub(crate) async fn lookup_existing_conversation(
         &self,
         message: &PlatformMessage,
     ) -> Result<Option<ExistingConversation>, BotError> {
+        // Channel lookup catches active thread/channel continuations before any
+        // quoted-message relationship is considered.
         let channel = channel_from_message(&message.id);
         tracing::debug!(
             lookup = "channel",
@@ -1229,6 +1356,8 @@ where
             "no existing conversation found by channel"
         );
 
+        // Referenced-message lookup lets an explicit reply join the conversation
+        // that produced or linked the replied-to platform message.
         if let Some(referenced) = message.referenced_message_id().cloned() {
             tracing::debug!(
                 lookup = "referenced_message",
@@ -1277,6 +1406,8 @@ where
             );
         }
 
+        // Current-message lookup handles repeated delivery after the message has
+        // already been linked to a turn.
         tracing::debug!(
             lookup = "message",
             lookup_platform = %message.id.platform,
@@ -1318,6 +1449,11 @@ where
         }))
     }
 
+    /// Build persisted context items for the quoted message and current message.
+    ///
+    /// Quoted user messages are included only when privacy allows them. Quoted
+    /// assistant replies from the same conversation are skipped because the
+    /// transcript already replays those assistant turns.
     pub(crate) async fn prepare_turn_context(
         &self,
         message: &PlatformMessage,
@@ -1328,6 +1464,8 @@ where
         let mut items = Vec::new();
         let mut position = 0;
 
+        // Quoted context is useful for reply semantics, but must not duplicate
+        // an assistant answer already present in the conversation transcript.
         if let Some(referenced) = message.referenced_message()
             && self
                 .quoted_message_allowed(referenced, settings, conversation)
@@ -1350,6 +1488,9 @@ where
             .await?;
         }
 
+        // Audio may have been saved during wake-up preflight. Empty media marks
+        // "already handled but not exposed" so push_message_context does not
+        // save the same attachments a second time.
         let current_audio_media = match incoming_audio.saved_audio {
             Some(audio_media) if incoming_audio.expose_audio_to_model => Some(audio_media),
             Some(_) => Some(Vec::new()),
@@ -1372,6 +1513,11 @@ where
         Ok(PreparedTurnContext { items })
     }
 
+    /// Save message media and append one platform message context block.
+    ///
+    /// The first item is the platform adapter's structured message context.
+    /// Follow-up items expose stored image/audio URIs and a concise image-ref
+    /// hint so model tools can address attachments by stable media ids.
     pub(crate) async fn push_message_context(
         &self,
         items: &mut Vec<chudbot_api::ContextItem>,
@@ -1386,6 +1532,8 @@ where
             audio_transcriptions,
         } = input;
 
+        // Attachments are copied into the media store before the platform JSON
+        // is serialized so stable URIs can be injected into the context value.
         let image_media = self
             .save_matching_attachments(message, MediaCategory::Image, "image", looks_like_image_ref)
             .await;
@@ -1419,6 +1567,8 @@ where
         });
         *position += 1;
 
+        // Media URI items follow the message JSON in stable attachment order,
+        // preserving the position sequence used by transcript assembly.
         let mut image_refs = Vec::new();
         for saved in image_media {
             let uri = saved.media.uri().to_string();
@@ -1469,6 +1619,11 @@ where
         Ok(())
     }
 
+    /// Decide whether a referenced message may be included as quoted context.
+    ///
+    /// Open and channel-only modes allow quoted context. Conversation-only mode
+    /// suppresses it. Opt-in mode allows bot messages, messages already linked
+    /// to this conversation, or opted-in guild users.
     pub(crate) async fn quoted_message_allowed(
         &self,
         referenced: &PlatformMessage,
@@ -1510,6 +1665,7 @@ where
         }
     }
 
+    /// Check whether a quoted assistant message is already present in transcript history.
     pub(crate) async fn quoted_assistant_message_already_replays(
         &self,
         referenced: &PlatformMessage,
@@ -1537,20 +1693,32 @@ where
 
 /// Fully prepared state needed to execute one model-backed turn.
 pub(crate) struct TurnExecution {
+    /// Conversation that owns the turn and receives live viewer events.
     pub(crate) conversation: Conversation,
+    /// Durable turn row that will be driven to one terminal status.
     pub(crate) turn: Turn,
+    /// Resolved agent name recorded with the turn input and trace span.
     pub(crate) agent_name: String,
+    /// Agent configuration used to build providers, tools, and model request shape.
     pub(crate) agent_config: AgentConfig,
+    /// Final system prompt, including any conversation-specific guidance.
     pub(crate) system_prompt: String,
+    /// Model transcript prepared from stored conversation state and current context.
     pub(crate) transcript: Transcript,
+    /// Runtime privacy/opt-in settings captured for this turn.
     pub(crate) settings: RuntimeSettings,
+    /// Platform message that assistant output should reply to.
     pub(crate) reply_to: MessageRef,
+    /// Whether this turn opened the conversation and should include first-reply behavior.
     pub(crate) is_new: bool,
+    /// Tool traces produced before agent execution, such as audio transcription preflight.
     pub(crate) preflight_tool_traces: Vec<ToolTrace>,
+    /// Usage records produced before agent execution.
     pub(crate) preflight_usage: Vec<UsageRecord>,
 }
 
 impl TurnExecution {
+    /// Return turn usage with preflight usage prepended in execution order.
     pub(crate) fn usage_with_preflight(&self, mut usage: Vec<UsageRecord>) -> Vec<UsageRecord> {
         if self.preflight_usage.is_empty() {
             return usage;
@@ -1564,19 +1732,28 @@ impl TurnExecution {
 /// Existing conversation found for a new platform message.
 #[derive(Debug, Clone)]
 pub(crate) struct ExistingConversation {
+    /// Loaded conversation snapshot used for continuation and transcript assembly.
     pub(crate) snapshot: ConversationSnapshot,
+    /// Lookup route that found the snapshot.
     pub(crate) source: ConversationLookupSource,
 }
 
 /// Where a conversation lookup matched, used for audio wake-up decisions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ConversationLookupSource {
+    /// The message arrived in a channel already linked to a conversation.
     Channel,
+    /// The message explicitly replied to a message linked to a conversation.
     ReferencedMessage,
+    /// The current message was already linked to a conversation.
     Message,
 }
 
 impl ConversationLookupSource {
+    /// Return whether this lookup source should let audio continue a conversation.
+    ///
+    /// Already-linked current messages are treated as idempotent reprocessing,
+    /// not as a fresh audio mention.
     pub(crate) fn counts_as_audio_mention(self) -> bool {
         matches!(self, Self::Channel | Self::ReferencedMessage)
     }
@@ -1585,5 +1762,6 @@ impl ConversationLookupSource {
 /// Context items prepared for the model transcript and persisted trace.
 #[derive(Debug, Clone)]
 pub(crate) struct PreparedTurnContext {
+    /// Ordered context entries saved with the turn input.
     pub(crate) items: Vec<chudbot_api::ContextItem>,
 }

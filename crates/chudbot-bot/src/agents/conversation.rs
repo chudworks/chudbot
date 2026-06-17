@@ -1,4 +1,9 @@
-//! Top-level and nested conversation agent construction.
+//! Conversation-facing agent construction.
+//!
+//! This module bridges configured agents and per-turn runtime state into the
+//! executable agent used by a conversation turn. It owns the last-mile choices
+//! about runtime-only tool exposure, nested subagent wiring, and the operational
+//! guidance embedded in system prompts.
 
 use crate::prelude::*;
 use crate::*;
@@ -7,6 +12,12 @@ impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
 {
+    /// Build the executable agent used for one turn or subagent call.
+    ///
+    /// `top_level` controls tools that should only be available to the agent
+    /// directly answering the user. `stack` tracks the active agent expansion
+    /// chain so configured subagent cycles fail during construction instead of
+    /// becoming recursive tool calls at runtime.
     pub(crate) fn build_agent(
         &self,
         agent_name: &str,
@@ -22,6 +33,9 @@ where
         stack: &mut Vec<String>,
     ) -> Result<RuntimeAgent<R>, BotError> {
         self.ensure_agent_services_exist(agent_name, agent_config)?;
+
+        // Only the active expansion path is recursive. Sibling subagents may
+        // legitimately point at the same configured agent.
         if stack.iter().any(|name| name == agent_name) {
             tracing::warn!("recursive agent reference detected");
             return Err(BotError::RecursiveAgent {
@@ -39,6 +53,9 @@ where
             ensure_client_tool_enabled(&mut spec.client_tools, memory::FORGET_USER_MEMORY_TOOL);
         }
 
+        // Seed the executor with per-turn handles. Later blocks only enable
+        // feature bits or attach configured bindings; they do not change turn
+        // identity.
         let mut tool_executor = RuntimeToolExecutor::new(
             RuntimeToolDeps {
                 platforms: self.platforms.clone(),
@@ -83,6 +100,8 @@ where
             tool_executor.enabled.usage_report = true;
         }
 
+        // Provider-backed media tools are opt-in per agent because each binding
+        // names both a runtime provider registry entry and a model.
         if let Some(binding) = &agent_config.image_generation {
             tracing::debug!(
                 tool = GENERATE_IMAGE_TOOL,
@@ -113,6 +132,8 @@ where
             tool_executor.audio_transcription = Some(binding.clone());
         }
 
+        // Stored-media access is always wired in for conversation agents. The
+        // individual tools still enforce URI, MIME type, and attachment rules.
         tracing::debug!(tool = READ_ASSET_TOOL, "attaching media access tool");
         tool_executor.enabled.media_access.read = true;
         tracing::debug!(tool = STAT_ASSET_TOOL, "attaching media access tool");
@@ -156,6 +177,8 @@ where
             });
         }
 
+        // Successful expansion removes this node from the active path before
+        // building siblings or returning to the caller.
         stack.pop();
         let model = Model {
             backend: RoutedLlmBackend::new(self.llms.clone(), agent_config.provider.clone()),
@@ -166,6 +189,10 @@ where
         Ok(Agent::new(model, spec, tool_executor))
     }
 
+    /// Compose the system prompt for the top-level agent answering a turn.
+    ///
+    /// Top-level prompts may include user-memory guidance and a concrete trace
+    /// URL for the current conversation.
     pub(crate) fn compose_system_prompt(
         &self,
         agent: &AgentConfig,
@@ -180,6 +207,10 @@ where
         )
     }
 
+    /// Compose the narrower system prompt used by subagent tools.
+    ///
+    /// Subagents receive configured capability guidance, but not user-memory
+    /// instructions or a conversation trace URL.
     pub(crate) fn compose_subagent_system_prompt(
         &self,
         agent: &AgentConfig,
@@ -188,6 +219,11 @@ where
         self.compose_system_prompt_inner(agent, privacy, false, None)
     }
 
+    /// Shared system-prompt builder for top-level agents and subagents.
+    ///
+    /// `include_memory` and `conversation_id` are explicit knobs because prompt
+    /// text is advisory; the runtime tool executor remains the enforcement
+    /// boundary for which calls are actually accepted.
     pub(crate) fn compose_system_prompt_inner(
         &self,
         agent: &AgentConfig,
@@ -196,6 +232,8 @@ where
         conversation_id: Option<ConversationId>,
     ) -> String {
         let mut out = String::new();
+        // Deployment-wide policy leads so it frames all later operational and
+        // persona instructions.
         if let Some(extra) = self
             .config
             .extra_system_prompt
@@ -207,6 +245,9 @@ where
             out.push_str(extra);
             out.push_str("\n\n");
         }
+
+        // Runtime identity helps trace readers and model operators understand
+        // which configured provider/model produced the turn.
         out.push_str("Operational context:\n");
         out.push_str(&format!(
             "Bot build: {}. You are answering as model `{}` via `{}`.\n",
@@ -218,6 +259,9 @@ where
                 conversation_id,
             ));
         }
+
+        // Capability guidance is assembled from config and privacy mode. The
+        // executor built above still decides whether a tool call is permitted.
         out.push_str("Capabilities this turn:\n");
         if !agent.model.server_tools.is_empty() {
             out.push_str("- Provider-side tools configured on this model.\n");
@@ -280,10 +324,14 @@ where
         out
     }
 
+    /// Return whether user-memory behavior should be exposed for this agent.
+    ///
+    /// Memory is gated by both deployment config and the individual agent flag.
     pub(crate) fn agent_memory_enabled(&self, agent: &AgentConfig) -> bool {
         self.memory_config.enabled && agent.memory
     }
 
+    /// Apply final reply formatting using this runtime's configured web base URL.
     pub(crate) fn format_reply(
         &self,
         text: &str,
@@ -293,6 +341,7 @@ where
         format_reply_content(text, is_new, conversation_id, &self.config.web_base_url)
     }
 
+    /// Verify that an agent's LLM provider exists in the runtime registry.
     pub(crate) fn ensure_provider_exists(
         &self,
         agent_name: &str,
@@ -317,11 +366,17 @@ where
         })
     }
 
+    /// Verify every provider-backed service referenced by an agent.
+    ///
+    /// Construction checks all configured media helpers up front so the model is
+    /// never built with prompt text or tool bindings for missing services.
     pub(crate) fn ensure_agent_services_exist(
         &self,
         agent_name: &str,
         agent: &AgentConfig,
     ) -> Result<(), BotError> {
+        // Every agent needs an LLM provider; media services are conditional on
+        // that agent exposing the corresponding generation/transcription tool.
         self.ensure_provider_exists(agent_name, agent)?;
         if let Some(binding) = &agent.image_generation
             && !self.images.contains_generator(&binding.provider)

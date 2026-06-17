@@ -1,4 +1,13 @@
-//! Configuration and default agent resolution for user memory.
+//! Configuration for the background user-memory scheduler.
+//!
+//! The public config shape is the optional `[memory]` table. Every field is
+//! defaulted so deployments can opt in with only `enabled = true`; the rest of
+//! the table controls scheduler cadence, job leasing, retry behavior, and the
+//! size of each diary summarization window.
+//!
+//! Memory job prompts are not configured here. They are reserved system agents
+//! resolved from the normal `[bot.agents]` map when present, with built-in
+//! fallback model specs when omitted.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -17,40 +26,50 @@ use super::{compact, diary};
 const MEMORY_MODEL_ID: &str = "grok-4.3";
 const MEMORY_REASONING_EFFORT: &str = "high";
 
-/// User-memory runtime configuration.
+/// User-memory runtime configuration parsed from `[memory]`.
+///
+/// This type intentionally does not use `serde(deny_unknown_fields)`. Stale
+/// `[memory]` keys are reported by the source-aware config diagnostics layer,
+/// which can aggregate them with other `check-config` findings and point at
+/// the related TOML span.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
-    /// Global memory switch.
+    /// Enables the background memory scheduler.
     #[serde(default)]
     pub enabled: bool,
-    /// Scheduler poll interval in seconds.
+    /// Scheduler poll interval in seconds, clamped to at least one second when
+    /// converted to a [`Duration`].
     #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
-    /// Human-readable compaction interval such as `12h` or `24h`.
+    /// Minimum age between profile-compaction jobs for the same user.
+    ///
+    /// Uses the memory duration grammar parsed by [`parse_duration_seconds`],
+    /// such as `12h` or `24h`.
     #[serde(default = "default_compaction_interval")]
     pub compaction_interval: String,
-    /// Human-readable maximum age for turns considered by diary backfill.
+    /// Maximum age of completed turns considered when diary jobs backfill
+    /// missing windows.
     #[serde(default = "default_diary_backfill_window")]
     pub diary_backfill_window: String,
-    /// Human-readable source window summarized by one diary entry.
+    /// Size of the source window summarized by one diary entry.
     #[serde(default = "default_diary_interval")]
     pub diary_interval: String,
-    /// SQL lease duration in seconds.
+    /// SQL lease duration in seconds for claimed memory jobs.
     #[serde(default = "default_lease_seconds")]
     pub lease_seconds: u64,
-    /// Maximum jobs to claim per scheduler tick.
+    /// Maximum jobs to claim from storage per scheduler tick.
     #[serde(default = "default_max_jobs_per_tick")]
     pub max_jobs_per_tick: u32,
-    /// Maximum jobs to run concurrently inside this process.
+    /// Maximum claimed memory jobs to run concurrently inside this process.
     #[serde(default = "default_max_concurrent_jobs")]
     pub max_concurrent_jobs: u32,
-    /// Maximum completed turns included in one diary job.
+    /// Maximum completed transcript turns included in one diary job request.
     #[serde(default = "default_max_transcript_turns_per_diary_job")]
     pub max_transcript_turns_per_diary_job: u32,
-    /// Base retry backoff after a failed memory job.
+    /// Base retry backoff in seconds after a failed memory job.
     #[serde(default = "default_retry_backoff_seconds")]
     pub retry_backoff_seconds: u64,
-    /// Attempts after which a job is marked failed instead of retried.
+    /// Attempt count after which a job is marked failed instead of retried.
     #[serde(default = "default_max_job_attempts")]
     pub max_job_attempts: i32,
 }
@@ -74,28 +93,33 @@ impl Default for MemoryConfig {
 }
 
 impl MemoryConfig {
-    /// Parse and validate the human-readable compaction interval.
+    /// Parse and validate [`Self::compaction_interval`].
     pub fn compaction_interval_seconds(&self) -> Result<u64, MemoryConfigError> {
         parse_duration_seconds(&self.compaction_interval)
     }
 
-    /// Parse and validate the maximum diary backfill window.
+    /// Parse and validate [`Self::diary_backfill_window`].
     pub fn diary_backfill_window_seconds(&self) -> Result<u64, MemoryConfigError> {
         parse_duration_seconds(&self.diary_backfill_window)
     }
 
-    /// Parse and validate the source window summarized by one diary entry.
+    /// Parse and validate [`Self::diary_interval`].
     pub fn diary_interval_seconds(&self) -> Result<u64, MemoryConfigError> {
         parse_duration_seconds(&self.diary_interval)
     }
 
-    /// Poll interval as a non-zero duration.
+    /// Return the scheduler poll interval as a non-zero duration.
     pub fn poll_interval(&self) -> Duration {
         Duration::from_secs(self.poll_interval_seconds.max(1))
     }
 
     /// Resolve the configured memory agents, falling back to the built-in
     /// default specs for any job kind without a matching configured agent.
+    ///
+    /// This is used by config validation and status surfaces that need to show
+    /// the concrete provider selected for each reserved memory agent without
+    /// constructing the whole runtime.
+    ///
     /// Return the memory agents and providers that would be used at runtime.
     pub fn resolved_agent_providers(
         &self,
@@ -108,6 +132,8 @@ impl MemoryConfig {
             .collect()
     }
 
+    /// Resolve the reserved memory agent set from configured agents plus
+    /// built-in fallbacks.
     pub(crate) fn resolve_agent_set(
         &self,
         agents: &BTreeMap<String, AgentConfig>,
@@ -119,10 +145,16 @@ impl MemoryConfig {
         }
     }
 
+    /// Return the storage lease duration as a non-zero duration.
     pub(crate) fn lease_duration(&self) -> Duration {
         Duration::from_secs(self.lease_seconds.max(1))
     }
 
+    /// Return linear retry backoff for a failed job attempt.
+    ///
+    /// The configured base is clamped to at least one second and the attempt
+    /// multiplier is capped so invalid or very large persisted attempts cannot
+    /// create unbounded delays.
     pub(crate) fn retry_backoff(&self, attempts: i32) -> time::Duration {
         let attempts = attempts.max(1) as u64;
         let seconds = self
@@ -133,22 +165,28 @@ impl MemoryConfig {
     }
 }
 
-/// Resolved memory agents used by the background scheduler.
+/// Resolved reserved agents used by the background memory scheduler.
 #[derive(Debug, Clone)]
 pub(crate) struct MemoryAgentSet {
-    /// Diary agent.
+    /// Agent that turns recent conversation windows into diary entries.
     pub(crate) diary: SystemAgentConfig,
-    /// Profile compaction agent.
+    /// Agent that compacts diary/profile state into the long-lived user memory.
     pub(crate) compact: SystemAgentConfig,
 }
 
 impl MemoryAgentSet {
-    /// Iterate all configured memory agents.
+    /// Iterate the reserved agents in stable scheduler order.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &SystemAgentConfig> {
         [&self.diary, &self.compact].into_iter()
     }
 }
 
+/// Resolve one reserved memory agent by name.
+///
+/// A matching `[bot.agents.<name>]` entry wins and inherits the runtime's
+/// default limits through [`SystemAgentConfig::from_agent_config`]. Missing
+/// entries use a built-in provider/model/prompt fallback for deployments that
+/// enable memory without defining dedicated agents.
 pub(crate) fn resolve_memory_agent(
     default_name: &'static str,
     default_prompt: &'static str,
@@ -163,6 +201,8 @@ pub(crate) fn resolve_memory_agent(
         return resolved;
     }
 
+    // Keep the fallback self-contained so a minimal `[memory]` table has a
+    // working diary and compaction agent without additional bot-agent config.
     let resolved = SystemAgentConfig::from_parts(
         default_name,
         default_memory_provider(),
@@ -229,18 +269,22 @@ fn default_max_job_attempts() -> i32 {
     5
 }
 
-/// Memory config validation errors.
+/// Memory config validation errors returned after TOML deserialization.
 #[derive(Debug, Error)]
 pub enum MemoryConfigError {
-    /// Duration string is invalid.
+    /// Duration string is malformed, has an unsupported suffix, overflows, or
+    /// resolves to zero seconds.
     #[error("invalid memory duration `{value}`; expected digits followed by s, m, h, or d")]
     InvalidDuration {
-        /// Invalid value.
+        /// Original invalid config value.
         value: String,
     },
 }
 
-/// Parse a duration with `s`, `m`, `h`, or `d` suffix.
+/// Parse a positive duration with an `s`, `m`, `h`, or `d` suffix.
+///
+/// Whitespace around the value is ignored. The numeric portion must be an
+/// unsigned integer and the final result must fit in `u64` seconds.
 pub fn parse_duration_seconds(value: &str) -> Result<u64, MemoryConfigError> {
     let value = value.trim();
     let Some(unit) = value.chars().last() else {

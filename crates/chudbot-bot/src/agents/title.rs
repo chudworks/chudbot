@@ -1,20 +1,41 @@
-//! Conversation title generation agent resolution and execution.
+//! Conversation-title system-agent resolution and execution.
+//!
+//! Titles are generated after the first completed user-visible turn, but the
+//! title model call is kept out of that turn's reply path. The background job
+//! reloads the stored conversation, builds a tiny one-turn transcript from the
+//! first completed exchange, and stores a cleaned display title for the trace
+//! viewer.
 
 use crate::prelude::*;
 use crate::*;
 
-/// Resolver for conversation title generation agents.
+/// Startup-cached resolver for the reserved conversation-title agent.
+///
+/// A configured `[bot.agents.conversation_title]` entry is used exactly. When
+/// that reserved entry is absent, the title agent inherits from normal agent
+/// config so titles are generated with the same provider family as the agent
+/// that answered the conversation.
 #[derive(Debug, Clone)]
 pub(crate) struct ConversationTitleSystemAgents {
+    /// Exact reserved-agent override loaded from config.
     pub(crate) configured: Option<SystemAgentConfig>,
+    /// Synthesized title-agent defaults keyed by the source agent name.
     pub(crate) agent_defaults: BTreeMap<String, SystemAgentConfig>,
+    /// Precomputed fallback for each configured platform's default agent.
     pub(crate) platform_defaults: BTreeMap<PlatformName, SystemAgentConfig>,
+    /// Fallback inherited from the deployment's default agent.
     pub(crate) default: Option<SystemAgentConfig>,
 }
 
 impl ConversationTitleSystemAgents {
+    /// Resolve all title-agent variants once from runtime config.
+    ///
+    /// The cached shape keeps per-turn title spawning cheap while preserving the
+    /// inheritance order used before startup caching: explicit reserved agent,
+    /// source agent, platform default agent, then deployment default agent.
     pub(crate) fn from_config(config: &BotConfig) -> Self {
         if let Some(configured) = configured_system_agent(config, CONVERSATION_TITLE_AGENT) {
+            // Exact config wins globally; inherited defaults are unreachable.
             return Self {
                 configured: Some(configured),
                 agent_defaults: BTreeMap::new(),
@@ -52,6 +73,7 @@ impl ConversationTitleSystemAgents {
         }
     }
 
+    /// Return the title agent for a conversation answered by `source_agent_name`.
     pub(crate) fn get(
         &self,
         source_agent_name: &str,
@@ -71,6 +93,11 @@ impl ConversationTitleSystemAgents {
     }
 }
 
+/// Build the inherited default title agent for a normal configured agent.
+///
+/// Defaults intentionally copy provider, model id, provider options, and loop
+/// limits from the source agent, but replace the prompt, sampling, and server
+/// tools with title-specific settings.
 pub(crate) fn default_conversation_title_agent(
     source: &AgentConfig,
     default_limits: AgentLimits,
@@ -97,6 +124,7 @@ impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
 {
+    /// Resolve the cached title-agent config for the active conversation.
     pub(crate) fn conversation_title_agent(
         &self,
         source_agent_name: &str,
@@ -109,6 +137,12 @@ where
         )
     }
 
+    /// Start fire-and-log title generation for a newly answered conversation.
+    ///
+    /// This runs after the first turn has already been posted and stored, so a
+    /// title failure must not fail the user's turn. The background task logs and
+    /// exits; a later caller can still set a title if the conversation remains
+    /// untitled.
     pub(crate) fn spawn_title_generation(
         &self,
         conversation_id: ConversationId,
@@ -127,6 +161,13 @@ where
         });
     }
 
+    /// Generate and persist a title when the stored conversation is still untitled.
+    ///
+    /// The model sees only a synthetic user turn containing the first completed
+    /// user message and stored assistant reply. It does not see the full stored
+    /// trace, prior platform history, or any live client tools, and its run is
+    /// not appended as another conversation turn. The trace viewer learns about
+    /// the result only through the stored title and a `TitleUpdated` event.
     pub(crate) async fn generate_title(
         &self,
         conversation_id: ConversationId,
@@ -142,6 +183,8 @@ where
         else {
             return Err(BotError::MissingConversation { conversation_id });
         };
+        // Re-check after loading; background jobs can race with another title
+        // writer or with a manually titled conversation.
         if snapshot.conversation.title.is_some() {
             tracing::debug!("conversation title already exists; skipping");
             return Ok(());
@@ -156,6 +199,9 @@ where
         };
         let agent =
             self.conversation_title_agent(agent_name, &snapshot.conversation.channel.platform)?;
+        // Use the stored assistant text, not the raw model answer. On the first
+        // reply this can include the Discord full-trace footer, so the title
+        // prompt must be strong enough to ignore reply chrome.
         let user_text = format!(
             "User said:\n{}\n\nAssistant replied:\n{}",
             first.turn.user_content,
@@ -195,6 +241,7 @@ where
         };
         let title = clean_title(&raw);
         if title.is_empty() {
+            // Empty titles are a model-quality issue, not a conversation failure.
             tracing::warn!(raw = %raw, "title generation returned empty title");
             return Ok(());
         }
@@ -208,7 +255,11 @@ where
     }
 }
 
-/// Normalize the title model output into a short display title.
+/// Normalize title-model output into the stored display title.
+///
+/// Providers sometimes echo label text or quote the title despite the prompt.
+/// Cleanup is deliberately small: strip the common wrappers and enforce the
+/// display-length cap without trying to reinterpret the model's words.
 pub(crate) fn clean_title(raw: &str) -> String {
     let trimmed = raw.trim();
     let trimmed = trimmed

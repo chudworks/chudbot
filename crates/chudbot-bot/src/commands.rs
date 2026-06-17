@@ -1,4 +1,13 @@
-//! Slash-command definitions and command handlers.
+//! Platform-neutral slash-command definitions and handlers.
+//!
+//! This module owns the command surface Chudbot registers with each platform and
+//! the handlers that turn normalized `PlatformCommand` inputs into ephemeral
+//! responses. The code stays on `chudbot-api` types so platform adapters can
+//! translate Discord or future interaction payloads before they reach bot
+//! orchestration.
+//!
+//! Commands here mutate durable runtime state: per-user privacy opt-in records,
+//! server privacy modes, and scoped agent overrides.
 
 use crate::prelude::*;
 use crate::*;
@@ -7,10 +16,16 @@ impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
 {
+    /// Dispatch a normalized platform command and send the platform response.
+    ///
+    /// Recoverable command-input errors are rendered as the ephemeral command
+    /// response body; storage and platform failures still bubble out as
+    /// `BotError`s.
     pub(crate) async fn handle_command(
         &self,
         command: PlatformCommand,
     ) -> Result<BotAction, BotError> {
+        // Step 1: route by the stable command names registered below.
         let handled = match command.name.as_str() {
             "chudbot-privacy" => self.handle_privacy_command(&command).await,
             "chudbot-mode" => self.handle_mode_command(&command).await,
@@ -21,11 +36,17 @@ where
                     .to_string())
             }
         };
+
+        // Step 2: command-input problems are user-facing validation messages,
+        // while operational failures should be handled by the event runner.
         let content = match handled {
             Ok(content) => content,
             Err(BotError::CommandInput(message)) => message,
             Err(error) => return Err(error),
         };
+
+        // Step 3: slash-command replies are private by default so status and
+        // configuration details do not clutter the channel.
         self.platforms
             .respond_to_command(PlatformCommandResponse {
                 target: command.response_target,
@@ -37,6 +58,11 @@ where
         Ok(BotAction::HandledCommand)
     }
 
+    /// Handle `/chudbot-privacy` for the invoking user's server opt-in state.
+    ///
+    /// Privacy opt-in records are scoped by platform, guild, and user. Direct
+    /// messages have no guild key, so the command only reports that the action
+    /// must be run inside a server channel.
     pub(crate) async fn handle_privacy_command(
         &self,
         command: &PlatformCommand,
@@ -50,6 +76,9 @@ where
         let Some(sub) = command_subcommand(command) else {
             return Ok("Missing subcommand.".to_string());
         };
+
+        // Store only the explicit opt-in bit. Runtime privacy mode resolution
+        // combines this with the guild's active mode when a turn is built.
         match sub.name.as_str() {
             "in" => {
                 self.storage
@@ -99,6 +128,10 @@ where
         }
     }
 
+    /// Handle `/chudbot-mode`, the administrator command for server privacy mode.
+    ///
+    /// This command reads or updates the guild-level runtime privacy mode that
+    /// controls which surrounding messages may be considered as model context.
     pub(crate) async fn handle_mode_command(
         &self,
         command: &PlatformCommand,
@@ -137,9 +170,16 @@ where
                 let mode = sub_option_string(&sub, "mode")
                     .ok_or_else(|| BotError::CommandInput("missing `mode`".to_string()))?;
                 let channel = sub_option_string(&sub, "channel");
+
+                // Platforms should enforce the declared bounds, but clamping
+                // keeps imported or replayed normalized commands safe too.
                 let history_size = sub_option_integer(&sub, "history_size").map(|value| {
                     u32::try_from(value.clamp(HISTORY_SIZE_MIN, HISTORY_SIZE_MAX)).unwrap_or(20)
                 });
+
+                // Translate the flat slash-command options into the stored
+                // privacy enum before persisting so invalid combinations can
+                // return a command-input response.
                 let privacy = command_privacy_mode(
                     command.channel.platform.clone(),
                     guild.as_str().to_string(),
@@ -165,6 +205,7 @@ where
         }
     }
 
+    /// Route `/chudbot-agent` subcommands for listing and scoped overrides.
     pub(crate) async fn handle_agent_command(
         &self,
         command: &PlatformCommand,
@@ -181,10 +222,18 @@ where
         }
     }
 
+    /// Build the `/chudbot-agent show` explanation for the current command site.
+    ///
+    /// The response lists every scope that can contribute an agent selection,
+    /// then reports the active configured agent after applying the canonical
+    /// narrow-to-broad command precedence.
     pub(crate) async fn handle_agent_show(
         &self,
         command: &PlatformCommand,
     ) -> Result<String, BotError> {
+        // Step 1: derive the storage keys that depend on the current command
+        // location. Channel scope intentionally uses the parent thread/channel
+        // when the platform can resolve one.
         let conversation = self.command_conversation(command).await?;
         let channel = self.command_scope_channel(command).await;
         let guild = command
@@ -193,6 +242,8 @@ where
             .as_ref()
             .map(|id| id.as_str().to_string());
 
+        // Step 2: load each possible override independently so the user can see
+        // shadowed settings instead of only the winner.
         let conv_pick = match conversation {
             Some(conversation_id) => self
                 .storage
@@ -241,6 +292,8 @@ where
             .await
             .map_err(storage_error)?;
 
+        // Step 3: resolve the active name from most specific to broadest scope,
+        // falling back to the configured default only when storage has no pick.
         let active_name = conv_pick
             .clone()
             .or_else(|| user_pick.clone())
@@ -249,6 +302,9 @@ where
             .or_else(|| platform_pick.clone())
             .unwrap_or_else(|| self.config.default_agent.clone());
         let active = self.config.agents.get(&active_name);
+
+        // Step 4: render a compact diagnostic that is useful in an ephemeral
+        // command response.
         let mut out = String::from("Agent resolution here\n");
         out.push_str(&format!(
             "conversation: {}\n",
@@ -278,6 +334,10 @@ where
         Ok(out)
     }
 
+    /// Store a configured agent override for the requested `/chudbot-agent` scope.
+    ///
+    /// User-scoped selections are self-service, while channel and guild scopes
+    /// are protected by `command_agent_selection` when `enforce_admin` is true.
     pub(crate) async fn handle_agent_set(
         &self,
         command: &PlatformCommand,
@@ -312,6 +372,7 @@ where
         ))
     }
 
+    /// Clear a configured agent override for the requested `/chudbot-agent` scope.
     pub(crate) async fn handle_agent_clear(
         &self,
         command: &PlatformCommand,
@@ -339,6 +400,11 @@ where
         }
     }
 
+    /// Convert a user-visible agent scope into the storage selection key.
+    ///
+    /// The `enforce_admin` flag lets callers reuse the mapper for read-only
+    /// diagnostics if needed while still requiring administrators for channel
+    /// and guild mutations in the command handlers.
     pub(crate) async fn command_agent_selection(
         &self,
         command: &PlatformCommand,
@@ -347,6 +413,8 @@ where
     ) -> Result<AgentSelection, BotError> {
         match scope {
             "conversation" => {
+                // Conversation overrides require the command to run in a
+                // channel already linked to a stored conversation.
                 let Some(conversation_id) = self.command_conversation(command).await? else {
                     return Err(BotError::CommandInput(
                         "No conversation is bound to this channel. Run this inside a thread the bot opened for an answer."
@@ -375,6 +443,9 @@ where
                     ));
                 }
                 let channel = self.command_scope_channel(command).await;
+
+                // Match turn-time agent resolution by keying thread commands to
+                // their parent channel when a platform exposes that relationship.
                 Ok(AgentSelection::Channel {
                     message_provider: command.channel.platform.clone(),
                     guild_key: command
@@ -406,6 +477,7 @@ where
         }
     }
 
+    /// Find the conversation currently bound to the command channel, if any.
     pub(crate) async fn command_conversation(
         &self,
         command: &PlatformCommand,
@@ -420,6 +492,12 @@ where
         Ok(snapshot.map(|snapshot| snapshot.conversation.id))
     }
 
+    /// Resolve the channel key used for command-scoped settings.
+    ///
+    /// Platforms such as Discord may invoke commands inside threads. Agent
+    /// channel overrides should usually apply to the parent channel, matching
+    /// turn-time agent resolution, so failures fall back to the interaction
+    /// channel with a warning.
     pub(crate) async fn command_scope_channel(&self, command: &PlatformCommand) -> ChannelRef {
         match self.platforms.parent_channel(command.channel.clone()).await {
             Ok(parent) => parent,
@@ -435,6 +513,11 @@ where
     }
 }
 
+/// Return the platform-neutral slash-command definitions registered at startup.
+///
+/// Platform adapters translate these definitions into native command
+/// registrations, but the names and option values here are also the stable
+/// strings consumed by the handlers above.
 pub(crate) fn command_definitions() -> Vec<PlatformCommandDefinition> {
     vec![
         PlatformCommandDefinition {
@@ -556,6 +639,7 @@ pub(crate) fn command_definitions() -> Vec<PlatformCommandDefinition> {
     ]
 }
 
+/// Build a bare command option definition with no choices or nested options.
 pub(crate) fn option(
     name: &str,
     description: &str,
@@ -574,6 +658,7 @@ pub(crate) fn option(
     }
 }
 
+/// Build a top-level subcommand option with nested arguments.
 pub(crate) fn subcommand(
     name: &str,
     description: &str,
@@ -590,6 +675,7 @@ pub(crate) fn subcommand(
     }
 }
 
+/// Build a string option definition, optionally constrained to choices.
 pub(crate) fn string_option(
     name: &str,
     description: &str,
@@ -607,6 +693,7 @@ pub(crate) fn string_option(
     }
 }
 
+/// Build an integer option definition with optional platform-enforced bounds.
 pub(crate) fn integer_option(
     name: &str,
     description: &str,
@@ -626,6 +713,7 @@ pub(crate) fn integer_option(
     }
 }
 
+/// Build a user-visible choice label and its stable stored value.
 pub(crate) fn choice(name: &str, value: &str) -> PlatformCommandOptionChoice {
     PlatformCommandOptionChoice {
         name: name.to_string(),
@@ -633,10 +721,18 @@ pub(crate) fn choice(name: &str, value: &str) -> PlatformCommandOptionChoice {
     }
 }
 
+/// Return the only top-level subcommand supplied to these commands.
+///
+/// The current command definitions do not use subcommand groups, so the first
+/// normalized option is the subcommand selected by the user.
 pub(crate) fn command_subcommand(command: &PlatformCommand) -> Option<PlatformCommandInput> {
     command.options.first().cloned()
 }
 
+/// Extract a string-like nested option from a subcommand.
+///
+/// Channel options are returned as their channel id string so callers can pass
+/// the value directly into storage-key builders.
 pub(crate) fn sub_option_string<'a>(
     option: &'a PlatformCommandInput,
     name: &str,
@@ -653,6 +749,7 @@ pub(crate) fn sub_option_string<'a>(
         })
 }
 
+/// Extract an integer nested option from a subcommand.
 pub(crate) fn sub_option_integer(option: &PlatformCommandInput, name: &str) -> Option<i64> {
     option
         .options
@@ -665,6 +762,10 @@ pub(crate) fn sub_option_integer(option: &PlatformCommandInput, name: &str) -> O
         })
 }
 
+/// Convert `/chudbot-mode set` options into the stored `PrivacyMode`.
+///
+/// `channel_only` is the only mode that needs a channel id; other modes ignore
+/// the optional channel argument but still share the optional history size.
 pub(crate) fn command_privacy_mode(
     platform: PlatformName,
     guild: String,
@@ -697,6 +798,11 @@ pub(crate) fn command_privacy_mode(
     }
 }
 
+/// Render the user-selectable configured agents for `/chudbot-agent list`.
+///
+/// Reserved system agents are hidden because they are implementation details
+/// for memory, safety, and title-generation jobs rather than interactive chat
+/// agents.
 pub(crate) fn agent_list_response(config: &BotConfig) -> String {
     let mut out = String::from("Available agents\n");
     for (name, agent) in &config.agents {
@@ -716,6 +822,7 @@ pub(crate) fn agent_list_response(config: &BotConfig) -> String {
     out
 }
 
+/// Render the same user-selectable agent set as a short inline help fragment.
 pub(crate) fn available_agents(config: &BotConfig) -> String {
     let names = config
         .agents
@@ -727,6 +834,7 @@ pub(crate) fn available_agents(config: &BotConfig) -> String {
     format!("Available agents: {names}")
 }
 
+/// Return whether an agent name is reserved for internal background work.
 pub(crate) fn is_system_agent_name(name: &str) -> bool {
     matches!(
         name,
@@ -737,6 +845,10 @@ pub(crate) fn is_system_agent_name(name: &str) -> bool {
     )
 }
 
+/// Add a required client tool to an explicit allowlist.
+///
+/// `None` means the agent allows all client tools, so only `Some` lists need to
+/// be updated.
 pub(crate) fn ensure_client_tool_enabled(tools: &mut Option<Vec<ToolName>>, name: &str) {
     let Some(tools) = tools else {
         return;
@@ -747,12 +859,14 @@ pub(crate) fn ensure_client_tool_enabled(tools: &mut Option<Vec<ToolName>>, name
     tools.push(ToolName::new(name));
 }
 
+/// Format an optional selected value for the agent-resolution status display.
 pub(crate) fn option_tick(value: Option<&str>) -> String {
     value
         .map(|value| format!("`{value}`"))
         .unwrap_or_else(|| "-".to_string())
 }
 
+/// Convert a stable scope value into user-facing response text.
 pub(crate) fn scope_description(scope: &str) -> &'static str {
     match scope {
         "conversation" => "this conversation",
@@ -763,6 +877,7 @@ pub(crate) fn scope_description(scope: &str) -> &'static str {
     }
 }
 
+/// Pretty-print command diagnostics as JSON without failing the command path.
 pub(crate) fn pretty_json<T>(value: &T) -> String
 where
     T: Serialize,

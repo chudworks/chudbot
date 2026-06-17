@@ -1,11 +1,22 @@
-//! Single runtime tool executor that owns tool discovery and name-based dispatch.
+//! Runtime implementation of Chudbot's provider-neutral client tool executor.
+//!
+//! The agent loop asks this executor for model-visible tool specifications and
+//! later calls it for each model-requested client tool call. This module owns
+//! single-call dispatch only: the surrounding agent runtime handles launching
+//! multiple calls concurrently, restoring the model-emitted call order, turning
+//! results into transcript blocks, and recording client tool traces for storage.
 
 use super::*;
 
 /// Runtime tool execution error after tool-specific errors are stringified.
+///
+/// Individual tools use different concrete error types. The runtime executor
+/// erases those failures into one displayable error so the agent loop can apply
+/// uniform error-result and trace serialization behavior.
 #[derive(Debug)]
 pub(crate) struct RuntimeToolError(String);
 
+/// Runtime agent type wired to routed LLM providers and Chudbot client tools.
 pub(crate) type RuntimeAgent<R> =
     Agent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
 
@@ -15,56 +26,88 @@ pub(crate) type RuntimeSubagentTool<R> =
 
 /// One configured subagent exposed as a named client tool.
 pub(crate) struct RuntimeSubagent<R: BotRuntimeTypes> {
+    /// Tool name advertised to the parent model.
     pub(crate) name: ToolName,
+    /// Nested agent tool. Boxed so recursive config graphs have a finite size.
     pub(crate) tool: Box<RuntimeSubagentTool<R>>,
 }
 
 /// Shared runtime services available to all tool calls for one turn.
+///
+/// These are cloneable handles into the platform, storage, media, and provider
+/// registries. Tool wrappers are built from them lazily for each advertised or
+/// executed tool rather than being stored as separate executor fields.
 pub(crate) struct RuntimeToolDeps<R: BotRuntimeTypes> {
+    /// Platform registry used by tools that fetch messages or modify replies.
     pub(crate) platforms: R::Platforms,
+    /// Storage implementation used for conversation, usage, memory, and jobs.
     pub(crate) storage: R::Storage,
+    /// Media store used by generation, transcription, and stored-asset tools.
     pub(crate) media_store: R::Media,
+    /// Image provider registry used by the configured image-generation binding.
     pub(crate) images: R::Images,
+    /// Video provider registry used by the configured video-generation binding.
     pub(crate) videos: R::Videos,
+    /// Audio provider registry used by the configured transcription binding.
     pub(crate) audio: R::Audio,
+    /// Per-scope locks shared by persistent video generation tools.
     pub(crate) video_rate_limit_locks: VideoRateLimitLocks,
 }
 
 /// Per-turn context captured by tools that interact with the current conversation.
 pub(crate) struct RuntimeToolContext {
+    /// Channel used when a tool needs the current conversation's default target.
     pub(crate) default_channel: ChannelRef,
+    /// Bot message the turn is replying through.
     pub(crate) reply_to: MessageRef,
+    /// Conversation whose trace and user-facing link this turn belongs to.
     pub(crate) conversation_id: ConversationId,
+    /// Storage turn id used by status and persistent media job tools.
     pub(crate) turn_id: TurnId,
+    /// User who triggered the turn, used for scoped memory and rate limits.
     pub(crate) turn_user: UserRef,
+    /// Privacy mode that gates history-fetch behavior for this turn.
     pub(crate) privacy: PrivacyMode,
 }
 
 /// Dynamic tool exposure toggles for one agent run.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RuntimeToolFlags {
+    /// Allow the model to fetch platform history according to privacy rules.
     pub(crate) fetch_messages: bool,
+    /// Allow the model to post progress/status updates in the reply channel.
     pub(crate) post_status: bool,
+    /// Allow the model to react to the message being handled.
     pub(crate) add_reaction: bool,
+    /// Allow the model to inspect usage/cost for the current channel.
     pub(crate) usage_report: bool,
+    /// Stored-media access tools exposed for this run.
     pub(crate) media_access: RuntimeMediaAccessFlags,
+    /// User-memory tools exposed for this run.
     pub(crate) memory: RuntimeMemoryFlags,
 }
 
 /// Enabled stored-media access operations.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RuntimeMediaAccessFlags {
+    /// Allow reading stored media into the next model step.
     pub(crate) read: bool,
+    /// Allow inspecting stored media metadata.
     pub(crate) stat: bool,
+    /// Allow resolving a stored asset to a public URL when supported.
     pub(crate) public_url: bool,
+    /// Allow queueing a stored asset for the final platform reply.
     pub(crate) attach: bool,
 }
 
 /// Enabled user-memory operations.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RuntimeMemoryFlags {
+    /// Allow lookup of relevant memories for the current user.
     pub(crate) lookup: bool,
+    /// Allow writing a new memory for the current user.
     pub(crate) remember: bool,
+    /// Allow deleting memories for the current user.
     pub(crate) forget: bool,
 }
 
@@ -72,14 +115,30 @@ pub(crate) struct RuntimeMemoryFlags {
 ///
 /// Tool specs and tool execution are both derived from the same dependencies,
 /// context, and feature flags, so enabled/disabled behavior stays in one place.
+/// Each successful call returns a `ClientToolOutput`: its `result` is sent back
+/// to the model, its `trace_response` is serialized into the client tool trace,
+/// and any media handles are carried only to the next model step.
+///
+/// The executor handles one call at a time. The agent runtime may call it for
+/// several model-emitted tool calls in parallel, then sort those completed
+/// results back into original call order before appending transcript blocks and
+/// later persisting trace rows.
 pub(crate) struct RuntimeToolExecutor<R: BotRuntimeTypes> {
+    /// Shared service handles used to construct concrete tools.
     pub(crate) deps: RuntimeToolDeps<R>,
+    /// Conversation and user context captured for this turn.
     pub(crate) context: RuntimeToolContext,
+    /// Runtime flags controlling which built-in tools are advertised and accepted.
     pub(crate) enabled: RuntimeToolFlags,
+    /// Memory context, present only when memory tools are enabled.
     pub(crate) memory: Option<MemoryToolContext>,
+    /// Configured image-generation binding exposed as `generate_image`.
     pub(crate) image_generation: Option<GenerationBinding>,
+    /// Configured video-generation binding exposed as `generate_video`.
     pub(crate) video_generation: Option<GenerationBinding>,
+    /// Configured audio-transcription binding exposed as `transcribe_audio`.
     pub(crate) audio_transcription: Option<TranscriptionBinding>,
+    /// Configured subagents exposed as additional named client tools.
     pub(crate) subagents: Vec<RuntimeSubagent<R>>,
 }
 
@@ -94,8 +153,9 @@ where
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
         let name = call.name.clone();
-        // Dispatch by stable tool name. Unknown names fall through to subagents,
-        // then to the executor's sentinel unknown-tool error.
+        // This is the single-call dispatch point invoked by the concurrent
+        // agent loop. Unknown names fall through to subagents, then to the
+        // executor's sentinel unknown-tool error.
         match name.as_str() {
             FETCH_MESSAGES_TOOL if self.enabled.fetch_messages => self.fetch_messages(call).await,
             POST_STATUS_TOOL if self.enabled.post_status => self.post_status(call).await,
@@ -130,8 +190,8 @@ where
     }
 
     fn tools(&self) -> Vec<ClientToolDefinition> {
-        // Keep this list in sync with `execute`: a tool should be advertised only
-        // when the matching dispatch arm is enabled.
+        // Keep this list in sync with `execute`: a tool should be advertised
+        // only when the matching dispatch arm is enabled.
         let mut definitions = Vec::new();
         if self.enabled.fetch_messages {
             definitions.push(ClientToolDefinition::new(
@@ -230,6 +290,7 @@ impl std::fmt::Display for RuntimeToolError {
 impl std::error::Error for RuntimeToolError {}
 
 impl RuntimeMemoryFlags {
+    /// Enable the full read/write/delete memory surface for a configured agent.
     pub(crate) fn all() -> Self {
         Self {
             lookup: true,
@@ -270,6 +331,7 @@ impl<R> RuntimeToolExecutor<R>
 where
     R: BotRuntimeTypes,
 {
+    /// Build an executor with no optional tools enabled.
     pub(crate) fn new(deps: RuntimeToolDeps<R>, context: RuntimeToolContext) -> Self {
         Self {
             deps,
@@ -283,6 +345,7 @@ where
         }
     }
 
+    /// Attach scoped memory context and expose the complete memory tool set.
     pub(crate) fn enable_memory(&mut self, context: MemoryToolContext) {
         self.memory = Some(context);
         self.enabled.memory = RuntimeMemoryFlags::all();
@@ -391,6 +454,11 @@ where
         })
     }
 
+    // The wrapper methods below preserve each tool's `ClientToolOutput` on
+    // success. On failure, they normalize tool-specific errors into
+    // `RuntimeToolError`; the agent loop converts that into an `is_error` tool
+    // result plus an error JSON object in the client tool trace.
+
     async fn fetch_messages(
         &self,
         call: ClientToolCall,
@@ -435,6 +503,8 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        // Guard against stale model-visible calls if bindings changed between
+        // spec generation and dispatch.
         let Some(tool) = self.image_generation_tool() else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
@@ -445,6 +515,8 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        // Guard against stale model-visible calls if bindings changed between
+        // spec generation and dispatch.
         let Some(tool) = self.video_generation_tool() else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
@@ -455,6 +527,8 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        // Guard against stale model-visible calls if bindings changed between
+        // spec generation and dispatch.
         let Some(tool) = self.audio_transcription_tool() else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
@@ -501,6 +575,7 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        // Memory tools require both the enable flag and scoped memory context.
         let Some(context) = &self.memory else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
@@ -513,6 +588,7 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        // Memory tools require both the enable flag and scoped memory context.
         let Some(context) = &self.memory else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
@@ -525,6 +601,7 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        // Memory tools require both the enable flag and scoped memory context.
         let Some(context) = &self.memory else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
@@ -545,6 +622,8 @@ where
         else {
             return Err(ClientToolExecutorError::unknown(name));
         };
+        // Subagents use the same client-tool output contract. Their nested
+        // trace is packed into `trace_response` by `Subagent::call`.
         subagent
             .tool
             .call(call)
@@ -553,6 +632,10 @@ where
     }
 }
 
+/// Convert a concrete tool failure into the executor's single error type.
+///
+/// The caller records this as an execution failure, sends an error result back
+/// to the model, and stores the display string in trace JSON.
 pub(crate) fn runtime_tool_execution_error(
     error: impl std::fmt::Display,
 ) -> ClientToolExecutorError<RuntimeToolError> {

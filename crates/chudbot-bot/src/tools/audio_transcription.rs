@@ -1,16 +1,29 @@
 //! `transcribe_audio` client tool.
+//!
+//! The tool accepts a stored audio media URI, resolves it through the configured
+//! media store, and passes the resulting media reference to an audio
+//! transcriber. The model sees transcript metadata in the tool result while
+//! provider usage records stay on the `ClientToolOutput` for turn accounting.
 
 use super::*;
 
 /// Tool wrapper for transcribing stored audio media through the configured provider.
+///
+/// The generic parameters keep the executor on static dispatch while still
+/// allowing tests to supply fake transcribers and media stores.
 pub(crate) struct AudioTranscriptionTool<T, M> {
+    /// Provider implementation that performs speech-to-text.
     pub(crate) transcriber: T,
+    /// Store used to resolve the model-supplied media URI into verified audio.
     pub(crate) media_store: M,
+    /// Deployment-level keyterms appended to every request after input parsing.
     pub(crate) default_keyterms: Vec<String>,
+    /// Client-visible tool description.
     pub(crate) description: String,
 }
 
 impl<T, M> AudioTranscriptionTool<T, M> {
+    /// Creates a transcription tool with no default keyterms.
     pub(crate) fn new(transcriber: T, media_store: M) -> Self {
         Self {
             transcriber,
@@ -21,11 +34,13 @@ impl<T, M> AudioTranscriptionTool<T, M> {
         }
     }
 
+    /// Adds provider-level keyterms that should bias every transcription.
     pub(crate) fn with_default_keyterms(mut self, keyterms: Vec<String>) -> Self {
         self.default_keyterms = keyterms;
         self
     }
 
+    /// Overrides the default client-visible tool description.
     pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
         self
@@ -37,6 +52,7 @@ where
     T: AudioTranscriber,
     M: MediaStore,
 {
+    /// Builds the tool spec sent to model providers.
     pub(crate) fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.description.clone(),
@@ -44,6 +60,11 @@ where
         }
     }
 
+    /// Executes one `transcribe_audio` call from validation through provider output.
+    ///
+    /// The tool result is JSON-only; it does not attach media to the next model
+    /// step or the final platform reply. Usage records reported by the provider
+    /// are forwarded unchanged on the output.
     #[tracing::instrument(
         name = "tool.transcribe_audio",
         skip_all,
@@ -55,6 +76,8 @@ where
     ) -> Result<ClientToolOutput, BotToolError> {
         let mut request =
             audio_transcription_request_from_tool_input(&self.media_store, call.input).await?;
+        // Deployment defaults supplement user-supplied keyterms without
+        // changing the input validation rules below.
         append_default_audio_keyterms(&mut request.keyterms, &self.default_keyterms);
         let audio_uri = request.audio.uri().to_string();
         let audio_mime_type = request.audio.mime_type().to_string();
@@ -76,6 +99,8 @@ where
                 tracing::warn!(error = %error, "audio transcription failed");
                 BotToolError::Generator(error.to_string())
             })?;
+        // Keep the model-facing result focused on transcription data. The trace
+        // also records the resolved source audio for viewer/debugging context.
         let result = audio_transcription_model_result_json(&transcription);
         let trace_response = serde_json::json!({
             "audio": {
@@ -99,11 +124,20 @@ where
             media: Vec::new(),
             is_error: false,
             trace_response,
+            // Provider usage is not included in `result`; the turn runner reads
+            // this field for accounting and storage.
             usage: transcription.usage,
         })
     }
 }
 
+/// Converts raw tool input into a provider transcription request.
+///
+/// `audio_uri` is the primary input field and `audio` is an alias. The selected
+/// value is resolved as stored audio through `MediaStore`; this is the trust
+/// boundary that rejects unsupported categories and invalid stored-media
+/// references before any provider request is built. Optional language,
+/// keyterms, and model fields are validated with the shared tool helpers.
 pub(crate) async fn audio_transcription_request_from_tool_input<M>(
     media_store: &M,
     input: serde_json::Value,
@@ -111,15 +145,23 @@ pub(crate) async fn audio_transcription_request_from_tool_input<M>(
 where
     M: MediaStore,
 {
+    // Require a stored-media reference, accepting the short alias for provider
+    // compatibility while keeping the error message on the canonical field.
     let audio_value = input
         .get("audio_uri")
         .or_else(|| input.get("audio"))
         .ok_or_else(|| BotToolError::InvalidInput("`audio_uri` is required".to_string()))?;
+    // Resolution loads the stored media metadata/reference and enforces the
+    // audio category before the transcriber receives the request.
     let audio = resolve_tool_media_arg(media_store, MediaCategory::Audio, audio_value).await?;
+    // `keyterm` accepts a single string or list. `keyterms` is only consulted
+    // when the singular field is absent so existing prompts keep precedence.
     let keyterms = match tool_optional_string_list(&input, "keyterm")? {
         Some(keyterms) => keyterms,
         None => tool_optional_string_list(&input, "keyterms")?.unwrap_or_default(),
     };
+    // At this point the request is provider-neutral: it contains resolved media
+    // plus optional hints, leaving provider-specific serialization downstream.
     Ok(AudioTranscriptionRequest {
         audio,
         language: tool_optional_string(&input, "language")?,
@@ -128,6 +170,11 @@ where
     })
 }
 
+/// Shapes the successful transcription payload returned to the model.
+///
+/// Usage and source-audio metadata are intentionally omitted here. Usage travels
+/// on `ClientToolOutput::usage`, and the source audio is recorded in the trace
+/// response built by `AudioTranscriptionTool::call`.
 pub(crate) fn audio_transcription_model_result_json(
     transcription: &AudioTranscription,
 ) -> serde_json::Value {
@@ -141,6 +188,11 @@ pub(crate) fn audio_transcription_model_result_json(
     })
 }
 
+/// Returns the JSON schema used to validate model-supplied transcription input.
+///
+/// The schema rejects unknown fields and documents the aliases accepted by
+/// `audio_transcription_request_from_tool_input`; detailed type coercion and
+/// media validation still happen in the request parser.
 pub(crate) fn audio_transcription_tool_schema() -> ToolInputSchema {
     ToolInputSchema::new(serde_json::json!({
         "type": "object",

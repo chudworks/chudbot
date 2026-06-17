@@ -1,8 +1,17 @@
 //! `usage_report` client tool.
+//!
+//! The tool is a thin presentation layer over [`BotStorage::usage_cost_report`]:
+//! it parses model-supplied JSON filters, asks storage for already-aggregated
+//! usage/cost rows, and returns JSON that the model can summarize or cite in a
+//! user-facing reply.
 
 use super::*;
 
 /// Tool for querying stored usage costs for the current platform scope.
+///
+/// Reports are scoped from the current channel context by default. Storage does
+/// the aggregation across normal turn usage and background memory-job usage;
+/// this type handles input validation, truncation detection, and JSON shaping.
 pub(crate) struct UsageReportTool<S> {
     pub(crate) storage: S,
     pub(crate) channel: ChannelRef,
@@ -74,11 +83,16 @@ where
             .usage_cost_report(request.query.clone())
             .await
             .map_err(|error| BotToolError::Storage(error.to_string()))?;
+        // The storage query receives one extra row so we can report whether
+        // the visible, cost-sorted result set was truncated.
         let truncated = groups.len() > request.limit as usize;
         groups.truncate(request.limit as usize);
         let total = if request.query.group_by == UsageCostGrouping::Total {
             groups.first().cloned()
         } else {
+            // Grouped reports still include the overall total for the same
+            // filters; it is queried separately so it is not affected by the
+            // group limit.
             self.storage
                 .usage_cost_report(UsageCostQuery {
                     group_by: UsageCostGrouping::Total,
@@ -109,14 +123,28 @@ where
     }
 }
 
-/// Parsed usage report query plus presentation limits.
+/// Parsed usage report query plus presentation metadata.
+///
+/// `query` is the storage-facing aggregation request. `days` and `limit` keep
+/// the original presentation choices so the response can echo the requested
+/// window and trim the storage sentinel row.
 #[derive(Debug, Clone)]
 pub(crate) struct UsageReportRequest {
+    /// Storage query, including platform, scope, grouping, optional lower time
+    /// bound, and the one-row-overfetch limit used for truncation detection.
     pub(crate) query: UsageCostQuery,
+    /// User-facing look-back window in days, before conversion to `query.since`.
     pub(crate) days: Option<f64>,
+    /// Maximum number of group rows returned to the tool caller.
     pub(crate) limit: u32,
 }
 
+/// Parse the tool input into a storage aggregation request.
+///
+/// Defaults are intentionally broad: lifetime totals for the current guild, or
+/// for the current DM channel when no guild exists. `days` becomes an absolute
+/// `since` timestamp using `now`, and `limit` is validated as a display limit
+/// before the storage query adds one sentinel row.
 pub(crate) fn usage_report_request(
     input: &serde_json::Value,
     channel: &ChannelRef,
@@ -190,7 +218,8 @@ pub(crate) fn usage_report_request(
             scope,
             since,
             group_by,
-            // Fetch one extra row to detect truncation.
+            // Fetch one extra row to detect truncation without another count
+            // query. The caller removes this sentinel before rendering.
             limit: limit + 1,
         },
         days,
@@ -198,6 +227,10 @@ pub(crate) fn usage_report_request(
     })
 }
 
+/// Build the scope for the current channel or thread.
+///
+/// Guild ids are retained when available so channel-scoped reports can
+/// distinguish guild channels from DMs with the same platform channel id.
 pub(crate) fn current_channel_scope(channel: &ChannelRef) -> UsageCostScope {
     UsageCostScope::Channel {
         guild_id: channel
@@ -208,6 +241,12 @@ pub(crate) fn current_channel_scope(channel: &ChannelRef) -> UsageCostScope {
     }
 }
 
+/// Render a usage report as tool JSON.
+///
+/// The top-level object always includes `group_by`, `scope`, `window_days`,
+/// `since`, and `total`. Grouped reports additionally include `groups` in the
+/// storage-provided sort order and a `truncated` flag. Total-only reports omit
+/// `groups` because their single row is already represented by `total`.
 pub(crate) fn usage_report_value(
     request: &UsageReportRequest,
     total: Option<&UsageCostRow>,
@@ -233,6 +272,11 @@ pub(crate) fn usage_report_value(
     value
 }
 
+/// Convert one aggregated storage row to the public tool row shape.
+///
+/// This preserves the serialized [`UsageCostRow`] fields and adds a `mention`
+/// field only for grouping dimensions that can be rendered directly by the
+/// current platform.
 pub(crate) fn usage_cost_row_value(
     group_by: UsageCostGrouping,
     row: &UsageCostRow,

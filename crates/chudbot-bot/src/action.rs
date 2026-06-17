@@ -1,50 +1,65 @@
-//! Actions returned by platform event handling.
+//! Outcome markers returned by platform event handling.
+//!
+//! Event handlers do the durable work before returning one of these values:
+//! storage is updated, live events are published, and platform replies or
+//! reactions have already been attempted. `BotAction` is the small public
+//! summary that lets the runtime log the event, decide whether to add status
+//! reactions, and expose the affected turn or conversation ids when relevant.
 
 use crate::prelude::*;
 
+/// High-level result of handling one platform event.
+///
+/// The enum deliberately describes the bot-visible outcome rather than the
+/// source platform event. That keeps Discord-specific details out of the
+/// orchestration boundary while still carrying enough ids for callers to
+/// correlate a completed, failed, or cancelled turn with stored trace data.
 pub enum BotAction {
-    /// Event did not require work.
+    /// The event was recognized but did not require bot work.
     Ignored,
-    /// Event stream asked the bot to stop.
+    /// The platform event stream asked the bot process to stop.
     Shutdown,
-    /// Turn completed.
+    /// A turn reached a successful terminal state.
     CompletedTurn {
-        /// Conversation id.
+        /// Conversation that owns the completed turn.
         conversation_id: ConversationId,
-        /// Turn id.
+        /// Stored turn that was marked completed.
         turn_id: TurnId,
     },
-    /// Turn failed.
+    /// A turn reached a failed terminal state.
     FailedTurn {
-        /// Conversation id.
+        /// Conversation that owns the failed turn.
         conversation_id: ConversationId,
-        /// Turn id.
+        /// Stored turn that was marked failed.
         turn_id: TurnId,
     },
-    /// Turn was cancelled.
+    /// A turn was cancelled after it had already been created.
     CancelledTurn {
-        /// Conversation id.
+        /// Conversation that owns the cancelled turn.
         conversation_id: ConversationId,
-        /// Turn id.
+        /// Stored turn that was marked cancelled.
         turn_id: TurnId,
     },
-    /// Conversation was stopped.
+    /// A reaction or command stopped an active conversation.
     StoppedConversation {
-        /// Conversation id.
+        /// Conversation whose runtime state was stopped.
         conversation_id: ConversationId,
     },
-    /// Conversation was resumed.
+    /// A reaction or command resumed a stopped conversation.
     ResumedConversation {
-        /// Conversation id.
+        /// Conversation whose runtime state was resumed.
         conversation_id: ConversationId,
     },
-    /// Message was refused before turn creation.
+    /// A message was refused before a durable turn was created.
     RefusedMessage,
-    /// Platform command was handled.
+    /// A platform command was handled and acknowledged.
     HandledCommand,
 }
 
+/// Stable snake_case label for tracing and event-task diagnostics.
 pub(crate) fn bot_action_kind(action: &BotAction) -> &'static str {
+    // Keep these strings decoupled from Rust variant spelling so log filters
+    // and dashboards do not churn if the enum names ever change.
     match action {
         BotAction::Ignored => "ignored",
         BotAction::Shutdown => "shutdown",

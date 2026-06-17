@@ -1,3 +1,12 @@
+//! Concrete message-platform registry for this binary.
+//!
+//! `chudbot-bot` depends only on the platform-neutral
+//! [`MessagePlatformRegistry`] contract. This module is the process-launcher
+//! boundary that turns `[platforms.<name>]` config into concrete adapters,
+//! currently Discord/Twilight through `chudbot-discord`, and keeps those
+//! adapters addressable by the same platform names used in stored refs and
+//! `[bot.platforms.<name>]` runtime bindings.
+
 use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -14,24 +23,34 @@ use crate::PLATFORM_SHUTDOWN_TIMEOUT;
 use crate::config::MessagePlatformConfig;
 use crate::errors::ConfiguredPlatformError;
 
-/// Concrete named message platform registry.
+/// Concrete named message-platform registry used by `ConfiguredBotRuntime`.
+///
+/// Clones share the same platform clients and event receiver. Runtime code uses
+/// this value through [`MessagePlatformRegistry`], so no Twilight or Discord
+/// types cross into `chudbot-bot`.
 #[derive(Clone)]
 pub struct ConfiguredMessagePlatforms {
     inner: Arc<ConfiguredMessagePlatformsInner>,
 }
 
+/// Shared registry state behind cheap runtime clones.
 struct ConfiguredMessagePlatformsInner {
+    /// Discord adapters keyed by deployment-configured platform name.
     discord: BTreeMap<chudbot_api::PlatformName, ConfiguredDiscordPlatform>,
+    /// Fan-in receiver for events from every configured platform pump.
     events: tokio::sync::Mutex<
         tokio::sync::mpsc::Receiver<Result<PlatformEvent, ConfiguredPlatformError>>,
     >,
+    /// Owned pump tasks so shutdown can join or abort them exactly once.
     event_pumps: tokio::sync::Mutex<Vec<PlatformEventPump>>,
 }
 
+/// Concrete Discord adapter stored under one configured platform name.
 struct ConfiguredDiscordPlatform {
     platform: chudbot_discord::DiscordPlatform,
 }
 
+/// Background task forwarding one concrete platform stream into the registry.
 struct PlatformEventPump {
     platform: chudbot_api::PlatformName,
     task: JoinHandle<()>,
@@ -50,6 +69,11 @@ impl Default for ConfiguredMessagePlatforms {
     }
 }
 
+/// Spawn a Discord event pump and convert pump panics into registry errors.
+///
+/// `DiscordPlatform` owns the Twilight gateway shard and already translates
+/// gateway traffic into `PlatformEvent`. The pump only keeps that stream alive
+/// and forwards it into the registry fan-in channel that `BotRuntime` polls.
 fn spawn_discord_event_pump(
     platform_name: chudbot_api::PlatformName,
     platform: chudbot_discord::DiscordPlatform,
@@ -83,6 +107,7 @@ fn spawn_discord_event_pump(
     }
 }
 
+/// Forward one Discord event stream into the shared registry channel.
 async fn run_discord_event_pump(
     platform_name: chudbot_api::PlatformName,
     platform: chudbot_discord::DiscordPlatform,
@@ -101,6 +126,8 @@ async fn run_discord_event_pump(
         }
         let should_stop = matches!(&event, Ok(PlatformEvent::Shutdown));
         if should_stop {
+            // Shutdown is terminal for this pump, so do not wait behind a full
+            // queue after the runtime may have already stopped platform intake.
             match events.try_send(event) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
@@ -132,6 +159,7 @@ async fn run_discord_event_pump(
     }
 }
 
+/// Normalize arbitrary panic payloads into a loggable error message.
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&'static str>() {
         (*message).to_string()
@@ -142,6 +170,7 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+/// Log the outcome of a platform pump task after shutdown joins it.
 fn log_event_pump_join_result(platform: &chudbot_api::PlatformName, result: Result<(), JoinError>) {
     match result {
         Ok(()) => tracing::debug!(platform = %platform, "message platform event pump joined"),
@@ -170,7 +199,13 @@ fn log_event_pump_join_result(platform: &chudbot_api::PlatformName, result: Resu
 }
 
 impl ConfiguredMessagePlatforms {
-    /// Connect every configured message platform.
+    /// Connect every `[platforms.<name>]` service and build the runtime registry.
+    ///
+    /// Each configured platform is connected once, stored by its configured
+    /// name, and given an event pump that forwards into one shared receiver.
+    /// `[bot.platforms.<name>]` agent bindings remain in `BotConfig`; the
+    /// platform name is the join key between those runtime bindings and this
+    /// concrete transport registry.
     #[tracing::instrument(
         name = "platform_registry.connect",
         skip_all,
@@ -188,6 +223,10 @@ impl ConfiguredMessagePlatforms {
                     token,
                     dev_guild_id,
                 } => {
+                    // Discord is the current concrete integration boundary:
+                    // this is where configured names become Twilight-backed
+                    // clients while the rest of the runtime keeps using
+                    // chudbot-api contracts.
                     if dev_guild_id.is_some() {
                         tracing::warn!(
                             platform = %name,
@@ -219,6 +258,7 @@ impl ConfiguredMessagePlatforms {
         })
     }
 
+    /// Look up the concrete Discord adapter named by a neutral platform ref.
     fn discord(
         &self,
         platform: &chudbot_api::PlatformName,
@@ -229,6 +269,7 @@ impl ConfiguredMessagePlatforms {
             .ok_or_else(|| ConfiguredPlatformError::Missing(platform.clone()))
     }
 
+    /// Request graceful shutdown for all platform clients and their pumps.
     async fn shutdown_platforms(&self) -> Result<(), ConfiguredPlatformError> {
         if self.inner.discord.is_empty() {
             return Ok(());
@@ -239,6 +280,8 @@ impl ConfiguredMessagePlatforms {
             configured.platform.request_shutdown();
         }
 
+        // Take the task handles out of shared state so repeated shutdown calls
+        // from cloned registries cannot attempt to join the same pumps twice.
         let mut handles = {
             let mut event_pumps = self.inner.event_pumps.lock().await;
             std::mem::take(&mut *event_pumps)
@@ -252,6 +295,8 @@ impl ConfiguredMessagePlatforms {
         let mut timed_out = false;
         for pump in &mut handles {
             let platform = pump.platform.clone();
+            // One deadline covers the whole platform shutdown phase, not each
+            // pump independently, to keep process teardown bounded.
             tokio::select! {
                 result = &mut pump.task => {
                     log_event_pump_join_result(&platform, result);
@@ -288,6 +333,12 @@ impl ConfiguredMessagePlatforms {
     }
 }
 
+/// Runtime-facing registry implementation.
+///
+/// The bot runtime calls this trait with neutral refs such as `PlatformName`,
+/// `ChannelRef`, and `MessageRef`. Each method routes by that name, delegates
+/// to the concrete adapter, and wraps adapter-specific errors at this binary
+/// boundary.
 impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
     type Error = ConfiguredPlatformError;
 
@@ -304,6 +355,8 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
         &self,
         commands: Vec<PlatformCommandDefinition>,
     ) -> Result<(), Self::Error> {
+        // Commands are process-global for each Discord application here; the
+        // legacy dev-guild config knob is accepted but ignored during connect.
         for configured in self.inner.discord.values() {
             MessagePlatform::register_commands(&configured.platform, commands.clone(), None)
                 .await
@@ -316,6 +369,8 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
         if self.inner.discord.is_empty() {
             return Err(ConfiguredPlatformError::Empty);
         }
+        // `BotRuntime` consumes one merged stream regardless of how many
+        // concrete platform clients are configured.
         self.inner
             .events
             .lock()
@@ -333,6 +388,9 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
         &self,
         response: PlatformCommandResponse,
     ) -> Result<(), Self::Error> {
+        // Outbound operations carry their target platform in the neutral API
+        // type, so dispatch stays table-driven instead of leaking adapter
+        // choices into the bot runtime.
         let platform = self.discord(&response.target.platform)?;
         MessagePlatform::respond_to_command(&platform.platform, response)
             .await
