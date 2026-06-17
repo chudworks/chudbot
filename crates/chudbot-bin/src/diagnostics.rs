@@ -2155,6 +2155,12 @@ title_prefix = "Chudbot"
 frontend_dir = "frontend-build"
 frontned_dir = "typo"
 
+[memory]
+enabled = true
+provider = "stale"
+max_diary_output_tokens = 1024
+max_profile_output_tokens = 2048
+
 [default_privacy]
 mode = "open"
 history_size = 20
@@ -2216,6 +2222,9 @@ provider = "openai"
         assert!(rendered.contains("unexpected config key `database.pool_size`"));
         assert!(rendered.contains("unexpected config key `web.frontned_dir`"));
         assert!(rendered.contains("did you mean `frontend_dir`?"));
+        assert!(rendered.contains("unexpected config key `memory.provider`"));
+        assert!(rendered.contains("unexpected config key `memory.max_diary_output_tokens`"));
+        assert!(rendered.contains("unexpected config key `memory.max_profile_output_tokens`"));
         assert!(rendered.contains("unexpected config section `default_privacy.channel`"));
         assert!(rendered.contains("unexpected config key `bot.admins[0].nickname`"));
         assert!(rendered.contains("unexpected config key `bot.agents.default.persona`"));

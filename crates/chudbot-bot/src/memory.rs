@@ -58,7 +58,6 @@ const EMPTY_MEMORY: &str = "(no stored memory)";
 
 /// User-memory runtime configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct MemoryConfig {
     /// Global memory switch.
     #[serde(default)]
@@ -1617,28 +1616,6 @@ mod tests {
                 (MEMORY_COMPACT_AGENT.to_string(), ProviderName::new("grok")),
             ]
         );
-    }
-
-    #[test]
-    fn memory_config_rejects_removed_model_fields() {
-        for field in [
-            "provider",
-            "max_diary_output_tokens",
-            "max_profile_output_tokens",
-        ] {
-            let mut value = json!({ "enabled": true });
-            value
-                .as_object_mut()
-                .expect("object")
-                .insert(field.to_string(), json!("stale"));
-            let error = serde_json::from_value::<MemoryConfig>(value).unwrap_err();
-
-            assert!(
-                error
-                    .to_string()
-                    .contains(&format!("unknown field `{field}`"))
-            );
-        }
     }
 
     fn test_agent_config(provider: &str, model: &str) -> AgentConfig {
