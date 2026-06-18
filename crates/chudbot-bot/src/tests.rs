@@ -768,14 +768,13 @@ fn video_rate_limit_tool<G>(
         media_store: NoopMediaStore,
         storage,
         rate_limit_locks,
-        context: RuntimeToolContext {
-            default_channel: channel_ref(Some("guild-1")),
-            reply_to: message_ref("message-1"),
-            conversation_id: ConversationId::new(),
-            turn_id: TurnId::new(),
+        context: RuntimeToolContext::new(
+            message_ref("message-1"),
+            ConversationId::new(),
+            TurnId::new(),
             turn_user,
-            privacy: PrivacyMode::ConversationOnly,
-        },
+            PrivacyMode::ConversationOnly,
+        ),
         binding: GenerationBinding {
             provider: ProviderName::new("grok_video"),
             model: ModelId::new("grok-video-test"),

@@ -883,6 +883,7 @@ name = "chudbot-bot"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bitflags",
  "chudbot-api",
  "reqwest",
  "serde",

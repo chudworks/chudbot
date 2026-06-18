@@ -138,21 +138,20 @@ where
                 audio: self.audio.clone(),
                 video_rate_limit_locks: self.video_rate_limit_locks.clone(),
             },
-            RuntimeToolContext {
-                default_channel: channel_from_message(context.reply_to),
-                reply_to: context.reply_to.clone(),
-                conversation_id: context.conversation_id,
-                turn_id: context.turn_id,
-                turn_user: context.turn_user.clone(),
-                privacy: context.settings.privacy.clone(),
-            },
+            RuntimeToolContext::new(
+                context.reply_to.clone(),
+                context.conversation_id,
+                context.turn_id,
+                context.turn_user.clone(),
+                context.settings.privacy.clone(),
+            ),
         );
         // Conversation helpers are available to both top-level agents and
         // subagents. They operate on the same turn context and do not create
         // final reply artifacts.
         if policy.fetch_messages() {
             tracing::debug!(tool = FETCH_MESSAGES_TOOL, "attaching runtime tool");
-            tool_executor.enabled.fetch_messages = true;
+            tool_executor.enable_tools(RuntimeToolFlags::FETCH_MESSAGES);
         }
         if policy.memory_lookup() {
             let base_key = memory::key_from_user_ref(context.turn_user);
@@ -171,11 +170,9 @@ where
             }
         }
         tracing::debug!(tool = POST_STATUS_TOOL, "attaching runtime tool");
-        tool_executor.enabled.post_status = true;
         tracing::debug!(tool = ADD_REACTION_TOOL, "attaching runtime tool");
-        tool_executor.enabled.add_reaction = true;
         tracing::debug!(tool = USAGE_REPORT_TOOL, "attaching runtime tool");
-        tool_executor.enabled.usage_report = true;
+        tool_executor.enable_tools(RuntimeToolFlags::CONVERSATION_HELPERS);
 
         // Generated media is only delivered from the top-level trace. Subagents
         // return text to their parent, so exposing generation there would make
@@ -188,7 +185,7 @@ where
                     model = %binding.model,
                     "attaching image generation tool"
                 );
-                tool_executor.image_generation = Some(binding.clone());
+                tool_executor.enable_image_generation(binding.clone());
             }
 
             if let Some(binding) = &agent_config.video_generation {
@@ -198,7 +195,7 @@ where
                     model = %binding.model,
                     "attaching video generation tool"
                 );
-                tool_executor.video_generation = Some(binding.clone());
+                tool_executor.enable_video_generation(binding.clone());
             }
         }
 
@@ -209,21 +206,20 @@ where
                 model = ?binding.model.as_ref(),
                 "attaching audio transcription tool"
             );
-            tool_executor.audio_transcription = Some(binding.clone());
+            tool_executor.enable_audio_transcription(binding.clone());
         }
 
         // Stored-media inspection is always wired in for conversation agents.
         // `attach` is top-level only because it queues final reply artifacts.
         tracing::debug!(tool = READ_ASSET_TOOL, "attaching media access tool");
-        tool_executor.enabled.media_access.read = true;
         tracing::debug!(tool = STAT_ASSET_TOOL, "attaching media access tool");
-        tool_executor.enabled.media_access.stat = true;
         tracing::debug!(tool = PUBLIC_URL_ASSET_TOOL, "attaching media access tool");
-        tool_executor.enabled.media_access.public_url = true;
+        let mut media_tools = RuntimeToolFlags::MEDIA_INSPECT;
         if policy.final_reply_attach() {
             tracing::debug!(tool = ATTACH_ASSET_TOOL, "attaching media access tool");
-            tool_executor.enabled.media_access.attach = true;
+            media_tools |= RuntimeToolFlags::MEDIA_ATTACH;
         }
+        tool_executor.enable_tools(media_tools);
 
         for (tool_name, binding) in &agent_config.subagents {
             let (subagent_name, subagent_config) = self
@@ -248,10 +244,7 @@ where
                 context,
                 stack,
             )?;
-            tool_executor.subagents.insert(
-                tool_name.clone(),
-                Subagent::new(binding.description.clone(), nested),
-            );
+            tool_executor.add_subagent(tool_name.clone(), binding.description.clone(), nested);
         }
 
         // Successful expansion removes this node from the active path before

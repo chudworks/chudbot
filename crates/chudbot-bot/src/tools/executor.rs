@@ -131,67 +131,105 @@ pub(crate) struct RuntimeToolDeps<R: BotRuntimeTypes> {
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeToolContext {
     /// Channel used when a tool needs the current conversation's default target.
-    pub(crate) default_channel: ChannelRef,
+    pub(in crate::tools) default_channel: ChannelRef,
     /// Bot message the turn is replying through.
-    pub(crate) reply_to: MessageRef,
+    pub(in crate::tools) reply_to: MessageRef,
     /// Conversation whose trace and user-facing link this turn belongs to.
-    pub(crate) conversation_id: ConversationId,
+    pub(in crate::tools) conversation_id: ConversationId,
     /// Storage turn id used by status and persistent media job tools.
-    pub(crate) turn_id: TurnId,
+    pub(in crate::tools) turn_id: TurnId,
     /// User who triggered the turn, used for scoped memory and rate limits.
-    pub(crate) turn_user: UserRef,
+    pub(in crate::tools) turn_user: UserRef,
     /// Privacy mode that gates history-fetch behavior for this turn.
-    pub(crate) privacy: PrivacyMode,
+    pub(in crate::tools) privacy: PrivacyMode,
 }
 
-/// Dynamic tool exposure toggles for one agent run.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RuntimeToolFlags {
-    /// Allow the model to fetch platform history according to privacy rules.
-    pub(crate) fetch_messages: bool,
-    /// Allow the model to post progress/status updates in the reply channel.
-    pub(crate) post_status: bool,
-    /// Allow the model to react to the message being handled.
-    pub(crate) add_reaction: bool,
-    /// Allow the model to inspect usage/cost for the current channel.
-    pub(crate) usage_report: bool,
-    /// Stored-media access tools exposed for this run.
-    pub(crate) media_access: RuntimeMediaAccessFlags,
-    /// User-memory tools exposed for this run.
-    pub(crate) memory: RuntimeMemoryFlags,
-}
-
-/// Enabled stored-media access operations.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RuntimeMediaAccessFlags {
-    /// Allow reading stored media into the next model step.
-    pub(crate) read: bool,
-    /// Allow inspecting stored media metadata.
-    pub(crate) stat: bool,
-    /// Allow resolving a stored asset to a public URL when supported.
-    pub(crate) public_url: bool,
-    /// Allow queueing a stored asset for the final platform reply.
-    pub(crate) attach: bool,
-}
-
-/// Enabled user-memory operations.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct RuntimeMemoryFlags {
-    /// Allow lookup of relevant memories for the current user.
-    pub(crate) lookup: bool,
-    /// Allow writing a new memory for the current user.
-    pub(crate) remember: bool,
-    /// Allow deleting memories for the current user.
-    pub(crate) forget: bool,
-}
-
-impl RuntimeMemoryFlags {
-    /// Enable the full read/write/delete memory surface for a configured agent.
-    pub(crate) fn all() -> Self {
+impl RuntimeToolContext {
+    /// Capture the turn identity used by runtime tools.
+    ///
+    /// The default channel is derived from the reply message so callers cannot
+    /// accidentally construct a context where `reply_to` and `default_channel`
+    /// point at different platform surfaces.
+    pub(crate) fn new(
+        reply_to: MessageRef,
+        conversation_id: ConversationId,
+        turn_id: TurnId,
+        turn_user: UserRef,
+        privacy: PrivacyMode,
+    ) -> Self {
+        let default_channel = channel_from_message(&reply_to);
         Self {
-            lookup: true,
-            remember: true,
-            forget: true,
+            default_channel,
+            reply_to,
+            conversation_id,
+            turn_id,
+            turn_user,
+            privacy,
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Dynamic tool exposure toggles for one agent run.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub(crate) struct RuntimeToolFlags: u16 {
+        /// Allow the model to fetch platform history according to privacy rules.
+        const FETCH_MESSAGES = 1 << 0;
+        /// Allow the model to post progress/status updates in the reply channel.
+        const POST_STATUS = 1 << 1;
+        /// Allow the model to react to the message being handled.
+        const ADD_REACTION = 1 << 2;
+        /// Allow the model to inspect usage/cost for the current channel.
+        const USAGE_REPORT = 1 << 3;
+        /// Allow reading stored media into the next model step.
+        const MEDIA_READ = 1 << 4;
+        /// Allow inspecting stored media metadata.
+        const MEDIA_STAT = 1 << 5;
+        /// Allow resolving a stored asset to a public URL when supported.
+        const MEDIA_PUBLIC_URL = 1 << 6;
+        /// Allow queueing a stored asset for the final platform reply.
+        const MEDIA_ATTACH = 1 << 7;
+
+        /// Conversation helper tools exposed to every conversation agent.
+        const CONVERSATION_HELPERS =
+            Self::POST_STATUS.bits()
+            | Self::ADD_REACTION.bits()
+            | Self::USAGE_REPORT.bits();
+        /// Stored-media inspection tools exposed to every conversation agent.
+        const MEDIA_INSPECT =
+            Self::MEDIA_READ.bits()
+            | Self::MEDIA_STAT.bits()
+            | Self::MEDIA_PUBLIC_URL.bits();
+    }
+}
+
+/// Enabled user-memory surface plus the context every memory call requires.
+#[derive(Debug, Clone)]
+enum RuntimeMemoryTools {
+    /// Read-only memory lookup, used by subagents.
+    Lookup { context: MemoryToolContext },
+    /// Full memory lookup/write/delete surface, used by top-level agents.
+    Full { context: MemoryToolContext },
+}
+
+impl RuntimeMemoryTools {
+    fn mode(&self) -> &'static str {
+        match self {
+            Self::Lookup { .. } => "lookup",
+            Self::Full { .. } => "full",
+        }
+    }
+
+    fn lookup_context(&self) -> &MemoryToolContext {
+        match self {
+            Self::Lookup { context } | Self::Full { context } => context,
+        }
+    }
+
+    fn write_context(&self) -> Option<&MemoryToolContext> {
+        match self {
+            Self::Lookup { .. } => None,
+            Self::Full { context } => Some(context),
         }
     }
 }
@@ -210,22 +248,21 @@ impl RuntimeMemoryFlags {
 /// later persisting trace rows.
 pub(crate) struct RuntimeToolExecutor<R: BotRuntimeTypes> {
     /// Shared service handles used to construct concrete tools.
-    pub(crate) deps: RuntimeToolDeps<R>,
+    deps: RuntimeToolDeps<R>,
     /// Conversation and user context captured for this turn.
-    pub(crate) context: RuntimeToolContext,
+    context: RuntimeToolContext,
     /// Runtime flags controlling which built-in tools are advertised and accepted.
-    pub(crate) enabled: RuntimeToolFlags,
-    /// Memory context, present only when memory tools are enabled.
-    pub(crate) memory: Option<MemoryToolContext>,
+    enabled: RuntimeToolFlags,
+    /// Memory tools, present only when memory is enabled for this run.
+    memory: Option<RuntimeMemoryTools>,
     /// Configured image-generation binding exposed as `generate_image`.
-    pub(crate) image_generation: Option<GenerationBinding>,
+    image_generation: Option<GenerationBinding>,
     /// Configured video-generation binding exposed as `generate_video`.
-    pub(crate) video_generation: Option<GenerationBinding>,
+    video_generation: Option<GenerationBinding>,
     /// Configured audio-transcription binding exposed as `transcribe_audio`.
-    pub(crate) audio_transcription: Option<TranscriptionBinding>,
+    audio_transcription: Option<TranscriptionBinding>,
     /// Configured subagents exposed as additional named client tools.
-    pub(crate) subagents:
-        BTreeMap<ToolName, Subagent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, Self>>,
+    subagents: BTreeMap<ToolName, Subagent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, Self>>,
 }
 
 impl<R> std::fmt::Debug for RuntimeToolExecutor<R>
@@ -235,7 +272,10 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RuntimeToolExecutor")
             .field("enabled", &self.enabled)
-            .field("memory", &self.memory.is_some())
+            .field(
+                "memory",
+                &self.memory.as_ref().map(RuntimeMemoryTools::mode),
+            )
             .field("image_generation", &self.image_generation.is_some())
             .field("video_generation", &self.video_generation.is_some())
             .field("audio_transcription", &self.audio_transcription.is_some())
@@ -258,10 +298,18 @@ where
         // agent loop. Unknown names fall through to subagents, then to the
         // executor's sentinel unknown-tool error.
         match call.name.as_str() {
-            FETCH_MESSAGES_TOOL if self.enabled.fetch_messages => self.fetch_messages(call).await,
-            POST_STATUS_TOOL if self.enabled.post_status => self.post_status(call).await,
-            ADD_REACTION_TOOL if self.enabled.add_reaction => self.add_reaction(call).await,
-            USAGE_REPORT_TOOL if self.enabled.usage_report => self.usage_report(call).await,
+            FETCH_MESSAGES_TOOL if self.enabled.contains(RuntimeToolFlags::FETCH_MESSAGES) => {
+                self.fetch_messages(call).await
+            }
+            POST_STATUS_TOOL if self.enabled.contains(RuntimeToolFlags::POST_STATUS) => {
+                self.post_status(call).await
+            }
+            ADD_REACTION_TOOL if self.enabled.contains(RuntimeToolFlags::ADD_REACTION) => {
+                self.add_reaction(call).await
+            }
+            USAGE_REPORT_TOOL if self.enabled.contains(RuntimeToolFlags::USAGE_REPORT) => {
+                self.usage_report(call).await
+            }
             GENERATE_IMAGE_TOOL if self.image_generation.is_some() => {
                 self.generate_image(call).await
             }
@@ -271,19 +319,25 @@ where
             TRANSCRIBE_AUDIO_TOOL if self.audio_transcription.is_some() => {
                 self.transcribe_audio(call).await
             }
-            READ_ASSET_TOOL if self.enabled.media_access.read => self.read_asset(call).await,
-            STAT_ASSET_TOOL if self.enabled.media_access.stat => self.stat_asset(call).await,
-            PUBLIC_URL_ASSET_TOOL if self.enabled.media_access.public_url => {
+            READ_ASSET_TOOL if self.enabled.contains(RuntimeToolFlags::MEDIA_READ) => {
+                self.read_asset(call).await
+            }
+            STAT_ASSET_TOOL if self.enabled.contains(RuntimeToolFlags::MEDIA_STAT) => {
+                self.stat_asset(call).await
+            }
+            PUBLIC_URL_ASSET_TOOL if self.enabled.contains(RuntimeToolFlags::MEDIA_PUBLIC_URL) => {
                 self.public_url_asset(call).await
             }
-            ATTACH_ASSET_TOOL if self.enabled.media_access.attach => self.attach_asset(call).await,
-            LOOKUP_USER_MEMORY_TOOL if self.enabled.memory.lookup => {
+            ATTACH_ASSET_TOOL if self.enabled.contains(RuntimeToolFlags::MEDIA_ATTACH) => {
+                self.attach_asset(call).await
+            }
+            LOOKUP_USER_MEMORY_TOOL if self.memory_lookup_enabled() => {
                 self.lookup_user_memory(call).await
             }
-            REMEMBER_USER_MEMORY_TOOL if self.enabled.memory.remember => {
+            REMEMBER_USER_MEMORY_TOOL if self.memory_writes_enabled() => {
                 self.remember_user_memory(call).await
             }
-            FORGET_USER_MEMORY_TOOL if self.enabled.memory.forget => {
+            FORGET_USER_MEMORY_TOOL if self.memory_writes_enabled() => {
                 self.forget_user_memory(call).await
             }
             _ => self.execute_subagent_or_unknown(call).await,
@@ -294,25 +348,25 @@ where
         // Keep this list in sync with `execute`: a tool should be advertised
         // only when the matching dispatch arm is enabled.
         let mut definitions = Vec::new();
-        if self.enabled.fetch_messages {
+        if self.enabled.contains(RuntimeToolFlags::FETCH_MESSAGES) {
             definitions.push(ClientToolDefinition::new(
                 FETCH_MESSAGES_TOOL,
                 self.fetch_messages_tool().spec(),
             ));
         }
-        if self.enabled.post_status {
+        if self.enabled.contains(RuntimeToolFlags::POST_STATUS) {
             definitions.push(ClientToolDefinition::new(
                 POST_STATUS_TOOL,
                 self.post_status_tool().spec(),
             ));
         }
-        if self.enabled.add_reaction {
+        if self.enabled.contains(RuntimeToolFlags::ADD_REACTION) {
             definitions.push(ClientToolDefinition::new(
                 ADD_REACTION_TOOL,
                 self.add_reaction_tool().spec(),
             ));
         }
-        if self.enabled.usage_report {
+        if self.enabled.contains(RuntimeToolFlags::USAGE_REPORT) {
             definitions.push(ClientToolDefinition::new(
                 USAGE_REPORT_TOOL,
                 self.usage_report_tool().spec(),
@@ -330,43 +384,43 @@ where
                 tool.spec(),
             ));
         }
-        if self.enabled.media_access.read {
+        if self.enabled.contains(RuntimeToolFlags::MEDIA_READ) {
             definitions.push(ClientToolDefinition::new(
                 READ_ASSET_TOOL,
                 read_asset_spec(),
             ));
         }
-        if self.enabled.media_access.stat {
+        if self.enabled.contains(RuntimeToolFlags::MEDIA_STAT) {
             definitions.push(ClientToolDefinition::new(
                 STAT_ASSET_TOOL,
                 stat_asset_spec(),
             ));
         }
-        if self.enabled.media_access.public_url {
+        if self.enabled.contains(RuntimeToolFlags::MEDIA_PUBLIC_URL) {
             definitions.push(ClientToolDefinition::new(
                 PUBLIC_URL_ASSET_TOOL,
                 public_url_asset_spec(),
             ));
         }
-        if self.enabled.media_access.attach {
+        if self.enabled.contains(RuntimeToolFlags::MEDIA_ATTACH) {
             definitions.push(ClientToolDefinition::new(
                 ATTACH_ASSET_TOOL,
                 attach_asset_spec(),
             ));
         }
-        if self.enabled.memory.lookup {
+        if self.memory_lookup_enabled() {
             definitions.push(ClientToolDefinition::new(
                 LOOKUP_USER_MEMORY_TOOL,
                 lookup_user_memory_spec(),
             ));
         }
-        if self.enabled.memory.remember {
+        if self.memory_writes_enabled() {
             definitions.push(ClientToolDefinition::new(
                 REMEMBER_USER_MEMORY_TOOL,
                 remember_user_memory_spec(),
             ));
         }
-        if self.enabled.memory.forget {
+        if self.memory_writes_enabled() {
             definitions.push(ClientToolDefinition::new(
                 FORGET_USER_MEMORY_TOOL,
                 forget_user_memory_spec(),
@@ -399,14 +453,38 @@ where
 
     /// Attach scoped memory context and expose the complete memory tool set.
     pub(crate) fn enable_memory(&mut self, context: MemoryToolContext) {
-        self.memory = Some(context);
-        self.enabled.memory = RuntimeMemoryFlags::all();
+        self.memory = Some(RuntimeMemoryTools::Full { context });
     }
 
     /// Attach scoped memory context and expose read-only memory lookup.
     pub(crate) fn enable_memory_lookup(&mut self, context: MemoryToolContext) {
-        self.memory = Some(context);
-        self.enabled.memory.lookup = true;
+        self.memory = Some(RuntimeMemoryTools::Lookup { context });
+    }
+
+    pub(crate) fn enable_tools(&mut self, flags: RuntimeToolFlags) {
+        self.enabled.insert(flags);
+    }
+
+    pub(crate) fn enable_image_generation(&mut self, binding: GenerationBinding) {
+        self.image_generation = Some(binding);
+    }
+
+    pub(crate) fn enable_video_generation(&mut self, binding: GenerationBinding) {
+        self.video_generation = Some(binding);
+    }
+
+    pub(crate) fn enable_audio_transcription(&mut self, binding: TranscriptionBinding) {
+        self.audio_transcription = Some(binding);
+    }
+
+    pub(crate) fn add_subagent(
+        &mut self,
+        name: ToolName,
+        description: impl Into<String>,
+        agent: Agent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, Self>,
+    ) {
+        self.subagents
+            .insert(name, Subagent::new(description, agent));
     }
 
     // Tool wrappers are built lazily so the executor stores services and flags,
@@ -506,6 +584,17 @@ where
                     .unwrap_or_default()
             ))
         })
+    }
+
+    fn memory_lookup_enabled(&self) -> bool {
+        self.memory.is_some()
+    }
+
+    fn memory_writes_enabled(&self) -> bool {
+        self.memory
+            .as_ref()
+            .and_then(RuntimeMemoryTools::write_context)
+            .is_some()
     }
 
     // The wrapper methods below preserve each tool's `ClientToolOutput` on
@@ -629,8 +718,7 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
-        // Memory tools require both the enable flag and scoped memory context.
-        let Some(context) = &self.memory else {
+        let Some(context) = self.memory.as_ref().map(RuntimeMemoryTools::lookup_context) else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
         lookup_user_memory(&self.deps.storage, context, call)
@@ -642,8 +730,11 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
-        // Memory tools require both the enable flag and scoped memory context.
-        let Some(context) = &self.memory else {
+        let Some(context) = self
+            .memory
+            .as_ref()
+            .and_then(RuntimeMemoryTools::write_context)
+        else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
         remember_user_memory(&self.deps.storage, context, call)
@@ -655,8 +746,11 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
-        // Memory tools require both the enable flag and scoped memory context.
-        let Some(context) = &self.memory else {
+        let Some(context) = self
+            .memory
+            .as_ref()
+            .and_then(RuntimeMemoryTools::write_context)
+        else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
         forget_user_memory(&self.deps.storage, context, call)

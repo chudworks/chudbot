@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+bitflags.workspace = true
 chudbot-api = { path = "../chudbot-api" }
 reqwest.workspace = true
 serde.workspace = true

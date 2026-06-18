@@ -17,7 +17,7 @@ use crate::constants::*;
 use crate::media::{
     attach_supports_media, model_transcript_supports_media, public_url_supports_media,
 };
-use crate::platform::{privacy_mode_kind, requested_channel};
+use crate::platform::{channel_from_message, privacy_mode_kind, requested_channel};
 use crate::prelude::*;
 use crate::registries::{
     RoutedAudioTranscriber, RoutedImageGenerator, RoutedLlmBackend, RoutedVideoGenerator,
