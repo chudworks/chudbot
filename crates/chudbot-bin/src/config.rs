@@ -460,6 +460,9 @@ pub enum LlmProviderConfig {
         /// Optional base URL override.
         #[serde(default)]
         base_url: Option<String>,
+        /// Optional local directory for pretty-printed xAI request/response dumps.
+        #[serde(default)]
+        dump_dir: Option<PathBuf>,
         /// Optional per-model metadata fallback.
         #[serde(default)]
         model_info: BTreeMap<ModelId, LlmModelInfoConfig>,

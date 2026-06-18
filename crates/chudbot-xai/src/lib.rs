@@ -17,6 +17,8 @@ mod audio;
 mod imagine;
 mod llm;
 
+use std::path::{Path, PathBuf};
+
 use chudbot_api::ProviderName;
 use chudbot_api::retry::{ClassifyError, ErrorClass, RetryPolicy, with_retry};
 use serde::Deserialize;
@@ -40,6 +42,7 @@ pub struct XaiClient {
     api_key: String,
     base_url: String,
     provider_name: ProviderName,
+    dump_dir: Option<PathBuf>,
 }
 
 impl XaiClient {
@@ -53,6 +56,7 @@ impl XaiClient {
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
             provider_name,
+            dump_dir: None,
         }
     }
 
@@ -62,6 +66,12 @@ impl XaiClient {
     /// use the default API root.
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = base_url.into();
+        self
+    }
+
+    /// Enable local JSON dumps for xAI language-model requests and stream responses.
+    pub fn with_dump_dir(mut self, dump_dir: impl Into<PathBuf>) -> Self {
+        self.dump_dir = Some(dump_dir.into());
         self
     }
 
@@ -82,6 +92,10 @@ impl XaiClient {
 
     pub(crate) fn provider_name(&self) -> &ProviderName {
         &self.provider_name
+    }
+
+    pub(crate) fn dump_dir(&self) -> Option<&Path> {
+        self.dump_dir.as_deref()
     }
 
     pub(crate) async fn post_json<T>(

@@ -337,16 +337,23 @@ impl ConfiguredLlmProviders {
                     providers.gemini.insert(name.clone(), client);
                 }
                 LlmProviderConfig::Xai {
-                    api_key, base_url, ..
+                    api_key,
+                    base_url,
+                    dump_dir,
+                    ..
                 } => {
                     let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
                     if let Some(base_url) = base_url {
                         client = client.with_base_url(base_url.clone());
                     }
+                    if let Some(dump_dir) = dump_dir {
+                        client = client.with_dump_dir(dump_dir.clone());
+                    }
                     tracing::info!(
                         provider = %name,
                         kind = "xai",
                         base_url_override = base_url.is_some(),
+                        dump_enabled = dump_dir.is_some(),
                         model_info_fallbacks,
                         "registered LLM provider"
                     );
@@ -1055,6 +1062,7 @@ mod tests {
                 LlmProviderConfig::Xai {
                     api_key: "test-key".to_string(),
                     base_url: None,
+                    dump_dir: None,
                     model_info: model_info(),
                 },
             ),

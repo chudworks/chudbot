@@ -4,6 +4,7 @@
 /images
 /videos
 /avatars
+/grok_dumps
 /frontend-build
 /frontend/node_modules
 /frontend/dist

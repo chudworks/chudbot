@@ -166,6 +166,10 @@ token = "DISCORD_BOT_TOKEN"
 kind = "xai"
 api_key = "xai-..."
 # base_url = "https://api.x.ai/v1"
+# Optional exact local JSON dumps for debugging xAI Responses caching. Files are
+# grouped by Chudbot conversation id, for example
+# dumps/<conversation-id>/0001_request.json and 0001_response.json.
+# dump_dir = "dumps"
 
 [llm.openai]
 kind = "openai"

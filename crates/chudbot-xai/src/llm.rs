@@ -7,6 +7,8 @@
 //! into text/tool/server-use blocks, and normalizing usage into Chudbot records.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use chudbot_api::reasoning::TurnReasoning;
@@ -22,6 +24,8 @@ use chudbot_api::{
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::fs::{self, File, OpenOptions};
+use tokio::io::AsyncWriteExt;
 
 use crate::imagine::media_provider_url;
 use crate::{XaiClient, XaiError, json_strip_nulls};
@@ -57,6 +61,7 @@ impl LlmBackend for XaiClient {
 
             'attempts: loop {
                 let started = Instant::now();
+                let mut dump = self.start_step_dump(&body).await;
                 let resp = self
                     .post_json_stream("/responses", &body, label)
                     .await?;
@@ -88,6 +93,7 @@ impl LlmBackend for XaiClient {
                         }
                     };
                     for event in events {
+                        dump_xai_stream_event(&mut dump, &event).await;
                         let outcome = match xai_stream_event(
                             event,
                             self.provider_name(),
@@ -126,6 +132,7 @@ impl LlmBackend for XaiClient {
                     }
                 };
                 if let Some(event) = final_event {
+                    dump_xai_stream_event(&mut dump, &event).await;
                     let outcome = match xai_stream_event(
                         event,
                         self.provider_name(),
@@ -198,6 +205,179 @@ fn build_step_body_from_input(request: &ModelStepRequest, input: Vec<Value>) -> 
         "store": false,
         "stream": true,
     }))
+}
+
+impl XaiClient {
+    async fn start_step_dump(&self, body: &Value) -> Option<XaiStepDump> {
+        let Some(root) = self.dump_dir() else {
+            return None;
+        };
+        match XaiStepDump::create(root, body).await {
+            Ok(dump) => dump,
+            Err(error) => {
+                tracing::warn!(
+                    provider = %self.provider_name(),
+                    dump_dir = %root.display(),
+                    error = %error,
+                    "failed to create xAI request dump"
+                );
+                None
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct XaiStepDump {
+    dir: PathBuf,
+    prefix: String,
+}
+
+impl XaiStepDump {
+    async fn create(root: &Path, body: &Value) -> io::Result<Option<Self>> {
+        let Some(conversation) = dump_conversation_id(body) else {
+            return Ok(None);
+        };
+        let dir = root.join(sanitize_dump_path_segment(conversation));
+        fs::create_dir_all(&dir).await?;
+        let start = next_dump_ordinal(&dir).await?;
+        for ordinal in start.. {
+            let dump = Self {
+                dir: dir.clone(),
+                prefix: format!("{ordinal:04}"),
+            };
+            match dump.write_json_new("request", body).await {
+                Ok(()) => {
+                    tracing::debug!(
+                        dump_dir = %dump.dir.display(),
+                        dump_prefix = %dump.prefix,
+                        "created xAI request dump"
+                    );
+                    return Ok(Some(dump));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("unbounded dump ordinal iterator should return or fail");
+    }
+
+    async fn write_stream_event(&mut self, event: &ServerSentEvent) -> io::Result<()> {
+        if event.data.trim() == "[DONE]" {
+            return Ok(());
+        }
+
+        let value: Value = serde_json::from_str(&event.data).map_err(io::Error::other)?;
+        self.write_terminal_payloads(&value).await
+    }
+
+    async fn write_terminal_payloads(&self, event: &Value) -> io::Result<()> {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match event_type {
+            "response.completed" | "response.incomplete" => {
+                let response = event.get("response").unwrap_or(event);
+                self.write_json("response", response).await?;
+                if let Some(output) = response.get("output").and_then(Value::as_array) {
+                    let continuation = replayable_continuation_items(output.iter().cloned());
+                    if !continuation.is_empty() {
+                        self.write_json("continuation", &Value::Array(continuation))
+                            .await?;
+                    }
+                }
+            }
+            "response.failed" | "error" => {
+                self.write_json("error", event).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn write_json(&self, suffix: &str, value: &Value) -> io::Result<()> {
+        let path = self.path_for(suffix);
+        write_pretty_json_file(File::create(path).await?, value).await
+    }
+
+    async fn write_json_new(&self, suffix: &str, value: &Value) -> io::Result<()> {
+        let path = self.path_for(suffix);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await?;
+        write_pretty_json_file(file, value).await
+    }
+
+    fn path_for(&self, suffix: &str) -> PathBuf {
+        self.dir.join(format!("{}_{}.json", self.prefix, suffix))
+    }
+}
+
+async fn dump_xai_stream_event(dump: &mut Option<XaiStepDump>, event: &ServerSentEvent) {
+    let Some(writer) = dump.as_mut() else {
+        return;
+    };
+    if let Err(error) = writer.write_stream_event(event).await {
+        tracing::warn!(
+            dump_dir = %writer.dir.display(),
+            dump_prefix = %writer.prefix,
+            error = %error,
+            "failed to write xAI stream dump"
+        );
+        *dump = None;
+    }
+}
+
+async fn write_pretty_json_file(mut file: File, value: &Value) -> io::Result<()> {
+    let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+    file.write_all(&bytes).await
+}
+
+async fn next_dump_ordinal(dir: &Path) -> io::Result<u32> {
+    let mut max = 0;
+    let mut entries = fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Some((prefix, suffix)) = name.split_once('_') else {
+            continue;
+        };
+        if suffix == "request.json"
+            && prefix.len() == 4
+            && prefix.chars().all(|ch| ch.is_ascii_digit())
+            && let Ok(ordinal) = prefix.parse::<u32>()
+        {
+            max = max.max(ordinal);
+        }
+    }
+    Ok(max.saturating_add(1).max(1))
+}
+
+fn dump_conversation_id(body: &Value) -> Option<&str> {
+    body.get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+fn sanitize_dump_path_segment(value: &str) -> String {
+    let mut segment = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            segment.push(ch);
+        } else {
+            segment.push('_');
+        }
+    }
+    if segment.is_empty() {
+        "unnamed".to_string()
+    } else {
+        segment
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1135,6 +1315,15 @@ mod tests {
         ProviderOptions, ToolInputField, ToolInputSchema, ToolInputValueSchema, TranscriptTurn,
         collect_model_step,
     };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dump_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("chudbot-xai-{name}-{}-{nanos}", std::process::id()))
+    }
 
     #[test]
     fn synthesized_role_messages_include_stable_ids() {
@@ -1158,6 +1347,83 @@ mod tests {
         assert_eq!(input[0]["role"], "system");
         assert_eq!(input[1]["id"], "chudbot_turn_user_1");
         assert_eq!(input[1]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn step_dump_writes_request_response_and_continuation_json() {
+        let root = temp_dump_root("stream-dump");
+        let request = json!({
+            "prompt_cache_key": "conv/123",
+            "input": [{ "role": "user", "content": "hi" }],
+        });
+        let mut dump = XaiStepDump::create(&root, &request).await.unwrap().unwrap();
+        let event = ServerSentEvent {
+            event: Some("response.completed".to_string()),
+            data: json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "model": "grok-4.3",
+                    "output": [
+                        { "type": "reasoning", "id": "rs_1", "encrypted_content": "BLOB" },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "id": "msg_1",
+                            "content": [{ "type": "output_text", "text": "hello" }],
+                        }
+                    ],
+                    "usage": { "input_tokens": 10, "output_tokens": 2, "total_tokens": 12 }
+                }
+            })
+            .to_string(),
+        };
+
+        dump.write_stream_event(&event).await.unwrap();
+
+        let dir = root.join("conv_123");
+        let request_file = fs::read_to_string(dir.join("0001_request.json"))
+            .await
+            .unwrap();
+        let response_file = fs::read_to_string(dir.join("0001_response.json"))
+            .await
+            .unwrap();
+        let continuation_file = fs::read_to_string(dir.join("0001_continuation.json"))
+            .await
+            .unwrap();
+
+        assert!(request_file.contains("\"prompt_cache_key\": \"conv/123\""));
+        assert!(response_file.contains("\"id\": \"resp_1\""));
+        assert!(continuation_file.contains("\"encrypted_content\": \"BLOB\""));
+        assert!(!dir.join("0001_event_0001_response.completed.json").exists());
+
+        fs::remove_dir_all(root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn step_dump_skips_requests_without_conversation_id() {
+        let root = temp_dump_root("stream-dump-no-conversation");
+        let request = json!({ "input": [{ "role": "user", "content": "hi" }] });
+
+        let dump = XaiStepDump::create(&root, &request).await.unwrap();
+
+        assert!(dump.is_none());
+        assert!(!root.exists());
+    }
+
+    #[tokio::test]
+    async fn step_dump_increments_request_ordinal_per_conversation() {
+        let root = temp_dump_root("stream-dump-ordinal");
+        let request = json!({ "prompt_cache_key": "conv-123" });
+
+        XaiStepDump::create(&root, &request).await.unwrap().unwrap();
+        XaiStepDump::create(&root, &request).await.unwrap().unwrap();
+
+        let dir = root.join("conv-123");
+        assert!(dir.join("0001_request.json").exists());
+        assert!(dir.join("0002_request.json").exists());
+
+        fs::remove_dir_all(root).await.ok();
     }
 
     #[test]
