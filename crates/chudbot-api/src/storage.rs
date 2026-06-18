@@ -1514,7 +1514,7 @@ mod tests {
         assert_timestamp_fields(
             "MemoryTurnWindow",
             serde_json::to_value(MemoryTurnWindow {
-                key: key.clone(),
+                key,
                 window_start: timestamp,
                 window_end: timestamp,
                 max_turns: 40,

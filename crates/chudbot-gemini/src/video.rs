@@ -173,9 +173,12 @@ async fn video_image(media: &dyn MediaRef) -> Result<Value, GeminiError> {
             media.uri()
         )));
     }
-    Ok(json!({
-        "inlineData": inline_media(media).await?["inlineData"].clone(),
-    }))
+    let mut inline = inline_media(media).await?;
+    let inline_data = inline
+        .as_object_mut()
+        .and_then(|object| object.remove("inlineData"))
+        .unwrap_or(Value::Null);
+    Ok(json!({ "inlineData": inline_data }))
 }
 
 /// Keep only provider controls the caller supplied.

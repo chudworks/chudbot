@@ -174,11 +174,16 @@ impl RuntimeConfig {
         // Serde owns syntax and type-shape failures. Unknown/stale keys remain
         // on the diagnostics path so `check-config` can report them together
         // with cross-reference and semantic errors.
-        let mut config: Self = toml::from_str(&content).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            content: content.clone().into_boxed_str(),
-            source: Box::new(source),
-        })?;
+        let mut config: Self = match toml::from_str(&content) {
+            Ok(config) => config,
+            Err(source) => {
+                return Err(ConfigError::Parse {
+                    path: path.to_path_buf(),
+                    content: content.into_boxed_str(),
+                    source: Box::new(source),
+                });
+            }
+        };
 
         // The bot prompt includes a version label. If config omits it, use the
         // binary build version without making operators duplicate deployment

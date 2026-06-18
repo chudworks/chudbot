@@ -73,8 +73,9 @@ impl MemoryToolContext {
             return Ok(self.base_key.clone());
         };
         Ok(UserMemoryKey {
+            platform: self.base_key.platform.clone(),
+            scope_key: self.base_key.scope_key.clone(),
             user_key: target,
-            ..self.base_key.clone()
         })
     }
 }

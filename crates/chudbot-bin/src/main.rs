@@ -168,20 +168,19 @@ async fn run(
             // Register the git build once per deployment and expose the
             // monotonic app-version id to bot replies, traces, and viewer UI.
             let app_version = storage.register_app_version(VERSION).await?;
-            let version_label = format!("v{}", app_version.id);
+            config.bot.version = format!("v{}", app_version.id);
             tracing::info!(
                 version_number = app_version.id,
                 git_version = %app_version.git_version,
                 first_seen = %app_version.first_seen_at,
                 "resolved build version"
             );
-            config.bot.version = version_label.clone();
 
             // Build concrete provider/media registries from named config
             // entries. These are cheap Arc-backed registries until individual
             // requests call a provider.
             let mut services = BootstrapServices::build(&config)?;
-            services.web.version = format!("{version_label} ({VERSION})");
+            services.web.version = format!("{} ({VERSION})", config.bot.version);
             let storage = storage.with_app_version_id(app_version.id);
 
             // Platforms connect after validation and storage setup so incoming

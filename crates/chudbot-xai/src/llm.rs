@@ -76,8 +76,6 @@ impl LlmBackend for XaiClient {
         );
         log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
 
-        let continuation = continuation_from_output(self.provider_name(), &parsed.output);
-
         // Split the mixed Responses output stream into Chudbot's assistant
         // step surface while keeping the raw server/citation data available to
         // the trace viewer.
@@ -92,6 +90,7 @@ impl LlmBackend for XaiClient {
                 }]
             })
             .unwrap_or_default();
+        let continuation = continuation_from_output(self.provider_name(), parsed.output);
 
         let mut content = Vec::new();
         if !text.is_empty() {
@@ -355,11 +354,11 @@ fn push_responses_message(
 
 fn continuation_from_output(
     provider: &ProviderName,
-    output: &[Value],
+    output: Vec<Value>,
 ) -> Option<ProviderContinuation> {
     // Persist the replayable subset of raw output so a later step can resume
     // xAI-side reasoning/tool state instead of reconstructing it from text.
-    let items = replayable_continuation_items(output.iter().cloned());
+    let items = replayable_continuation_items(output);
     (!items.is_empty()).then_some(ProviderContinuation {
         provider: provider.clone(),
         data: Value::Array(items),
@@ -811,7 +810,7 @@ mod tests {
             }),
         ];
 
-        let continuation = continuation_from_output(&provider, &output).unwrap();
+        let continuation = continuation_from_output(&provider, output).unwrap();
         let items = continuation.data.as_array().unwrap();
 
         assert_eq!(items.len(), 1);

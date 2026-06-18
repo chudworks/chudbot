@@ -100,7 +100,7 @@ impl BootstrapServices {
         // Media links should resolve through the public web surface. A storage
         // override wins, otherwise generated links point at the bot web base URL.
         let media_store =
-            ConfiguredMediaStore::from_config(&config.storage, config.bot.web_base_url.clone());
+            ConfiguredMediaStore::from_config(&config.storage, config.bot.web_base_url.as_str());
 
         // Provider names come from the TOML table keys. Agent assembly later
         // routes model and tool calls through these registries by that name.
@@ -138,7 +138,7 @@ pub enum ConfiguredMediaStore {
 }
 
 impl ConfiguredMediaStore {
-    fn from_config(config: &StorageConfig, fallback_public_base_url: String) -> Self {
+    fn from_config(config: &StorageConfig, fallback_public_base_url: &str) -> Self {
         match config {
             StorageConfig::Local(config) => Self::Local(LocalMediaStore::new(
                 config.images_dir.clone(),
@@ -148,7 +148,7 @@ impl ConfiguredMediaStore {
                 config
                     .public_base_url
                     .clone()
-                    .or(Some(fallback_public_base_url)),
+                    .or_else(|| Some(fallback_public_base_url.to_string())),
             )),
             StorageConfig::S3(config) => Self::S3(S3MediaStore::new(
                 config.bucket.clone(),
@@ -158,7 +158,7 @@ impl ConfiguredMediaStore {
                 config
                     .public_base_url
                     .clone()
-                    .or(Some(fallback_public_base_url)),
+                    .or_else(|| Some(fallback_public_base_url.to_string())),
             )),
         }
     }

@@ -280,13 +280,12 @@ impl ConfiguredMessagePlatforms {
         let deadline = tokio::time::sleep(PLATFORM_SHUTDOWN_TIMEOUT);
         tokio::pin!(deadline);
         let mut timed_out = false;
-        for pump in &mut handles {
-            let platform = pump.platform.clone();
+        for PlatformEventPump { platform, task } in &mut handles {
             // One deadline covers the whole platform shutdown phase, not each
             // pump independently, to keep process teardown bounded.
             tokio::select! {
-                result = &mut pump.task => {
-                    log_event_pump_join_result(&platform, result);
+                result = task => {
+                    log_event_pump_join_result(platform, result);
                 }
                 () = &mut deadline => {
                     timed_out = true;

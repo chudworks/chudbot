@@ -138,9 +138,7 @@ where
         // `media` stays empty because final platform delivery reloads the
         // stored asset from the successful tool trace's top-level URI.
         Ok(ClientToolOutput {
-            result: ClientToolResultContent::Json {
-                value: result.clone(),
-            },
+            result: ClientToolResultContent::Json { value: result },
             media: Vec::new(),
             is_error: false,
             trace_response,

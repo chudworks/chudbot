@@ -281,7 +281,7 @@ impl MediaStore for RecordingMediaStore {
         Ok(Box::new(RecordingMediaRef {
             metadata: MediaMetadata {
                 category,
-                name: name.clone(),
+                name,
                 uri,
                 mime_type,
                 size_bytes: input.bytes.len() as u64,

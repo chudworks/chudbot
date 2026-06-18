@@ -243,11 +243,10 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<Self::Error>> {
-        let name = call.name.clone();
         // This is the single-call dispatch point invoked by the concurrent
         // agent loop. Unknown names fall through to subagents, then to the
         // executor's sentinel unknown-tool error.
-        match name.as_str() {
+        match call.name.as_str() {
             FETCH_MESSAGES_TOOL if self.enabled.fetch_messages => self.fetch_messages(call).await,
             POST_STATUS_TOOL if self.enabled.post_status => self.post_status(call).await,
             ADD_REACTION_TOOL if self.enabled.add_reaction => self.add_reaction(call).await,

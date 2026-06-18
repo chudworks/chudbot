@@ -611,13 +611,14 @@ fn enabled_server_tools(
     model_tools: &ServerToolSet,
     agent_tools: Option<&ServerToolSet>,
 ) -> ServerToolSet {
-    let model_tools = normalized_server_tools(model_tools);
+    let mut model_tools = normalized_server_tools(model_tools);
     let Some(agent_tools) = agent_tools else {
         return model_tools;
     };
 
     let agent_tools = normalized_server_tools(agent_tools);
-    model_tools.intersection(&agent_tools).cloned().collect()
+    model_tools.retain(|tool| agent_tools.contains(tool));
+    model_tools
 }
 
 /// Normalize a set of provider-side tool names for cross-provider matching.

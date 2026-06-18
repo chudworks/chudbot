@@ -337,10 +337,8 @@ pub(crate) fn media_access_metadata_json(
         "mime_type": media.mime_type(),
         "size_bytes": media.size_bytes(),
     });
-    if let (Some(value), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
-        for (key, extra_value) in extra {
-            value.insert(key.clone(), extra_value.clone());
-        }
+    if let (Some(value), serde_json::Value::Object(extra)) = (value.as_object_mut(), extra) {
+        value.extend(extra);
     }
     value
 }

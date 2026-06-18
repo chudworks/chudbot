@@ -43,12 +43,11 @@ impl AudioTranscriber for XaiClient {
         // repeat the upstream STT request, not local storage reads or URL
         // signing.
         let audio = resolve_stt_audio(request.audio.as_ref()).await?;
-        let model = request.model.clone();
         tracing::debug!(
             audio_source = audio.kind(),
             language = ?request.language.as_deref(),
             keyterms = request.keyterms.len(),
-            model = ?model.as_ref().map(ModelId::as_str),
+            model = ?request.model.as_ref().map(ModelId::as_str),
             "building xAI STT request"
         );
         let url = format!("{}{}", self.base_url(), STT_ENDPOINT);
@@ -81,6 +80,7 @@ impl AudioTranscriber for XaiClient {
             tracing::warn!(error = %error, "failed to decode xAI STT response shape");
             XaiError::Decode(error.to_string())
         })?;
+        let model = request.model;
         let duration_seconds = parsed.duration.unwrap_or(0.0);
         let language = parsed
             .language
@@ -92,7 +92,7 @@ impl AudioTranscriber for XaiClient {
             model.clone(),
             parsed.usage.as_ref(),
             duration_seconds,
-            raw.clone(),
+            raw,
         );
         tracing::info!(
             duration_seconds,

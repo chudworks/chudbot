@@ -118,9 +118,7 @@ where
         );
 
         Ok(ClientToolOutput {
-            result: ClientToolResultContent::Json {
-                value: result.clone(),
-            },
+            result: ClientToolResultContent::Json { value: result },
             media: Vec::new(),
             is_error: false,
             trace_response,

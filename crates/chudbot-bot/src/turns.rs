@@ -1057,10 +1057,10 @@ where
                     })
                     .await
                     .map_err(storage_error)?;
-                for message in &posted.extra_messages {
+                for message in posted.extra_messages {
                     self.storage
                         .link_message(MessageLink {
-                            message: message.clone(),
+                            message,
                             conversation_id: execution.conversation.id,
                             turn_id: execution.turn.id,
                             role: "assistant".to_string(),
@@ -1199,10 +1199,10 @@ where
             })
             .await
             .map_err(storage_error)?;
-        for message in &posted.extra_messages {
+        for message in posted.extra_messages {
             self.storage
                 .link_message(MessageLink {
-                    message: message.clone(),
+                    message,
                     conversation_id: execution.conversation.id,
                     turn_id: execution.turn.id,
                     role: "assistant_error".to_string(),
@@ -1433,7 +1433,7 @@ where
 
         // Referenced-message lookup lets an explicit reply join the conversation
         // that produced or linked the replied-to platform message.
-        if let Some(referenced) = message.referenced_message_id().cloned() {
+        if let Some(referenced) = message.referenced_message_id() {
             tracing::debug!(
                 lookup = "referenced_message",
                 reference_kind = platform_message_reference_kind(&message.reference),

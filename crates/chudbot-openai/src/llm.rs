@@ -75,16 +75,15 @@ impl LlmBackend for OpenAiClient {
         );
         log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
 
-        // Store raw output items as the continuation. Responses reasoning items
-        // are opaque to Chudbot but must be sent back verbatim for stateful models.
-        let output = Value::Array(parsed.output.clone());
-        let continuation = (!parsed.output.is_empty()).then_some(ProviderContinuation {
-            provider: self.provider_name().clone(),
-            data: output,
-        });
-
         let (text, client_tool_calls, server_tool_uses, grounding) =
             walk_output(&parsed.output, self.provider_name());
+        // Store raw output items as the continuation. Responses reasoning items
+        // are opaque to Chudbot but must be sent back verbatim for stateful models.
+        let has_output = !parsed.output.is_empty();
+        let continuation = has_output.then_some(ProviderContinuation {
+            provider: self.provider_name().clone(),
+            data: Value::Array(parsed.output),
+        });
 
         let mut content = Vec::new();
         if !text.is_empty() {

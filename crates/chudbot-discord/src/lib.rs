@@ -582,11 +582,9 @@ impl MessagePlatform for DiscordPlatform {
             ));
         }
 
-        let id = posted
-            .first()
-            .cloned()
-            .ok_or(DiscordError::NoPostedMessage)?;
-        let extra_messages = posted.into_iter().skip(1).collect();
+        let mut posted = posted.into_iter();
+        let id = posted.next().ok_or(DiscordError::NoPostedMessage)?;
+        let extra_messages = posted.collect();
         Ok(PostedMessage {
             id,
             channel: ChannelRef {
@@ -979,7 +977,7 @@ fn platform_command(platform: &PlatformName, interaction: &Interaction) -> Optio
             guild_id: guild_id.clone(),
             channel_id: external_id(channel_id),
         },
-        options: platform_command_options(platform, guild_id.clone(), &data.options),
+        options: platform_command_options(platform, guild_id, &data.options),
         is_admin: interaction
             .member
             .as_ref()
@@ -1845,7 +1843,7 @@ mod tests {
             id: MessageRef {
                 platform: platform.clone(),
                 guild_id: Some(guild.clone()),
-                channel_id: channel.clone(),
+                channel_id: channel,
                 message_id: ExternalId::new("333"),
             },
             author: UserProfile {

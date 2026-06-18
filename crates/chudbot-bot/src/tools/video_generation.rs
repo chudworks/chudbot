@@ -189,9 +189,7 @@ where
                     // `media` stays empty because final platform delivery
                     // reloads generated media from successful tool traces.
                     return Ok(ClientToolOutput {
-                        result: ClientToolResultContent::Json {
-                            value: result.clone(),
-                        },
+                        result: ClientToolResultContent::Json { value: result },
                         media: Vec::new(),
                         is_error: false,
                         trace_response,
@@ -199,19 +197,18 @@ where
                     });
                 }
                 VideoJobStatus::Failed { message } => {
+                    let error = format!("video generation failed: {message}");
                     self.storage
                         .update_video_job(UpdateVideoJob {
                             provider: self.provider.clone(),
                             provider_job_id: job_id.as_str().to_string(),
                             status: "failed".to_string(),
                             output_uri: None,
-                            error: Some(message.clone()),
+                            error: Some(message),
                         })
                         .await
                         .map_err(|error| BotToolError::Storage(error.to_string()))?;
-                    return Err(BotToolError::Generator(format!(
-                        "video generation failed: {message}"
-                    )));
+                    return Err(BotToolError::Generator(error));
                 }
                 VideoJobStatus::Expired => {
                     self.storage

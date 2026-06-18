@@ -544,16 +544,18 @@ fn render_label(
         match line {
             RenderedLine::Line(line) => {
                 let line_range = lines.line_range(input, line);
-                let line_text = input.get(line_range.clone()).unwrap_or_default();
+                let line_start = line_range.start;
+                let line_len = line_range.len();
+                let line_text = input.get(line_range).unwrap_or_default();
                 let highlight_start_byte = if line == start_line {
-                    start.saturating_sub(line_range.start)
+                    start.saturating_sub(line_start)
                 } else {
                     0
                 };
                 let highlight_end_byte = if line == end_line {
-                    end.saturating_sub(line_range.start)
+                    end.saturating_sub(line_start)
                 } else {
-                    line_range.len()
+                    line_len
                 };
                 // Spans are byte offsets, but gutters and carets are rendered
                 // in character columns so UTF-8 input stays aligned.
@@ -1249,10 +1251,7 @@ fn unexpected_key_diagnostic(
     };
     // Prefer a direct path lookup so inline tables and arrays get consistent
     // path formatting; otherwise use the span already carried by the entry.
-    let span = source
-        .span_for(&full_path)
-        .unwrap_or_else(|| entry.span())
-        .clone();
+    let span = source.span_for(&full_path).unwrap_or_else(|| entry.span());
     ConfigDiagnostic::new(format!(
         "unexpected config {entry_kind} `{}`",
         config_path(&full_path)

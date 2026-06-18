@@ -280,7 +280,7 @@ fn summary_text(kind: Option<&str>, text: &str) -> ReasoningSummary {
 
 /// Aggregate positive model-step reasoning-token counts by provider/model.
 fn reasoning_usage_from_records(records: &[UsageRecord]) -> Vec<ReasoningUsage> {
-    let mut by_provider_model = BTreeMap::<(ProviderName, Option<ModelId>), u64>::new();
+    let mut by_provider_model = BTreeMap::<(&ProviderName, Option<&ModelId>), u64>::new();
     for record in records {
         // Only language-model steps belong in the reasoning panel. Other
         // subjects are displayed and billed elsewhere.
@@ -291,14 +291,14 @@ fn reasoning_usage_from_records(records: &[UsageRecord]) -> Vec<ReasoningUsage> 
         let Some(tokens) = record.reasoning_tokens.filter(|tokens| *tokens > 0) else {
             continue;
         };
-        let key = (record.provider.clone(), record.model.clone());
+        let key = (&record.provider, record.model.as_ref());
         *by_provider_model.entry(key).or_default() += tokens;
     }
     by_provider_model
         .into_iter()
         .map(|((provider, model), reasoning_tokens)| ReasoningUsage {
-            provider,
-            model,
+            provider: provider.clone(),
+            model: model.cloned(),
             reasoning_tokens,
         })
         .collect()

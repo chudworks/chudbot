@@ -1513,9 +1513,9 @@ impl BotStorage for SqlxStorage {
         &self,
         query: UsageCostQuery,
     ) -> Result<Vec<UsageCostRow>, Self::Error> {
-        let (guild, channel) = match &query.scope {
+        let (guild, channel): (Option<&str>, Option<String>) = match &query.scope {
             UsageCostScope::All => (None, None),
-            UsageCostScope::Guild { guild_id } => (Some(guild_id.clone()), None),
+            UsageCostScope::Guild { guild_id } => (Some(guild_id.as_str()), None),
             UsageCostScope::Channel {
                 guild_id,
                 channel_id,
@@ -2187,17 +2187,11 @@ impl BotStorage for SqlxStorage {
             })
             .collect::<Vec<_>>();
         let turn_ids = turns.iter().map(|turn| turn.turn_id.0).collect::<Vec<_>>();
-        let images_by_turn = load_memory_image_context(&self.pool, &turn_ids).await?;
-        let audio_by_turn = load_memory_audio_transcriptions(&self.pool, &turn_ids).await?;
+        let mut images_by_turn = load_memory_image_context(&self.pool, &turn_ids).await?;
+        let mut audio_by_turn = load_memory_audio_transcriptions(&self.pool, &turn_ids).await?;
         for turn in &mut turns {
-            turn.image_context = images_by_turn
-                .get(&turn.turn_id)
-                .cloned()
-                .unwrap_or_default();
-            turn.audio_transcriptions = audio_by_turn
-                .get(&turn.turn_id)
-                .cloned()
-                .unwrap_or_default();
+            turn.image_context = images_by_turn.remove(&turn.turn_id).unwrap_or_default();
+            turn.audio_transcriptions = audio_by_turn.remove(&turn.turn_id).unwrap_or_default();
         }
         Ok(turns)
     }
@@ -2581,8 +2575,8 @@ async fn insert_context_item(
     let media_uri = item
         .content
         .starts_with("file://")
-        .then(|| item.content.clone());
-    if let Some(uri) = &media_uri {
+        .then_some(item.content.as_str());
+    if let Some(uri) = media_uri {
         upsert_media_asset(tx, uri).await?;
     }
     let context_item_id: i64 = sqlx::query_scalar(
