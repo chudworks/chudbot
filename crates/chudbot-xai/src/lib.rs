@@ -114,15 +114,15 @@ impl XaiClient {
         // across requests. The source field remains in the JSON body because it
         // is also part of provider request semantics.
         let grok_conv_id = prompt_cache_key_header_value(body).map(str::to_string);
-        log_json_request(&self.provider_name, endpoint, body);
-        tracing::debug!(
-            provider = %self.provider_name,
-            endpoint = %endpoint,
-            base_url = %self.base_url,
-            x_grok_conv_id = grok_conv_id.is_some(),
-            "sending xAI JSON request"
-        );
         with_retry(policy, label, || {
+            log_json_request(&self.provider_name, endpoint, body);
+            tracing::debug!(
+                provider = %self.provider_name,
+                endpoint = %endpoint,
+                base_url = %self.base_url,
+                x_grok_conv_id = grok_conv_id.is_some(),
+                "sending xAI JSON request"
+            );
             // Build the request inside the retry closure so every attempt gets a
             // fresh reqwest builder and body serializer.
             let mut request = self.http.post(&url).bearer_auth(&self.api_key).json(body);
