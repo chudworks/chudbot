@@ -613,8 +613,8 @@ fn build_generation_config(request: &ModelStepRequest, options: &GeminiOptions) 
     let thinking_config = build_thinking_config(options);
     let value = json_strip_nulls(json!({
         "maxOutputTokens": request.sampling.max_output_tokens,
-        "temperature": request.sampling.temperature,
-        "topP": request.sampling.top_p,
+        "temperature": request.sampling.temperature.as_ref(),
+        "topP": request.sampling.top_p.as_ref(),
         "thinkingConfig": thinking_config,
     }));
     match &value {

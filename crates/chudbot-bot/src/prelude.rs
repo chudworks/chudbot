@@ -35,12 +35,13 @@ pub(crate) use chudbot_api::{
     PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
     PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
     PlatformMessageRelationship, PlatformName, PlatformReaction, PrivacyMode, ProviderName,
-    ReactionKind, ResolveAgent, RuntimeSettings, SamplingOptions, SaveTurnInput, SendMessage,
-    StoredVideoJob, ThreadRequest, ToolInputField, ToolInputSchema, ToolInputValueSchema, ToolName,
-    ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole,
-    TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageCostGrouping, UsageCostQuery, UsageCostRow,
-    UsageCostScope, UsageRecord, UserProfile, UserRef, VideoGenerator, VideoGeneratorRegistry,
-    VideoJobId, VideoJobStatus, VideoRequest, collect_agent_run,
+    ReactionKind, ResolveAgent, RuntimeSettings, SamplingNumber, SamplingOptions, SaveTurnInput,
+    SendMessage, StoredVideoJob, ThreadRequest, ToolInputField, ToolInputSchema,
+    ToolInputValueSchema, ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn,
+    TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageCostGrouping,
+    UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UserProfile, UserRef,
+    VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
+    collect_agent_run,
 };
 
 // Small helper crates used broadly enough that local imports would add noise.

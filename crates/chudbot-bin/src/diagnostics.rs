@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chudbot_api::{PrivacyMode, ProviderName};
+use chudbot_api::{PrivacyMode, ProviderName, SamplingNumber};
 use chudbot_bot::{GenerationBinding, TranscriptionBinding, VideoGenerationRateLimit};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -71,6 +71,15 @@ impl ConfigSource {
 
     pub(crate) fn input(&self) -> &str {
         &self.input
+    }
+
+    pub(crate) fn source_for_keys(&self, keys: &[&str]) -> Option<&str> {
+        let path = keys
+            .iter()
+            .map(|part| PathPart::Key(*part))
+            .collect::<Vec<_>>();
+        let span = self.span_for(&path)?;
+        self.input.get(span)
     }
 
     // Walk a logical config path through the spanned source tree. Quoted TOML
@@ -821,6 +830,7 @@ pub(crate) fn validate_runtime_config(
     validate_logging(config, source, &mut diagnostics);
     validate_storage(config, source, &mut diagnostics);
     validate_bot_config(config, source, &mut diagnostics);
+    validate_sampling_number_literals(config, source, &mut diagnostics);
     validate_memory_durations(config, source, &mut diagnostics);
     validate_runtime_references(config, source, &mut diagnostics);
     validate_web(config, source, &mut diagnostics);
@@ -1585,6 +1595,58 @@ fn validate_bot_config(
     }
 }
 
+fn validate_sampling_number_literals(
+    config: &RuntimeConfig,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    for (agent_name, agent) in &config.bot.agents {
+        let sampling = &agent.model.sampling;
+        if sampling.temperature.is_some() {
+            validate_sampling_number_literal(source, diagnostics, agent_name, "temperature");
+        }
+        if sampling.top_p.is_some() {
+            validate_sampling_number_literal(source, diagnostics, agent_name, "top_p");
+        }
+    }
+}
+
+fn validate_sampling_number_literal(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    agent_name: &str,
+    field: &str,
+) {
+    let path = [
+        key("bot"),
+        key("agents"),
+        key(agent_name),
+        key("model"),
+        key("sampling"),
+        key(field),
+    ];
+    let Some(raw) =
+        source.source_for_keys(&["bot", "agents", agent_name, "model", "sampling", field])
+    else {
+        return;
+    };
+    if SamplingNumber::from_json_number_literal(raw).is_ok() {
+        return;
+    }
+    diagnostics.push(
+        ConfigDiagnostic::new(format!(
+            "`{}` must be a JSON-compatible number literal",
+            config_path(&path)
+        ))
+        .with_label(source.primary_label(
+            &path,
+            &path[..path.len() - 1],
+            "cannot be copied into JSON exactly as written",
+        ))
+        .with_help("use JSON number syntax such as `1.3`; avoid TOML-only forms like `+1.3`, `1_000`, `inf`, or `nan`"),
+    );
+}
+
 fn validate_generation_binding(
     source: &ConfigSource,
     diagnostics: &mut Vec<ConfigDiagnostic>,
@@ -2328,6 +2390,51 @@ token = "token"
         assert!(rendered.contains("\x1b[34m-->\x1b[0m"));
         assert!(rendered.contains("\x1b[34m|\x1b[0m"));
         assert!(rendered.contains("\x1b[32mhelp\x1b[0m"));
+    }
+
+    #[test]
+    fn sampling_numbers_reject_toml_only_number_syntax() {
+        let input = r#"
+[database]
+url = "postgres://localhost/chudbot"
+
+[web]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+
+[bot.agents.default]
+provider = "grok"
+system_prompt = "hi"
+
+[bot.agents.default.model]
+id = "grok-test"
+
+[bot.agents.default.model.sampling]
+temperature = +1.3
+top_p = 1_000
+
+[llm.grok]
+kind = "xai"
+api_key = "key"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
+        let report = validate_runtime_config(&config, &source).unwrap_err();
+        let rendered = report.render();
+
+        assert!(rendered.contains(
+            "`bot.agents.default.model.sampling.temperature` must be a JSON-compatible number literal"
+        ));
+        assert!(rendered.contains("temperature = +1.3"));
+        assert!(rendered.contains(
+            "`bot.agents.default.model.sampling.top_p` must be a JSON-compatible number literal"
+        ));
+        assert!(rendered.contains("top_p = 1_000"));
+        assert!(rendered.contains("avoid TOML-only forms"));
     }
 
     #[test]

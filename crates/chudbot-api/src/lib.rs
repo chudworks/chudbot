@@ -102,8 +102,8 @@ pub use storage::{
 pub use llm::{
     LlmBackend, Model, ModelInfo, ModelInfoRequest, ModelOutputBlock, ModelSpec, ModelStep,
     ModelStepCollectionError, ModelStepDelta, ModelStepEvent, ModelStepItem, ModelStepOutput,
-    ModelStepReducerError, ModelStepRequest, ProviderOptions, SamplingOptions, ServerToolSet,
-    collect_model_step, reasoning_items_to_delta_events,
+    ModelStepReducerError, ModelStepRequest, ProviderOptions, SamplingNumber, SamplingOptions,
+    ServerToolSet, collect_model_step, reasoning_items_to_delta_events,
 };
 
 // Agent loop contracts: static agent config, runtime agent execution, outcomes,

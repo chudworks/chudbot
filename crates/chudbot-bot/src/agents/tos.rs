@@ -204,7 +204,7 @@ pub(crate) fn default_tos_preflight_agent(
             server_tools: Default::default(),
             sampling: SamplingOptions {
                 max_output_tokens: Some(8),
-                temperature: Some(0.0),
+                temperature: Some(SamplingNumber::from_static("0.0")),
                 top_p: None,
             },
             provider_options: None,

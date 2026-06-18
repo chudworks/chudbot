@@ -31,13 +31,17 @@
 //!   result.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::future::Future;
 
 pub(crate) use crate::collector::ModelStepCollector;
 pub use crate::collector::{ModelStepCollectionError, ModelStepReducerError, collect_model_step};
 
 use futures::Stream;
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
+use thiserror::Error;
 
 use crate::ids::{ModelId, ProviderName, ToolName};
 use crate::reasoning::ReasoningItem;
@@ -491,19 +495,138 @@ pub fn reasoning_items_to_delta_events(
     events
 }
 
+/// JSON-compatible sampling number preserved as its original numeric token.
+///
+/// TOML deserialization validates that the configured value is numeric. The
+/// process config loader then replaces this normalized fallback with the exact
+/// source token when the token can be emitted as JSON unchanged.
+pub struct SamplingNumber {
+    raw: Box<RawValue>,
+}
+
+impl SamplingNumber {
+    /// Parse an already-spelled JSON number literal.
+    pub fn from_json_number_literal(raw: &str) -> Result<Self, SamplingNumberError> {
+        let raw = raw.trim();
+        match serde_json::from_str::<serde_json::Value>(raw)? {
+            serde_json::Value::Number(_) => Ok(Self {
+                raw: RawValue::from_string(raw.to_string())?,
+            }),
+            _ => Err(SamplingNumberError::NotNumber),
+        }
+    }
+
+    /// Build a sampling number from a known-valid static JSON number literal.
+    pub fn from_static(raw: &'static str) -> Self {
+        Self::from_json_number_literal(raw).expect("static sampling number is valid JSON")
+    }
+
+    /// Return the JSON number literal that will be emitted on provider requests.
+    pub fn as_str(&self) -> &str {
+        self.raw.get()
+    }
+}
+
+impl Clone for SamplingNumber {
+    fn clone(&self) -> Self {
+        Self::from_json_number_literal(self.as_str())
+            .expect("stored sampling number remains valid JSON")
+    }
+}
+
+impl PartialEq for SamplingNumber {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for SamplingNumber {}
+
+impl fmt::Debug for SamplingNumber {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("SamplingNumber")
+            .field(&self.as_str())
+            .finish()
+    }
+}
+
+impl Serialize for SamplingNumber {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SamplingNumber {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(SamplingNumberVisitor)
+    }
+}
+
+struct SamplingNumberVisitor;
+
+impl<'de> Visitor<'de> for SamplingNumberVisitor {
+    type Value = SamplingNumber;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-compatible number")
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        SamplingNumber::from_json_number_literal(&value.to_string()).map_err(E::custom)
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        SamplingNumber::from_json_number_literal(&value.to_string()).map_err(E::custom)
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        let number = serde_json::Number::from_f64(value)
+            .ok_or_else(|| E::custom("sampling number must be finite"))?;
+        SamplingNumber::from_json_number_literal(&number.to_string()).map_err(E::custom)
+    }
+}
+
+/// Error returned when a sampling value cannot be represented as a raw JSON
+/// number token.
+#[derive(Debug, Error)]
+pub enum SamplingNumberError {
+    /// The token was valid JSON but not a JSON number.
+    #[error("sampling value must be a JSON number literal")]
+    NotNumber,
+    /// The token was not valid JSON.
+    #[error("sampling value is not valid JSON: {0}")]
+    InvalidJson(#[from] serde_json::Error),
+}
+
 /// Provider-neutral sampling knobs shared by model providers.
 ///
 /// Every field is optional because providers differ in defaults and support.
 /// Provider adapters should omit unsupported knobs rather than inventing a
 /// cross-provider default in this contract.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SamplingOptions {
     /// Max output tokens for one model step.
     pub max_output_tokens: Option<u32>,
     /// Sampling temperature.
-    pub temperature: Option<f32>,
+    pub temperature: Option<SamplingNumber>,
     /// Nucleus sampling probability mass.
-    pub top_p: Option<f32>,
+    pub top_p: Option<SamplingNumber>,
 }
 
 /// Provider-specific options for the already-routed backend.
@@ -516,4 +639,37 @@ pub struct SamplingOptions {
 pub struct ProviderOptions {
     /// Provider-owned serialized value, usually decoded by the provider crate.
     pub value: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampling_number_serializes_exact_raw_literal() {
+        let number = SamplingNumber::from_json_number_literal("1.30").unwrap();
+
+        assert_eq!(serde_json::to_string(&number).unwrap(), "1.30");
+    }
+
+    #[test]
+    fn sampling_number_survives_json_value_construction() {
+        let number = SamplingNumber::from_json_number_literal("1.30").unwrap();
+        let value = serde_json::json!({ "temperature": &number });
+
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"temperature":1.30}"#
+        );
+    }
+
+    #[test]
+    fn sampling_number_rejects_non_json_number_literals() {
+        for raw in ["+1.3", "1_000", "inf", "nan", "\"1.3\""] {
+            assert!(
+                SamplingNumber::from_json_number_literal(raw).is_err(),
+                "{raw} should not be accepted"
+            );
+        }
+    }
 }

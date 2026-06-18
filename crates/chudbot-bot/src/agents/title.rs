@@ -111,7 +111,7 @@ pub(crate) fn default_conversation_title_agent(
             server_tools: Default::default(),
             sampling: SamplingOptions {
                 max_output_tokens: Some(TITLE_MAX_TOKENS),
-                temperature: Some(0.3),
+                temperature: Some(SamplingNumber::from_static("0.3")),
                 top_p: None,
             },
             provider_options: source.model.provider_options.clone(),

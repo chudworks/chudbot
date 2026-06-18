@@ -62,8 +62,8 @@ impl OpenAiCompatClient {
             "tool_choice": tool_choice,
             "parallel_tool_calls": options.parallel_tool_calls,
             "max_tokens": request.sampling.max_output_tokens,
-            "temperature": request.sampling.temperature,
-            "top_p": request.sampling.top_p,
+            "temperature": request.sampling.temperature.as_ref(),
+            "top_p": request.sampling.top_p.as_ref(),
         }));
         merge_extra_body(&mut body, options.extra_body);
 

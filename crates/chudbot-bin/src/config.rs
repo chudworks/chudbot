@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use chudbot_api::{ModelId, PrivacyMode, ProviderName};
+use chudbot_api::{ModelId, PrivacyMode, ProviderName, SamplingNumber};
 use chudbot_bot::{BotConfig, MemoryConfig};
 use chudbot_web::WebConfig;
 use serde::de::Deserializer;
@@ -193,6 +193,9 @@ impl RuntimeConfig {
             tracing::debug!(version = VERSION, "defaulted bot version from binary");
         }
 
+        let source = ConfigSource::new(path.to_path_buf(), content);
+        config.apply_sampling_source_literals(&source);
+
         tracing::info!(
             agents = config.bot.agents.len(),
             llm_providers = config.llm.len(),
@@ -202,8 +205,24 @@ impl RuntimeConfig {
             platforms = config.platforms.len(),
             "loaded runtime config"
         );
-        let source = ConfigSource::new(path.to_path_buf(), content);
         Ok(LoadedRuntimeConfig { config, source })
+    }
+
+    fn apply_sampling_source_literals(&mut self, source: &ConfigSource) {
+        for (agent_name, agent) in &mut self.bot.agents {
+            apply_sampling_source_literal(
+                source,
+                agent_name.as_str(),
+                "temperature",
+                &mut agent.model.sampling.temperature,
+            );
+            apply_sampling_source_literal(
+                source,
+                agent_name.as_str(),
+                "top_p",
+                &mut agent.model.sampling.top_p,
+            );
+        }
     }
 
     /// Validate config and return all static diagnostics with TOML spans.
@@ -222,6 +241,69 @@ impl RuntimeConfig {
             return Err(BinError::MissingDatabaseUrl);
         }
         Ok(())
+    }
+}
+
+fn apply_sampling_source_literal(
+    source: &ConfigSource,
+    agent_name: &str,
+    field: &str,
+    target: &mut Option<SamplingNumber>,
+) {
+    if target.is_none() {
+        return;
+    }
+    let keys = ["bot", "agents", agent_name, "model", "sampling", field];
+    if let Some(raw) = source.source_for_keys(&keys)
+        && let Ok(number) = SamplingNumber::from_json_number_literal(raw)
+    {
+        *target = Some(number);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampling_literals_preserve_user_source_spelling() {
+        let input = r#"
+[database]
+url = "postgres://localhost/chudbot"
+
+[web]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+
+[bot.agents.default]
+provider = "grok"
+system_prompt = "hi"
+
+[bot.agents.default.model]
+id = "grok-test"
+
+[bot.agents.default.model.sampling]
+temperature = 1.30
+top_p = 0.950
+"#;
+        let mut config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
+
+        config.apply_sampling_source_literals(&source);
+        let sampling = &config.bot.agents["default"].model.sampling;
+
+        assert_eq!(
+            serde_json::to_string(sampling.temperature.as_ref().unwrap()).unwrap(),
+            "1.30"
+        );
+        assert_eq!(
+            serde_json::to_string(sampling.top_p.as_ref().unwrap()).unwrap(),
+            "0.950"
+        );
     }
 }
 

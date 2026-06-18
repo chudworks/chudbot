@@ -197,8 +197,8 @@ fn build_step_body_from_input(request: &ModelStepRequest, input: Vec<Value>) -> 
         "tools": has_tools.then_some(tools),
         "parallel_tool_calls": has_tools.then_some(true),
         "max_output_tokens": request.sampling.max_output_tokens,
-        "temperature": request.sampling.temperature,
-        "top_p": request.sampling.top_p,
+        "temperature": request.sampling.temperature.as_ref(),
+        "top_p": request.sampling.top_p.as_ref(),
         "reasoning": reasoning,
         "prompt_cache_key": request.transcript.id,
         "include": REASONING_INCLUDE,
@@ -1312,8 +1312,8 @@ struct TokenDetails {
 mod tests {
     use super::*;
     use chudbot_api::{
-        ProviderOptions, ToolInputField, ToolInputSchema, ToolInputValueSchema, TranscriptTurn,
-        collect_model_step,
+        ProviderOptions, SamplingNumber, SamplingOptions, ToolInputField, ToolInputSchema,
+        ToolInputValueSchema, TranscriptTurn, collect_model_step,
     };
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1585,6 +1585,28 @@ mod tests {
                 .as_deref(),
             Some("high")
         );
+    }
+
+    #[test]
+    fn request_body_preserves_sampling_number_literals() {
+        let request = ModelStepRequest {
+            model: ModelId::new("grok-4.3"),
+            transcript: Transcript::from_user_text("hi"),
+            client_tools: BTreeMap::new(),
+            server_tools: ServerToolSet::new(),
+            sampling: SamplingOptions {
+                max_output_tokens: None,
+                temperature: Some(SamplingNumber::from_json_number_literal("1.30").unwrap()),
+                top_p: Some(SamplingNumber::from_json_number_literal("0.950").unwrap()),
+            },
+            provider_options: None,
+        };
+
+        let body = build_step_body_from_input(&request, vec![json!({"role": "user"})]);
+        let serialized = serde_json::to_string(&body).unwrap();
+
+        assert!(serialized.contains(r#""temperature":1.30"#));
+        assert!(serialized.contains(r#""top_p":0.950"#));
     }
 
     #[test]

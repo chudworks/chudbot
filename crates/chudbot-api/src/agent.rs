@@ -491,7 +491,7 @@ where
                     transcript: transcript.clone(),
                     client_tools: client_tools.clone(),
                     server_tools: server_tools.clone(),
-                    sampling: self.model.spec.sampling,
+                    sampling: self.model.spec.sampling.clone(),
                     provider_options: self.model.spec.provider_options.clone(),
                 });
                 futures::pin_mut!(events);

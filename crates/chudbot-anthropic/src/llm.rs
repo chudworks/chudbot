@@ -19,8 +19,8 @@ use chudbot_api::{
     ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
     GroundingMetadata, LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta,
     ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
-    ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole,
-    UsageRecord, UsageSubject, reasoning_items_to_delta_events,
+    SamplingNumber, ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript,
+    TurnRole, UsageRecord, UsageSubject, reasoning_items_to_delta_events,
 };
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -50,8 +50,8 @@ impl AnthropicClient {
             messages: &messages,
             system,
             tools: &tools,
-            temperature: request.sampling.temperature,
-            top_p: request.sampling.top_p,
+            temperature: request.sampling.temperature.as_ref(),
+            top_p: request.sampling.top_p.as_ref(),
             thinking: options.thinking.as_ref(),
             effort: options.effort.as_deref(),
             stream: true,
@@ -1103,9 +1103,9 @@ struct AnthropicRequest<'a> {
     #[serde(skip_serializing_if = "<[Value]>::is_empty")]
     tools: &'a [Value],
     #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
+    temperature: Option<&'a SamplingNumber>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f32>,
+    top_p: Option<&'a SamplingNumber>,
     #[serde(skip_serializing_if = "Option::is_none")]
     thinking: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
