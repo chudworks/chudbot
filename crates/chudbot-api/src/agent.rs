@@ -23,7 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{FuturesOrdered, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Instrument;
@@ -491,8 +491,8 @@ where
                     let calls = step.client_tool_calls.clone();
                     append_assistant_step(&mut transcript, step);
 
-                    // Tool calls run concurrently, then are sorted back into
-                    // the provider-requested order before they become the next
+                    // Tool calls run concurrently, then are yielded back in
+                    // provider-requested order before they become the next
                     // user turn.
                     let tool_results =
                         execute_client_tool_calls(&client_tools, &self.tool_executor, calls).await;
@@ -641,8 +641,8 @@ fn normalize_server_tool(tool: &str) -> Option<String> {
 /// Execute all client tool calls from one provider step.
 ///
 /// Calls are dispatched concurrently to avoid serializing independent tool
-/// latency. The returned vector is sorted back to the provider's original call
-/// order before the results are appended to the transcript.
+/// latency. Results are yielded in the provider's original call order before
+/// they are appended to the transcript.
 async fn execute_client_tool_calls(
     enabled_tools: &BTreeMap<ToolName, ClientToolSpec>,
     tool_executor: &impl ClientToolExecutor,
@@ -653,14 +653,14 @@ async fn execute_client_tool_calls(
     Vec<crate::media::BoxedMediaRef>,
 )> {
     tracing::debug!(calls = calls.len(), "executing client tool calls");
-    let mut pending = FuturesUnordered::new();
-    for (index, call) in calls.into_iter().enumerate() {
+    let mut pending = FuturesOrdered::new();
+    for call in calls {
         let tool_name = call.name.to_string();
         let tool_use_id = call.id.to_string();
-        pending.push(
+        pending.push_back(
             async move {
                 let output = call_client_tool(enabled_tools, tool_executor, call.clone()).await;
-                (index, call, output)
+                (call, output)
             }
             .instrument(tracing::debug_span!(
                 "agent.client_tool",
@@ -671,7 +671,7 @@ async fn execute_client_tool_calls(
     }
 
     let mut completed = Vec::new();
-    while let Some((index, call, output)) = pending.next().await {
+    while let Some((call, output)) = pending.next().await {
         let output = match output {
             Ok(output) => {
                 tracing::debug!(
@@ -716,16 +716,9 @@ async fn execute_client_tool_calls(
             trace_response: output.trace_response,
             usage: output.usage,
         };
-        completed.push((index, result, tool_trace, output.media));
+        completed.push((result, tool_trace, output.media));
     }
 
-    // Futures complete in latency order; transcript/tool-result order must
-    // match the assistant's requested call order.
-    completed.sort_by_key(|(index, _, _, _)| *index);
-    let completed = completed
-        .into_iter()
-        .map(|(_, result, tool_trace, media)| (result, tool_trace, media))
-        .collect::<Vec<_>>();
     tracing::debug!(completed = completed.len(), "client tool calls finished");
     completed
 }
@@ -1385,8 +1378,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(run.outcome, AgentOutcome::Completed { .. }));
-        let mut observed = result_order.lock().unwrap().clone();
-        observed.sort();
+        let observed = result_order.lock().unwrap().clone();
         assert_eq!(observed, vec!["call-1".to_string(), "call-2".to_string()]);
     }
 
