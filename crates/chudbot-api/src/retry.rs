@@ -100,7 +100,7 @@ impl Default for RetryPolicy {
 
 impl RetryPolicy {
     /// Whether an error of the given class should be retried under this policy.
-    fn should_retry(&self, class: ErrorClass) -> bool {
+    pub fn should_retry(&self, class: ErrorClass) -> bool {
         match class {
             ErrorClass::ServerTransient => true,
             ErrorClass::Network => self.retry_network,
@@ -109,12 +109,45 @@ impl RetryPolicy {
     }
 
     /// Backoff before the `retry`-th retry, where retry is 1-based.
-    fn backoff(&self, retry: u32) -> Duration {
+    pub fn backoff(&self, retry: u32) -> Duration {
         // Use saturating arithmetic so very large retry indexes cannot panic or
         // wrap before the policy cap is applied.
         let factor = 2u32.saturating_pow(retry.saturating_sub(1));
         self.base_delay.saturating_mul(factor).min(self.max_delay)
     }
+}
+
+/// Sleep before retrying an operation controlled by a caller-owned loop.
+///
+/// This is the lower-level piece used by [`with_retry`]. Streaming adapters use
+/// it when the operation can only be retried before any user-visible events have
+/// been yielded; after that point retrying could duplicate output.
+pub async fn retry_after_error<E>(
+    policy: RetryPolicy,
+    label: &str,
+    attempt: &mut u32,
+    err: &E,
+) -> bool
+where
+    E: ClassifyError + Display,
+{
+    let class = err.error_class();
+    if *attempt >= policy.max_attempts || !policy.should_retry(class) {
+        return false;
+    }
+
+    let delay = policy.backoff(*attempt);
+    tracing::warn!(
+        label,
+        attempt = *attempt,
+        max_attempts = policy.max_attempts,
+        delay_ms = delay.as_millis() as u64,
+        error = %err,
+        "transient failure; retrying after backoff"
+    );
+    tokio::time::sleep(delay).await;
+    *attempt += 1;
+    true
 }
 
 /// Run `op`, retrying transient failures per `policy`.
@@ -141,28 +174,11 @@ where
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) => {
-                // Step 2: reduce the concrete provider error to retry policy.
-                let class = err.error_class();
-
-                // Step 3: stop on exhausted attempts or non-retryable classes,
+                // Step 2: stop on exhausted attempts or non-retryable classes,
                 // returning the original provider error unchanged.
-                if attempt >= policy.max_attempts || !policy.should_retry(class) {
+                if !retry_after_error(policy, label, &mut attempt, &err).await {
                     return Err(err);
                 }
-
-                // Step 4: log the handled transient failure and wait before the
-                // next fresh attempt.
-                let delay = policy.backoff(attempt);
-                tracing::warn!(
-                    label,
-                    attempt,
-                    max_attempts = policy.max_attempts,
-                    delay_ms = delay.as_millis() as u64,
-                    error = %err,
-                    "transient failure; retrying after backoff"
-                );
-                tokio::time::sleep(delay).await;
-                attempt += 1;
             }
         }
     }

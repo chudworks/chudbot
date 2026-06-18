@@ -15,6 +15,7 @@ use chudbot_api::{
     ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
     ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole,
     UsageRecord, UsageSubject,
+    retry::{RetryPolicy, retry_after_error},
     sse::{ServerSentEvent, SseDecoder},
 };
 use futures::{Stream, StreamExt};
@@ -58,58 +59,122 @@ impl LlmBackend for GeminiClient {
         request: ModelStepRequest,
     ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
         async_stream::try_stream! {
-            let started = Instant::now();
             let requested_model = request.model.clone();
             let body = self.build_step_body(&request).await?;
             let endpoint = format!(
                 "/models/{}:streamGenerateContent?alt=sse",
                 request.model.as_str()
             );
-            let resp = self
-                .post_json_stream(&endpoint, &body, "llm[gemini.stream]")
-                .await?;
-            let chunks = resp.bytes_stream();
-            futures::pin_mut!(chunks);
-            let mut decoder = SseDecoder::new();
-            let mut state = GeminiStreamState::default();
+            let policy = RetryPolicy::default();
+            let label = "llm[gemini.stream]";
+            let mut attempt = 1;
 
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk.map_err(|error| GeminiError::Transport(error.to_string()))?;
-                for event in decoder
-                    .push(&chunk)
-                    .map_err(|error| GeminiError::Decode(error.to_string()))?
-                {
-                    for event in gemini_stream_event(
+            'attempts: loop {
+                let started = Instant::now();
+                let resp = self
+                    .post_json_stream(&endpoint, &body, label)
+                    .await?;
+                let chunks = resp.bytes_stream();
+                futures::pin_mut!(chunks);
+                let mut decoder = SseDecoder::new();
+                let mut state = GeminiStreamState::default();
+                let mut emitted = false;
+
+                while let Some(chunk) = chunks.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let error = GeminiError::Transport(error.to_string());
+                            if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                                continue 'attempts;
+                            }
+                            Err(error)?
+                        }
+                    };
+                    let events = match decoder.push(&chunk) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            let error = GeminiError::Decode(error.to_string());
+                            if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                                continue 'attempts;
+                            }
+                            Err(error)?
+                        }
+                    };
+                    for event in events {
+                        let events = match gemini_stream_event(
+                            event,
+                            self.provider_name(),
+                            &requested_model,
+                            &mut state,
+                        ) {
+                            Ok(events) => events,
+                            Err(error) => {
+                                if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                                    continue 'attempts;
+                                }
+                                Err(error)?
+                            }
+                        };
+                        if !events.is_empty() {
+                            emitted = true;
+                        }
+                        for event in events {
+                            yield event;
+                        }
+                    }
+                }
+
+                let final_event = match decoder.finish() {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let error = GeminiError::Decode(error.to_string());
+                        if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                            continue 'attempts;
+                        }
+                        Err(error)?
+                    }
+                };
+                if let Some(event) = final_event {
+                    let events = match gemini_stream_event(
                         event,
                         self.provider_name(),
                         &requested_model,
                         &mut state,
-                    )? {
+                    ) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                                continue 'attempts;
+                            }
+                            Err(error)?
+                        }
+                    };
+                    if !events.is_empty() {
+                        emitted = true;
+                    }
+                    for event in events {
                         yield event;
                     }
                 }
-            }
 
-            if let Some(event) = decoder
-                .finish()
-                .map_err(|error| GeminiError::Decode(error.to_string()))?
-            {
-                for event in gemini_stream_event(
-                    event,
+                let events = match state.finish(
                     self.provider_name(),
                     &requested_model,
-                    &mut state,
-                )? {
+                    started.elapsed(),
+                ) {
+                    Ok(events) => events,
+                    Err(error) => {
+                        if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                            continue 'attempts;
+                        }
+                        Err(error)?
+                    }
+                };
+                for event in events {
                     yield event;
                 }
-            }
-
-            for event in state.finish(
-                self.provider_name(),
-                &requested_model,
-                started.elapsed(),
-            )? {
-                yield event;
+                return;
             }
         }
     }

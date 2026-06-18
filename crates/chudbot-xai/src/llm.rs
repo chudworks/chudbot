@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use chudbot_api::reasoning::TurnReasoning;
+use chudbot_api::retry::{RetryPolicy, retry_after_error};
 use chudbot_api::sse::{ServerSentEvent, SseDecoder};
 use chudbot_api::{
     ClientToolCall, ClientToolSpec, ContentBlock, CostAmount, GroundingMetadata, LlmBackend,
@@ -48,25 +49,101 @@ impl LlmBackend for XaiClient {
         request: ModelStepRequest,
     ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
         async_stream::try_stream! {
-            let started = Instant::now();
             let requested_model = request.model.clone();
             let body = self.build_step_body(&request).await?;
-            let resp = self
-                .post_json_stream("/responses", &body, "llm[xai.stream]")
-                .await?;
-            let chunks = resp.bytes_stream();
-            futures::pin_mut!(chunks);
-            let mut decoder = SseDecoder::new();
-            let mut state = XaiStreamState::default();
+            let policy = RetryPolicy::default();
+            let label = "llm[xai.stream]";
+            let mut attempt = 1;
 
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk.map_err(|error| XaiError::Transport(error.to_string()))?;
-                for event in decoder
-                    .push(&chunk)
-                    .map_err(|error| XaiError::Decode(error.to_string()))?
-                {
-                    let outcome =
-                        xai_stream_event(event, self.provider_name(), &requested_model, started, &mut state)?;
+            'attempts: loop {
+                let started = Instant::now();
+                let resp = self
+                    .post_json_stream("/responses", &body, label)
+                    .await?;
+                let chunks = resp.bytes_stream();
+                futures::pin_mut!(chunks);
+                let mut decoder = SseDecoder::new();
+                let mut state = XaiStreamState::default();
+                let mut emitted = false;
+
+                while let Some(chunk) = chunks.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(error) => {
+                            let error = XaiError::Transport(error.to_string());
+                            if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                                continue 'attempts;
+                            }
+                            Err(error)?
+                        }
+                    };
+                    let events = match decoder.push(&chunk) {
+                        Ok(events) => events,
+                        Err(error) => {
+                            let error = XaiError::Decode(error.to_string());
+                            if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                                continue 'attempts;
+                            }
+                            Err(error)?
+                        }
+                    };
+                    for event in events {
+                        let outcome = match xai_stream_event(
+                            event,
+                            self.provider_name(),
+                            &requested_model,
+                            started,
+                            &mut state,
+                        ) {
+                            Ok(outcome) => outcome,
+                            Err(error) => {
+                                if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                                    continue 'attempts;
+                                }
+                                Err(error)?
+                            }
+                        };
+                        if !outcome.events.is_empty() {
+                            emitted = true;
+                        }
+                        for event in outcome.events {
+                            yield event;
+                        }
+                        if outcome.finished {
+                            return;
+                        }
+                    }
+                }
+
+                let final_event = match decoder.finish() {
+                    Ok(event) => event,
+                    Err(error) => {
+                        let error = XaiError::Decode(error.to_string());
+                        if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                            continue 'attempts;
+                        }
+                        Err(error)?
+                    }
+                };
+                if let Some(event) = final_event {
+                    let outcome = match xai_stream_event(
+                        event,
+                        self.provider_name(),
+                        &requested_model,
+                        started,
+                        &mut state,
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                                continue 'attempts;
+                            }
+                            Err(error)?
+                        }
+                    };
+                    if !outcome.events.is_empty() {
+                        emitted = true;
+                    }
                     for event in outcome.events {
                         yield event;
                     }
@@ -74,25 +151,15 @@ impl LlmBackend for XaiClient {
                         return;
                     }
                 }
-            }
 
-            if let Some(event) = decoder
-                .finish()
-                .map_err(|error| XaiError::Decode(error.to_string()))?
-            {
-                let outcome =
-                    xai_stream_event(event, self.provider_name(), &requested_model, started, &mut state)?;
-                for event in outcome.events {
-                    yield event;
+                let error = XaiError::Decode(
+                    "xAI stream ended without a terminal response event".to_string(),
+                );
+                if !emitted && retry_after_error(policy, label, &mut attempt, &error).await {
+                    continue 'attempts;
                 }
-                if outcome.finished {
-                    return;
-                }
+                Err(error)?
             }
-
-            Err(XaiError::Decode(
-                "xAI stream ended without a terminal response event".to_string(),
-            ))?;
         }
     }
 
@@ -249,15 +316,12 @@ fn xai_stream_event(
         }
         "response.failed" => {
             let response = value.get("response").unwrap_or(&value);
-            Err(XaiError::Decode(provider_error_message(
-                response,
-                "xAI stream failed",
-            )))
+            Err(provider_stream_error(response, "xAI stream failed"))
         }
-        "error" => Err(XaiError::Decode(provider_error_message(
+        "error" => Err(provider_stream_error(
             &value,
             "xAI stream returned an error event",
-        ))),
+        )),
         _ => Ok(StreamEventOutcome::default()),
     }
 }
@@ -499,6 +563,50 @@ fn provider_error_message(value: &Value, fallback: &str) -> String {
         .or_else(|| value.get("message").and_then(Value::as_str))
         .unwrap_or(fallback)
         .to_string()
+}
+
+fn provider_stream_error(value: &Value, fallback: &str) -> XaiError {
+    let message = provider_error_message(value, fallback);
+    match provider_error_status(value, &message) {
+        Some(status) => XaiError::Api {
+            status,
+            body: message,
+        },
+        None => XaiError::Decode(message),
+    }
+}
+
+fn provider_error_status(value: &Value, message: &str) -> Option<u16> {
+    let error = value.get("error");
+    for field in ["status", "status_code", "http_status"] {
+        if let Some(status) = value
+            .get(field)
+            .or_else(|| error.and_then(|error| error.get(field)))
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok())
+        {
+            return Some(status);
+        }
+    }
+
+    let code = error
+        .and_then(|error| error.get("code").or_else(|| error.get("type")))
+        .or_else(|| value.get("code").or_else(|| value.get("type")))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let marker = format!("{code} {message}").to_ascii_lowercase();
+    if marker.contains("rate_limit") || marker.contains("rate limit") {
+        Some(429)
+    } else if marker.contains("temporarily unavailable")
+        || marker.contains("temporary unavailable")
+        || marker.contains("service_unavailable")
+        || marker.contains("service unavailable")
+        || marker.contains("overloaded")
+    {
+        Some(503)
+    } else {
+        None
+    }
 }
 
 /// Extract token limits from either a single model object or an OpenAI-style list.
@@ -1263,6 +1371,36 @@ mod tests {
         assert_eq!(output.usage[0].cached_input_tokens, Some(3));
         assert_eq!(output.usage[0].output_tokens, Some(1));
         assert_eq!(output.usage[0].total_tokens, Some(42));
+    }
+
+    #[test]
+    fn stream_service_unavailable_error_is_retryable() {
+        let provider = ProviderName::new("xai");
+        let requested_model = ModelId::new("grok-4.3");
+        let error = xai_stream_event(
+            ServerSentEvent {
+                event: Some("error".to_string()),
+                data: json!({
+                    "type": "error",
+                    "error": {
+                        "code": "service_unavailable",
+                        "message": "Service temporarily unavailable."
+                    }
+                })
+                .to_string(),
+            },
+            &provider,
+            &requested_model,
+            Instant::now(),
+            &mut XaiStreamState::default(),
+        )
+        .expect_err("stream error");
+
+        assert!(matches!(error, XaiError::Api { status: 503, .. }));
+        assert_eq!(
+            chudbot_api::retry::ClassifyError::error_class(&error),
+            chudbot_api::retry::ErrorClass::ServerTransient
+        );
     }
 
     #[test]
