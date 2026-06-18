@@ -442,7 +442,9 @@ temperature = 0.4
 # value = { effort = "medium", thinking = { type = "adaptive", display = "summarized" } }
 
 # Subagents expose another configured agent as a client-side tool to the parent
-# model. The target agent must exist in [bot.agents].
+# model. The target agent must exist in [bot.agents]. Subagent runs share the
+# conversation context, but generated-media delivery, explicit attachment, and
+# memory writes stay with the top-level agent.
 [bot.agents.default.subagents.research_helper]
 agent = "research"
 description = "Ask a focused research subagent to gather facts and return a concise summary."

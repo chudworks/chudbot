@@ -15,7 +15,7 @@ use crate::*;
 /// that reserved entry is absent, the title agent inherits from normal agent
 /// config so titles are generated with the same provider family as the agent
 /// that answered the conversation.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ConversationTitleSystemAgents {
     /// Exact reserved-agent override loaded from config.
     pub(crate) configured: Option<SystemAgentConfig>,

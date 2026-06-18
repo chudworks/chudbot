@@ -23,7 +23,7 @@ use crate::*;
 ///   then global default agent.
 /// - `conversation_title`: configured reserved agent, then source conversation
 ///   agent, then platform default agent, then global default agent.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct RuntimeSystemAgents {
     /// Safety preflight resolver/cache.
     pub(crate) tos_preflight: TosPreflightSystemAgents,

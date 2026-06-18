@@ -30,7 +30,7 @@ const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 /// The client is intentionally small: it keeps the configured provider name
 /// for trace attribution, the base URL for gateway/test deployments, and the
 /// pricing tables needed to attach local cost estimates to usage records.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct OpenAiClient {
     http: reqwest::Client,
     api_key: String,

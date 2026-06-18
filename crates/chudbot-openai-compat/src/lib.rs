@@ -25,11 +25,11 @@ pub use llm::OpenAiCompatOptions;
 
 /// OpenAI-compatible API client for Chat Completions-style local backends.
 ///
-/// The client is intentionally small and cloneable. Provider-specific request
-/// shaping lives in the backend modules, while this type centralizes the parts
-/// that should behave the same for `/chat/completions`, `/models`, and future
-/// compatibility endpoints.
-#[derive(Debug, Clone)]
+/// The client is intentionally small. Provider-specific request shaping lives
+/// in the backend modules, while this type centralizes the parts that should
+/// behave the same for `/chat/completions`, `/models`, and future compatibility
+/// endpoints.
+#[derive(Debug)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
     api_key: Option<String>,

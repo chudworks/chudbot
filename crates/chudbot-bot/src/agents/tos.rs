@@ -16,7 +16,7 @@ use crate::*;
 /// resolution synthesizes moderation agents from the configured default agent
 /// and any platform-specific default agents so each platform inherits the model
 /// family it would otherwise talk to.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct TosPreflightSystemAgents {
     /// Exact `tos_preflight` entry loaded from normal agent config.
     pub(crate) configured: Option<SystemAgentConfig>,

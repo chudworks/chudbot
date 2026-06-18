@@ -5,6 +5,8 @@
 //! fans those events out to per-event tasks, and coordinates orderly shutdown
 //! for memory jobs, event handlers, and background work.
 
+use std::ops::Deref;
+
 use crate::prelude::*;
 use crate::*;
 
@@ -33,13 +35,45 @@ pub trait BotRuntimeTypes {
 }
 
 /// Platform-neutral bot runtime and shared service handle.
-///
-/// Clones of this value are cheap handles into the same underlying registries,
-/// task trackers, and cancellation maps. Event tasks take a clone so they can
-/// run independently of the intake loop while still publishing trace events and
-/// sharing cancellation state.
-#[derive(Debug)]
 pub struct BotRuntime<R: BotRuntimeTypes> {
+    inner: Arc<BotRuntimeInner<R>>,
+}
+
+impl<R> std::fmt::Debug for BotRuntime<R>
+where
+    R: BotRuntimeTypes,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BotRuntime").finish_non_exhaustive()
+    }
+}
+
+impl<R> Clone for BotRuntime<R>
+where
+    R: BotRuntimeTypes,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<R> Deref for BotRuntime<R>
+where
+    R: BotRuntimeTypes,
+{
+    type Target = BotRuntimeInner<R>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Shared runtime state behind [`BotRuntime`].
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct BotRuntimeInner<R: BotRuntimeTypes> {
     /// Platform registry that supplies events and sends platform-side effects.
     pub(crate) platforms: R::Platforms,
     /// Durable storage used by turn handling, commands, and background jobs.
@@ -72,36 +106,11 @@ pub struct BotRuntime<R: BotRuntimeTypes> {
     pub(crate) system_agents: RuntimeSystemAgents,
 }
 
-impl<R> Clone for BotRuntime<R>
-where
-    R: BotRuntimeTypes,
-{
-    fn clone(&self) -> Self {
-        Self {
-            platforms: self.platforms.clone(),
-            storage: self.storage.clone(),
-            media_store: self.media_store.clone(),
-            llms: self.llms.clone(),
-            images: self.images.clone(),
-            videos: self.videos.clone(),
-            audio: self.audio.clone(),
-            events: self.events.clone(),
-            background: self.background.clone(),
-            turn_cancellations: self.turn_cancellations.clone(),
-            video_rate_limit_locks: self.video_rate_limit_locks.clone(),
-            download_http: self.download_http.clone(),
-            config: self.config.clone(),
-            memory_config: self.memory_config.clone(),
-            system_agents: self.system_agents.clone(),
-        }
-    }
-}
-
 /// Runtime service implementations supplied by the binary crate.
 ///
 /// This is the construction boundary between concrete service setup in
 /// `chudbot-bin` and platform-neutral orchestration in `chudbot-bot`.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BotRuntimeParts<R: BotRuntimeTypes> {
     /// Message platform registry that receives events and performs platform I/O.
     pub platforms: R::Platforms,
@@ -254,21 +263,23 @@ where
         // view is immutable for this process and belongs at runtime startup.
         let system_agents = RuntimeSystemAgents::from_config(&config);
         Self {
-            platforms: parts.platforms,
-            storage: parts.storage,
-            media_store: parts.media_store,
-            llms: parts.llms,
-            images: parts.images,
-            videos: parts.videos,
-            audio: parts.audio,
-            events: parts.events,
-            background: TaskTracker::new(),
-            turn_cancellations: TurnCancellations::default(),
-            video_rate_limit_locks: VideoRateLimitLocks::default(),
-            download_http: reqwest::Client::new(),
-            config,
-            memory_config: parts.memory,
-            system_agents,
+            inner: Arc::new(BotRuntimeInner {
+                platforms: parts.platforms,
+                storage: parts.storage,
+                media_store: parts.media_store,
+                llms: parts.llms,
+                images: parts.images,
+                videos: parts.videos,
+                audio: parts.audio,
+                events: parts.events,
+                background: TaskTracker::new(),
+                turn_cancellations: TurnCancellations::default(),
+                video_rate_limit_locks: VideoRateLimitLocks::default(),
+                download_http: reqwest::Client::new(),
+                config,
+                memory_config: parts.memory,
+                system_agents,
+            }),
         }
     }
 

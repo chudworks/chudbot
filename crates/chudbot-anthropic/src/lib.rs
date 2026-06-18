@@ -35,7 +35,7 @@ const API_VERSION: &str = "2023-06-01";
 /// credentials. That provider name is what shows up in Chudbot traces, usage
 /// records, and retry labels when a deployment registers more than one
 /// Anthropic-compatible service.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AnthropicClient {
     http: reqwest::Client,
     api_key: String,

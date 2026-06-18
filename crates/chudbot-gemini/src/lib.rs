@@ -30,9 +30,8 @@ const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta
 ///
 /// `GeminiClient` is intentionally small: it carries the HTTP client, endpoint
 /// base, API key, and Chudbot provider name, then each trait implementation
-/// builds the vendor-specific request body it needs. Cloning the client is
-/// cheap because `reqwest::Client` is internally reference-counted.
-#[derive(Debug, Clone)]
+/// builds the vendor-specific request body it needs.
+#[derive(Debug)]
 pub struct GeminiClient {
     /// Reused across LLM/image/video calls so connection pooling is shared.
     http: reqwest::Client,

@@ -9,6 +9,8 @@
 //! lifecycle explicit.
 
 use std::collections::{BTreeSet, VecDeque};
+use std::ops::Deref;
+use std::sync::Arc;
 
 use chudbot_api::{
     Agent, AgentOutcome, AgentRun, BotStorage, LlmProviderRegistry, MediaStore,
@@ -36,8 +38,36 @@ use super::{memory_guild_id, memory_profile_display_name, memory_scope_id, memor
 /// Scheduling, lease ownership, attempt counts, and source cutoffs are stored
 /// in `BotStorage`, which lets multiple bot processes poll concurrently
 /// without sharing memory.
-#[derive(Debug, Clone)]
 pub struct MemoryRuntime<S, L, M> {
+    inner: Arc<MemoryRuntimeInner<S, L, M>>,
+}
+
+impl<S, L, M> std::fmt::Debug for MemoryRuntime<S, L, M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MemoryRuntime").finish_non_exhaustive()
+    }
+}
+
+impl<S, L, M> Clone for MemoryRuntime<S, L, M> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl<S, L, M> Deref for MemoryRuntime<S, L, M> {
+    type Target = MemoryRuntimeInner<S, L, M>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Shared scheduler state behind [`MemoryRuntime`].
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MemoryRuntimeInner<S, L, M> {
     storage: S,
     llms: L,
     media_store: M,
@@ -56,11 +86,13 @@ impl<S, L, M> MemoryRuntime<S, L, M> {
         agents: MemoryAgentSet,
     ) -> Self {
         Self {
-            storage,
-            llms,
-            media_store,
-            config,
-            agents,
+            inner: Arc::new(MemoryRuntimeInner {
+                storage,
+                llms,
+                media_store,
+                config,
+                agents,
+            }),
         }
     }
 }

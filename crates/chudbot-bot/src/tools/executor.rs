@@ -403,6 +403,12 @@ where
         self.enabled.memory = RuntimeMemoryFlags::all();
     }
 
+    /// Attach scoped memory context and expose read-only memory lookup.
+    pub(crate) fn enable_memory_lookup(&mut self, context: MemoryToolContext) {
+        self.memory = Some(context);
+        self.enabled.memory.lookup = true;
+    }
+
     // Tool wrappers are built lazily so the executor stores services and flags,
     // not one field per possible tool.
     fn fetch_messages_tool(&self) -> FetchMessagesTool<R::Platforms, R::Storage> {

@@ -20,7 +20,7 @@ pub(crate) struct ConversationAgentAssembly<'a> {
     pub(crate) agent_config: &'a AgentConfig,
     /// Fully rendered system instructions for this top-level turn or subagent.
     pub(crate) rendered_system_instructions: String,
-    /// Whether this assembled agent is directly answering the user.
+    /// Whether this assembled agent can deliver final reply artifacts and write memory.
     pub(crate) top_level: bool,
 }
 
@@ -34,6 +34,44 @@ pub(crate) struct ConversationAgentContext<'a> {
     pub(crate) turn_id: TurnId,
 }
 
+/// Role-specific client-tool surface for a conversation agent run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConversationToolPolicy {
+    top_level: bool,
+    memory_enabled: bool,
+    privacy_allows_history: bool,
+}
+
+impl ConversationToolPolicy {
+    fn new(top_level: bool, memory_enabled: bool, privacy: &PrivacyMode) -> Self {
+        Self {
+            top_level,
+            memory_enabled,
+            privacy_allows_history: !matches!(privacy, PrivacyMode::ConversationOnly),
+        }
+    }
+
+    fn fetch_messages(self) -> bool {
+        self.privacy_allows_history
+    }
+
+    fn memory_lookup(self) -> bool {
+        self.memory_enabled
+    }
+
+    fn memory_writes(self) -> bool {
+        self.top_level && self.memory_enabled
+    }
+
+    fn generated_media_tools(self) -> bool {
+        self.top_level
+    }
+
+    fn final_reply_attach(self) -> bool {
+        self.top_level
+    }
+}
+
 impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
@@ -45,7 +83,7 @@ where
     /// tracks the active agent expansion
     /// chain so configured subagent cycles fail during construction instead of
     /// becoming recursive tool calls at runtime.
-    pub(crate) fn build_agent(
+    pub(crate) fn build_conversation_agent(
         &self,
         assembly: ConversationAgentAssembly<'_>,
         context: &ConversationAgentContext<'_>,
@@ -57,7 +95,12 @@ where
             rendered_system_instructions,
             top_level,
         } = assembly;
-        self.ensure_agent_services_exist(agent_name, agent_config)?;
+        let policy = ConversationToolPolicy::new(
+            top_level,
+            self.agent_memory_enabled(agent_config),
+            &context.settings.privacy,
+        );
+        self.ensure_conversation_agent_services_exist(agent_name, agent_config, policy)?;
 
         // Only the active expansion path is recursive. Sibling subagents may
         // legitimately point at the same configured agent.
@@ -74,8 +117,10 @@ where
         // exposure.
         let mut spec = agent_config.agent_spec(self.config.limits);
         spec.system_prompt = rendered_system_instructions;
-        if top_level && self.agent_memory_enabled(agent_config) {
+        if policy.memory_lookup() {
             ensure_client_tool_enabled(&mut spec.client_tools, memory::LOOKUP_USER_MEMORY_TOOL);
+        }
+        if policy.memory_writes() {
             ensure_client_tool_enabled(&mut spec.client_tools, memory::REMEMBER_USER_MEMORY_TOOL);
             ensure_client_tool_enabled(&mut spec.client_tools, memory::FORGET_USER_MEMORY_TOOL);
         }
@@ -102,51 +147,59 @@ where
                 privacy: context.settings.privacy.clone(),
             },
         );
-        // Top-level agents get conversation-management tools. Subagents keep a narrower
-        // surface and only receive explicitly configured generation/media/subagent tools.
-        if top_level {
-            if !matches!(context.settings.privacy, PrivacyMode::ConversationOnly) {
-                tracing::debug!(tool = FETCH_MESSAGES_TOOL, "attaching runtime tool");
-                tool_executor.enabled.fetch_messages = true;
-            }
-            if self.agent_memory_enabled(agent_config) {
-                let base_key = memory::key_from_user_ref(context.turn_user);
+        // Conversation helpers are available to both top-level agents and
+        // subagents. They operate on the same turn context and do not create
+        // final reply artifacts.
+        if policy.fetch_messages() {
+            tracing::debug!(tool = FETCH_MESSAGES_TOOL, "attaching runtime tool");
+            tool_executor.enabled.fetch_messages = true;
+        }
+        if policy.memory_lookup() {
+            let base_key = memory::key_from_user_ref(context.turn_user);
+            let memory_context = MemoryToolContext::new(
+                base_key,
+                context.turn_user_display_name.to_string(),
+                context.conversation_id,
+                context.turn_id,
+            );
+            if policy.memory_writes() {
                 tracing::debug!("attaching user memory tools");
-                tool_executor.enable_memory(MemoryToolContext::new(
-                    base_key,
-                    context.turn_user_display_name.to_string(),
-                    context.conversation_id,
-                    context.turn_id,
-                ));
+                tool_executor.enable_memory(memory_context);
+            } else {
+                tracing::debug!("attaching read-only user memory tool");
+                tool_executor.enable_memory_lookup(memory_context);
             }
-            tracing::debug!(tool = POST_STATUS_TOOL, "attaching runtime tool");
-            tool_executor.enabled.post_status = true;
-            tracing::debug!(tool = ADD_REACTION_TOOL, "attaching runtime tool");
-            tool_executor.enabled.add_reaction = true;
-            tracing::debug!(tool = USAGE_REPORT_TOOL, "attaching runtime tool");
-            tool_executor.enabled.usage_report = true;
         }
+        tracing::debug!(tool = POST_STATUS_TOOL, "attaching runtime tool");
+        tool_executor.enabled.post_status = true;
+        tracing::debug!(tool = ADD_REACTION_TOOL, "attaching runtime tool");
+        tool_executor.enabled.add_reaction = true;
+        tracing::debug!(tool = USAGE_REPORT_TOOL, "attaching runtime tool");
+        tool_executor.enabled.usage_report = true;
 
-        // Provider-backed media tools are opt-in per agent because each binding
-        // names both a runtime provider registry entry and a model.
-        if let Some(binding) = &agent_config.image_generation {
-            tracing::debug!(
-                tool = GENERATE_IMAGE_TOOL,
-                provider = %binding.provider,
-                model = %binding.model,
-                "attaching image generation tool"
-            );
-            tool_executor.image_generation = Some(binding.clone());
-        }
+        // Generated media is only delivered from the top-level trace. Subagents
+        // return text to their parent, so exposing generation there would make
+        // the tool's final-reply delivery contract false.
+        if policy.generated_media_tools() {
+            if let Some(binding) = &agent_config.image_generation {
+                tracing::debug!(
+                    tool = GENERATE_IMAGE_TOOL,
+                    provider = %binding.provider,
+                    model = %binding.model,
+                    "attaching image generation tool"
+                );
+                tool_executor.image_generation = Some(binding.clone());
+            }
 
-        if let Some(binding) = &agent_config.video_generation {
-            tracing::debug!(
-                tool = GENERATE_VIDEO_TOOL,
-                provider = %binding.provider,
-                model = %binding.model,
-                "attaching video generation tool"
-            );
-            tool_executor.video_generation = Some(binding.clone());
+            if let Some(binding) = &agent_config.video_generation {
+                tracing::debug!(
+                    tool = GENERATE_VIDEO_TOOL,
+                    provider = %binding.provider,
+                    model = %binding.model,
+                    "attaching video generation tool"
+                );
+                tool_executor.video_generation = Some(binding.clone());
+            }
         }
 
         if let Some(binding) = &agent_config.audio_transcription {
@@ -159,16 +212,18 @@ where
             tool_executor.audio_transcription = Some(binding.clone());
         }
 
-        // Stored-media access is always wired in for conversation agents. The
-        // individual tools still enforce URI, MIME type, and attachment rules.
+        // Stored-media inspection is always wired in for conversation agents.
+        // `attach` is top-level only because it queues final reply artifacts.
         tracing::debug!(tool = READ_ASSET_TOOL, "attaching media access tool");
         tool_executor.enabled.media_access.read = true;
         tracing::debug!(tool = STAT_ASSET_TOOL, "attaching media access tool");
         tool_executor.enabled.media_access.stat = true;
         tracing::debug!(tool = PUBLIC_URL_ASSET_TOOL, "attaching media access tool");
         tool_executor.enabled.media_access.public_url = true;
-        tracing::debug!(tool = ATTACH_ASSET_TOOL, "attaching media access tool");
-        tool_executor.enabled.media_access.attach = true;
+        if policy.final_reply_attach() {
+            tracing::debug!(tool = ATTACH_ASSET_TOOL, "attaching media access tool");
+            tool_executor.enabled.media_access.attach = true;
+        }
 
         for (tool_name, binding) in &agent_config.subagents {
             let (subagent_name, subagent_config) = self
@@ -181,9 +236,9 @@ where
                 model = %subagent_config.model.id,
                 "attaching subagent tool"
             );
-            let prompt = self
-                .compose_subagent_system_prompt(subagent_config, &PrivacyMode::ConversationOnly);
-            let nested = self.build_agent(
+            let prompt =
+                self.compose_subagent_system_prompt(subagent_config, &context.settings.privacy);
+            let nested = self.build_conversation_agent(
                 ConversationAgentAssembly {
                     agent_name: &subagent_name,
                     agent_config: subagent_config,
@@ -223,34 +278,37 @@ where
     ) -> String {
         self.compose_system_prompt_inner(
             agent,
-            privacy,
-            self.agent_memory_enabled(agent),
+            ConversationToolPolicy::new(true, self.agent_memory_enabled(agent), privacy),
             conversation_id,
         )
     }
 
     /// Compose the narrower system prompt used by subagent tools.
     ///
-    /// Subagents receive configured capability guidance, but not user-memory
-    /// instructions or a conversation trace URL.
+    /// Subagents receive the conversation's privacy-scoped context guidance and
+    /// read-only memory lookup guidance, but not final media delivery guidance,
+    /// memory-write instructions, or a conversation trace URL.
     pub(crate) fn compose_subagent_system_prompt(
         &self,
         agent: &AgentConfig,
         privacy: &PrivacyMode,
     ) -> String {
-        self.compose_system_prompt_inner(agent, privacy, false, None)
+        self.compose_system_prompt_inner(
+            agent,
+            ConversationToolPolicy::new(false, self.agent_memory_enabled(agent), privacy),
+            None,
+        )
     }
 
     /// Shared system-prompt builder for top-level agents and subagents.
     ///
-    /// `include_memory` and `conversation_id` are explicit knobs because prompt
+    /// The tool policy and `conversation_id` are explicit knobs because prompt
     /// text is advisory; the runtime tool executor remains the enforcement
     /// boundary for which calls are actually accepted.
-    pub(crate) fn compose_system_prompt_inner(
+    fn compose_system_prompt_inner(
         &self,
         agent: &AgentConfig,
-        privacy: &PrivacyMode,
-        include_memory: bool,
+        policy: ConversationToolPolicy,
         conversation_id: Option<ConversationId>,
     ) -> String {
         let mut out = String::new();
@@ -288,32 +346,34 @@ where
         if !agent.model.server_tools.is_empty() {
             out.push_str("- Provider-side tools configured on this model.\n");
         }
-        if !matches!(privacy, PrivacyMode::ConversationOnly) {
+        if policy.fetch_messages() {
             out.push_str("- Recent platform messages are available through fetch_messages.\n");
         }
-        if let Some(binding) = &agent.image_generation {
-            out.push_str(&format!(
-                concat!(
-                    "- Image generation and image editing are available through generate_image ",
-                    "using provider `{}` and model `{}`. When the user asks to edit, restyle, ",
-                    "transform, or make a variation of an existing image, pass the exact ",
-                    "available URI in reference_images.\n"
-                ),
-                binding.provider, binding.model
-            ));
-        }
-        if let Some(binding) = &agent.video_generation {
-            out.push_str(&format!(
-                "- Video generation is available through generate_video using provider `{}` and model `{}`.\n",
-                binding.provider, binding.model
-            ));
-            if let Some(limit) = &binding.rate_limit {
+        if policy.generated_media_tools() {
+            if let Some(binding) = &agent.image_generation {
                 out.push_str(&format!(
-                    "- Each non-bypassed platform scope is limited to {} active video generation{} per {}.\n",
-                    limit.limit,
-                    if limit.limit == 1 { "" } else { "s" },
-                    limit.interval
+                    concat!(
+                        "- Image generation and image editing are available through generate_image ",
+                        "using provider `{}` and model `{}`. When the user asks to edit, restyle, ",
+                        "transform, or make a variation of an existing image, pass the exact ",
+                        "available URI in reference_images.\n"
+                    ),
+                    binding.provider, binding.model
                 ));
+            }
+            if let Some(binding) = &agent.video_generation {
+                out.push_str(&format!(
+                    "- Video generation is available through generate_video using provider `{}` and model `{}`.\n",
+                    binding.provider, binding.model
+                ));
+                if let Some(limit) = &binding.rate_limit {
+                    out.push_str(&format!(
+                        "- Each non-bypassed platform scope is limited to {} active video generation{} per {}.\n",
+                        limit.limit,
+                        if limit.limit == 1 { "" } else { "s" },
+                        limit.interval
+                    ));
+                }
             }
         }
         if let Some(binding) = &agent.audio_transcription {
@@ -331,14 +391,21 @@ where
         if !agent.subagents.is_empty() {
             out.push_str("- Specialist subagents are available as tools.\n");
         }
-        if include_memory {
+        if policy.memory_writes() {
             out.push_str("- User memory is available through lookup_user_memory, remember_user_memory, and forget_user_memory.\n");
+        } else if policy.memory_lookup() {
+            out.push_str("- User memory lookup is available through lookup_user_memory. Subagents can read memory but cannot remember or forget facts.\n");
         }
-        out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, visually inspected with read, and explicitly attached to the final platform reply with attach. read and attach only accept verified stored image assets, never return file bytes, and reject videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths. attach deduplicates with generated media already queued for the final reply.\n");
-        out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, file:// URIs, filenames, or markdown media links in user-facing text.\n");
-        out.push_str("- Slow work (video generation, subagent calls, research) SHOULD be narrated with calls to the post_status_message tool.\n");
+        if policy.final_reply_attach() {
+            out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, visually inspected with read, and explicitly attached to the final platform reply with attach. read and attach only accept verified stored image assets, never return file bytes, and reject videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths. attach deduplicates with generated media already queued for the final reply.\n");
+            out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, file:// URIs, filenames, or markdown media links in user-facing text.\n");
+            out.push_str("- Slow work (video generation, subagent calls, research) SHOULD be narrated with calls to the post_status_message tool.\n");
+        } else {
+            out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, and visually inspected with read. read only accepts verified stored image assets, never returns file bytes, and rejects videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths.\n");
+            out.push_str("- Slow work (subagent calls or research) SHOULD be narrated with calls to the post_status_message tool.\n");
+        }
         out.push_str("- A subtle Unicode emoji reaction can be added to the user's current message with add_reaction when a compact nonverbal acknowledgement, mood, or topic cue is helpful; use it sparingly and never instead of answering.\n");
-        if include_memory {
+        if policy.memory_writes() {
             out.push_str(memory::PROMPT_GUIDANCE);
         }
         out.push_str("Agent Persona Prompt:\n");
@@ -443,5 +510,93 @@ where
             });
         }
         Ok(())
+    }
+
+    /// Verify services for the role-specific conversation tool surface.
+    fn ensure_conversation_agent_services_exist(
+        &self,
+        agent_name: &str,
+        agent: &AgentConfig,
+        policy: ConversationToolPolicy,
+    ) -> Result<(), BotError> {
+        self.ensure_provider_exists(agent_name, agent)?;
+        if policy.generated_media_tools() {
+            if let Some(binding) = &agent.image_generation
+                && !self.images.contains_generator(&binding.provider)
+            {
+                tracing::warn!(
+                    agent = %agent_name,
+                    provider = %binding.provider,
+                    model = %binding.model,
+                    "agent image generation provider is not configured"
+                );
+                return Err(BotError::MissingImageGenerator {
+                    agent: agent_name.to_string(),
+                    provider: binding.provider.clone(),
+                });
+            }
+            if let Some(binding) = &agent.video_generation
+                && !self.videos.contains_generator(&binding.provider)
+            {
+                tracing::warn!(
+                    agent = %agent_name,
+                    provider = %binding.provider,
+                    model = %binding.model,
+                    "agent video generation provider is not configured"
+                );
+                return Err(BotError::MissingVideoGenerator {
+                    agent: agent_name.to_string(),
+                    provider: binding.provider.clone(),
+                });
+            }
+        }
+        if let Some(binding) = &agent.audio_transcription
+            && !self.audio.contains_transcriber(&binding.provider)
+        {
+            tracing::warn!(
+                agent = %agent_name,
+                provider = %binding.provider,
+                model = ?binding.model.as_ref(),
+                "agent audio transcription provider is not configured"
+            );
+            return Err(BotError::MissingAudioTranscriber {
+                agent: agent_name.to_string(),
+                provider: binding.provider.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conversation_tool_policy_keeps_delivery_and_memory_writes_top_level() {
+        let top_level =
+            ConversationToolPolicy::new(true, true, &PrivacyMode::Open { history_size: 20 });
+        assert!(top_level.fetch_messages());
+        assert!(top_level.memory_lookup());
+        assert!(top_level.memory_writes());
+        assert!(top_level.generated_media_tools());
+        assert!(top_level.final_reply_attach());
+
+        let subagent =
+            ConversationToolPolicy::new(false, true, &PrivacyMode::Open { history_size: 20 });
+        assert!(subagent.fetch_messages());
+        assert!(subagent.memory_lookup());
+        assert!(!subagent.memory_writes());
+        assert!(!subagent.generated_media_tools());
+        assert!(!subagent.final_reply_attach());
+    }
+
+    #[test]
+    fn conversation_tool_policy_honors_conversation_only_privacy_for_all_roles() {
+        let top_level = ConversationToolPolicy::new(true, true, &PrivacyMode::ConversationOnly);
+        let subagent = ConversationToolPolicy::new(false, true, &PrivacyMode::ConversationOnly);
+
+        assert!(!top_level.fetch_messages());
+        assert!(!subagent.fetch_messages());
     }
 }

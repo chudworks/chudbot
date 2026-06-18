@@ -881,7 +881,7 @@ where
             });
         }
         tracing::debug!("building agent for turn");
-        let agent = self.build_agent(
+        let agent = self.build_conversation_agent(
             ConversationAgentAssembly {
                 agent_name: &execution.agent_name,
                 agent_config: &execution.agent_config,

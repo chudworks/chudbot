@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::path::{Component, Path as FsPath, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{ConnectInfo, Request};
@@ -163,15 +165,18 @@ pub trait WebRuntimeTypes: 'static {
 }
 
 /// State shared by web handlers.
-#[derive(Debug)]
 pub struct WebState<R: WebRuntimeTypes> {
-    storage: R::Storage,
-    media_store: R::Media,
-    llms: R::Llms,
-    events: EventBus,
-    config: WebConfig,
-    static_files: StaticFileCache,
+    inner: Arc<WebStateInner<R>>,
     shutdown: CancellationToken,
+}
+
+impl<R> std::fmt::Debug for WebState<R>
+where
+    R: WebRuntimeTypes,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WebState").finish_non_exhaustive()
+    }
 }
 
 impl<R> Clone for WebState<R>
@@ -180,15 +185,33 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            storage: self.storage.clone(),
-            media_store: self.media_store.clone(),
-            llms: self.llms.clone(),
-            events: self.events.clone(),
-            config: self.config.clone(),
-            static_files: self.static_files.clone(),
+            inner: Arc::clone(&self.inner),
             shutdown: self.shutdown.clone(),
         }
     }
+}
+
+impl<R> Deref for WebState<R>
+where
+    R: WebRuntimeTypes,
+{
+    type Target = WebStateInner<R>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+/// Shared web-handler state behind [`WebState`].
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct WebStateInner<R: WebRuntimeTypes> {
+    storage: R::Storage,
+    media_store: R::Media,
+    llms: R::Llms,
+    events: EventBus,
+    config: WebConfig,
+    static_files: StaticFileCache,
 }
 
 impl<R> WebState<R>
@@ -210,12 +233,14 @@ where
             "constructing web state"
         );
         Self {
-            storage,
-            media_store,
-            llms,
-            events,
-            config,
-            static_files: StaticFileCache::new(),
+            inner: Arc::new(WebStateInner {
+                storage,
+                media_store,
+                llms,
+                events,
+                config,
+                static_files: StaticFileCache::new(),
+            }),
             shutdown: CancellationToken::new(),
         }
     }

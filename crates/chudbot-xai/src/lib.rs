@@ -34,7 +34,7 @@ const X_GROK_CONV_ID_HEADER: &str = "x-grok-conv-id";
 /// base URL. Modality implementations keep their public provider contracts in
 /// their own modules and call the crate-private request helpers here so retries,
 /// response decoding, and debug redaction stay consistent.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct XaiClient {
     http: reqwest::Client,
     api_key: String,
