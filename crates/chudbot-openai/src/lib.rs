@@ -142,6 +142,49 @@ impl OpenAiClient {
         .await
     }
 
+    pub(crate) async fn post_json_stream(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        label: &str,
+    ) -> Result<reqwest::Response, OpenAiError> {
+        let url = format!("{}{}", self.base_url, endpoint);
+        log_json_request(&self.provider_name, endpoint, body);
+        tracing::debug!(
+            provider = %self.provider_name,
+            endpoint = %endpoint,
+            base_url = %self.base_url,
+            "sending OpenAI streaming JSON request"
+        );
+        with_retry(RetryPolicy::default(), label, || {
+            let request = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .json(body);
+            async move {
+                let resp = request.send().await.map_err(|e| {
+                    tracing::warn!(
+                        provider = %self.provider_name,
+                        endpoint = %endpoint,
+                        error = %e,
+                        "OpenAI streaming request transport error"
+                    );
+                    OpenAiError::Transport(e.to_string())
+                })?;
+                tracing::debug!(
+                    provider = %self.provider_name,
+                    endpoint = %endpoint,
+                    status = %resp.status(),
+                    "received OpenAI streaming response"
+                );
+                ensure_stream_success(resp, &self.provider_name, endpoint).await
+            }
+        })
+        .await
+    }
+
     pub(crate) async fn get_json<T>(&self, endpoint: &str, label: &str) -> Result<T, OpenAiError>
     where
         T: for<'de> Deserialize<'de>,
@@ -246,6 +289,37 @@ where
             "failed to decode OpenAI response shape"
         );
         OpenAiError::Decode(e.to_string())
+    })
+}
+
+async fn ensure_stream_success(
+    resp: reqwest::Response,
+    provider: &ProviderName,
+    endpoint: &str,
+) -> Result<reqwest::Response, OpenAiError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+
+    let body = resp.text().await.map_err(|e| {
+        tracing::warn!(
+            status = status.as_u16(),
+            error = %e,
+            "failed to read OpenAI streaming error body"
+        );
+        OpenAiError::Decode(e.to_string())
+    })?;
+    log_text_response(provider, endpoint, status.as_u16(), &body);
+    let body = truncate_body(body, 600);
+    tracing::warn!(
+        status = status.as_u16(),
+        body_chars = body.chars().count(),
+        "OpenAI streaming API returned non-success status"
+    );
+    Err(OpenAiError::Api {
+        status: status.as_u16(),
+        body,
     })
 }
 

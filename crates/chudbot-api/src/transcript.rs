@@ -177,7 +177,8 @@ pub enum ContentBlock {
 
 /// Opaque provider-specific state to replay on a later model step.
 ///
-/// Providers return this through [`crate::llm::AssistantStep::continuation`].
+/// Providers return this through [`crate::llm::ModelStepOutput`] transcript
+/// blocks.
 /// The agent loop can append it to the transcript so the same provider can
 /// continue from private state without forcing `chudbot-api` to understand the
 /// provider's payload.

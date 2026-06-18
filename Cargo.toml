@@ -18,6 +18,7 @@ all = "deny"
 aws-config = "1"
 aws-sdk-s3 = "1"
 async-trait = "0.1"
+async-stream = "0.3"
 bitflags = "2"
 thiserror = "2"
 tracing = "0.1"
@@ -48,7 +49,7 @@ features = ["sync"]
 [workspace.dependencies.reqwest]
 version = "0.13"
 default-features = false
-features = ["json", "rustls", "http2", "multipart"]
+features = ["json", "rustls", "http2", "multipart", "stream"]
 
 [workspace.dependencies.serde]
 version = "1"

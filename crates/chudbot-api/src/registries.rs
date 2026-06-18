@@ -21,8 +21,10 @@
 
 use std::future::Future;
 
+use futures::Stream;
+
 use crate::ids::{ChannelRef, MessageRef, PlatformName, ProviderName, VideoJobId};
-use crate::llm::{ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest};
+use crate::llm::{ModelInfo, ModelInfoRequest, ModelStepEvent, ModelStepRequest};
 use crate::media::{
     AudioTranscription, AudioTranscriptionRequest, GeneratedImage, ImageRequest, VideoJobStatus,
     VideoRequest,
@@ -59,11 +61,11 @@ pub trait LlmProviderRegistry: Clone + Send + Sync {
     /// The request is already provider-neutral and contains the model id,
     /// transcript, client/server tool allowances, sampling options, and opaque
     /// provider options for the selected backend.
-    fn step(
-        &self,
-        provider: &ProviderName,
+    fn step<'a>(
+        &'a self,
+        provider: &'a ProviderName,
         request: ModelStepRequest,
-    ) -> impl Future<Output = Result<ModelStep, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + 'a;
 
     /// Fetch model metadata from a named provider, when supported.
     ///

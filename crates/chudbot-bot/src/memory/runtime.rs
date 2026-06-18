@@ -16,7 +16,7 @@ use chudbot_api::{
     Agent, AgentOutcome, AgentRun, BotStorage, LlmProviderRegistry, MediaStore,
     MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, Model, ModelId,
     NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NoClientTools, Transcript, UsageRecord,
-    UserMemoryJob,
+    UserMemoryJob, collect_agent_run,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -484,8 +484,7 @@ where
             agent_config.spec.clone(),
             NoClientTools,
         );
-        let run = agent
-            .run(transcript)
+        let run = collect_agent_run(agent.run(transcript))
             .await
             .map_err(|error| MemoryError::Model(error.to_string()))?;
         memory_model_output(run, &agent_config.model.id)

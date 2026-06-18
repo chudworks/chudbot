@@ -194,6 +194,17 @@ pub enum ModelStepKind {
     ClientTools,
 }
 
+impl ModelStepKind {
+    /// Stable label for logging, storage, and diagnostics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Final => "final",
+            Self::Continue => "continue",
+            Self::ClientTools => "client_tools",
+        }
+    }
+}
+
 /// Turn metadata for one user message.
 ///
 /// Turn ordering has two axes: [`Self::ordinal`] tracks user-message arrival,

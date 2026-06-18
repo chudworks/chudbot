@@ -6,7 +6,7 @@
 //! transcript blocks are lowered into Chat Completions messages, client tools
 //! are exposed as function tools, backend-specific request extensions are
 //! merged into the JSON body, and provider responses are normalized back into
-//! [`ModelStep`] values for the shared agent loop.
+//! [`ModelStepEvent`] values for the shared agent loop.
 //!
 //! Compatibility hosts vary more than the OpenAI surface suggests. Keep parsing
 //! permissive, preserve raw usage/model metadata where possible, and prefer
@@ -18,30 +18,24 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use chudbot_api::reasoning::TurnReasoning;
 use chudbot_api::{
-    AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
-    ContentBlock, LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest, ModelStep,
-    ModelStepRequest, ProviderContinuation, ProviderName, ToolInputSchema, ToolName, ToolUseId,
-    Transcript, TurnRole, UsageRecord, UsageSubject,
+    ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
+    LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta, ModelStepEvent,
+    ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName, ToolInputSchema, ToolName,
+    ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject, reasoning_items_to_delta_events,
 };
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{OpenAiCompatClient, OpenAiCompatError};
 
-impl LlmBackend for OpenAiCompatClient {
-    type Error = OpenAiCompatError;
-
-    fn backend_name(&self) -> &ProviderName {
-        self.provider_name()
-    }
-
-    #[tracing::instrument(
-        name = "openai_compat.step",
-        skip_all,
-        fields(model = %request.model)
-    )]
-    async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
+impl OpenAiCompatClient {
+    async fn step_output(
+        &self,
+        request: ModelStepRequest,
+    ) -> Result<OpenAiCompatStepOutput, OpenAiCompatError> {
         // Build the provider request in Chat Completions terms while preserving
         // the shared agent-loop semantics: transcript, client tools, sampling,
         // and opaque provider options all come from the already-shaped request.
@@ -108,25 +102,84 @@ impl LlmBackend for OpenAiCompatClient {
             choice.message.reasoning_content.as_deref(),
         );
 
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
-        }
-
-        let step = AssistantStep {
-            content,
-            client_tool_calls,
-            server_tool_uses: Vec::new(),
-            grounding: Vec::new(),
+        let kind = if client_tool_calls.is_empty() {
+            ModelStepKind::Final
+        } else {
+            ModelStepKind::ClientTools
+        };
+        Ok(OpenAiCompatStepOutput {
             model_id,
+            kind,
+            text,
+            client_tool_calls,
             continuation,
             usage: usage.into_iter().collect(),
-        };
+        })
+    }
+}
 
-        if !step.client_tool_calls.is_empty() {
-            Ok(ModelStep::UseClientTools { step })
-        } else {
-            Ok(ModelStep::Final { step })
+#[derive(Debug)]
+struct OpenAiCompatStepOutput {
+    model_id: ModelId,
+    kind: ModelStepKind,
+    text: String,
+    client_tool_calls: Vec<ClientToolCall>,
+    continuation: Option<ProviderContinuation>,
+    usage: Vec<UsageRecord>,
+}
+
+impl LlmBackend for OpenAiCompatClient {
+    type Error = OpenAiCompatError;
+
+    fn backend_name(&self) -> &ProviderName {
+        self.provider_name()
+    }
+
+    #[tracing::instrument(
+        name = "openai_compat.step",
+        skip_all,
+        fields(model = %request.model)
+    )]
+    fn step(
+        &self,
+        request: ModelStepRequest,
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+        async_stream::try_stream! {
+            let output = self.step_output(request).await?;
+            let model_id = output.model_id;
+            let kind = output.kind;
+            if !output.text.is_empty() {
+                yield ModelStepEvent::Delta(ModelStepDelta::Text {
+                    item_id: "openai_compat_text:0".to_string(),
+                    delta: output.text,
+                });
+            }
+            for (index, call) in output.client_tool_calls.into_iter().enumerate() {
+                yield ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                    item_id: format!("openai_compat_tool:{index}"),
+                    id: call.id,
+                    name: Some(call.name),
+                    arguments_delta: call.input.to_string(),
+                });
+            }
+            if let Some(continuation) = output.continuation {
+                for event in reasoning_items_to_delta_events(
+                    TurnReasoning::from_continuation_and_usage(
+                        Some(&continuation),
+                        Some(&model_id),
+                        &[],
+                    )
+                    .items,
+                    "openai_compat_reasoning",
+                ) {
+                    yield event;
+                }
+                yield ModelStepEvent::Continuation(continuation);
+            }
+            for usage in output.usage {
+                yield ModelStepEvent::Usage(usage);
+            }
+            yield ModelStepEvent::Finished { kind, model_id };
         }
     }
 

@@ -25,17 +25,23 @@
 //! - Provider-specific request knobs travel through [`ProviderOptions`].
 //!   Provider-specific replay state travels back through
 //!   [`ProviderContinuation`]. The API crate treats both as opaque JSON.
-//! - Client tools are executed by Chudbot code after a
-//!   [`ModelStep::UseClientTools`] response. Server tools and grounding metadata
+//! - Client tools are executed by Chudbot code after a model step with
+//!   [`ModelStepKind::ClientTools`]. Server tools and grounding metadata
 //!   are provider-owned trace data; they do not imply any client-furnished tool
 //!   result.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
+pub(crate) use crate::collector::ModelStepCollector;
+pub use crate::collector::{ModelStepCollectionError, ModelStepReducerError, collect_model_step};
+
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ModelId, ProviderName, ToolName};
+use crate::reasoning::ReasoningItem;
+use crate::storage::ModelStepKind;
 use crate::tool::{ClientToolCall, ClientToolSpec, GroundingMetadata, ServerToolUse};
 use crate::transcript::{ContentBlock, ProviderContinuation, Transcript};
 use crate::usage::UsageRecord;
@@ -60,17 +66,18 @@ pub trait LlmBackend: Send + Sync {
     /// Provider name used for tracing, continuation ownership, and audit data.
     fn backend_name(&self) -> &ProviderName;
 
-    /// Execute one model round trip and return the agent-loop control decision.
+    /// Execute one model round trip and stream normalized provider events.
     ///
     /// A provider adapter is responsible for translating transcripts, client
     /// tool specs, server-tool names, sampling, and provider options into the
-    /// provider's native request format. The returned [`ModelStep`] must contain
-    /// normalized tool, grounding, continuation, and usage data for the rest of
-    /// the bot to persist without understanding provider wire formats.
+    /// provider's native request format. The returned stream must finish with
+    /// one [`ModelStepEvent::Finished`] event so the agent loop can reduce the
+    /// event stream into a [`ModelStep`] for persistence and compatibility
+    /// callers.
     fn step(
         &self,
         request: ModelStepRequest,
-    ) -> impl Future<Output = Result<ModelStep, Self::Error>> + Send;
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_;
 
     /// Fetch provider-reported metadata for one model, when supported.
     ///
@@ -139,7 +146,7 @@ pub struct ModelStepRequest {
     ///
     /// Providers serialize these into their function/tool declaration format.
     /// Actual execution stays outside provider crates and only happens if the
-    /// response is [`ModelStep::UseClientTools`].
+    /// response has [`ModelStepKind::ClientTools`].
     pub client_tools: BTreeMap<ToolName, ClientToolSpec>,
     /// Provider-side/server-side tools available for the provider to run.
     ///
@@ -183,71 +190,305 @@ pub struct ModelInfo {
     pub raw: Option<serde_json::Value>,
 }
 
-/// Agent-loop decision returned by one provider round trip.
+/// Agent-loop decision collected from one provider round trip.
 ///
-/// A provider adapter should return exactly one variant per request. The shared
-/// [`AssistantStep`] payload carries any assistant content, client tool calls,
-/// server-tool traces, grounding metadata, continuation state, and usage emitted
-/// by that round trip.
+/// A provider adapter must finish each streamed step with exactly one terminal
+/// kind. The shared [`ModelStepOutput`] payload carries the ordered provider
+/// items and usage emitted during that round trip.
 #[derive(Debug, Clone)]
-pub enum ModelStep {
-    /// Final assistant answer for the current agent run.
-    ///
-    /// The agent persists trace and usage data, appends the assistant content to
-    /// the transcript, and stops iterating.
-    Final {
-        /// Assistant step data. `client_tool_calls` should be empty.
-        step: AssistantStep,
-    },
-    /// Assistant requested client-side tools that Chudbot must execute.
-    ///
-    /// The agent appends this assistant step, executes the requested client
-    /// tools through its tool executor, appends tool results as a user turn, and
-    /// asks the backend for another step.
-    UseClientTools {
-        /// Assistant step data. `client_tool_calls` should be non-empty.
-        step: AssistantStep,
-    },
-    /// Provider returned useful continuation/usage/server-tool state but no
-    /// client tools and no user-visible answer yet. The agent loop should
-    /// append the continuation and call the provider again, bounded by its
-    /// iteration limits.
-    Continue {
-        /// Assistant step data.
-        step: AssistantStep,
-    },
+pub struct ModelStep {
+    /// Terminal kind for this model step.
+    pub kind: ModelStepKind,
+    /// Collected provider output.
+    pub output: ModelStepOutput,
 }
 
-/// Provider response data shared by all [`ModelStep`] outcomes.
+impl ModelStep {
+    /// Build a collected step from its terminal kind and output.
+    pub fn new(kind: ModelStepKind, output: ModelStepOutput) -> Self {
+        Self { kind, output }
+    }
+
+    /// Terminal kind for this model step.
+    pub fn kind(&self) -> ModelStepKind {
+        self.kind
+    }
+
+    /// Borrow the collected output.
+    pub fn output(&self) -> &ModelStepOutput {
+        &self.output
+    }
+
+    /// Consume the step and return its collected output.
+    pub fn into_output(self) -> ModelStepOutput {
+        self.output
+    }
+}
+
+/// Ordered provider response data shared by all [`ModelStep`] outcomes.
 ///
-/// Provider adapters normalize native responses into this struct before the
-/// agent loop decides what to do next. Fields here are also the source for
-/// persisted model-step traces, tool traces, continuation replay, and usage
-/// accounting.
+/// Provider adapters normalize native responses into ordered items before the
+/// agent loop decides what to do next. Transcript blocks are the only items the
+/// agent appends to [`Transcript`]; reasoning, server tools, grounding, and
+/// usage are trace metadata.
 #[derive(Debug, Clone)]
-pub struct AssistantStep {
-    /// Assistant content blocks emitted before any client tool calls.
-    ///
-    /// For final steps these blocks become the user-visible answer. For
-    /// non-final steps they are preserved in the transcript so the provider can
-    /// continue from the exact assistant state it emitted.
-    pub content: Vec<ContentBlock>,
-    /// Client-side tool calls requested by the model for Chudbot to execute.
-    pub client_tool_calls: Vec<ClientToolCall>,
-    /// Server-side provider tools already run during this step. These do not
-    /// produce client-furnished results.
-    pub server_tool_uses: Vec<ServerToolUse>,
-    /// Provider grounding/citation metadata not tied to a client tool result.
-    pub grounding: Vec<GroundingMetadata>,
+pub struct ModelStepOutput {
     /// Actual model id reported by the provider for this step.
     ///
     /// Providers may return aliases, dated variants, or deployment-specific
     /// identifiers that differ from the requested [`ModelStepRequest::model`].
     pub model_id: ModelId,
-    /// Opaque continuation to replay only to the provider that emitted it.
-    pub continuation: Option<ProviderContinuation>,
+    /// Ordered provider output items.
+    pub items: Vec<ModelStepItem>,
     /// Usage/cost reported for this model step.
     pub usage: Vec<UsageRecord>,
+}
+
+impl ModelStepOutput {
+    /// Build an empty collected output for a concrete model id.
+    pub fn new(model_id: ModelId) -> Self {
+        Self {
+            model_id,
+            items: Vec::new(),
+            usage: Vec::new(),
+        }
+    }
+
+    /// Model-facing output blocks emitted by this step.
+    fn output_blocks(&self) -> impl Iterator<Item = &ModelOutputBlock> {
+        self.items.iter().filter_map(|item| match item {
+            ModelStepItem::OutputBlock(block) => Some(block),
+            ModelStepItem::Reasoning(_)
+            | ModelStepItem::ServerToolUse(_)
+            | ModelStepItem::Grounding(_) => None,
+        })
+    }
+
+    /// Model-facing transcript blocks emitted by this step.
+    pub fn transcript_blocks(&self) -> impl Iterator<Item = ContentBlock> + '_ {
+        self.output_blocks()
+            .cloned()
+            .map(ModelOutputBlock::into_content_block)
+    }
+
+    /// Final answer blocks, excluding tool calls and provider continuations.
+    pub fn answer_blocks(&self) -> Vec<ContentBlock> {
+        self.output_blocks()
+            .filter_map(|block| match block {
+                ModelOutputBlock::Text { .. } => Some(block.clone().into_content_block()),
+                ModelOutputBlock::ClientToolCall(_) | ModelOutputBlock::Continuation(_) => None,
+            })
+            .collect()
+    }
+
+    /// Client-side tool calls requested by the model.
+    pub fn client_tool_calls(&self) -> impl Iterator<Item = &ClientToolCall> {
+        self.output_blocks().filter_map(|block| match block {
+            ModelOutputBlock::ClientToolCall(call) => Some(call),
+            ModelOutputBlock::Text { .. } | ModelOutputBlock::Continuation(_) => None,
+        })
+    }
+
+    /// Viewer-safe reasoning summary metadata.
+    pub fn reasoning(&self) -> impl Iterator<Item = &ReasoningItem> {
+        self.items.iter().filter_map(|item| match item {
+            ModelStepItem::Reasoning(reasoning) => Some(reasoning),
+            ModelStepItem::OutputBlock(_)
+            | ModelStepItem::ServerToolUse(_)
+            | ModelStepItem::Grounding(_) => None,
+        })
+    }
+
+    /// Provider-owned server-side tool activity.
+    pub fn server_tool_uses(&self) -> impl Iterator<Item = &ServerToolUse> {
+        self.items.iter().filter_map(|item| match item {
+            ModelStepItem::ServerToolUse(tool) => Some(tool),
+            ModelStepItem::OutputBlock(_)
+            | ModelStepItem::Reasoning(_)
+            | ModelStepItem::Grounding(_) => None,
+        })
+    }
+
+    /// Provider grounding/citation metadata.
+    pub fn grounding(&self) -> impl Iterator<Item = &GroundingMetadata> {
+        self.items.iter().filter_map(|item| match item {
+            ModelStepItem::Grounding(metadata) => Some(metadata),
+            ModelStepItem::OutputBlock(_)
+            | ModelStepItem::Reasoning(_)
+            | ModelStepItem::ServerToolUse(_) => None,
+        })
+    }
+
+    /// Last provider continuation emitted in transcript-visible output.
+    pub fn continuation(&self) -> Option<&ProviderContinuation> {
+        self.output_blocks()
+            .filter_map(|block| match block {
+                ModelOutputBlock::Continuation(continuation) => Some(continuation),
+                ModelOutputBlock::Text { .. } | ModelOutputBlock::ClientToolCall(_) => None,
+            })
+            .last()
+    }
+
+    /// Concatenate text transcript blocks for user-facing answer text.
+    pub fn answer_text(&self) -> String {
+        let mut text = String::new();
+        for block in self.output_blocks() {
+            if let ModelOutputBlock::Text { text: block_text } = block {
+                text.push_str(block_text);
+            }
+        }
+        text
+    }
+}
+
+/// One model-facing output block emitted by a provider/model step.
+///
+/// This is intentionally narrower than [`ContentBlock`]: providers may emit
+/// assistant text, client-tool-call intents, and provider continuations, but
+/// only the agent runtime can append client-tool results or tool-result media.
+#[derive(Debug, Clone)]
+pub enum ModelOutputBlock {
+    /// Plain UTF-8 assistant text.
+    Text {
+        /// Text fragment or completed text block.
+        text: String,
+    },
+    /// Assistant-requested client tool invocation.
+    ClientToolCall(ClientToolCall),
+    /// Opaque provider continuation state.
+    Continuation(ProviderContinuation),
+}
+
+impl ModelOutputBlock {
+    /// Convert this model-output block to the transcript block replayed later.
+    pub fn into_content_block(self) -> ContentBlock {
+        match self {
+            Self::Text { text } => ContentBlock::Text { text },
+            Self::ClientToolCall(call) => ContentBlock::ClientToolCall(call),
+            Self::Continuation(continuation) => ContentBlock::Continuation(continuation),
+        }
+    }
+}
+
+/// One ordered item emitted by a model step.
+#[derive(Debug, Clone)]
+pub enum ModelStepItem {
+    /// Model-facing output that can be appended to the assistant transcript turn.
+    OutputBlock(ModelOutputBlock),
+    /// Viewer-safe reasoning summary metadata.
+    Reasoning(ReasoningItem),
+    /// Provider-owned hosted/server-side tool activity.
+    ServerToolUse(ServerToolUse),
+    /// Provider-owned citation or grounding metadata.
+    Grounding(GroundingMetadata),
+}
+
+/// Stream event emitted by one provider/model round trip.
+#[derive(Debug, Clone)]
+pub enum ModelStepEvent {
+    /// Delta for one ordered output item.
+    Delta(ModelStepDelta),
+    /// Opaque provider continuation state.
+    Continuation(ProviderContinuation),
+    /// Provider-owned hosted/server-side tool activity.
+    ServerToolUse(ServerToolUse),
+    /// Provider-owned citation or grounding metadata.
+    Grounding(GroundingMetadata),
+    /// Usage/cost reported by the provider for this step.
+    Usage(UsageRecord),
+    /// Terminal control-flow classification for this provider step.
+    Finished {
+        /// Terminal kind.
+        kind: ModelStepKind,
+        /// Actual model id reported by the provider for this step.
+        model_id: ModelId,
+    },
+}
+
+impl ModelStepEvent {
+    /// Stable kind label for logging and diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Delta(delta) => delta.kind(),
+            Self::Continuation(_) => "continuation",
+            Self::ServerToolUse(_) => "server_tool_use",
+            Self::Grounding(_) => "grounding",
+            Self::Usage(_) => "usage",
+            Self::Finished { .. } => "finished",
+        }
+    }
+}
+
+/// Streaming delta for one model-step item.
+#[derive(Debug, Clone)]
+pub enum ModelStepDelta {
+    /// Text delta for one assistant transcript block.
+    Text {
+        /// Provider or adapter item id for ordering and accumulation.
+        item_id: String,
+        /// Text fragment.
+        delta: String,
+    },
+    /// Reasoning-summary delta.
+    ReasoningSummary {
+        /// Provider or adapter item id for ordering and accumulation.
+        item_id: String,
+        /// Provider that emitted this reasoning item.
+        provider: ProviderName,
+        /// Provider-specific summary kind, if any.
+        kind: Option<String>,
+        /// Summary text fragment.
+        delta: String,
+    },
+    /// Client-tool-call delta.
+    ClientToolCall {
+        /// Provider or adapter item id for ordering and accumulation.
+        item_id: String,
+        /// Stable tool-use id.
+        id: crate::ids::ToolUseId,
+        /// Tool name, when known for this delta.
+        name: Option<ToolName>,
+        /// JSON argument fragment.
+        arguments_delta: String,
+    },
+}
+
+impl ModelStepDelta {
+    /// Stable kind label for logging and diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Text { .. } => "delta.text",
+            Self::ReasoningSummary { .. } => "delta.reasoning_summary",
+            Self::ClientToolCall { .. } => "delta.client_tool_call",
+        }
+    }
+}
+
+/// Convert completed reasoning items into delta events for providers that only
+/// expose reasoning after the terminal response is known.
+pub fn reasoning_items_to_delta_events(
+    items: impl IntoIterator<Item = ReasoningItem>,
+    fallback_prefix: &str,
+) -> Vec<ModelStepEvent> {
+    let mut events = Vec::new();
+    for (item_index, item) in items.into_iter().enumerate() {
+        let item_id = item
+            .id
+            .clone()
+            .unwrap_or_else(|| format!("{fallback_prefix}:{item_index}"));
+        for summary in item.summary {
+            if summary.text.is_empty() {
+                continue;
+            }
+            events.push(ModelStepEvent::Delta(ModelStepDelta::ReasoningSummary {
+                item_id: item_id.clone(),
+                provider: item.provider.clone(),
+                kind: summary.kind,
+                delta: summary.text,
+            }));
+        }
+    }
+    events
 }
 
 /// Provider-neutral sampling knobs shared by model providers.

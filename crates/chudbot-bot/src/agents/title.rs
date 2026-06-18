@@ -197,8 +197,7 @@ where
         let mut transcript = Transcript::new();
         transcript.push(TranscriptTurn::text(TurnRole::User, user_text));
         let agent_runtime = self.system_agent(agent);
-        let run = agent_runtime
-            .run(transcript)
+        let run = collect_agent_run(agent_runtime.run(transcript))
             .await
             .map_err(|error| BotError::Model {
                 message: error.to_string(),

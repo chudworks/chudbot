@@ -16,11 +16,12 @@
 use chudbot_api::{
     AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
     GeneratedImage, ImageGenerator, ImageGeneratorRegistry, ImageRequest, LlmBackend,
-    LlmProviderRegistry, ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest,
+    LlmProviderRegistry, ModelId, ModelInfo, ModelInfoRequest, ModelStepEvent, ModelStepRequest,
     ProviderName, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
 };
+use futures::{Stream, TryStreamExt};
 
-use crate::model_step_kind;
+use crate::model_step_kind_from_event;
 
 /// `LlmBackend` adapter for one configured provider inside a registry.
 ///
@@ -68,19 +69,22 @@ where
             server_tools = request.server_tools.len(),
         )
     )]
-    async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
+    fn step(
+        &self,
+        request: ModelStepRequest,
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
         // Step 1: keep LLM request shaping owned by the caller's model config.
         tracing::debug!("dispatching model step through provider registry");
 
         // Step 2: route the request to the configured provider.
-        let result = self.registry.step(&self.provider, request).await;
-
-        // Step 3: record a provider-neutral outcome without consuming it.
-        match &result {
-            Ok(step) => tracing::debug!(outcome = model_step_kind(step), "model step completed"),
-            Err(error) => tracing::warn!(error = %error, "model step failed"),
-        }
-        result
+        self.registry
+            .step(&self.provider, request)
+            .inspect_ok(|event| {
+                if let Some(kind) = model_step_kind_from_event(event) {
+                    tracing::debug!(outcome = kind, "model step completed");
+                }
+            })
+            .inspect_err(|error| tracing::warn!(error = %error, "model step failed"))
     }
 
     #[tracing::instrument(

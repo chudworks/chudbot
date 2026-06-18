@@ -13,7 +13,7 @@ use chudbot_api::{
     AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
     BoxedMediaRef, CreateMedia, GeneratedImage, ImageGenerator, ImageGeneratorRegistry,
     ImageRequest, LlmBackend, LlmProviderRegistry, MediaCategory, MediaError, MediaStore, MediaUri,
-    ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest, ProviderName,
+    ModelId, ModelInfo, ModelInfoRequest, ModelStepEvent, ModelStepRequest, ProviderName,
     VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
@@ -21,6 +21,7 @@ use chudbot_asset_s3::S3MediaStore;
 use chudbot_bot::BotRuntimeTypes;
 use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::{EventBus, WebConfig, WebRuntimeTypes};
+use futures::{Stream, StreamExt, TryStreamExt};
 use moka::future::Cache;
 use serde_json::json;
 
@@ -428,45 +429,47 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
         skip_all,
         fields(provider = %provider, model = %request.model)
     )]
-    async fn step(
-        &self,
-        provider: &ProviderName,
+    fn step<'a>(
+        &'a self,
+        provider: &'a ProviderName,
         request: ModelStepRequest,
-    ) -> Result<ModelStep, Self::Error> {
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + 'a {
         // Agents call through `RoutedLlmBackend`; by this point the provider
         // name is the route key and the request shape is already final.
         if let Some(client) = self.inner.anthropic.get(provider) {
             tracing::debug!(kind = "anthropic", "dispatching model step");
             return LlmBackend::step(client, request)
-                .await
-                .map_err(ConfiguredLlmError::Anthropic);
+                .map_err(ConfiguredLlmError::Anthropic)
+                .boxed();
         }
         if let Some(client) = self.inner.openai.get(provider) {
             tracing::debug!(kind = "openai", "dispatching model step");
             return LlmBackend::step(client, request)
-                .await
-                .map_err(ConfiguredLlmError::OpenAi);
+                .map_err(ConfiguredLlmError::OpenAi)
+                .boxed();
         }
         if let Some(client) = self.inner.openai_compat.get(provider) {
             tracing::debug!(kind = "openai_compat", "dispatching model step");
             return LlmBackend::step(client, request)
-                .await
-                .map_err(ConfiguredLlmError::OpenAiCompat);
+                .map_err(ConfiguredLlmError::OpenAiCompat)
+                .boxed();
         }
         if let Some(client) = self.inner.gemini.get(provider) {
             tracing::debug!(kind = "gemini", "dispatching model step");
             return LlmBackend::step(client, request)
-                .await
-                .map_err(ConfiguredLlmError::Gemini);
+                .map_err(ConfiguredLlmError::Gemini)
+                .boxed();
         }
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching model step");
             return LlmBackend::step(client, request)
-                .await
-                .map_err(ConfiguredLlmError::Xai);
+                .map_err(ConfiguredLlmError::Xai)
+                .boxed();
         }
+
         tracing::warn!("requested provider is missing from registry");
-        Err(ConfiguredLlmError::Missing(provider.clone()))
+        futures::stream::once(async move { Err(ConfiguredLlmError::Missing(provider.clone())) })
+            .boxed()
     }
 
     #[tracing::instrument(

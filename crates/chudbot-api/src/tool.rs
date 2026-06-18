@@ -394,6 +394,16 @@ pub enum ClientToolResultContent {
     },
 }
 
+impl ClientToolResultContent {
+    /// Stable kind label for logging and diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Json { .. } => "json",
+            Self::Text { .. } => "text",
+        }
+    }
+}
+
 /// Output from a client-side tool executor.
 ///
 /// This is the runtime-only shape returned by tool implementations before the

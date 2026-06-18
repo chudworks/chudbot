@@ -2,21 +2,26 @@
 //!
 //! This module owns the translation between `Transcript` turns and Anthropic
 //! Messages request blocks, then maps Anthropic response blocks back into
-//! `AssistantStep` content, client tool calls, server tool usage, grounding,
-//! continuation state, and token usage. Provider-specific wire shapes stay here
-//! so the rest of the bot can operate on `chudbot-api` types.
+//! ordered model-step output containing content, client tool calls, server tool
+//! usage, grounding, continuation state, and token usage. Provider-specific
+//! wire shapes stay here so the rest of the bot can operate on `chudbot-api`
+//! types.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
+use chudbot_api::reasoning::TurnReasoning;
+use chudbot_api::sse::{ServerSentEvent, SseDecoder};
 use chudbot_api::{
-    AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
-    ContentBlock, GroundingMetadata, LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest,
-    ModelStep, ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
-    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
+    GroundingMetadata, LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta,
+    ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
+    ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole,
+    UsageRecord, UsageSubject, reasoning_items_to_delta_events,
 };
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -27,25 +32,15 @@ const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 4096;
 const WEB_SEARCH_TOOL_TYPE: &str = "web_search_20250305";
 const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
-impl LlmBackend for AnthropicClient {
-    type Error = AnthropicError;
-
-    fn backend_name(&self) -> &ProviderName {
-        self.provider_name()
-    }
-
-    #[tracing::instrument(name = "anthropic.step", skip_all, fields(model = %request.model))]
-    async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
-        // Build Anthropic's request shape first; the response parser below
-        // mirrors this split so transport errors stay separate from mapping
-        // provider blocks back into the bot's agent-loop model.
+impl AnthropicClient {
+    async fn build_step_body(&self, request: &ModelStepRequest) -> Result<Value, AnthropicError> {
         let (system, mut messages) =
             to_anthropic_messages(&request.transcript, self.provider_name()).await?;
         mark_last_block_ephemeral(&mut messages);
 
         let tools = build_messages_tools(&request.client_tools, &request.server_tools);
-        let options = AnthropicOptions::from_request(&request);
-        let body = serde_json::to_value(AnthropicRequest {
+        let options = AnthropicOptions::from_request(request);
+        serde_json::to_value(AnthropicRequest {
             model: request.model.as_str(),
             max_tokens: request
                 .sampling
@@ -58,52 +53,83 @@ impl LlmBackend for AnthropicClient {
             top_p: request.sampling.top_p,
             thinking: options.thinking.as_ref(),
             effort: options.effort.as_deref(),
+            stream: true,
         })
-        .map_err(|e| AnthropicError::Decode(e.to_string()))?;
+        .map_err(|e| AnthropicError::Decode(e.to_string()))
+    }
+}
 
-        let started = Instant::now();
-        let parsed: AnthropicResponse =
-            self.post_json("/messages", &body, "llm[anthropic]").await?;
-        let model_id = parsed
-            .model
-            .as_deref()
-            .map(ModelId::new)
-            .unwrap_or_else(|| request.model.clone());
-        let usage = usage_from_anthropic(
-            self.provider_name(),
-            Some(model_id.clone()),
-            UsageSubject::ModelStep,
-            parsed.usage.as_ref(),
-            self.pricing(),
-        );
-        log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
+impl LlmBackend for AnthropicClient {
+    type Error = AnthropicError;
 
-        // Anthropic interleaves text, client tools, server tools, and citations
-        // in one content array. Keep the raw array as the provider continuation
-        // so pause_turn and server-tool flows can be replayed exactly.
-        let (text, client_tool_calls, server_tool_uses, grounding) =
-            walk_blocks(&parsed.content, self.provider_name());
-        let continuation = continuation_from_content(self.provider_name(), &parsed.content);
+    fn backend_name(&self) -> &ProviderName {
+        self.provider_name()
+    }
 
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
+    #[tracing::instrument(name = "anthropic.step", skip_all, fields(model = %request.model))]
+    fn step(
+        &self,
+        request: ModelStepRequest,
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+        async_stream::try_stream! {
+            let started = Instant::now();
+            let requested_model = request.model.clone();
+            let body = self.build_step_body(&request).await?;
+            let resp = self
+                .post_json_stream("/messages", &body, "llm[anthropic.stream]")
+                .await?;
+            let chunks = resp.bytes_stream();
+            futures::pin_mut!(chunks);
+            let mut decoder = SseDecoder::new();
+            let mut state = AnthropicStreamState::default();
+
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|error| AnthropicError::Transport(error.to_string()))?;
+                for event in decoder
+                    .push(&chunk)
+                    .map_err(|error| AnthropicError::Decode(error.to_string()))?
+                {
+                    let outcome = anthropic_stream_event(
+                        event,
+                        self.provider_name(),
+                        &requested_model,
+                        self.pricing(),
+                        started,
+                        &mut state,
+                    )?;
+                    for event in outcome.events {
+                        yield event;
+                    }
+                    if outcome.finished {
+                        return;
+                    }
+                }
+            }
+
+            if let Some(event) = decoder
+                .finish()
+                .map_err(|error| AnthropicError::Decode(error.to_string()))?
+            {
+                let outcome = anthropic_stream_event(
+                    event,
+                    self.provider_name(),
+                    &requested_model,
+                    self.pricing(),
+                    started,
+                    &mut state,
+                )?;
+                for event in outcome.events {
+                    yield event;
+                }
+                if outcome.finished {
+                    return;
+                }
+            }
+
+            Err(AnthropicError::Decode(
+                "Anthropic stream ended without message_stop".to_string(),
+            ))?;
         }
-
-        let step = AssistantStep {
-            content,
-            client_tool_calls,
-            server_tool_uses,
-            grounding,
-            model_id,
-            continuation,
-            usage: usage.into_iter().collect(),
-        };
-
-        Ok(model_step_from_assistant_step(
-            step,
-            parsed.stop_reason.as_deref(),
-        ))
     }
 
     #[tracing::instrument(name = "anthropic.model_info", skip_all, fields(model = %request.model))]
@@ -115,6 +141,371 @@ impl LlmBackend for AnthropicClient {
         let raw: Value = self.get_json(&endpoint, "model_info[anthropic]").await?;
         Ok(Some(model_info_from_anthropic_model(request.model, raw)))
     }
+}
+
+#[derive(Debug, Default)]
+struct AnthropicStreamState {
+    model_id: Option<ModelId>,
+    stop_reason: Option<String>,
+    start_usage: Option<Value>,
+    latest_usage: Option<Value>,
+    blocks: BTreeMap<usize, AnthropicStreamBlock>,
+    emitted_text_delta: bool,
+    emitted_reasoning_delta: bool,
+}
+
+#[derive(Debug, Default)]
+struct AnthropicStreamBlock {
+    raw: Value,
+    input_json: String,
+    emitted_client_delta: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamEventOutcome {
+    events: Vec<ModelStepEvent>,
+    finished: bool,
+}
+
+fn anthropic_stream_event(
+    event: ServerSentEvent,
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    pricing: &AnthropicPricing,
+    started: Instant,
+    state: &mut AnthropicStreamState,
+) -> Result<StreamEventOutcome, AnthropicError> {
+    let value = serde_json::from_str::<Value>(&event.data).map_err(|error| {
+        AnthropicError::Decode(format!("failed to decode Anthropic SSE event: {error}"))
+    })?;
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .or(event.event.as_deref())
+        .unwrap_or("");
+
+    match event_type {
+        "message_start" => {
+            if let Some(message) = value.get("message") {
+                if let Some(model) = message.get("model").and_then(Value::as_str) {
+                    state.model_id = Some(ModelId::new(model));
+                }
+                if let Some(usage) = message.get("usage")
+                    && !usage.is_null()
+                {
+                    state.start_usage = Some(usage.clone());
+                }
+            }
+            Ok(StreamEventOutcome::default())
+        }
+        "content_block_start" => {
+            let Some(index) = stream_index(&value)? else {
+                return Ok(StreamEventOutcome::default());
+            };
+            let raw = value
+                .get("content_block")
+                .cloned()
+                .unwrap_or_else(|| json!({ "type": "unknown" }));
+            let mut events = Vec::new();
+            if raw.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = raw.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                state.emitted_text_delta = true;
+                events.push(ModelStepEvent::Delta(ModelStepDelta::Text {
+                    item_id: format!("anthropic_text:{index}"),
+                    delta: text.to_string(),
+                }));
+            }
+            state.blocks.insert(
+                index,
+                AnthropicStreamBlock {
+                    raw,
+                    input_json: String::new(),
+                    emitted_client_delta: false,
+                },
+            );
+            Ok(StreamEventOutcome {
+                events,
+                finished: false,
+            })
+        }
+        "content_block_delta" => {
+            let Some(index) = stream_index(&value)? else {
+                return Ok(StreamEventOutcome::default());
+            };
+            let Some(delta) = value.get("delta") else {
+                return Ok(StreamEventOutcome::default());
+            };
+            let mut events = Vec::new();
+            let block = state
+                .blocks
+                .entry(index)
+                .or_insert_with(|| AnthropicStreamBlock {
+                    raw: json!({ "type": "unknown" }),
+                    input_json: String::new(),
+                    emitted_client_delta: false,
+                });
+            match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+                "text_delta" => {
+                    if let Some(text) = delta.get("text").and_then(Value::as_str)
+                        && !text.is_empty()
+                    {
+                        state.emitted_text_delta = true;
+                        append_string_field(&mut block.raw, "text", text);
+                        events.push(ModelStepEvent::Delta(ModelStepDelta::Text {
+                            item_id: format!("anthropic_text:{index}"),
+                            delta: text.to_string(),
+                        }));
+                    }
+                }
+                "input_json_delta" => {
+                    let partial = delta
+                        .get("partial_json")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    block.input_json.push_str(partial);
+                    if block.raw.get("type").and_then(Value::as_str) == Some("tool_use") {
+                        block.emitted_client_delta = true;
+                        events.push(ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                            item_id: format!("anthropic_tool:{index}"),
+                            id: ToolUseId::new(
+                                block.raw.get("id").and_then(Value::as_str).unwrap_or(""),
+                            ),
+                            name: block
+                                .raw
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .map(ToolName::new),
+                            arguments_delta: partial.to_string(),
+                        }));
+                    }
+                }
+                "thinking_delta" => {
+                    if let Some(thinking) = delta.get("thinking").and_then(Value::as_str)
+                        && !thinking.is_empty()
+                    {
+                        state.emitted_reasoning_delta = true;
+                        append_string_field(&mut block.raw, "thinking", thinking);
+                        events.push(ModelStepEvent::Delta(ModelStepDelta::ReasoningSummary {
+                            item_id: format!("anthropic_reasoning:{index}"),
+                            provider: provider.clone(),
+                            kind: Some("thinking".to_string()),
+                            delta: thinking.to_string(),
+                        }));
+                    }
+                }
+                "signature_delta" => {
+                    if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                        set_field(
+                            &mut block.raw,
+                            "signature",
+                            Value::String(signature.to_string()),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            Ok(StreamEventOutcome {
+                events,
+                finished: false,
+            })
+        }
+        "content_block_stop" => {
+            let Some(index) = stream_index(&value)? else {
+                return Ok(StreamEventOutcome::default());
+            };
+            let events = state
+                .blocks
+                .get_mut(&index)
+                .map(|block| finish_anthropic_block(index, block))
+                .transpose()?
+                .unwrap_or_default();
+            Ok(StreamEventOutcome {
+                events,
+                finished: false,
+            })
+        }
+        "message_delta" => {
+            if let Some(delta) = value.get("delta")
+                && let Some(stop_reason) = delta.get("stop_reason").and_then(Value::as_str)
+            {
+                state.stop_reason = Some(stop_reason.to_string());
+            }
+            if let Some(usage) = value.get("usage")
+                && !usage.is_null()
+            {
+                state.latest_usage = Some(usage.clone());
+            }
+            Ok(StreamEventOutcome::default())
+        }
+        "message_stop" => {
+            let events =
+                anthropic_terminal_events(provider, requested_model, pricing, started, state);
+            Ok(StreamEventOutcome {
+                events,
+                finished: true,
+            })
+        }
+        "error" => Err(AnthropicError::Decode(provider_error_message(
+            &value,
+            "Anthropic stream returned an error event",
+        ))),
+        "ping" => Ok(StreamEventOutcome::default()),
+        _ => Ok(StreamEventOutcome::default()),
+    }
+}
+
+fn stream_index(value: &Value) -> Result<Option<usize>, AnthropicError> {
+    value
+        .get("index")
+        .and_then(Value::as_u64)
+        .map(|index| {
+            usize::try_from(index).map_err(|_| {
+                AnthropicError::Decode(format!("Anthropic content index `{index}` is too large"))
+            })
+        })
+        .transpose()
+}
+
+fn finish_anthropic_block(
+    index: usize,
+    block: &mut AnthropicStreamBlock,
+) -> Result<Vec<ModelStepEvent>, AnthropicError> {
+    let mut events = Vec::new();
+    if !block.input_json.trim().is_empty() {
+        let input = serde_json::from_str::<Value>(&block.input_json).map_err(|error| {
+            AnthropicError::Decode(format!(
+                "failed to decode Anthropic input JSON delta for block {index}: {error}"
+            ))
+        })?;
+        set_field(&mut block.raw, "input", input);
+    }
+    if block.raw.get("type").and_then(Value::as_str) == Some("tool_use")
+        && !block.emitted_client_delta
+    {
+        let input = block.raw.get("input").cloned().unwrap_or_else(|| json!({}));
+        let arguments = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
+        events.push(ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+            item_id: format!("anthropic_tool:{index}"),
+            id: ToolUseId::new(block.raw.get("id").and_then(Value::as_str).unwrap_or("")),
+            name: block
+                .raw
+                .get("name")
+                .and_then(Value::as_str)
+                .map(ToolName::new),
+            arguments_delta: arguments,
+        }));
+    }
+    Ok(events)
+}
+
+fn anthropic_terminal_events(
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    pricing: &AnthropicPricing,
+    started: Instant,
+    state: &AnthropicStreamState,
+) -> Vec<ModelStepEvent> {
+    let model_id = state
+        .model_id
+        .clone()
+        .unwrap_or_else(|| requested_model.clone());
+    let usage_raw = merged_anthropic_usage(state);
+    let usage = usage_from_anthropic(
+        provider,
+        Some(model_id.clone()),
+        UsageSubject::ModelStep,
+        usage_raw.as_ref(),
+        pricing,
+    );
+    log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
+
+    let content = state
+        .blocks
+        .values()
+        .map(|block| block.raw.clone())
+        .collect::<Vec<_>>();
+    let (text, client_tool_calls, server_tool_uses, grounding) = walk_blocks(&content, provider);
+    let kind = if !client_tool_calls.is_empty() {
+        ModelStepKind::ClientTools
+    } else if state.stop_reason.as_deref() == Some("pause_turn") || text.is_empty() {
+        ModelStepKind::Continue
+    } else {
+        ModelStepKind::Final
+    };
+    let continuation = continuation_from_content(provider, &content);
+
+    let mut events = Vec::new();
+    if !state.emitted_text_delta && !text.is_empty() {
+        events.push(ModelStepEvent::Delta(ModelStepDelta::Text {
+            item_id: "anthropic_text:terminal".to_string(),
+            delta: text,
+        }));
+    }
+    if !state.emitted_reasoning_delta
+        && let Some(continuation) = continuation.as_ref()
+    {
+        events.extend(reasoning_items_to_delta_events(
+            TurnReasoning::from_continuation_and_usage(Some(continuation), Some(&model_id), &[])
+                .items,
+            "anthropic_reasoning",
+        ));
+    }
+    if let Some(continuation) = continuation {
+        events.push(ModelStepEvent::Continuation(continuation));
+    }
+    events.extend(
+        server_tool_uses
+            .into_iter()
+            .map(ModelStepEvent::ServerToolUse),
+    );
+    events.extend(grounding.into_iter().map(ModelStepEvent::Grounding));
+    events.extend(usage.into_iter().map(ModelStepEvent::Usage));
+    events.push(ModelStepEvent::Finished { kind, model_id });
+    events
+}
+
+fn merged_anthropic_usage(state: &AnthropicStreamState) -> Option<Value> {
+    let mut usage = state.start_usage.clone().unwrap_or_else(|| json!({}));
+    if let Some(latest) = &state.latest_usage
+        && let (Some(target), Some(source)) = (usage.as_object_mut(), latest.as_object())
+    {
+        for (key, value) in source {
+            target.insert(key.clone(), value.clone());
+        }
+    }
+    usage
+        .as_object()
+        .is_some_and(|map| !map.is_empty())
+        .then_some(usage)
+}
+
+fn append_string_field(value: &mut Value, field: &str, delta: &str) {
+    if let Value::Object(map) = value {
+        let entry = map
+            .entry(field.to_string())
+            .or_insert_with(|| Value::String(String::new()));
+        if let Value::String(text) = entry {
+            text.push_str(delta);
+        }
+    }
+}
+
+fn set_field(value: &mut Value, field: &str, next: Value) {
+    if let Value::Object(map) = value {
+        map.insert(field.to_string(), next);
+    }
+}
+
+fn provider_error_message(value: &Value, fallback: &str) -> String {
+    value
+        .get("error")
+        .and_then(|error| error.get("message").or_else(|| error.get("type")))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// Convert an Anthropic model document into Chudbot's optional model metadata.
@@ -431,14 +822,18 @@ fn continuation_from_content(
     })
 }
 
-/// Classify the assistant step for the provider-neutral agent loop.
-fn model_step_from_assistant_step(step: AssistantStep, stop_reason: Option<&str>) -> ModelStep {
-    if !step.client_tool_calls.is_empty() {
-        ModelStep::UseClientTools { step }
-    } else if stop_reason == Some("pause_turn") || step.content.is_empty() {
-        ModelStep::Continue { step }
+/// Classify the collected output for the provider-neutral agent loop.
+#[cfg(test)]
+fn model_step_from_output(
+    output: chudbot_api::ModelStepOutput,
+    stop_reason: Option<&str>,
+) -> chudbot_api::ModelStep {
+    if output.client_tool_calls().next().is_some() {
+        chudbot_api::ModelStep::new(ModelStepKind::ClientTools, output)
+    } else if stop_reason == Some("pause_turn") || output.answer_blocks().is_empty() {
+        chudbot_api::ModelStep::new(ModelStepKind::Continue, output)
     } else {
-        ModelStep::Final { step }
+        chudbot_api::ModelStep::new(ModelStepKind::Final, output)
     }
 }
 
@@ -613,6 +1008,7 @@ struct AnthropicRequest<'a> {
     thinking: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     effort: Option<&'a str>,
+    stream: bool,
 }
 
 /// Mark the newest content block as Anthropic's prompt-cache breakpoint.
@@ -624,19 +1020,6 @@ fn mark_last_block_ephemeral(messages: &mut [Value]) {
     {
         obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
     }
-}
-
-/// Minimal response shape needed from the Anthropic Messages API.
-#[derive(Deserialize)]
-struct AnthropicResponse {
-    #[serde(default)]
-    content: Vec<Value>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    stop_reason: Option<String>,
-    #[serde(default)]
-    usage: Option<Value>,
 }
 
 /// Anthropic usage payload with both legacy and detailed cache-write fields.
@@ -699,8 +1082,9 @@ impl CacheCreationUsage {
 mod tests {
     use chudbot_api::{
         ClientToolResult, ClientToolResultContent, LoadedMedia, MediaCategory, MediaMetadata,
-        MediaRef, MediaUri, ProviderName, PublicMediaUrl, ToolInputField, ToolInputSchema,
-        ToolInputValueSchema, ToolUseId, TranscriptTurn, TurnRole, UrlMediaRef,
+        MediaRef, MediaUri, ModelOutputBlock, ModelStepItem, ModelStepOutput, ProviderName,
+        PublicMediaUrl, ToolInputField, ToolInputSchema, ToolInputValueSchema, ToolUseId,
+        TranscriptTurn, TurnRole, UrlMediaRef, collect_model_step,
     };
     use serde_json::json;
 
@@ -838,25 +1222,27 @@ mod tests {
 
     #[test]
     fn pause_turn_continues_even_with_text_content() {
-        let step = AssistantStep {
-            content: vec![ContentBlock::Text {
-                text: "I'll search for that.".to_string(),
-            }],
-            client_tool_calls: Vec::new(),
-            server_tool_uses: Vec::new(),
-            grounding: Vec::new(),
+        let output = ModelStepOutput {
             model_id: ModelId::new("claude-sonnet-4-6"),
-            continuation: continuation_from_content(
-                &ProviderName::new("anthropic"),
-                &[json!({"type": "text", "text": "I'll search for that."})],
-            ),
+            items: vec![
+                ModelStepItem::OutputBlock(ModelOutputBlock::Text {
+                    text: "I'll search for that.".to_string(),
+                }),
+                ModelStepItem::OutputBlock(ModelOutputBlock::Continuation(
+                    continuation_from_content(
+                        &ProviderName::new("anthropic"),
+                        &[json!({"type": "text", "text": "I'll search for that."})],
+                    )
+                    .expect("continuation"),
+                )),
+            ],
             usage: Vec::new(),
         };
 
-        assert!(matches!(
-            model_step_from_assistant_step(step, Some("pause_turn")),
-            ModelStep::Continue { .. }
-        ));
+        assert_eq!(
+            model_step_from_output(output, Some("pause_turn")).kind,
+            ModelStepKind::Continue
+        );
     }
 
     #[test]
@@ -911,6 +1297,90 @@ mod tests {
         assert_eq!(client_uses.len(), 1);
         assert_eq!(client_uses[0].name.as_str(), "fetch_messages");
         assert_eq!(client_uses[0].input["limit"], 30);
+    }
+
+    #[test]
+    fn streams_anthropic_text_tool_and_usage_events() {
+        let provider = ProviderName::new("anthropic");
+        let requested_model = ModelId::new("claude-sonnet-4-6");
+        let mut state = AnthropicStreamState::default();
+        let mut events = Vec::new();
+        for data in [
+            json!({
+                "type": "message_start",
+                "message": {
+                    "model": "claude-sonnet-4-6",
+                    "usage": { "input_tokens": 20, "output_tokens": 1 }
+                }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "text", "text": "" }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "Hello" }
+            }),
+            json!({ "type": "content_block_stop", "index": 0 }),
+            json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "fetch_messages",
+                    "input": {}
+                }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": "{\"limit\":30}"
+                }
+            }),
+            json!({ "type": "content_block_stop", "index": 1 }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "tool_use", "stop_sequence": null },
+                "usage": { "output_tokens": 12 }
+            }),
+            json!({ "type": "message_stop" }),
+        ] {
+            let outcome = anthropic_stream_event(
+                ServerSentEvent {
+                    event: None,
+                    data: data.to_string(),
+                },
+                &provider,
+                &requested_model,
+                &AnthropicPricing::default(),
+                Instant::now(),
+                &mut state,
+            )
+            .expect("stream event");
+            events.extend(outcome.events);
+            if outcome.finished {
+                break;
+            }
+        }
+
+        let step = futures::executor::block_on(collect_model_step(futures::stream::iter(
+            events.into_iter().map(Ok::<_, AnthropicError>),
+        )))
+        .expect("finished step");
+        assert!(matches!(step.kind(), ModelStepKind::ClientTools));
+        let output = step.output();
+        assert_eq!(output.answer_text(), "Hello");
+        let calls = output.client_tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name.as_str(), "fetch_messages");
+        assert_eq!(calls[0].input["limit"], 30);
+        assert_eq!(output.usage[0].input_tokens, Some(20));
+        assert_eq!(output.usage[0].output_tokens, Some(12));
     }
 
     #[test]
@@ -995,6 +1465,7 @@ mod tests {
             top_p: None,
             thinking: Some(&thinking),
             effort: Some("medium"),
+            stream: true,
         })
         .expect("serialize request");
 

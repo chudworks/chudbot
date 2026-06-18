@@ -103,28 +103,19 @@ impl AnthropicClient {
         &self.pricing
     }
 
-    /// POST a JSON body to an Anthropic endpoint and deserialize the JSON result.
-    ///
-    /// This helper is the single write path for the Messages API adapter. It
-    /// attaches Anthropic's required authentication/version headers, logs a
-    /// redacted payload at debug level, retries errors classified as transient,
-    /// and delegates status/body handling to [`decode_response`].
-    pub(crate) async fn post_json<T>(
+    pub(crate) async fn post_json_stream(
         &self,
         endpoint: &str,
         body: &serde_json::Value,
         label: &str,
-    ) -> Result<T, AnthropicError>
-    where
-        T: for<'de> Deserialize<'de>,
-    {
+    ) -> Result<reqwest::Response, AnthropicError> {
         let url = format!("{}{}", self.base_url, endpoint);
         log_json_request(&self.provider_name, endpoint, body);
         tracing::debug!(
             provider = %self.provider_name,
             endpoint = %endpoint,
             base_url = %self.base_url,
-            "sending Anthropic JSON request"
+            "sending Anthropic streaming JSON request"
         );
         with_retry(RetryPolicy::default(), label, || {
             let request = self
@@ -132,6 +123,7 @@ impl AnthropicClient {
                 .post(&url)
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", API_VERSION)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
                 .json(body);
             async move {
                 let resp = request.send().await.map_err(|e| {
@@ -139,7 +131,7 @@ impl AnthropicClient {
                         provider = %self.provider_name,
                         endpoint = %endpoint,
                         error = %e,
-                        "Anthropic request transport error"
+                        "Anthropic streaming request transport error"
                     );
                     AnthropicError::Transport(e.to_string())
                 })?;
@@ -147,9 +139,9 @@ impl AnthropicClient {
                     provider = %self.provider_name,
                     endpoint = %endpoint,
                     status = %resp.status(),
-                    "received Anthropic response"
+                    "received Anthropic streaming response"
                 );
-                decode_response(resp, &self.provider_name, endpoint).await
+                ensure_stream_success(resp, &self.provider_name, endpoint).await
             }
         })
         .await
@@ -257,6 +249,37 @@ where
             "failed to decode Anthropic response shape"
         );
         AnthropicError::Decode(e.to_string())
+    })
+}
+
+async fn ensure_stream_success(
+    resp: reqwest::Response,
+    provider: &ProviderName,
+    endpoint: &str,
+) -> Result<reqwest::Response, AnthropicError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+
+    let body = resp.text().await.map_err(|e| {
+        tracing::warn!(
+            status = status.as_u16(),
+            error = %e,
+            "failed to read Anthropic streaming error body"
+        );
+        AnthropicError::Decode(e.to_string())
+    })?;
+    log_text_response(provider, endpoint, status.as_u16(), &body);
+    let body = truncate_body(body, 600);
+    tracing::warn!(
+        status = status.as_u16(),
+        body_chars = body.chars().count(),
+        "Anthropic streaming API returned non-success status"
+    );
+    Err(AnthropicError::Api {
+        status: status.as_u16(),
+        body,
     })
 }
 

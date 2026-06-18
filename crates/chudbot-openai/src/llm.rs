@@ -6,15 +6,19 @@
 //! continuation items for later turns, and folds Responses output back into
 //! text, tool calls, server-tool usage, grounding metadata, and token usage.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use chudbot_api::reasoning::TurnReasoning;
+use chudbot_api::sse::{ServerSentEvent, SseDecoder};
 use chudbot_api::{
-    AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
-    ContentBlock, GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep,
-    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
-    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
+    GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta,
+    ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
+    ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole,
+    UsageRecord, UsageSubject, reasoning_items_to_delta_events,
 };
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -25,6 +29,13 @@ use crate::{OpenAiClient, OpenAiError, json_strip_nulls};
 /// Response fields needed to replay OpenAI reasoning continuations on later turns.
 const REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
 
+impl OpenAiClient {
+    async fn build_step_body(&self, request: &ModelStepRequest) -> Result<Value, OpenAiError> {
+        let input = to_responses_input(&request.transcript, self).await?;
+        Ok(build_step_body_from_input(request, input))
+    }
+}
+
 impl LlmBackend for OpenAiClient {
     type Error = OpenAiError;
 
@@ -33,81 +44,68 @@ impl LlmBackend for OpenAiClient {
     }
 
     #[tracing::instrument(name = "openai.step", skip_all, fields(model = %request.model))]
-    async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
-        // Build the provider request in layers so provider options affect only
-        // OpenAI-specific knobs while transcript and tool mapping stay stable.
-        let input = to_responses_input(&request.transcript, self).await?;
-        let tools = build_responses_tools(&request.client_tools, &request.server_tools);
-        let options = OpenAiOptions::from_request(&request);
-        let reasoning = build_reasoning_options(&options);
-        let text = build_text_options(&options);
-        let sampling = model_supports_sampling(request.model.as_str());
-        let has_tools = !tools.is_empty();
+    fn step(
+        &self,
+        request: ModelStepRequest,
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+        async_stream::try_stream! {
+            let started = Instant::now();
+            let requested_model = request.model.clone();
+            let body = self.build_step_body(&request).await?;
+            let resp = self
+                .post_json_stream("/responses", &body, "llm[openai.stream]")
+                .await?;
+            let chunks = resp.bytes_stream();
+            futures::pin_mut!(chunks);
+            let mut decoder = SseDecoder::new();
+            let mut state = OpenAiStreamState::default();
 
-        let body = json_strip_nulls(json!({
-            "model": request.model.as_str(),
-            "input": input,
-            "tools": has_tools.then_some(tools),
-            "parallel_tool_calls": has_tools.then_some(true),
-            "max_output_tokens": request.sampling.max_output_tokens,
-            "temperature": sampling.then_some(request.sampling.temperature).flatten(),
-            "top_p": sampling.then_some(request.sampling.top_p).flatten(),
-            "reasoning": reasoning,
-            "text": text,
-            "prompt_cache_key": request.transcript.id,
-            "include": REASONING_INCLUDE,
-            "store": false,
-        }));
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|error| OpenAiError::Transport(error.to_string()))?;
+                for event in decoder
+                    .push(&chunk)
+                    .map_err(|error| OpenAiError::Decode(error.to_string()))?
+                {
+                    let outcome = openai_stream_event(
+                        event,
+                        self.provider_name(),
+                        &requested_model,
+                        self.pricing(),
+                        started,
+                        &mut state,
+                    )?;
+                    for event in outcome.events {
+                        yield event;
+                    }
+                    if outcome.finished {
+                        return;
+                    }
+                }
+            }
 
-        let started = Instant::now();
-        let parsed: ResponsesResponse = self.post_json("/responses", &body, "llm[openai]").await?;
-        let model_id = parsed
-            .model
-            .as_deref()
-            .map(ModelId::new)
-            .unwrap_or_else(|| request.model.clone());
-        let usage = usage_from_openai(
-            self.provider_name(),
-            Some(model_id.clone()),
-            UsageSubject::ModelStep,
-            parsed.usage.as_ref(),
-            self.pricing(),
-        );
-        log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
+            if let Some(event) = decoder
+                .finish()
+                .map_err(|error| OpenAiError::Decode(error.to_string()))?
+            {
+                let outcome = openai_stream_event(
+                    event,
+                    self.provider_name(),
+                    &requested_model,
+                    self.pricing(),
+                    started,
+                    &mut state,
+                )?;
+                for event in outcome.events {
+                    yield event;
+                }
+                if outcome.finished {
+                    return;
+                }
+            }
 
-        let (text, client_tool_calls, server_tool_uses, grounding) =
-            walk_output(&parsed.output, self.provider_name());
-        // Store raw output items as the continuation. Responses reasoning items
-        // are opaque to Chudbot but must be sent back verbatim for stateful models.
-        let has_output = !parsed.output.is_empty();
-        let continuation = has_output.then_some(ProviderContinuation {
-            provider: self.provider_name().clone(),
-            data: Value::Array(parsed.output),
-        });
-
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
-        }
-
-        let step = AssistantStep {
-            content,
-            client_tool_calls,
-            server_tool_uses,
-            grounding,
-            model_id,
-            continuation,
-            usage: usage.into_iter().collect(),
-        };
-
-        // The bot turn loop uses this classification to decide whether to run
-        // tools, ask the provider to keep going, or deliver assistant text.
-        if !step.client_tool_calls.is_empty() {
-            Ok(ModelStep::UseClientTools { step })
-        } else if step.content.is_empty() {
-            Ok(ModelStep::Continue { step })
-        } else {
-            Ok(ModelStep::Final { step })
+            Err(OpenAiError::Decode(
+                "OpenAI stream ended without a terminal response event".to_string(),
+            ))?;
         }
     }
 
@@ -120,6 +118,298 @@ impl LlmBackend for OpenAiClient {
         let raw: Value = self.get_json(&endpoint, "model_info[openai]").await?;
         Ok(model_info_from_openai_model(request.model, raw))
     }
+}
+
+fn build_step_body_from_input(request: &ModelStepRequest, input: Vec<Value>) -> Value {
+    let tools = build_responses_tools(&request.client_tools, &request.server_tools);
+    let options = OpenAiOptions::from_request(request);
+    let reasoning = build_reasoning_options(&options);
+    let text = build_text_options(&options);
+    let sampling = model_supports_sampling(request.model.as_str());
+    let has_tools = !tools.is_empty();
+
+    json_strip_nulls(json!({
+        "model": request.model.as_str(),
+        "input": input,
+        "tools": has_tools.then_some(tools),
+        "parallel_tool_calls": has_tools.then_some(true),
+        "max_output_tokens": request.sampling.max_output_tokens,
+        "temperature": sampling.then_some(request.sampling.temperature).flatten(),
+        "top_p": sampling.then_some(request.sampling.top_p).flatten(),
+        "reasoning": reasoning,
+        "text": text,
+        "prompt_cache_key": request.transcript.id,
+        "include": REASONING_INCLUDE,
+        "store": false,
+        "stream": true,
+    }))
+}
+
+#[derive(Debug, Default)]
+struct OpenAiStreamState {
+    emitted_text_delta: bool,
+    emitted_reasoning_delta: bool,
+    function_calls: BTreeMap<String, StreamingFunctionCall>,
+    streamed_tool_ids: BTreeSet<ToolUseId>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingFunctionCall {
+    id: ToolUseId,
+    name: Option<ToolName>,
+}
+
+#[derive(Debug, Default)]
+struct StreamEventOutcome {
+    events: Vec<ModelStepEvent>,
+    finished: bool,
+}
+
+fn openai_stream_event(
+    event: ServerSentEvent,
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    pricing: &OpenAiPricing,
+    started: Instant,
+    state: &mut OpenAiStreamState,
+) -> Result<StreamEventOutcome, OpenAiError> {
+    if event.data.trim() == "[DONE]" {
+        return Ok(StreamEventOutcome::default());
+    }
+
+    let value = serde_json::from_str::<Value>(&event.data).map_err(|error| {
+        OpenAiError::Decode(format!("failed to decode OpenAI SSE event: {error}"))
+    })?;
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .or(event.event.as_deref())
+        .unwrap_or("");
+
+    match event_type {
+        "response.output_text.delta" => {
+            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                return Ok(StreamEventOutcome::default());
+            };
+            state.emitted_text_delta = true;
+            Ok(StreamEventOutcome {
+                events: vec![ModelStepEvent::Delta(ModelStepDelta::Text {
+                    item_id: stream_item_id(&value, "openai_text"),
+                    delta: delta.to_string(),
+                })],
+                finished: false,
+            })
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                return Ok(StreamEventOutcome::default());
+            };
+            state.emitted_reasoning_delta = true;
+            Ok(StreamEventOutcome {
+                events: vec![ModelStepEvent::Delta(ModelStepDelta::ReasoningSummary {
+                    item_id: stream_item_id(&value, "openai_reasoning"),
+                    provider: provider.clone(),
+                    kind: Some(event_type.trim_start_matches("response.").to_string()),
+                    delta: delta.to_string(),
+                })],
+                finished: false,
+            })
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            if let Some((key, call)) = streaming_function_call(&value) {
+                state.function_calls.insert(key, call);
+            }
+            Ok(StreamEventOutcome::default())
+        }
+        "response.function_call_arguments.delta" => {
+            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                return Ok(StreamEventOutcome::default());
+            };
+            let key = stream_item_id(&value, "openai_function_call");
+            let Some(call) = state.function_calls.get(&key) else {
+                return Ok(StreamEventOutcome::default());
+            };
+            state.streamed_tool_ids.insert(call.id.clone());
+            Ok(StreamEventOutcome {
+                events: vec![ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                    item_id: key,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments_delta: delta.to_string(),
+                })],
+                finished: false,
+            })
+        }
+        "response.completed" | "response.incomplete" => {
+            let response = value.get("response").cloned().unwrap_or(value);
+            let events = openai_terminal_events(
+                response,
+                provider,
+                requested_model,
+                pricing,
+                started,
+                state,
+            )?;
+            Ok(StreamEventOutcome {
+                events,
+                finished: true,
+            })
+        }
+        "response.failed" => {
+            let response = value.get("response").unwrap_or(&value);
+            Err(OpenAiError::Decode(provider_error_message(
+                response,
+                "OpenAI stream failed",
+            )))
+        }
+        "error" => Err(OpenAiError::Decode(provider_error_message(
+            &value,
+            "OpenAI stream returned an error event",
+        ))),
+        _ => Ok(StreamEventOutcome::default()),
+    }
+}
+
+fn streaming_function_call(value: &Value) -> Option<(String, StreamingFunctionCall)> {
+    let item = value.get("item").unwrap_or(value);
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    let key = stream_item_id(value, "openai_function_call");
+    let id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())?;
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(ToolName::new);
+    Some((
+        key,
+        StreamingFunctionCall {
+            id: ToolUseId::new(id),
+            name,
+        },
+    ))
+}
+
+fn stream_item_id(value: &Value, fallback: &str) -> String {
+    value
+        .get("item_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|index| format!("{fallback}:{index}"))
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn openai_terminal_events(
+    response: Value,
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    pricing: &OpenAiPricing,
+    started: Instant,
+    state: &OpenAiStreamState,
+) -> Result<Vec<ModelStepEvent>, OpenAiError> {
+    let parsed: ResponsesResponse = serde_json::from_value(response.clone()).map_err(|error| {
+        OpenAiError::Decode(format!(
+            "failed to decode terminal OpenAI response: {error}"
+        ))
+    })?;
+    let model_id = parsed
+        .model
+        .as_deref()
+        .map(ModelId::new)
+        .unwrap_or_else(|| requested_model.clone());
+    let usage = usage_from_openai(
+        provider,
+        Some(model_id.clone()),
+        UsageSubject::ModelStep,
+        parsed.usage.as_ref(),
+        pricing,
+    );
+    log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
+
+    let (text, client_tool_calls, server_tool_uses, grounding) =
+        walk_output(&parsed.output, provider);
+    let kind = if !client_tool_calls.is_empty() {
+        ModelStepKind::ClientTools
+    } else if text.is_empty() {
+        ModelStepKind::Continue
+    } else {
+        ModelStepKind::Final
+    };
+
+    let continuation = (!parsed.output.is_empty()).then_some(ProviderContinuation {
+        provider: provider.clone(),
+        data: Value::Array(parsed.output),
+    });
+
+    let mut events = Vec::new();
+    if !state.emitted_text_delta && !text.is_empty() {
+        events.push(ModelStepEvent::Delta(ModelStepDelta::Text {
+            item_id: "openai_text:terminal".to_string(),
+            delta: text,
+        }));
+    }
+    events.extend(
+        client_tool_calls
+            .into_iter()
+            .filter(|call| !state.streamed_tool_ids.contains(&call.id))
+            .enumerate()
+            .map(|(index, call)| {
+                ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                    item_id: format!("openai_tool:{index}"),
+                    id: call.id,
+                    name: Some(call.name),
+                    arguments_delta: call.input.to_string(),
+                })
+            }),
+    );
+    if !state.emitted_reasoning_delta
+        && let Some(continuation) = continuation.as_ref()
+    {
+        events.extend(reasoning_items_to_delta_events(
+            TurnReasoning::from_continuation_and_usage(Some(continuation), Some(&model_id), &[])
+                .items,
+            "openai_reasoning",
+        ));
+    }
+    if let Some(continuation) = continuation {
+        events.push(ModelStepEvent::Continuation(continuation));
+    }
+    events.extend(
+        server_tool_uses
+            .into_iter()
+            .map(ModelStepEvent::ServerToolUse),
+    );
+    events.extend(grounding.into_iter().map(ModelStepEvent::Grounding));
+    events.extend(usage.into_iter().map(ModelStepEvent::Usage));
+    events.push(ModelStepEvent::Finished { kind, model_id });
+    Ok(events)
+}
+
+fn provider_error_message(value: &Value, fallback: &str) -> String {
+    value
+        .get("error")
+        .and_then(|error| error.get("message").or_else(|| error.get("type")))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// Extract known model limits from OpenAI's model metadata response.
@@ -598,6 +888,7 @@ mod tests {
     use super::*;
     use chudbot_api::{
         ProviderOptions, ToolInputField, ToolInputSchema, ToolInputValueSchema, TranscriptTurn,
+        collect_model_step,
     };
 
     #[test]
@@ -689,6 +980,97 @@ mod tests {
             grounding[0].raw["annotations"][0]["url"],
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn streams_responses_text_reasoning_and_tool_arguments() {
+        let provider = ProviderName::new("openai");
+        let requested_model = ModelId::new("gpt-5");
+        let mut state = OpenAiStreamState::default();
+        let mut events = Vec::new();
+        for data in [
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "Hi",
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "delta": "Plan",
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "fetch_messages",
+                },
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{\"limit\":30}",
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "model": "gpt-5",
+                    "output": [
+                        {
+                            "type": "message",
+                            "id": "msg_1",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": "Hi" }]
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "fc_1",
+                            "call_id": "call_1",
+                            "name": "fetch_messages",
+                            "arguments": "{\"limit\":30}"
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12
+                    }
+                }
+            }),
+        ] {
+            let outcome = openai_stream_event(
+                ServerSentEvent {
+                    event: None,
+                    data: data.to_string(),
+                },
+                &provider,
+                &requested_model,
+                &OpenAiPricing::default(),
+                Instant::now(),
+                &mut state,
+            )
+            .expect("stream event");
+            events.extend(outcome.events);
+            if outcome.finished {
+                break;
+            }
+        }
+
+        let step = futures::executor::block_on(collect_model_step(futures::stream::iter(
+            events.into_iter().map(Ok::<_, OpenAiError>),
+        )))
+        .expect("finished step");
+        assert!(matches!(step.kind(), ModelStepKind::ClientTools));
+        let output = step.output();
+        assert_eq!(output.answer_text(), "Hi");
+        assert_eq!(output.reasoning().count(), 1);
+        let calls = output.client_tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id.as_str(), "call_1");
+        assert_eq!(calls[0].input["limit"], 30);
+        assert_eq!(output.usage[0].input_tokens, Some(10));
     }
 
     #[test]

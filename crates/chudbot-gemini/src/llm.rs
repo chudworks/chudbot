@@ -10,32 +10,28 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use chudbot_api::{
-    AssistantStep, ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec,
-    ContentBlock, GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep,
-    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
-    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
+    GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta,
+    ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
+    ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole,
+    UsageRecord, UsageSubject,
+    sse::{ServerSentEvent, SseDecoder},
 };
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::{GeminiClient, GeminiError, get_field, inline_media, json_strip_nulls};
 
-impl LlmBackend for GeminiClient {
-    type Error = GeminiError;
-
-    fn backend_name(&self) -> &ProviderName {
-        self.provider_name()
-    }
-
-    #[tracing::instrument(name = "gemini.step", skip_all, fields(model = %request.model))]
-    async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
+impl GeminiClient {
+    async fn build_step_body(&self, request: &ModelStepRequest) -> Result<Value, GeminiError> {
         // Convert the durable transcript first so Gemini continuations can
         // short-circuit re-encoding for provider-native content.
         let contents = to_gemini_contents(&request.transcript, self.provider_name()).await?;
         let tools = build_tools(&request.client_tools, &request.server_tools);
         let tool_config = build_tool_config(&request.server_tools);
-        let options = GeminiOptions::from_request(&request);
-        let generation_config = build_generation_config(&request, &options);
+        let options = GeminiOptions::from_request(request);
+        let generation_config = build_generation_config(request, &options);
 
         let mut body = json_strip_nulls(json!({
             "contents": contents,
@@ -45,88 +41,76 @@ impl LlmBackend for GeminiClient {
             "generationConfig": generation_config,
         }));
         merge_extra_body(&mut body, options.extra_body);
+        Ok(body)
+    }
+}
 
-        let endpoint = format!("/models/{}:generateContent", request.model.as_str());
-        let started = Instant::now();
-        let parsed: Value = self.post_json(&endpoint, &body, "llm[gemini]").await?;
-        // Chudbot consumes only the first candidate today. The raw candidate
-        // content is kept as a continuation so follow-up turns can echo Gemini's
-        // native function-call and thought-bearing parts back to the provider.
-        let candidate = parsed
-            .get("candidates")
-            .and_then(Value::as_array)
-            .and_then(|items| items.first())
-            .ok_or_else(|| GeminiError::Decode("response had no candidates".to_string()))?;
-        let content = candidate
-            .get("content")
-            .ok_or_else(|| GeminiError::Decode("candidate had no content".to_string()))?;
+impl LlmBackend for GeminiClient {
+    type Error = GeminiError;
 
-        let model_id = parsed
-            .get("modelVersion")
-            .or_else(|| parsed.get("model_version"))
-            .and_then(Value::as_str)
-            .map(ModelId::new)
-            .unwrap_or_else(|| request.model.clone());
-        let usage = usage_from_gemini(
-            self.provider_name(),
-            Some(model_id.clone()),
-            UsageSubject::ModelStep,
-            get_field(&parsed, "usageMetadata", "usage_metadata"),
-        );
-        log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
+    fn backend_name(&self) -> &ProviderName {
+        self.provider_name()
+    }
 
-        let (text, client_tool_calls, mut server_tool_uses, mut grounding) =
-            walk_content(content, self.provider_name());
-        // Gemini may attach grounding and server-side web-search metadata at
-        // the candidate level instead of inside individual parts.
-        if let Some(metadata) = get_field(candidate, "groundingMetadata", "grounding_metadata") {
-            grounding.push(GroundingMetadata {
-                provider: self.provider_name().clone(),
-                raw: metadata.clone(),
-            });
-        }
-        if let Some(invocations) = get_field(
-            candidate,
-            "serverSideToolInvocations",
-            "server_side_tool_invocations",
-        )
-        .and_then(Value::as_array)
-        {
-            server_tool_uses.extend(invocations.iter().cloned().map(|raw| {
-                ServerToolUse {
-                    provider: self.provider_name().clone(),
-                    name: ToolName::new("web_search"),
-                    id: raw.get("id").and_then(Value::as_str).map(str::to_string),
-                    status: raw
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    raw,
-                    usage: Vec::new(),
+    #[tracing::instrument(name = "gemini.step", skip_all, fields(model = %request.model))]
+    fn step(
+        &self,
+        request: ModelStepRequest,
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+        async_stream::try_stream! {
+            let started = Instant::now();
+            let requested_model = request.model.clone();
+            let body = self.build_step_body(&request).await?;
+            let endpoint = format!(
+                "/models/{}:streamGenerateContent?alt=sse",
+                request.model.as_str()
+            );
+            let resp = self
+                .post_json_stream(&endpoint, &body, "llm[gemini.stream]")
+                .await?;
+            let chunks = resp.bytes_stream();
+            futures::pin_mut!(chunks);
+            let mut decoder = SseDecoder::new();
+            let mut state = GeminiStreamState::default();
+
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|error| GeminiError::Transport(error.to_string()))?;
+                for event in decoder
+                    .push(&chunk)
+                    .map_err(|error| GeminiError::Decode(error.to_string()))?
+                {
+                    for event in gemini_stream_event(
+                        event,
+                        self.provider_name(),
+                        &requested_model,
+                        &mut state,
+                    )? {
+                        yield event;
+                    }
                 }
-            }));
-        }
+            }
 
-        let mut assistant_content = Vec::new();
-        if !text.is_empty() {
-            assistant_content.push(ContentBlock::Text { text });
-        }
-        let step = AssistantStep {
-            content: assistant_content,
-            client_tool_calls,
-            server_tool_uses,
-            grounding,
-            model_id,
-            continuation: continuation_from_content(self.provider_name(), content),
-            usage: usage.into_iter().collect(),
-        };
+            if let Some(event) = decoder
+                .finish()
+                .map_err(|error| GeminiError::Decode(error.to_string()))?
+            {
+                for event in gemini_stream_event(
+                    event,
+                    self.provider_name(),
+                    &requested_model,
+                    &mut state,
+                )? {
+                    yield event;
+                }
+            }
 
-        if !step.client_tool_calls.is_empty() {
-            Ok(ModelStep::UseClientTools { step })
-        } else if step.content.is_empty() {
-            Ok(ModelStep::Continue { step })
-        } else {
-            Ok(ModelStep::Final { step })
+            for event in state.finish(
+                self.provider_name(),
+                &requested_model,
+                started.elapsed(),
+            )? {
+                yield event;
+            }
         }
     }
 
@@ -139,6 +123,201 @@ impl LlmBackend for GeminiClient {
         let raw: Value = self.get_json(&endpoint, "model_info[gemini]").await?;
         Ok(Some(model_info_from_gemini(request.model, raw)))
     }
+}
+
+#[derive(Debug, Default)]
+struct GeminiStreamState {
+    model_id: Option<ModelId>,
+    saw_candidate: bool,
+    saw_answer_text: bool,
+    saw_client_tool_call: bool,
+    content_role: Option<String>,
+    content_parts: Vec<Value>,
+    latest_usage: Option<UsageRecord>,
+}
+
+impl GeminiStreamState {
+    fn observe_response(
+        &mut self,
+        value: Value,
+        provider: &ProviderName,
+        requested_model: &ModelId,
+    ) -> Result<Vec<ModelStepEvent>, GeminiError> {
+        if let Some(model_id) = value
+            .get("modelVersion")
+            .or_else(|| value.get("model_version"))
+            .and_then(Value::as_str)
+            .map(ModelId::new)
+        {
+            self.model_id = Some(model_id);
+        }
+
+        let current_model = self
+            .model_id
+            .clone()
+            .unwrap_or_else(|| requested_model.clone());
+        if let Some(usage) = usage_from_gemini(
+            provider,
+            Some(current_model),
+            UsageSubject::ModelStep,
+            get_field(&value, "usageMetadata", "usage_metadata"),
+        ) {
+            self.latest_usage = Some(usage);
+        }
+
+        let Some(candidate) = value
+            .get("candidates")
+            .and_then(Value::as_array)
+            .and_then(|items| items.first())
+        else {
+            return Ok(Vec::new());
+        };
+        self.saw_candidate = true;
+
+        let mut events = Vec::new();
+        if let Some(content) = candidate.get("content") {
+            self.append_content(content);
+            let (text, client_tool_calls, server_tool_uses, grounding) =
+                walk_content(content, provider);
+            if !text.is_empty() {
+                self.saw_answer_text = true;
+                events.push(ModelStepEvent::Delta(ModelStepDelta::Text {
+                    item_id: "gemini_text".to_string(),
+                    delta: text,
+                }));
+            }
+            for (index, call) in client_tool_calls.into_iter().enumerate() {
+                self.saw_client_tool_call = true;
+                events.push(ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                    item_id: format!("gemini_tool:{index}"),
+                    id: call.id,
+                    name: Some(call.name),
+                    arguments_delta: call.input.to_string(),
+                }));
+            }
+            events.extend(
+                server_tool_uses
+                    .into_iter()
+                    .map(ModelStepEvent::ServerToolUse),
+            );
+            events.extend(grounding.into_iter().map(ModelStepEvent::Grounding));
+        }
+
+        if let Some(metadata) = get_field(candidate, "groundingMetadata", "grounding_metadata") {
+            events.push(ModelStepEvent::Grounding(GroundingMetadata {
+                provider: provider.clone(),
+                raw: metadata.clone(),
+            }));
+        }
+        if let Some(invocations) = get_field(
+            candidate,
+            "serverSideToolInvocations",
+            "server_side_tool_invocations",
+        )
+        .and_then(Value::as_array)
+        {
+            events.extend(invocations.iter().cloned().map(|raw| {
+                ModelStepEvent::ServerToolUse(ServerToolUse {
+                    provider: provider.clone(),
+                    name: ToolName::new("web_search"),
+                    id: raw.get("id").and_then(Value::as_str).map(str::to_string),
+                    status: raw
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    raw,
+                    usage: Vec::new(),
+                })
+            }));
+        }
+
+        Ok(events)
+    }
+
+    fn append_content(&mut self, content: &Value) {
+        if self.content_role.is_none()
+            && let Some(role) = content.get("role").and_then(Value::as_str)
+        {
+            self.content_role = Some(role.to_string());
+        }
+        if let Some(parts) = content.get("parts").and_then(Value::as_array) {
+            self.content_parts.extend(parts.iter().cloned());
+        }
+    }
+
+    fn finish(
+        self,
+        provider: &ProviderName,
+        requested_model: &ModelId,
+        elapsed: Duration,
+    ) -> Result<Vec<ModelStepEvent>, GeminiError> {
+        if !self.saw_candidate {
+            return Err(GeminiError::Decode(
+                "Gemini stream ended without candidates".to_string(),
+            ));
+        }
+
+        let model_id = self
+            .model_id
+            .clone()
+            .unwrap_or_else(|| requested_model.clone());
+        log_usage(model_id.as_str(), self.latest_usage.as_ref(), elapsed);
+
+        let kind = if self.saw_client_tool_call {
+            ModelStepKind::ClientTools
+        } else if self.saw_answer_text {
+            ModelStepKind::Final
+        } else {
+            ModelStepKind::Continue
+        };
+
+        let mut events = Vec::new();
+        if let Some(continuation) = self.continuation(provider) {
+            events.push(ModelStepEvent::Continuation(continuation));
+        }
+        if let Some(usage) = self.latest_usage {
+            events.push(ModelStepEvent::Usage(usage));
+        }
+        events.push(ModelStepEvent::Finished { kind, model_id });
+        Ok(events)
+    }
+
+    fn continuation(&self, provider: &ProviderName) -> Option<ProviderContinuation> {
+        if self.content_parts.is_empty() {
+            return None;
+        }
+
+        let mut content = Map::new();
+        content.insert(
+            "role".to_string(),
+            Value::String(
+                self.content_role
+                    .clone()
+                    .unwrap_or_else(|| "model".to_string()),
+            ),
+        );
+        content.insert(
+            "parts".to_string(),
+            Value::Array(self.content_parts.clone()),
+        );
+        continuation_from_content(provider, &Value::Object(content))
+    }
+}
+
+fn gemini_stream_event(
+    event: ServerSentEvent,
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    state: &mut GeminiStreamState,
+) -> Result<Vec<ModelStepEvent>, GeminiError> {
+    let data = event.data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return Ok(Vec::new());
+    }
+    let value = serde_json::from_str::<Value>(data).map_err(|error| {
+        GeminiError::Decode(format!("failed to decode Gemini stream event: {error}"))
+    })?;
+    state.observe_response(value, provider, requested_model)
 }
 
 /// Builds a Gemini model endpoint from either `gemini-*` or `models/gemini-*`.
@@ -607,7 +786,9 @@ struct UsageMetadata {
 mod tests {
     use chudbot_api::{
         ProviderName, ServerToolSet, ToolInputField, ToolInputSchema, ToolInputValueSchema,
+        collect_model_step,
     };
+    use futures::stream;
     use serde_json::json;
 
     use super::*;
@@ -698,6 +879,84 @@ mod tests {
         assert_eq!(info.context_window_tokens, Some(1_048_576));
         assert_eq!(info.max_output_tokens, Some(65_536));
         assert!(info.raw.is_some());
+    }
+
+    #[test]
+    fn streams_gemini_text_usage_and_continuation_events() {
+        let provider = ProviderName::new("gemini");
+        let requested_model = ModelId::new("gemini-3.5-flash");
+        let mut state = GeminiStreamState::default();
+        let mut events = Vec::new();
+        events.extend(
+            gemini_stream_event(
+                ServerSentEvent {
+                    event: None,
+                    data: json!({
+                        "modelVersion": "gemini-3.5-flash-001",
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{ "text": "hel" }]
+                            }
+                        }]
+                    })
+                    .to_string(),
+                },
+                &provider,
+                &requested_model,
+                &mut state,
+            )
+            .unwrap(),
+        );
+        events.extend(
+            gemini_stream_event(
+                ServerSentEvent {
+                    event: None,
+                    data: json!({
+                        "candidates": [{
+                            "content": {
+                                "role": "model",
+                                "parts": [{ "text": "lo" }]
+                            }
+                        }],
+                        "usageMetadata": {
+                            "promptTokenCount": 2,
+                            "candidatesTokenCount": 1,
+                            "totalTokenCount": 3
+                        }
+                    })
+                    .to_string(),
+                },
+                &provider,
+                &requested_model,
+                &mut state,
+            )
+            .unwrap(),
+        );
+        events.extend(
+            state
+                .finish(&provider, &requested_model, Duration::from_millis(1))
+                .unwrap(),
+        );
+
+        let step = futures::executor::block_on(collect_model_step(stream::iter(
+            events.into_iter().map(Ok::<_, GeminiError>),
+        )))
+        .unwrap();
+
+        assert_eq!(step.kind, ModelStepKind::Final);
+        assert_eq!(step.output.model_id.as_str(), "gemini-3.5-flash-001");
+        assert_eq!(step.output.usage.len(), 1);
+        let answer_blocks = step.output.answer_blocks();
+        assert_eq!(answer_blocks.len(), 1);
+        let ContentBlock::Text { text } = &answer_blocks[0] else {
+            panic!("expected text answer block");
+        };
+        assert_eq!(text, "hello");
+        let continuation = step.output.continuation().unwrap();
+        assert_eq!(continuation.provider, provider);
+        assert_eq!(continuation.data["role"], "model");
+        assert_eq!(continuation.data["parts"].as_array().unwrap().len(), 2);
     }
 
     #[test]

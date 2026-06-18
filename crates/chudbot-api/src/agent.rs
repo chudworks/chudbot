@@ -23,13 +23,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use futures::Stream;
 use futures::stream::{FuturesOrdered, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::Instrument;
 
 use crate::ids::{ModelId, ProviderName, ToolName};
-use crate::llm::{AssistantStep, LlmBackend, Model, ModelStep, ServerToolSet};
+use crate::llm::{
+    LlmBackend, Model, ModelStep, ModelStepCollector, ModelStepDelta, ModelStepEvent,
+    ModelStepOutput, ModelStepReducerError, ServerToolSet,
+};
+use crate::media::BoxedMediaRef;
 use crate::storage::{ModelStepKind, ModelStepTrace};
 use crate::tool::{
     ClientToolCall, ClientToolDefinition, ClientToolExecutor, ClientToolExecutorError,
@@ -155,6 +160,15 @@ where
     /// Provider step failed.
     #[error("model error: {0}")]
     Model(#[source] BE),
+    /// Provider step events could not be reduced into a valid model step.
+    #[error("model step stream error: {0}")]
+    ModelStep(#[from] ModelStepReducerError),
+    /// Agent event stream ended before a terminal run event.
+    #[error("agent run stream ended before a finished event")]
+    RunStreamEnded,
+    /// Agent event stream emitted more than one terminal run event.
+    #[error("agent run stream emitted more than one finished event")]
+    DuplicateRunFinished,
 }
 
 /// Limits for the provider/tool loop inside [`Agent::run`].
@@ -218,6 +232,94 @@ impl AgentRun {
     }
 }
 
+/// Streaming event emitted by [`Agent::run`].
+#[derive(Debug, Clone)]
+pub enum AgentRunEvent {
+    /// Agent run started.
+    RunStarted,
+    /// One provider/model step started.
+    ModelStepStarted {
+        /// Zero-based model-step ordinal.
+        ordinal: u32,
+    },
+    /// Provider/model event forwarded from the active step.
+    ModelEvent {
+        /// Zero-based model-step ordinal.
+        ordinal: u32,
+        /// Provider event.
+        event: ModelStepEvent,
+    },
+    /// Chudbot-owned client tool execution started.
+    ClientToolStarted {
+        /// Tool call requested by the model.
+        call: ClientToolCall,
+    },
+    /// Chudbot-owned client tool execution finished.
+    ClientToolFinished {
+        /// Model-facing tool result.
+        result: ClientToolResult,
+        /// Persistable tool trace.
+        trace: ClientToolTrace,
+        /// Media references appended to the following user turn.
+        media: Vec<BoxedMediaRef>,
+    },
+    /// Agent run finished and produced the stable collected output.
+    RunFinished {
+        /// Stable output used by existing callers.
+        run: AgentRun,
+    },
+}
+
+impl AgentRunEvent {
+    /// Stable kind label for logging and diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::RunStarted => "run_started",
+            Self::ModelStepStarted { .. } => "model_step_started",
+            Self::ModelEvent { .. } => "model_event",
+            Self::ClientToolStarted { .. } => "client_tool_started",
+            Self::ClientToolFinished { .. } => "client_tool_finished",
+            Self::RunFinished { .. } => "run_finished",
+        }
+    }
+}
+
+/// Collect a streaming agent run into the stable output shape.
+pub async fn collect_agent_run<S, BE>(events: S) -> Result<AgentRun, AgentRunError<BE>>
+where
+    S: Stream<Item = Result<AgentRunEvent, AgentRunError<BE>>> + Send,
+    BE: std::error::Error + Send + Sync + 'static,
+{
+    futures::pin_mut!(events);
+    let mut finished = None;
+    while let Some(event) = events.next().await {
+        let event = event?;
+        tracing::trace!(event = event.kind(), "collecting agent run event");
+        match event {
+            AgentRunEvent::RunFinished { run } => {
+                tracing::trace!(
+                    event = "run_finished",
+                    outcome = run.outcome.kind(),
+                    turns = run.transcript.turns.len(),
+                    trace_records = run.trace.len(),
+                    model_steps = run.model_steps.len(),
+                    usage_records = run.usage.len(),
+                    "collecting agent run event"
+                );
+                if finished.replace(run).is_some() {
+                    return Err(AgentRunError::DuplicateRunFinished);
+                }
+            }
+            AgentRunEvent::RunStarted
+            | AgentRunEvent::ModelStepStarted { .. }
+            | AgentRunEvent::ModelEvent { .. }
+            | AgentRunEvent::ClientToolStarted { .. }
+            | AgentRunEvent::ClientToolFinished { .. } => {}
+        }
+    }
+    finished.ok_or(AgentRunError::RunStreamEnded)
+}
+
 /// Outcome recorded for an agent attempt.
 ///
 /// [`Agent::run`] currently returns transport/provider failures as
@@ -248,6 +350,18 @@ pub enum AgentOutcome {
         /// Cancellation reason.
         reason: String,
     },
+}
+
+impl AgentOutcome {
+    /// Stable kind label for logging and diagnostics.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Completed { .. } => "completed",
+            Self::Failed { .. } => "failed",
+            Self::IterationLimit { .. } => "iteration_limit",
+            Self::Cancelled { .. } => "cancelled",
+        }
+    }
 }
 
 /// Final assistant answer returned by a completed run.
@@ -307,239 +421,487 @@ where
             server_tools = tracing::field::Empty,
         )
     )]
-    pub async fn run(&self, transcript: Transcript) -> Result<AgentRun, AgentRunError<B::Error>> {
-        // Prepare model input. Agent instructions are owned by the spec, so a
-        // caller-provided transcript cannot accidentally carry stale system text.
-        let Transcript { id, turns, .. } = transcript;
-        let initial_turns = turns.len();
-        let mut transcript = Transcript {
-            id,
-            instructions: Some(self.spec.system_prompt.clone()),
-            turns,
-        };
+    pub fn run(
+        &self,
+        transcript: Transcript,
+    ) -> impl Stream<Item = Result<AgentRunEvent, AgentRunError<B::Error>>> + Send + '_ {
+        async_stream::try_stream! {
+            let event = AgentRunEvent::RunStarted;
+            trace_agent_run_event(&event);
+            yield event;
+            // Prepare model input. Agent instructions are owned by the spec, so a
+            // caller-provided transcript cannot accidentally carry stale system text.
+            let Transcript { id, turns, .. } = transcript;
+            let initial_turns = turns.len();
+            let mut transcript = Transcript {
+                id,
+                instructions: Some(self.spec.system_prompt.clone()),
+                turns,
+            };
 
-        // Resolve the model-visible tool surfaces once for this run. Provider
-        // crates receive normalized server-tool names; local client tools remain
-        // keyed by the repo's typed `ToolName`.
-        let client_tools = enabled_tool_specs(&self.spec, &self.tool_executor);
-        let server_tools = enabled_server_tools(
-            &self.model.spec.server_tools,
-            self.spec.server_tools.as_ref(),
-        );
-        // Populate structured tracing fields after computing the effective
-        // request shape. These fields are intentionally low-cardinality except
-        // for transcript/model ids.
-        let span = tracing::Span::current();
-        if let Some(id) = transcript.id.as_deref() {
-            span.record("transcript_id", id);
-        }
-        span.record(
-            "provider",
-            tracing::field::display(self.model.backend.backend_name()),
-        );
-        span.record("model", tracing::field::display(&self.model.spec.id));
-        span.record("initial_turns", initial_turns);
-        span.record("max_iterations", self.spec.limits.max_iterations);
-        span.record("client_tools", client_tools.len());
-        span.record("server_tools", server_tools.len());
-        tracing::info!("starting agent run");
-
-        // Accumulators returned in `AgentRun`. The transcript is the model's
-        // replayable view; trace/model_steps/usage are the audit view.
-        let mut trace = Vec::new();
-        let mut model_steps = Vec::new();
-        let mut usage = Vec::new();
-        let mut last_model_id = None;
-        let mut final_continuation = None;
-        let provider = self.model.backend.backend_name().clone();
-
-        for iteration in 0..self.spec.limits.max_iterations {
-            // Step 1: ask the routed backend what should happen next.
-            tracing::debug!(
-                iteration = iteration + 1,
-                turns = transcript.turns.len(),
-                trace_records = trace.len(),
-                usage_records = usage.len(),
-                "requesting model step"
+            // Resolve the model-visible tool surfaces once for this run. Provider
+            // crates receive normalized server-tool names; local client tools remain
+            // keyed by the repo's typed `ToolName`.
+            let client_tools = enabled_tool_specs(&self.spec, &self.tool_executor);
+            let server_tools = enabled_server_tools(
+                &self.model.spec.server_tools,
+                self.spec.server_tools.as_ref(),
             );
-            let step = match self
-                .model
-                .backend
-                .step(crate::llm::ModelStepRequest {
+            // Populate structured tracing fields after computing the effective
+            // request shape. These fields are intentionally low-cardinality except
+            // for transcript/model ids.
+            let span = tracing::Span::current();
+            if let Some(id) = transcript.id.as_deref() {
+                span.record("transcript_id", id);
+            }
+            span.record(
+                "provider",
+                tracing::field::display(self.model.backend.backend_name()),
+            );
+            span.record("model", tracing::field::display(&self.model.spec.id));
+            span.record("initial_turns", initial_turns);
+            span.record("max_iterations", self.spec.limits.max_iterations);
+            span.record("client_tools", client_tools.len());
+            span.record("server_tools", server_tools.len());
+            tracing::info!("starting agent run");
+
+            // Accumulators returned in `AgentRun`. The transcript is the model's
+            // replayable view; trace/model_steps/usage are the audit view.
+            let mut trace = Vec::new();
+            let mut model_steps = Vec::new();
+            let mut usage = Vec::new();
+            let mut last_model_id = None;
+            let mut final_continuation = None;
+            let provider = self.model.backend.backend_name().clone();
+
+            for iteration in 0..self.spec.limits.max_iterations {
+                // Step 1: ask the routed backend what should happen next.
+                tracing::debug!(
+                    iteration = iteration + 1,
+                    turns = transcript.turns.len(),
+                    trace_records = trace.len(),
+                    usage_records = usage.len(),
+                    "requesting model step"
+                );
+                let event = AgentRunEvent::ModelStepStarted { ordinal: iteration };
+                trace_agent_run_event(&event);
+                yield event;
+                let events = self.model.backend.step(crate::llm::ModelStepRequest {
                     model: self.model.spec.id.clone(),
                     transcript: transcript.clone(),
                     client_tools: client_tools.clone(),
                     server_tools: server_tools.clone(),
                     sampling: self.model.spec.sampling,
                     provider_options: self.model.spec.provider_options.clone(),
-                })
-                .await
-            {
-                Ok(step) => step,
-                Err(error) => {
-                    tracing::warn!(
-                        iteration = iteration + 1,
-                        error = %error,
-                        "model step failed"
-                    );
-                    return Err(AgentRunError::Model(error));
+                });
+                futures::pin_mut!(events);
+                let mut collector = ModelStepCollector::default();
+                while let Some(event) = events.next().await {
+                    let event = match event {
+                        Ok(event) => event,
+                        Err(error) => {
+                            tracing::warn!(
+                                iteration = iteration + 1,
+                                error = %error,
+                                "model step failed"
+                            );
+                            Err(AgentRunError::Model(error))?
+                        }
+                    };
+                    collector.push(event.clone())?;
+                    let event = AgentRunEvent::ModelEvent {
+                        ordinal: iteration,
+                        event,
+                    };
+                    trace_agent_run_event(&event);
+                    yield event;
                 }
-            };
+                let step = collector.finish()?;
+                tracing::trace!(
+                    iteration = iteration + 1,
+                    step = ?step,
+                    "collected model step"
+                );
 
-            // Step 2: fold the provider's step into transcript, traces, usage,
-            // and continuation state. Client tool calls get an extra local
-            // dispatch phase before the next provider step.
-            match step {
-                ModelStep::Final { step } => {
-                    // Final content is both returned as `AssistantAnswer` and
-                    // appended to the replay transcript as an assistant turn.
-                    model_steps.push(model_step_trace(
-                        iteration,
-                        ModelStepKind::Final,
-                        &provider,
-                        &step,
-                    ));
-                    tracing::debug!(
-                        iteration = iteration + 1,
-                        model = %step.model_id,
-                        content_blocks = step.content.len(),
-                        server_tools = step.server_tool_uses.len(),
-                        grounding = step.grounding.len(),
-                        usage_records = step.usage.len(),
-                        has_continuation = step.continuation.is_some(),
-                        "model returned final answer"
-                    );
-                    append_step_trace(&mut trace, &step);
-                    usage.extend(step.usage.iter().cloned());
-                    last_model_id = Some(step.model_id.clone());
-                    final_continuation = step.continuation.clone();
-                    let answer = answer_from_content(step.content.clone());
-                    transcript.push(TranscriptTurn {
-                        role: TurnRole::Assistant,
-                        blocks: step.content,
-                        metadata: serde_json::Value::Null,
-                    });
-                    tracing::info!(
-                        iterations = iteration + 1,
-                        answer_chars = answer.text.chars().count(),
-                        trace_records = trace.len(),
-                        usage_records = usage.len(),
-                        "agent run completed"
-                    );
-                    return Ok(AgentRun {
-                        outcome: AgentOutcome::Completed { answer },
-                        transcript,
-                        trace,
-                        model_steps,
-                        last_model_id,
-                        final_continuation,
-                        usage,
-                    });
-                }
-                ModelStep::Continue { step } => {
-                    // Continuations are provider-owned state. We record and
-                    // replay them as transcript blocks, but only the backend
-                    // that created the continuation should interpret them.
-                    model_steps.push(model_step_trace(
-                        iteration,
-                        ModelStepKind::Continue,
-                        &provider,
-                        &step,
-                    ));
-                    tracing::debug!(
-                        iteration = iteration + 1,
-                        model = %step.model_id,
-                        content_blocks = step.content.len(),
-                        server_tools = step.server_tool_uses.len(),
-                        grounding = step.grounding.len(),
-                        usage_records = step.usage.len(),
-                        has_continuation = step.continuation.is_some(),
-                        "model requested continuation"
-                    );
-                    append_step_trace(&mut trace, &step);
-                    usage.extend(step.usage.iter().cloned());
-                    last_model_id = Some(step.model_id.clone());
-                    final_continuation = step.continuation.clone();
-                    append_assistant_step(&mut transcript, step);
-                }
-                ModelStep::UseClientTools { step } => {
-                    // Preserve the assistant tool-call turn before appending
-                    // local results. Providers rely on this call/result order
-                    // when converting the neutral transcript to native shapes.
-                    model_steps.push(model_step_trace(
-                        iteration,
-                        ModelStepKind::ClientTools,
-                        &provider,
-                        &step,
-                    ));
-                    tracing::debug!(
-                        iteration = iteration + 1,
-                        model = %step.model_id,
-                        content_blocks = step.content.len(),
-                        client_tool_calls = step.client_tool_calls.len(),
-                        server_tools = step.server_tool_uses.len(),
-                        grounding = step.grounding.len(),
-                        usage_records = step.usage.len(),
-                        has_continuation = step.continuation.is_some(),
-                        "model requested client tools"
-                    );
-                    append_step_trace(&mut trace, &step);
-                    usage.extend(step.usage.iter().cloned());
-                    last_model_id = Some(step.model_id.clone());
-                    final_continuation = step.continuation.clone();
-
-                    let calls = step.client_tool_calls.clone();
-                    append_assistant_step(&mut transcript, step);
-
-                    // Tool calls run concurrently, then are yielded back in
-                    // provider-requested order before they become the next
-                    // user turn.
-                    let tool_results =
-                        execute_client_tool_calls(&client_tools, &self.tool_executor, calls).await;
-                    let mut result_blocks = Vec::with_capacity(tool_results.len());
-                    for (result, tool_trace, media) in tool_results {
-                        result_blocks.push(ContentBlock::ClientToolResult(result));
-                        // Media handles are shown to the next model step as
-                        // native media blocks, while the trace keeps only the
-                        // JSON/text protocol result and audit payload.
-                        result_blocks
-                            .extend(media.into_iter().map(|media| ContentBlock::Media { media }));
-                        trace.push(ToolTrace::Client { trace: tool_trace });
+                // Step 2: fold the provider's step into transcript, traces, usage,
+                // and continuation state. Client tool calls get an extra local
+                // dispatch phase before the next provider step.
+                let ModelStep { kind, output } = step;
+                match kind {
+                    ModelStepKind::Final => {
+                        // Final content is both returned as `AssistantAnswer` and
+                        // appended to the replay transcript as an assistant turn.
+                        model_steps.push(model_step_trace(
+                            iteration,
+                            kind,
+                            &provider,
+                            &output,
+                        ));
+                        let answer_blocks = output.answer_blocks();
+                        tracing::debug!(
+                            iteration = iteration + 1,
+                            model = %output.model_id,
+                            content_blocks = answer_blocks.len(),
+                            server_tools = output.server_tool_uses().count(),
+                            grounding = output.grounding().count(),
+                            usage_records = output.usage.len(),
+                            has_continuation = output.continuation().is_some(),
+                            "model returned final answer"
+                        );
+                        append_step_trace(&mut trace, &output);
+                        usage.extend(output.usage.iter().cloned());
+                        last_model_id = Some(output.model_id.clone());
+                        final_continuation = output.continuation().cloned();
+                        let answer = answer_from_content(answer_blocks.clone());
+                        transcript.push(TranscriptTurn {
+                            role: TurnRole::Assistant,
+                            blocks: answer_blocks,
+                            metadata: serde_json::Value::Null,
+                        });
+                        tracing::info!(
+                            iterations = iteration + 1,
+                            answer_chars = answer.text.chars().count(),
+                            trace_records = trace.len(),
+                            usage_records = usage.len(),
+                            "agent run completed"
+                        );
+                        let run = AgentRun {
+                            outcome: AgentOutcome::Completed { answer },
+                            transcript,
+                            trace,
+                            model_steps,
+                            last_model_id,
+                            final_continuation,
+                            usage,
+                        };
+                        let event = AgentRunEvent::RunFinished { run };
+                        trace_agent_run_event(&event);
+                        yield event;
+                        return;
                     }
-                    transcript.push(TranscriptTurn {
-                        role: TurnRole::User,
-                        blocks: result_blocks,
-                        metadata: serde_json::Value::Null,
-                    });
-                    tracing::debug!(
-                        iteration = iteration + 1,
-                        turns = transcript.turns.len(),
-                        trace_records = trace.len(),
-                        "client tool results appended"
-                    );
+                    ModelStepKind::Continue => {
+                        // Continuations are provider-owned state. We record and
+                        // replay them as transcript blocks, but only the backend
+                        // that created the continuation should interpret them.
+                        model_steps.push(model_step_trace(
+                            iteration,
+                            kind,
+                            &provider,
+                            &output,
+                        ));
+                        tracing::debug!(
+                            iteration = iteration + 1,
+                            model = %output.model_id,
+                            content_blocks = output.transcript_blocks().count(),
+                            server_tools = output.server_tool_uses().count(),
+                            grounding = output.grounding().count(),
+                            usage_records = output.usage.len(),
+                            has_continuation = output.continuation().is_some(),
+                            "model requested continuation"
+                        );
+                        append_step_trace(&mut trace, &output);
+                        usage.extend(output.usage.iter().cloned());
+                        last_model_id = Some(output.model_id.clone());
+                        final_continuation = output.continuation().cloned();
+                        append_assistant_step(&mut transcript, output);
+                    }
+                    ModelStepKind::ClientTools => {
+                        // Preserve the assistant tool-call turn before appending
+                        // local results. Providers rely on this call/result order
+                        // when converting the neutral transcript to native shapes.
+                        model_steps.push(model_step_trace(
+                            iteration,
+                            kind,
+                            &provider,
+                            &output,
+                        ));
+                        let calls: Vec<_> = output.client_tool_calls().cloned().collect();
+                        tracing::debug!(
+                            iteration = iteration + 1,
+                            model = %output.model_id,
+                            content_blocks = output.transcript_blocks().count(),
+                            client_tool_calls = calls.len(),
+                            server_tools = output.server_tool_uses().count(),
+                            grounding = output.grounding().count(),
+                            usage_records = output.usage.len(),
+                            has_continuation = output.continuation().is_some(),
+                            "model requested client tools"
+                        );
+                        append_step_trace(&mut trace, &output);
+                        usage.extend(output.usage.iter().cloned());
+                        last_model_id = Some(output.model_id.clone());
+                        final_continuation = output.continuation().cloned();
+
+                        for call in &calls {
+                            let event = AgentRunEvent::ClientToolStarted { call: call.clone() };
+                            trace_agent_run_event(&event);
+                            yield event;
+                        }
+                        append_assistant_step(&mut transcript, output);
+
+                        // Tool calls run concurrently, then are yielded back in
+                        // provider-requested order before they become the next
+                        // user turn.
+                        let tool_results =
+                            execute_client_tool_calls(&client_tools, &self.tool_executor, calls).await;
+                        let mut result_blocks = Vec::with_capacity(tool_results.len());
+                        for (result, tool_trace, media) in tool_results {
+                            let event = AgentRunEvent::ClientToolFinished {
+                                result: result.clone(),
+                                trace: tool_trace.clone(),
+                                media: media.clone(),
+                            };
+                            trace_agent_run_event(&event);
+                            yield event;
+                            result_blocks.push(ContentBlock::ClientToolResult(result));
+                            // Media handles are shown to the next model step as
+                            // native media blocks, while the trace keeps only the
+                            // JSON/text protocol result and audit payload.
+                            result_blocks
+                                .extend(media.into_iter().map(|media| ContentBlock::Media { media }));
+                            trace.push(ToolTrace::Client { trace: tool_trace });
+                        }
+                        transcript.push(TranscriptTurn {
+                            role: TurnRole::User,
+                            blocks: result_blocks,
+                            metadata: serde_json::Value::Null,
+                        });
+                        tracing::debug!(
+                            iteration = iteration + 1,
+                            turns = transcript.turns.len(),
+                            trace_records = trace.len(),
+                            "client tool results appended"
+                        );
+                    }
                 }
             }
-        }
 
-        // The caller still gets the partial transcript and audit data so a UI
-        // can show exactly how far the loop got before the limit stopped it.
-        tracing::warn!(
-            max_iterations = self.spec.limits.max_iterations,
-            trace_records = trace.len(),
-            usage_records = usage.len(),
-            "agent run hit iteration limit"
-        );
-        Ok(AgentRun {
-            outcome: AgentOutcome::IterationLimit {
-                max_iterations: self.spec.limits.max_iterations,
-            },
-            transcript,
+            // The caller still gets the partial transcript and audit data so a UI
+            // can show exactly how far the loop got before the limit stopped it.
+            tracing::warn!(
+                max_iterations = self.spec.limits.max_iterations,
+                trace_records = trace.len(),
+                usage_records = usage.len(),
+                "agent run hit iteration limit"
+            );
+            let run = AgentRun {
+                outcome: AgentOutcome::IterationLimit {
+                    max_iterations: self.spec.limits.max_iterations,
+                },
+                transcript,
+                trace,
+                model_steps,
+                last_model_id,
+                final_continuation,
+                usage,
+            };
+            let event = AgentRunEvent::RunFinished { run };
+            trace_agent_run_event(&event);
+            yield event;
+        }
+    }
+}
+
+fn trace_agent_run_event(event: &AgentRunEvent) {
+    match event {
+        AgentRunEvent::RunStarted => {
+            tracing::trace!(event = "run_started", "yielding agent run event");
+        }
+        AgentRunEvent::ModelStepStarted { ordinal } => {
+            tracing::trace!(
+                event = "model_step_started",
+                ordinal,
+                iteration = ordinal + 1,
+                "yielding agent run event"
+            );
+        }
+        AgentRunEvent::ModelEvent { ordinal, event } => {
+            trace_model_step_event(*ordinal, event);
+        }
+        AgentRunEvent::ClientToolStarted { call } => {
+            tracing::trace!(
+                event = "client_tool_started",
+                tool_use_id = %call.id,
+                tool = %call.name,
+                "yielding agent run event"
+            );
+        }
+        AgentRunEvent::ClientToolFinished {
+            result,
             trace,
-            model_steps,
-            last_model_id,
-            final_continuation,
-            usage,
-        })
+            media,
+        } => {
+            tracing::trace!(
+                event = "client_tool_finished",
+                tool_use_id = %result.tool_use_id,
+                is_error = result.is_error,
+                content_kind = result.content.kind(),
+                content = ?result.content,
+                trace_response = ?trace.trace_response,
+                usage_records = trace.usage.len(),
+                media = media.len(),
+                "yielding agent run event"
+            );
+        }
+        AgentRunEvent::RunFinished { run } => {
+            tracing::trace!(
+                event = "run_finished",
+                outcome = run.outcome.kind(),
+                turns = run.transcript.turns.len(),
+                trace_records = run.trace.len(),
+                model_steps = run.model_steps.len(),
+                usage_records = run.usage.len(),
+                has_last_model = run.last_model_id.is_some(),
+                has_final_continuation = run.final_continuation.is_some(),
+                "yielding agent run event"
+            );
+        }
+    }
+}
+
+fn trace_model_step_event(ordinal: u32, event: &ModelStepEvent) {
+    match event {
+        ModelStepEvent::Delta(delta) => trace_model_step_delta(ordinal, delta),
+        ModelStepEvent::Continuation(continuation) => {
+            tracing::trace!(
+                event = "model_event",
+                model_event = "continuation",
+                ordinal,
+                iteration = ordinal + 1,
+                provider = %continuation.provider,
+                data_kind = continuation.data.kind(),
+                "yielding agent run event"
+            );
+        }
+        ModelStepEvent::ServerToolUse(tool) => {
+            tracing::trace!(
+                event = "model_event",
+                model_event = "server_tool_use",
+                ordinal,
+                iteration = ordinal + 1,
+                provider = %tool.provider,
+                tool = %tool.name,
+                id = tool.id.as_deref(),
+                status = tool.status.as_deref(),
+                raw = ?tool.raw,
+                usage_records = tool.usage.len(),
+                "yielding agent run event"
+            );
+        }
+        ModelStepEvent::Grounding(metadata) => {
+            tracing::trace!(
+                event = "model_event",
+                model_event = "grounding",
+                ordinal,
+                iteration = ordinal + 1,
+                provider = %metadata.provider,
+                raw = ?metadata.raw,
+                "yielding agent run event"
+            );
+        }
+        ModelStepEvent::Usage(usage) => {
+            tracing::trace!(
+                event = "model_event",
+                model_event = "usage",
+                ordinal,
+                iteration = ordinal + 1,
+                provider = %usage.provider,
+                model = usage.model.as_ref().map(ModelId::as_str),
+                input_tokens = usage.input_tokens,
+                cached_input_tokens = usage.cached_input_tokens,
+                output_tokens = usage.output_tokens,
+                reasoning_tokens = usage.reasoning_tokens,
+                total_tokens = usage.total_tokens,
+                has_cost = usage.cost.is_some(),
+                "yielding agent run event"
+            );
+        }
+        ModelStepEvent::Finished { kind, model_id } => {
+            tracing::trace!(
+                event = "model_event",
+                model_event = "finished",
+                ordinal,
+                iteration = ordinal + 1,
+                kind = kind.label(),
+                model = %model_id,
+                "yielding agent run event"
+            );
+        }
+    }
+}
+
+fn trace_model_step_delta(ordinal: u32, delta: &ModelStepDelta) {
+    match delta {
+        ModelStepDelta::Text { item_id, delta } => {
+            tracing::trace!(
+                event = "model_event",
+                model_event = "delta",
+                delta = "text",
+                ordinal,
+                iteration = ordinal + 1,
+                item_id = item_id.as_str(),
+                delta_chars = delta.chars().count(),
+                text_delta = ?delta,
+                "yielding agent run event"
+            );
+        }
+        ModelStepDelta::ReasoningSummary {
+            item_id,
+            provider,
+            kind,
+            delta,
+        } => {
+            tracing::trace!(
+                event = "model_event",
+                model_event = "delta",
+                delta = "reasoning_summary",
+                ordinal,
+                iteration = ordinal + 1,
+                item_id = item_id.as_str(),
+                provider = %provider,
+                kind = kind.as_deref(),
+                delta_chars = delta.chars().count(),
+                summary_delta = ?delta,
+                "yielding agent run event"
+            );
+        }
+        ModelStepDelta::ClientToolCall {
+            item_id,
+            id,
+            name,
+            arguments_delta,
+        } => {
+            tracing::trace!(
+                event = "model_event",
+                model_event = "delta",
+                delta = "client_tool_call",
+                ordinal,
+                iteration = ordinal + 1,
+                item_id = item_id.as_str(),
+                tool_use_id = %id,
+                tool = name.as_ref().map(ToolName::as_str),
+                arguments_delta_chars = arguments_delta.chars().count(),
+                arguments_delta = ?arguments_delta,
+                "yielding agent run event"
+            );
+        }
+    }
+}
+
+trait JsonValueKind {
+    fn kind(&self) -> &'static str;
+}
+
+impl JsonValueKind for serde_json::Value {
+    fn kind(&self) -> &'static str {
+        match self {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "bool",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
     }
 }
 
@@ -551,14 +913,14 @@ fn model_step_trace(
     iteration: u32,
     kind: ModelStepKind,
     provider: &ProviderName,
-    step: &AssistantStep,
+    output: &ModelStepOutput,
 ) -> ModelStepTrace {
     ModelStepTrace {
         ordinal: i32::try_from(iteration).unwrap_or(i32::MAX),
         kind,
         provider: provider.clone(),
-        model: step.model_id.clone(),
-        continuation: step.continuation.clone(),
+        model: output.model_id.clone(),
+        continuation: output.continuation().cloned(),
     }
 }
 
@@ -567,16 +929,16 @@ fn model_step_trace(
 /// Server tools and grounding are already complete when the provider returns a
 /// step. They do not produce local tool results, so they go straight into the
 /// trace stream instead of the transcript.
-fn append_step_trace(trace: &mut Vec<ToolTrace>, step: &AssistantStep) {
+fn append_step_trace(trace: &mut Vec<ToolTrace>, output: &ModelStepOutput) {
     trace.extend(
-        step.server_tool_uses
-            .iter()
+        output
+            .server_tool_uses()
             .cloned()
             .map(|tool| ToolTrace::Server { tool }),
     );
     trace.extend(
-        step.grounding
-            .iter()
+        output
+            .grounding()
             .cloned()
             .map(|metadata| ToolTrace::Grounding { metadata }),
     );
@@ -789,16 +1151,8 @@ where
 ///
 /// Empty assistant steps are skipped to avoid adding no-op turns during
 /// provider continuation loops.
-fn append_assistant_step(transcript: &mut Transcript, step: AssistantStep) {
-    let mut blocks = step.content;
-    blocks.extend(
-        step.client_tool_calls
-            .into_iter()
-            .map(ContentBlock::ClientToolCall),
-    );
-    if let Some(continuation) = step.continuation {
-        blocks.push(ContentBlock::Continuation(continuation));
-    }
+fn append_assistant_step(transcript: &mut Transcript, output: ModelStepOutput) {
+    let blocks: Vec<_> = output.transcript_blocks().collect();
     if !blocks.is_empty() {
         transcript.push(TranscriptTurn {
             role: TurnRole::Assistant,
@@ -837,7 +1191,10 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use crate::ids::{ProviderName, ToolUseId};
-    use crate::llm::{ModelSpec, SamplingOptions};
+    use crate::llm::{
+        ModelOutputBlock, ModelSpec, ModelStepEvent, ModelStepItem, ModelStepOutput,
+        SamplingOptions,
+    };
     use crate::tool::ToolInputSchema;
 
     use super::*;
@@ -869,6 +1226,100 @@ mod tests {
         ClientToolSpec {
             description: description.into(),
             input_schema: ToolInputSchema::default(),
+        }
+    }
+
+    fn final_text_step(text: impl Into<String>) -> ModelStep {
+        ModelStep::new(
+            ModelStepKind::Final,
+            ModelStepOutput {
+                model_id: ModelId::new("test-model"),
+                items: vec![ModelStepItem::OutputBlock(ModelOutputBlock::Text {
+                    text: text.into(),
+                })],
+                usage: Vec::new(),
+            },
+        )
+    }
+
+    fn client_tool_step(calls: Vec<ClientToolCall>) -> ModelStep {
+        ModelStep::new(
+            ModelStepKind::ClientTools,
+            ModelStepOutput {
+                model_id: ModelId::new("test-model"),
+                items: calls
+                    .into_iter()
+                    .map(ModelOutputBlock::ClientToolCall)
+                    .map(ModelStepItem::OutputBlock)
+                    .collect(),
+                usage: Vec::new(),
+            },
+        )
+    }
+
+    fn test_step_events<E: Send>(
+        step: ModelStep,
+    ) -> impl Stream<Item = Result<ModelStepEvent, E>> + Send {
+        let kind = step.kind();
+        let output = step.into_output();
+        let model_id = output.model_id;
+        let mut events = Vec::new();
+        for (index, item) in output.items.into_iter().enumerate() {
+            append_test_item_events(&mut events, index, item);
+        }
+        events.extend(output.usage.into_iter().map(ModelStepEvent::Usage).map(Ok));
+        events.push(Ok(ModelStepEvent::Finished { kind, model_id }));
+        futures::stream::iter(events)
+    }
+
+    fn append_test_item_events<E: Send>(
+        events: &mut Vec<Result<ModelStepEvent, E>>,
+        index: usize,
+        item: ModelStepItem,
+    ) {
+        match item {
+            ModelStepItem::OutputBlock(ModelOutputBlock::Text { text }) => {
+                events.push(Ok(ModelStepEvent::Delta(ModelStepDelta::Text {
+                    item_id: format!("test_text:{index}"),
+                    delta: text,
+                })));
+            }
+            ModelStepItem::OutputBlock(ModelOutputBlock::ClientToolCall(call)) => {
+                events.push(Ok(ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                    item_id: format!("test_tool:{index}"),
+                    id: call.id,
+                    name: Some(call.name),
+                    arguments_delta: call.input.to_string(),
+                })));
+            }
+            ModelStepItem::OutputBlock(ModelOutputBlock::Continuation(continuation)) => {
+                events.push(Ok(ModelStepEvent::Continuation(continuation)));
+            }
+            ModelStepItem::Reasoning(reasoning) => {
+                let item_id = reasoning
+                    .id
+                    .clone()
+                    .unwrap_or_else(|| format!("test_reasoning:{index}"));
+                for summary in reasoning.summary {
+                    if summary.text.is_empty() {
+                        continue;
+                    }
+                    events.push(Ok(ModelStepEvent::Delta(
+                        ModelStepDelta::ReasoningSummary {
+                            item_id: item_id.clone(),
+                            provider: reasoning.provider.clone(),
+                            kind: summary.kind,
+                            delta: summary.text,
+                        },
+                    )));
+                }
+            }
+            ModelStepItem::ServerToolUse(tool) => {
+                events.push(Ok(ModelStepEvent::ServerToolUse(tool)));
+            }
+            ModelStepItem::Grounding(metadata) => {
+                events.push(Ok(ModelStepEvent::Grounding(metadata)));
+            }
         }
     }
 
@@ -1002,28 +1453,16 @@ mod tests {
                 &self.name
             }
 
-            async fn step(
+            fn step(
                 &self,
                 request: crate::llm::ModelStepRequest,
-            ) -> Result<ModelStep, Self::Error> {
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
                 *self.seen_tools.lock().unwrap() = request
                     .client_tools
                     .keys()
                     .map(|name| name.as_str().to_string())
                     .collect();
-                Ok(ModelStep::Final {
-                    step: AssistantStep {
-                        content: vec![ContentBlock::Text {
-                            text: "done".to_string(),
-                        }],
-                        client_tool_calls: Vec::new(),
-                        server_tool_uses: Vec::new(),
-                        grounding: Vec::new(),
-                        model_id: ModelId::new("test-model"),
-                        continuation: None,
-                        usage: Vec::new(),
-                    },
-                })
+                test_step_events(final_text_step("done"))
             }
         }
 
@@ -1038,8 +1477,7 @@ mod tests {
         };
         let agent = Agent::new(test_model(backend), spec, tools);
 
-        let run = agent
-            .run(Transcript::from_user_text("list tools"))
+        let run = collect_agent_run(agent.run(Transcript::from_user_text("list tools")))
             .await
             .unwrap();
 
@@ -1065,24 +1503,12 @@ mod tests {
                 &self.name
             }
 
-            async fn step(
+            fn step(
                 &self,
                 request: crate::llm::ModelStepRequest,
-            ) -> Result<ModelStep, Self::Error> {
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
                 *self.seen.lock().unwrap() = Some(request.transcript);
-                Ok(ModelStep::Final {
-                    step: AssistantStep {
-                        content: vec![ContentBlock::Text {
-                            text: "done".to_string(),
-                        }],
-                        client_tool_calls: Vec::new(),
-                        server_tool_uses: Vec::new(),
-                        grounding: Vec::new(),
-                        model_id: ModelId::new("test-model"),
-                        continuation: None,
-                        usage: Vec::new(),
-                    },
-                })
+                test_step_events(final_text_step("done"))
             }
         }
 
@@ -1095,14 +1521,12 @@ mod tests {
         input.id = Some("conversation-1".to_string());
         input.instructions = Some("old saved system prompt".to_string());
 
-        let run = Agent::new(
+        let agent = Agent::new(
             test_model(backend),
             AgentSpec::new("new system prompt"),
             NoClientTools,
-        )
-        .run(input)
-        .await
-        .unwrap();
+        );
+        let run = collect_agent_run(agent.run(input)).await.unwrap();
 
         assert!(matches!(run.outcome, AgentOutcome::Completed { .. }));
         let seen = seen.lock().unwrap().clone().unwrap();
@@ -1127,24 +1551,12 @@ mod tests {
                 &self.name
             }
 
-            async fn step(
+            fn step(
                 &self,
                 request: crate::llm::ModelStepRequest,
-            ) -> Result<ModelStep, Self::Error> {
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
                 *self.seen_tools.lock().unwrap() = request.server_tools.into_iter().collect();
-                Ok(ModelStep::Final {
-                    step: AssistantStep {
-                        content: vec![ContentBlock::Text {
-                            text: "done".to_string(),
-                        }],
-                        client_tool_calls: Vec::new(),
-                        server_tool_uses: Vec::new(),
-                        grounding: Vec::new(),
-                        model_id: ModelId::new("test-model"),
-                        continuation: None,
-                        usage: Vec::new(),
-                    },
-                })
+                test_step_events(final_text_step("done"))
             }
         }
 
@@ -1166,8 +1578,8 @@ mod tests {
             "X_SEARCH".to_string(),
         ]));
 
-        let run = Agent::new(model, spec, NoClientTools)
-            .run(Transcript::from_user_text("use server tools"))
+        let agent = Agent::new(model, spec, NoClientTools);
+        let run = collect_agent_run(agent.run(Transcript::from_user_text("use server tools")))
             .await
             .unwrap();
 
@@ -1193,24 +1605,12 @@ mod tests {
                 &self.name
             }
 
-            async fn step(
+            fn step(
                 &self,
                 request: crate::llm::ModelStepRequest,
-            ) -> Result<ModelStep, Self::Error> {
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
                 *self.seen_tools.lock().unwrap() = request.server_tools.into_iter().collect();
-                Ok(ModelStep::Final {
-                    step: AssistantStep {
-                        content: vec![ContentBlock::Text {
-                            text: "done".to_string(),
-                        }],
-                        client_tool_calls: Vec::new(),
-                        server_tool_uses: Vec::new(),
-                        grounding: Vec::new(),
-                        model_id: ModelId::new("test-model"),
-                        continuation: None,
-                        usage: Vec::new(),
-                    },
-                })
+                test_step_events(final_text_step("done"))
             }
         }
 
@@ -1223,8 +1623,8 @@ mod tests {
         model.spec.server_tools =
             ServerToolSet::from(["WEB_SEARCH".to_string(), "x_search".to_string()]);
 
-        let run = Agent::new(model, AgentSpec::new("system"), NoClientTools)
-            .run(Transcript::from_user_text("use server tools"))
+        let agent = Agent::new(model, AgentSpec::new("system"), NoClientTools);
+        let run = collect_agent_run(agent.run(Transcript::from_user_text("use server tools")))
             .await
             .unwrap();
 
@@ -1251,74 +1651,56 @@ mod tests {
                 &self.name
             }
 
-            async fn step(
+            fn step(
                 &self,
                 request: crate::llm::ModelStepRequest,
-            ) -> Result<ModelStep, Self::Error> {
-                let mut calls = self.calls.lock().unwrap();
-                if *calls == 0 {
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+                let first_call = {
+                    let mut calls = self.calls.lock().unwrap();
+                    let first_call = *calls == 0;
                     *calls += 1;
-                    return Ok(ModelStep::UseClientTools {
-                        step: AssistantStep {
-                            content: Vec::new(),
-                            client_tool_calls: vec![
-                                ClientToolCall {
-                                    id: ToolUseId::new("call-1"),
-                                    name: ToolName::new("wait"),
-                                    input: json!({ "label": "first" }),
-                                },
-                                ClientToolCall {
-                                    id: ToolUseId::new("call-2"),
-                                    name: ToolName::new("wait"),
-                                    input: json!({ "label": "second" }),
-                                },
-                            ],
-                            server_tool_uses: Vec::new(),
-                            grounding: Vec::new(),
-                            model_id: ModelId::new("test-model"),
-                            continuation: None,
-                            usage: Vec::new(),
+                    first_call
+                };
+                let step = if first_call {
+                    client_tool_step(vec![
+                        ClientToolCall {
+                            id: ToolUseId::new("call-1"),
+                            name: ToolName::new("wait"),
+                            input: json!({ "label": "first" }),
                         },
-                    });
-                }
-                *calls += 1;
-                drop(calls);
+                        ClientToolCall {
+                            id: ToolUseId::new("call-2"),
+                            name: ToolName::new("wait"),
+                            input: json!({ "label": "second" }),
+                        },
+                    ])
+                } else {
+                    let observed = request
+                        .transcript
+                        .turns
+                        .last()
+                        .map(|message| {
+                            message
+                                .blocks
+                                .iter()
+                                .filter_map(|block| match block {
+                                    ContentBlock::ClientToolResult(result) => {
+                                        Some(result.tool_use_id.as_str().to_string())
+                                    }
+                                    ContentBlock::Text { .. }
+                                    | ContentBlock::Media { .. }
+                                    | ContentBlock::ClientToolCall(_)
+                                    | ContentBlock::Continuation(_) => None,
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    *self.result_order.lock().unwrap() = observed;
 
-                let observed = request
-                    .transcript
-                    .turns
-                    .last()
-                    .map(|message| {
-                        message
-                            .blocks
-                            .iter()
-                            .filter_map(|block| match block {
-                                ContentBlock::ClientToolResult(result) => {
-                                    Some(result.tool_use_id.as_str().to_string())
-                                }
-                                ContentBlock::Text { .. }
-                                | ContentBlock::Media { .. }
-                                | ContentBlock::ClientToolCall(_)
-                                | ContentBlock::Continuation(_) => None,
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                *self.result_order.lock().unwrap() = observed;
+                    final_text_step("done")
+                };
 
-                Ok(ModelStep::Final {
-                    step: AssistantStep {
-                        content: vec![ContentBlock::Text {
-                            text: "done".to_string(),
-                        }],
-                        client_tool_calls: Vec::new(),
-                        server_tool_uses: Vec::new(),
-                        grounding: Vec::new(),
-                        model_id: ModelId::new("test-model"),
-                        continuation: None,
-                        usage: Vec::new(),
-                    },
-                })
+                test_step_events(step)
             }
         }
 
@@ -1371,7 +1753,7 @@ mod tests {
 
         let run = timeout(
             Duration::from_secs(1),
-            agent.run(Transcript::from_user_text("run both tools")),
+            collect_agent_run(agent.run(Transcript::from_user_text("run both tools"))),
         )
         .await
         .expect("tool calls should run concurrently")

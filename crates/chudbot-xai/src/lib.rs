@@ -151,6 +151,54 @@ impl XaiClient {
         .await
     }
 
+    pub(crate) async fn post_json_stream(
+        &self,
+        endpoint: &str,
+        body: &Value,
+        label: &str,
+    ) -> Result<reqwest::Response, XaiError> {
+        let url = format!("{}{}", self.base_url, endpoint);
+        let grok_conv_id = prompt_cache_key_header_value(body).map(str::to_string);
+        with_retry(RetryPolicy::default(), label, || {
+            log_json_request(&self.provider_name, endpoint, body);
+            tracing::debug!(
+                provider = %self.provider_name,
+                endpoint = %endpoint,
+                base_url = %self.base_url,
+                x_grok_conv_id = grok_conv_id.is_some(),
+                "sending xAI streaming JSON request"
+            );
+            let mut request = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .header(reqwest::header::ACCEPT, "text/event-stream")
+                .json(body);
+            if let Some(grok_conv_id) = &grok_conv_id {
+                request = request.header(X_GROK_CONV_ID_HEADER, grok_conv_id);
+            }
+            async move {
+                let resp = request.send().await.map_err(|e| {
+                    tracing::warn!(
+                        provider = %self.provider_name,
+                        endpoint = %endpoint,
+                        error = %e,
+                        "xAI streaming request transport error"
+                    );
+                    XaiError::Transport(e.to_string())
+                })?;
+                tracing::debug!(
+                    provider = %self.provider_name,
+                    endpoint = %endpoint,
+                    status = %resp.status(),
+                    "received xAI streaming response"
+                );
+                ensure_stream_success(resp, &self.provider_name, endpoint).await
+            }
+        })
+        .await
+    }
+
     pub(crate) async fn get_json<T>(&self, endpoint: &str, label: &str) -> Result<T, XaiError>
     where
         T: for<'de> Deserialize<'de>,
@@ -256,6 +304,37 @@ where
             "failed to decode xAI response shape"
         );
         XaiError::Decode(e.to_string())
+    })
+}
+
+async fn ensure_stream_success(
+    resp: reqwest::Response,
+    provider: &ProviderName,
+    endpoint: &str,
+) -> Result<reqwest::Response, XaiError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+
+    let body = resp.text().await.map_err(|e| {
+        tracing::warn!(
+            status = status.as_u16(),
+            error = %e,
+            "failed to read xAI streaming error body"
+        );
+        XaiError::Decode(e.to_string())
+    })?;
+    log_text_response(provider, endpoint, status.as_u16(), &body);
+    let body = truncate_body(body, 600);
+    tracing::warn!(
+        status = status.as_u16(),
+        body_chars = body.chars().count(),
+        "xAI streaming API returned non-success status"
+    );
+    Err(XaiError::Api {
+        status: status.as_u16(),
+        body,
     })
 }
 

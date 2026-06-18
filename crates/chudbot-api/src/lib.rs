@@ -44,6 +44,8 @@
 
 // Topic modules. These are public so rustdoc has stable pages for each contract
 // family; the grouped re-exports below are the crate-root convenience surface.
+mod collector;
+
 pub mod agent;
 pub mod events;
 pub mod ids;
@@ -53,6 +55,7 @@ pub mod platform;
 pub mod reasoning;
 pub mod registries;
 pub mod retry;
+pub mod sse;
 pub mod storage;
 pub mod tool;
 pub mod transcript;
@@ -97,15 +100,17 @@ pub use storage::{
 // Model contracts cover both static model configuration and one provider
 // round-trip; provider crates translate these shapes to their native APIs.
 pub use llm::{
-    AssistantStep, LlmBackend, Model, ModelInfo, ModelInfoRequest, ModelSpec, ModelStep,
-    ModelStepRequest, ProviderOptions, SamplingOptions, ServerToolSet,
+    LlmBackend, Model, ModelInfo, ModelInfoRequest, ModelOutputBlock, ModelSpec, ModelStep,
+    ModelStepCollectionError, ModelStepDelta, ModelStepEvent, ModelStepItem, ModelStepOutput,
+    ModelStepReducerError, ModelStepRequest, ProviderOptions, SamplingOptions, ServerToolSet,
+    collect_model_step, reasoning_items_to_delta_events,
 };
 
 // Agent loop contracts: static agent config, runtime agent execution, outcomes,
 // and final assistant answers.
 pub use agent::{
-    Agent, AgentError, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentSpec,
-    AssistantAnswer,
+    Agent, AgentError, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentRunEvent,
+    AgentSpec, AssistantAnswer, collect_agent_run,
 };
 
 // Tool protocol shapes cover model-visible client tools, provider-run server

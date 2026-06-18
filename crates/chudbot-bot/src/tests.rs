@@ -8,10 +8,12 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chudbot_api::{
-    AgentSpec, AssistantStep, BoxedMediaRef, CreateMedia, ExternalId, LlmBackend, LoadedMedia,
-    MediaError, MediaMetadata, MediaRef, MediaStore, MediaUri, ModelStep, PlatformName,
-    PostedMessage, PublicMediaUrl, ServerToolSet, UsageSubject, VideoJobId,
+    AgentSpec, BoxedMediaRef, CreateMedia, ExternalId, LlmBackend, LoadedMedia, MediaError,
+    MediaMetadata, MediaRef, MediaStore, MediaUri, ModelOutputBlock, ModelStepDelta,
+    ModelStepEvent, ModelStepItem, ModelStepKind, ModelStepOutput, PlatformName, PostedMessage,
+    PublicMediaUrl, ServerToolSet, UsageSubject, VideoJobId,
 };
+use futures::Stream;
 use serde_json::json;
 use test_case::test_case;
 
@@ -997,11 +999,76 @@ fn test_llm_model<B>(backend: B) -> Model<B> {
     }
 }
 
+fn test_model_step_events(
+    kind: ModelStepKind,
+    output: ModelStepOutput,
+) -> impl Stream<Item = Result<ModelStepEvent, TestLlmError>> + Send {
+    let model_id = output.model_id;
+    let mut events = Vec::new();
+    for (index, item) in output.items.into_iter().enumerate() {
+        append_test_item_events(&mut events, index, item);
+    }
+    events.extend(output.usage.into_iter().map(ModelStepEvent::Usage).map(Ok));
+    events.push(Ok(ModelStepEvent::Finished { kind, model_id }));
+    futures::stream::iter(events)
+}
+
+fn append_test_item_events(
+    events: &mut Vec<Result<ModelStepEvent, TestLlmError>>,
+    index: usize,
+    item: ModelStepItem,
+) {
+    match item {
+        ModelStepItem::OutputBlock(ModelOutputBlock::Text { text }) => {
+            events.push(Ok(ModelStepEvent::Delta(ModelStepDelta::Text {
+                item_id: format!("test_text:{index}"),
+                delta: text,
+            })));
+        }
+        ModelStepItem::OutputBlock(ModelOutputBlock::ClientToolCall(call)) => {
+            events.push(Ok(ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                item_id: format!("test_tool:{index}"),
+                id: call.id,
+                name: Some(call.name),
+                arguments_delta: call.input.to_string(),
+            })));
+        }
+        ModelStepItem::OutputBlock(ModelOutputBlock::Continuation(continuation)) => {
+            events.push(Ok(ModelStepEvent::Continuation(continuation)));
+        }
+        ModelStepItem::Reasoning(reasoning) => {
+            let item_id = reasoning
+                .id
+                .clone()
+                .unwrap_or_else(|| format!("test_reasoning:{index}"));
+            for summary in reasoning.summary {
+                if summary.text.is_empty() {
+                    continue;
+                }
+                events.push(Ok(ModelStepEvent::Delta(
+                    ModelStepDelta::ReasoningSummary {
+                        item_id: item_id.clone(),
+                        provider: reasoning.provider.clone(),
+                        kind: summary.kind,
+                        delta: summary.text,
+                    },
+                )));
+            }
+        }
+        ModelStepItem::ServerToolUse(tool) => {
+            events.push(Ok(ModelStepEvent::ServerToolUse(tool)));
+        }
+        ModelStepItem::Grounding(metadata) => {
+            events.push(Ok(ModelStepEvent::Grounding(metadata)));
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RecordingLlmBackend {
     name: ProviderName,
     requests: Arc<Mutex<Vec<chudbot_api::ModelStepRequest>>>,
-    step: AssistantStep,
+    output: ModelStepOutput,
 }
 
 impl LlmBackend for RecordingLlmBackend {
@@ -1011,11 +1078,12 @@ impl LlmBackend for RecordingLlmBackend {
         &self.name
     }
 
-    async fn step(&self, request: chudbot_api::ModelStepRequest) -> Result<ModelStep, Self::Error> {
+    fn step(
+        &self,
+        request: chudbot_api::ModelStepRequest,
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
         self.requests.lock().unwrap().push(request);
-        Ok(ModelStep::Final {
-            step: self.step.clone(),
-        })
+        test_model_step_events(ModelStepKind::Final, self.output.clone())
     }
 }
 
@@ -1037,15 +1105,11 @@ async fn subagent_exposes_spec_and_executes_nested_agent() {
     let backend = RecordingLlmBackend {
         name: ProviderName::new("openai"),
         requests: requests.clone(),
-        step: AssistantStep {
-            content: vec![ContentBlock::Text {
-                text: "use VTI".to_string(),
-            }],
-            client_tool_calls: Vec::new(),
-            server_tool_uses: Vec::new(),
-            grounding: Vec::new(),
+        output: ModelStepOutput {
             model_id: ModelId::new("gpt-5"),
-            continuation: None,
+            items: vec![ModelStepItem::OutputBlock(ModelOutputBlock::Text {
+                text: "use VTI".to_string(),
+            })],
             usage: vec![usage],
         },
     };
@@ -1095,15 +1159,11 @@ async fn subagent_ignores_registration_name() {
     let backend = RecordingLlmBackend {
         name: ProviderName::new("openai"),
         requests: Arc::new(Mutex::new(Vec::new())),
-        step: AssistantStep {
-            content: vec![ContentBlock::Text {
-                text: "ok".to_string(),
-            }],
-            client_tool_calls: Vec::new(),
-            server_tool_uses: Vec::new(),
-            grounding: Vec::new(),
+        output: ModelStepOutput {
             model_id: ModelId::new("gpt-5"),
-            continuation: None,
+            items: vec![ModelStepItem::OutputBlock(ModelOutputBlock::Text {
+                text: "ok".to_string(),
+            })],
             usage: Vec::new(),
         },
     };

@@ -6,15 +6,19 @@
 //! preserving xAI continuation items for future turns, decoding model output
 //! into text/tool/server-use blocks, and normalizing usage into Chudbot records.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
+use chudbot_api::reasoning::TurnReasoning;
+use chudbot_api::sse::{ServerSentEvent, SseDecoder};
 use chudbot_api::{
-    AssistantStep, ClientToolCall, ClientToolSpec, ContentBlock, CostAmount, GroundingMetadata,
-    LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStep, ModelStepRequest,
-    ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse, ToolInputSchema, ToolName,
-    ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    ClientToolCall, ClientToolSpec, ContentBlock, CostAmount, GroundingMetadata, LlmBackend,
+    ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta, ModelStepEvent, ModelStepKind,
+    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
+    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    reasoning_items_to_delta_events,
 };
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -24,6 +28,13 @@ use crate::{XaiClient, XaiError, json_strip_nulls};
 /// Request encrypted reasoning blobs so later turns can replay provider state.
 const REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
 
+impl XaiClient {
+    async fn build_step_body(&self, request: &ModelStepRequest) -> Result<Value, XaiError> {
+        let input = to_responses_input(&request.transcript, self.provider_name()).await?;
+        Ok(build_step_body_from_input(request, input))
+    }
+}
+
 impl LlmBackend for XaiClient {
     type Error = XaiError;
 
@@ -32,90 +43,56 @@ impl LlmBackend for XaiClient {
     }
 
     #[tracing::instrument(name = "xai.step", skip_all, fields(model = %request.model))]
-    async fn step(&self, request: ModelStepRequest) -> Result<ModelStep, Self::Error> {
-        // Build the full Responses payload up front: transcript replay, tool
-        // declarations, sampling knobs, and provider-specific options all have
-        // to agree before xAI can continue the turn.
-        let input = to_responses_input(&request.transcript, self.provider_name()).await?;
-        let tools = build_responses_tools(&request.client_tools, &request.server_tools);
-        let options = XaiOptions::from_request(&request);
-        let reasoning = options
-            .reasoning_effort
-            .as_ref()
-            .map(|effort| json!({ "effort": effort }));
-        let has_tools = !tools.is_empty();
+    fn step(
+        &self,
+        request: ModelStepRequest,
+    ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+        async_stream::try_stream! {
+            let started = Instant::now();
+            let requested_model = request.model.clone();
+            let body = self.build_step_body(&request).await?;
+            let resp = self
+                .post_json_stream("/responses", &body, "llm[xai.stream]")
+                .await?;
+            let chunks = resp.bytes_stream();
+            futures::pin_mut!(chunks);
+            let mut decoder = SseDecoder::new();
+            let mut state = XaiStreamState::default();
 
-        let body = json_strip_nulls(json!({
-            "model": request.model.as_str(),
-            "input": input,
-            "tools": has_tools.then_some(tools),
-            "parallel_tool_calls": has_tools.then_some(true),
-            "max_output_tokens": request.sampling.max_output_tokens,
-            "temperature": request.sampling.temperature,
-            "top_p": request.sampling.top_p,
-            "reasoning": reasoning,
-            "prompt_cache_key": request.transcript.id,
-            "include": REASONING_INCLUDE,
-            "store": false,
-        }));
+            while let Some(chunk) = chunks.next().await {
+                let chunk = chunk.map_err(|error| XaiError::Transport(error.to_string()))?;
+                for event in decoder
+                    .push(&chunk)
+                    .map_err(|error| XaiError::Decode(error.to_string()))?
+                {
+                    let outcome =
+                        xai_stream_event(event, self.provider_name(), &requested_model, started, &mut state)?;
+                    for event in outcome.events {
+                        yield event;
+                    }
+                    if outcome.finished {
+                        return;
+                    }
+                }
+            }
 
-        let started = Instant::now();
-        let parsed: ResponsesResponse = self.post_json("/responses", &body, "llm[xai]").await?;
-        // Prefer xAI's echoed model id when present; aliases can resolve to a
-        // concrete serving model and downstream usage records should reflect it.
-        let model_id = parsed
-            .model
-            .as_deref()
-            .map(ModelId::new)
-            .unwrap_or_else(|| request.model.clone());
-        let usage = usage_from_xai(
-            self.provider_name(),
-            Some(model_id.clone()),
-            UsageSubject::ModelStep,
-            parsed.usage.as_ref(),
-        );
-        log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
+            if let Some(event) = decoder
+                .finish()
+                .map_err(|error| XaiError::Decode(error.to_string()))?
+            {
+                let outcome =
+                    xai_stream_event(event, self.provider_name(), &requested_model, started, &mut state)?;
+                for event in outcome.events {
+                    yield event;
+                }
+                if outcome.finished {
+                    return;
+                }
+            }
 
-        // Split the mixed Responses output stream into Chudbot's assistant
-        // step surface while keeping the raw server/citation data available to
-        // the trace viewer.
-        let (text, client_tool_calls, server_tool_uses) =
-            walk_output(&parsed.output, self.provider_name());
-        let grounding = parsed
-            .citations
-            .map(|raw| {
-                vec![GroundingMetadata {
-                    provider: self.provider_name().clone(),
-                    raw,
-                }]
-            })
-            .unwrap_or_default();
-        let continuation = continuation_from_output(self.provider_name(), parsed.output);
-
-        let mut content = Vec::new();
-        if !text.is_empty() {
-            content.push(ContentBlock::Text { text });
-        }
-
-        let step = AssistantStep {
-            content,
-            client_tool_calls,
-            server_tool_uses,
-            grounding,
-            model_id,
-            continuation,
-            usage: usage.into_iter().collect(),
-        };
-
-        // Client tool calls keep the conversation loop alive; text with no
-        // client calls is final, and empty content means the model produced
-        // replayable/provider state but still needs another turn.
-        if !step.client_tool_calls.is_empty() {
-            Ok(ModelStep::UseClientTools { step })
-        } else if step.content.is_empty() {
-            Ok(ModelStep::Continue { step })
-        } else {
-            Ok(ModelStep::Final { step })
+            Err(XaiError::Decode(
+                "xAI stream ended without a terminal response event".to_string(),
+            ))?;
         }
     }
 
@@ -129,6 +106,399 @@ impl LlmBackend for XaiClient {
         let raw: Value = self.get_json("/models", "model_info[xai]").await?;
         Ok(model_info_from_models_response(request.model, raw))
     }
+}
+
+fn build_step_body_from_input(request: &ModelStepRequest, input: Vec<Value>) -> Value {
+    let tools = build_responses_tools(&request.client_tools, &request.server_tools);
+    let options = XaiOptions::from_request(request);
+    let reasoning = options
+        .reasoning_effort
+        .as_ref()
+        .map(|effort| json!({ "effort": effort }));
+    let has_tools = !tools.is_empty();
+
+    json_strip_nulls(json!({
+        "model": request.model.as_str(),
+        "input": input,
+        "tools": has_tools.then_some(tools),
+        "parallel_tool_calls": has_tools.then_some(true),
+        "max_output_tokens": request.sampling.max_output_tokens,
+        "temperature": request.sampling.temperature,
+        "top_p": request.sampling.top_p,
+        "reasoning": reasoning,
+        "prompt_cache_key": request.transcript.id,
+        "include": REASONING_INCLUDE,
+        "store": false,
+        "stream": true,
+    }))
+}
+
+#[derive(Debug, Default)]
+struct XaiStreamState {
+    emitted_text_delta: bool,
+    emitted_reasoning_delta: bool,
+    function_calls: BTreeMap<String, StreamingFunctionCall>,
+    streamed_tool_ids: BTreeSet<ToolUseId>,
+    chat_seen: bool,
+    chat_model: Option<ModelId>,
+    chat_usage: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct StreamingFunctionCall {
+    id: ToolUseId,
+    name: Option<ToolName>,
+}
+
+#[derive(Debug, Default)]
+struct StreamEventOutcome {
+    events: Vec<ModelStepEvent>,
+    finished: bool,
+}
+
+fn xai_stream_event(
+    event: ServerSentEvent,
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    started: Instant,
+    state: &mut XaiStreamState,
+) -> Result<StreamEventOutcome, XaiError> {
+    if event.data.trim() == "[DONE]" {
+        if state.chat_seen {
+            return Ok(StreamEventOutcome {
+                events: xai_chat_terminal_events(provider, requested_model, started, state),
+                finished: true,
+            });
+        }
+        return Ok(StreamEventOutcome::default());
+    }
+
+    let value = serde_json::from_str::<Value>(&event.data)
+        .map_err(|error| XaiError::Decode(format!("failed to decode xAI SSE event: {error}")))?;
+    if value.get("object").and_then(Value::as_str) == Some("chat.completion.chunk") {
+        return xai_chat_stream_event(value, provider, requested_model, started, state);
+    }
+
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .or(event.event.as_deref())
+        .unwrap_or("");
+
+    match event_type {
+        "response.output_text.delta" => {
+            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                return Ok(StreamEventOutcome::default());
+            };
+            state.emitted_text_delta = true;
+            Ok(StreamEventOutcome {
+                events: vec![ModelStepEvent::Delta(ModelStepDelta::Text {
+                    item_id: stream_item_id(&value, "xai_text"),
+                    delta: delta.to_string(),
+                })],
+                finished: false,
+            })
+        }
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                return Ok(StreamEventOutcome::default());
+            };
+            state.emitted_reasoning_delta = true;
+            Ok(StreamEventOutcome {
+                events: vec![ModelStepEvent::Delta(ModelStepDelta::ReasoningSummary {
+                    item_id: stream_item_id(&value, "xai_reasoning"),
+                    provider: provider.clone(),
+                    kind: Some(event_type.trim_start_matches("response.").to_string()),
+                    delta: delta.to_string(),
+                })],
+                finished: false,
+            })
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            if let Some((key, call)) = streaming_function_call(&value) {
+                state.function_calls.insert(key, call);
+            }
+            Ok(StreamEventOutcome::default())
+        }
+        "response.function_call_arguments.delta" => {
+            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+                return Ok(StreamEventOutcome::default());
+            };
+            let key = stream_item_id(&value, "xai_function_call");
+            let Some(call) = state.function_calls.get(&key) else {
+                return Ok(StreamEventOutcome::default());
+            };
+            state.streamed_tool_ids.insert(call.id.clone());
+            Ok(StreamEventOutcome {
+                events: vec![ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                    item_id: key,
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments_delta: delta.to_string(),
+                })],
+                finished: false,
+            })
+        }
+        "response.completed" | "response.incomplete" => {
+            let response = value.get("response").cloned().unwrap_or(value);
+            let events = xai_terminal_events(response, provider, requested_model, started, state)?;
+            Ok(StreamEventOutcome {
+                events,
+                finished: true,
+            })
+        }
+        "response.failed" => {
+            let response = value.get("response").unwrap_or(&value);
+            Err(XaiError::Decode(provider_error_message(
+                response,
+                "xAI stream failed",
+            )))
+        }
+        "error" => Err(XaiError::Decode(provider_error_message(
+            &value,
+            "xAI stream returned an error event",
+        ))),
+        _ => Ok(StreamEventOutcome::default()),
+    }
+}
+
+fn streaming_function_call(value: &Value) -> Option<(String, StreamingFunctionCall)> {
+    let item = value.get("item").unwrap_or(value);
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return None;
+    }
+    let key = stream_item_id(value, "xai_function_call");
+    let id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())?;
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(ToolName::new);
+    Some((
+        key,
+        StreamingFunctionCall {
+            id: ToolUseId::new(id),
+            name,
+        },
+    ))
+}
+
+fn xai_chat_stream_event(
+    value: Value,
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    started: Instant,
+    state: &mut XaiStreamState,
+) -> Result<StreamEventOutcome, XaiError> {
+    state.chat_seen = true;
+    if let Some(model) = value.get("model").and_then(Value::as_str) {
+        state.chat_model = Some(ModelId::new(model));
+    }
+    if let Some(usage) = value.get("usage")
+        && !usage.is_null()
+    {
+        state.chat_usage = Some(usage.clone());
+    }
+
+    let mut events = Vec::new();
+    let mut finished = false;
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            if let Some(delta) = choice.get("delta") {
+                if let Some(text) = delta.get("content").and_then(Value::as_str)
+                    && !text.is_empty()
+                {
+                    state.emitted_text_delta = true;
+                    events.push(ModelStepEvent::Delta(ModelStepDelta::Text {
+                        item_id: "xai_chat_text".to_string(),
+                        delta: text.to_string(),
+                    }));
+                }
+                if let Some(reasoning) = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .and_then(Value::as_str)
+                    && !reasoning.is_empty()
+                {
+                    state.emitted_reasoning_delta = true;
+                    events.push(ModelStepEvent::Delta(ModelStepDelta::ReasoningSummary {
+                        item_id: "xai_chat_reasoning".to_string(),
+                        provider: provider.clone(),
+                        kind: Some("reasoning_content".to_string()),
+                        delta: reasoning.to_string(),
+                    }));
+                }
+            }
+            if choice
+                .get("finish_reason")
+                .is_some_and(|reason| !reason.is_null())
+            {
+                finished = true;
+            }
+        }
+    }
+
+    if finished {
+        events.extend(xai_chat_terminal_events(
+            provider,
+            requested_model,
+            started,
+            state,
+        ));
+    }
+    Ok(StreamEventOutcome { events, finished })
+}
+
+fn stream_item_id(value: &Value, fallback: &str) -> String {
+    value
+        .get("item_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(Value::as_str)
+        })
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|index| format!("{fallback}:{index}"))
+        })
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn xai_terminal_events(
+    response: Value,
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    started: Instant,
+    state: &XaiStreamState,
+) -> Result<Vec<ModelStepEvent>, XaiError> {
+    let parsed: ResponsesResponse = serde_json::from_value(response.clone()).map_err(|error| {
+        XaiError::Decode(format!("failed to decode terminal xAI response: {error}"))
+    })?;
+    let model_id = parsed
+        .model
+        .as_deref()
+        .map(ModelId::new)
+        .unwrap_or_else(|| requested_model.clone());
+    let usage = usage_from_xai(
+        provider,
+        Some(model_id.clone()),
+        UsageSubject::ModelStep,
+        parsed.usage.as_ref(),
+    );
+    log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
+
+    let (text, client_tool_calls, server_tool_uses) = walk_output(&parsed.output, provider);
+    let kind = if !client_tool_calls.is_empty() {
+        ModelStepKind::ClientTools
+    } else if text.is_empty() {
+        ModelStepKind::Continue
+    } else {
+        ModelStepKind::Final
+    };
+
+    let grounding = parsed
+        .citations
+        .map(|raw| {
+            vec![GroundingMetadata {
+                provider: provider.clone(),
+                raw,
+            }]
+        })
+        .unwrap_or_default();
+    let continuation = continuation_from_output(provider, parsed.output);
+
+    let mut events = Vec::new();
+    if !state.emitted_text_delta && !text.is_empty() {
+        events.push(ModelStepEvent::Delta(ModelStepDelta::Text {
+            item_id: "xai_text:terminal".to_string(),
+            delta: text,
+        }));
+    }
+    events.extend(
+        client_tool_calls
+            .into_iter()
+            .filter(|call| !state.streamed_tool_ids.contains(&call.id))
+            .enumerate()
+            .map(|(index, call)| {
+                ModelStepEvent::Delta(ModelStepDelta::ClientToolCall {
+                    item_id: format!("xai_tool:{index}"),
+                    id: call.id,
+                    name: Some(call.name),
+                    arguments_delta: call.input.to_string(),
+                })
+            }),
+    );
+    if !state.emitted_reasoning_delta
+        && let Some(continuation) = continuation.as_ref()
+    {
+        events.extend(reasoning_items_to_delta_events(
+            TurnReasoning::from_continuation_and_usage(Some(continuation), Some(&model_id), &[])
+                .items,
+            "xai_reasoning",
+        ));
+    }
+    if let Some(continuation) = continuation {
+        events.push(ModelStepEvent::Continuation(continuation));
+    }
+    events.extend(
+        server_tool_uses
+            .into_iter()
+            .map(ModelStepEvent::ServerToolUse),
+    );
+    events.extend(grounding.into_iter().map(ModelStepEvent::Grounding));
+    events.extend(usage.into_iter().map(ModelStepEvent::Usage));
+    events.push(ModelStepEvent::Finished { kind, model_id });
+    Ok(events)
+}
+
+fn xai_chat_terminal_events(
+    provider: &ProviderName,
+    requested_model: &ModelId,
+    started: Instant,
+    state: &XaiStreamState,
+) -> Vec<ModelStepEvent> {
+    let model_id = state
+        .chat_model
+        .clone()
+        .unwrap_or_else(|| requested_model.clone());
+    let usage = usage_from_xai(
+        provider,
+        Some(model_id.clone()),
+        UsageSubject::ModelStep,
+        state.chat_usage.as_ref(),
+    );
+    log_usage(model_id.as_str(), usage.as_ref(), started.elapsed());
+    let kind = if state.emitted_text_delta {
+        ModelStepKind::Final
+    } else {
+        ModelStepKind::Continue
+    };
+    let mut events = usage
+        .into_iter()
+        .map(ModelStepEvent::Usage)
+        .collect::<Vec<_>>();
+    events.push(ModelStepEvent::Finished { kind, model_id });
+    events
+}
+
+fn provider_error_message(value: &Value, fallback: &str) -> String {
+    value
+        .get("error")
+        .and_then(|error| error.get("message").or_else(|| error.get("type")))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .unwrap_or(fallback)
+        .to_string()
 }
 
 /// Extract token limits from either a single model object or an OpenAI-style list.
@@ -624,12 +994,16 @@ struct ResponsesResponse {
 #[derive(Deserialize, Debug, Default)]
 struct Usage {
     #[serde(default)]
+    #[serde(alias = "prompt_tokens")]
     input_tokens: u64,
     #[serde(default)]
+    #[serde(alias = "prompt_tokens_details")]
     input_tokens_details: TokenDetails,
     #[serde(default)]
+    #[serde(alias = "completion_tokens")]
     output_tokens: u64,
     #[serde(default)]
+    #[serde(alias = "completion_tokens_details")]
     output_tokens_details: TokenDetails,
     #[serde(default)]
     total_tokens: u64,
@@ -651,6 +1025,7 @@ mod tests {
     use super::*;
     use chudbot_api::{
         ProviderOptions, ToolInputField, ToolInputSchema, ToolInputValueSchema, TranscriptTurn,
+        collect_model_step,
     };
 
     #[test]
@@ -836,6 +1211,58 @@ mod tests {
                 .as_deref(),
             Some("high")
         );
+    }
+
+    #[test]
+    fn streams_documented_xai_chat_completion_chunks() {
+        let provider = ProviderName::new("xai");
+        let requested_model = ModelId::new("grok-4.3");
+        let mut state = XaiStreamState::default();
+        let mut events = Vec::new();
+        for data in [
+            json!({
+                "id": "chunk_1",
+                "object": "chat.completion.chunk",
+                "model": "grok-4.3",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "role": "assistant", "content": "Ah" }
+                }],
+                "usage": {
+                    "prompt_tokens": 41,
+                    "completion_tokens": 1,
+                    "total_tokens": 42,
+                    "prompt_tokens_details": { "cached_tokens": 3 }
+                }
+            })
+            .to_string(),
+            "[DONE]".to_string(),
+        ] {
+            let outcome = xai_stream_event(
+                ServerSentEvent { event: None, data },
+                &provider,
+                &requested_model,
+                Instant::now(),
+                &mut state,
+            )
+            .expect("stream event");
+            events.extend(outcome.events);
+            if outcome.finished {
+                break;
+            }
+        }
+
+        let step = futures::executor::block_on(collect_model_step(futures::stream::iter(
+            events.into_iter().map(Ok::<_, XaiError>),
+        )))
+        .expect("finished step");
+        assert!(matches!(step.kind(), ModelStepKind::Final));
+        let output = step.output();
+        assert_eq!(output.answer_text(), "Ah");
+        assert_eq!(output.usage[0].input_tokens, Some(41));
+        assert_eq!(output.usage[0].cached_input_tokens, Some(3));
+        assert_eq!(output.usage[0].output_tokens, Some(1));
+        assert_eq!(output.usage[0].total_tokens, Some(42));
     }
 
     #[test]

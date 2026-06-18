@@ -71,7 +71,7 @@ where
             ),
         ));
         let agent = self.system_agent(agent_config);
-        let run = match agent.run(transcript).await {
+        let run = match collect_agent_run(agent.run(transcript)).await {
             Ok(run) => run,
             Err(error) => {
                 let message = error.to_string();

@@ -87,12 +87,11 @@ where
             );
             async move {
                 tracing::debug!("starting subagent tool call");
-                let run = self
-                    .agent
-                    .run(subagent_transcript_for_input(call.input))
-                    .await?;
+                let run =
+                    collect_agent_run(self.agent.run(subagent_transcript_for_input(call.input)))
+                        .await?;
                 tracing::debug!(
-                    outcome = subagent_outcome_kind(&run.outcome),
+                    outcome = run.outcome.kind(),
                     usage_records = run.all_usage().len(),
                     trace_records = run.trace.len(),
                     "subagent tool call finished"
@@ -864,16 +863,6 @@ fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
             "reason": reason,
             "usage": run.all_usage(),
         }),
-    }
-}
-
-/// Low-cardinality nested-agent outcome label for structured logs.
-fn subagent_outcome_kind(outcome: &AgentOutcome) -> &'static str {
-    match outcome {
-        AgentOutcome::Completed { .. } => "completed",
-        AgentOutcome::Failed { .. } => "failed",
-        AgentOutcome::IterationLimit { .. } => "iteration_limit",
-        AgentOutcome::Cancelled { .. } => "cancelled",
     }
 }
 

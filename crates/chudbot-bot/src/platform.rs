@@ -325,22 +325,19 @@ pub(crate) fn platform_event_kind(event: &PlatformEvent) -> &'static str {
     }
 }
 
-/// Return the stable trace label for one model step variant.
-pub(crate) fn model_step_kind(step: &ModelStep) -> &'static str {
-    match step {
-        ModelStep::Final { .. } => "final",
-        ModelStep::UseClientTools { .. } => "use_client_tools",
-        ModelStep::Continue { .. } => "continue",
-    }
-}
-
-/// Return the stable trace label for a completed agent run outcome.
-pub(crate) fn agent_outcome_kind(outcome: &AgentOutcome) -> &'static str {
-    match outcome {
-        AgentOutcome::Completed { .. } => "completed",
-        AgentOutcome::Failed { .. } => "failed",
-        AgentOutcome::IterationLimit { .. } => "iteration_limit",
-        AgentOutcome::Cancelled { .. } => "cancelled",
+/// Return the stable trace label for a streamed model-step terminal event.
+pub(crate) fn model_step_kind_from_event(event: &ModelStepEvent) -> Option<&'static str> {
+    match event {
+        ModelStepEvent::Finished { kind, .. } => Some(match kind {
+            ModelStepKind::Final => "final",
+            ModelStepKind::ClientTools => "use_client_tools",
+            ModelStepKind::Continue => "continue",
+        }),
+        ModelStepEvent::Delta(_)
+        | ModelStepEvent::Continuation(_)
+        | ModelStepEvent::ServerToolUse(_)
+        | ModelStepEvent::Grounding(_)
+        | ModelStepEvent::Usage(_) => None,
     }
 }
 

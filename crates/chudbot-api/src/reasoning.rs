@@ -115,6 +115,10 @@ impl TurnReasoning {
         model_steps: &[ModelStepTrace],
         usage: &[UsageRecord],
     ) -> Self {
+        // FIXME(streaming): live `ModelStepItem::Reasoning` values are not
+        // persisted directly yet. Stored reasoning views are reconstructed from
+        // provider continuations, so provider adapters must keep terminal
+        // continuations complete until typed reasoning has a durable storage path.
         // Step 1: walk continuations in model-step order so the viewer follows
         // the same sequence the runtime observed.
         let items = model_steps

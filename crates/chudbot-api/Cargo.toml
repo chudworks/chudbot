@@ -9,6 +9,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-stream.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true

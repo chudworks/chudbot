@@ -908,13 +908,14 @@ where
         let typing = self.spawn_typing_indicator(channel_from_message(&execution.reply_to));
         // Registration ties this concrete turn to admin stop requests. Dropping
         // the guard unregisters the turn once the provider run is done.
+        let events = agent.run(transcript);
         let run = tokio::select! {
             biased;
             () = cancel_token.cancelled() => {
                 tracing::info!("turn cancelled before agent completed");
                 None
             }
-            run = agent.run(transcript) => Some(run),
+            run = collect_agent_run(events) => Some(run),
         };
         typing.stop().await;
         let Some(run) = run else {
@@ -954,7 +955,7 @@ where
         };
         drop(cancel_guard);
         tracing::debug!(
-            outcome = agent_outcome_kind(&run.outcome),
+            outcome = run.outcome.kind(),
             model_steps = run.model_steps.len(),
             trace_events = run.trace.len(),
             usage_records = run.all_usage().len(),
