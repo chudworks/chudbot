@@ -171,8 +171,8 @@ cmd_deploy() {
 
     build_frontend
 
-    echo "==> cargo build --frozen --profile $PROFILE"
-    (cd "$REPO_DIR" && cargo build --frozen --profile "$PROFILE" -p chudbot-bin)
+    echo "==> cargo build --locked --profile $PROFILE"
+    (cd "$REPO_DIR" && cargo build --locked --profile "$PROFILE" -p chudbot-bin)
     local built="$REPO_DIR/target/$PROFILE/chudbot"
     if [[ ! -x "$built" ]]; then
         echo "error: cargo build did not produce $built" >&2
