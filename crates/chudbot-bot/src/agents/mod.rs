@@ -10,6 +10,7 @@ mod system;
 mod title;
 mod tos;
 
+pub(crate) use conversation::*;
 pub(crate) use system::*;
 pub(crate) use title::*;
 pub(crate) use tos::*;

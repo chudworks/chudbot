@@ -756,21 +756,48 @@ impl PersistentVideoStorage for VideoRateLimitStorage {
 #[error("test storage error")]
 struct TestVideoStorageError;
 
+fn video_rate_limit_tool<G>(
+    generator: G,
+    storage: VideoRateLimitStorage,
+    rate_limit_locks: VideoRateLimitLocks,
+    turn_user: UserRef,
+    rate_limit: Option<VideoGenerationRateLimit>,
+) -> PersistentVideoGeneratorTool<G, NoopMediaStore, VideoRateLimitStorage> {
+    PersistentVideoGeneratorTool {
+        generator,
+        media_store: NoopMediaStore,
+        storage,
+        rate_limit_locks,
+        context: RuntimeToolContext {
+            default_channel: channel_ref(Some("guild-1")),
+            reply_to: message_ref("message-1"),
+            conversation_id: ConversationId::new(),
+            turn_id: TurnId::new(),
+            turn_user,
+            privacy: PrivacyMode::ConversationOnly,
+        },
+        binding: GenerationBinding {
+            provider: ProviderName::new("grok_video"),
+            model: ModelId::new("grok-video-test"),
+            rate_limit,
+        },
+        poll_interval: DEFAULT_VIDEO_POLL_INTERVAL,
+        max_polls: DEFAULT_VIDEO_MAX_POLLS,
+    }
+}
+
 #[tokio::test]
 async fn video_rate_limit_fails_before_provider_submit() {
     let submits = Arc::new(AtomicUsize::new(0));
     let storage = VideoRateLimitStorage::new(2);
-    let tool = PersistentVideoGeneratorTool::new(
+    let tool = video_rate_limit_tool(
         CountingVideoGenerator {
             submits: submits.clone(),
             submit_delay: Duration::ZERO,
         },
-        NoopMediaStore,
         storage.clone(),
         VideoRateLimitLocks::default(),
-        TurnId::new(),
         user("discord", Some("guild-1"), "user-1"),
-        ProviderName::new("grok_video"),
         Some(VideoGenerationRateLimit {
             limit: 2,
             interval: "4h".to_string(),
@@ -818,25 +845,19 @@ async fn video_rate_limit_counts_pending_jobs_between_parallel_calls() {
         submits: submits.clone(),
         submit_delay: Duration::from_millis(50),
     };
-    let mut first = PersistentVideoGeneratorTool::new(
+    let mut first = video_rate_limit_tool(
         generator.clone(),
-        NoopMediaStore,
         storage.clone(),
         rate_limit_locks.clone(),
-        TurnId::new(),
         user("discord", Some("guild-1"), "user-1"),
-        ProviderName::new("grok_video"),
         rate_limit.clone(),
     );
     first.max_polls = 0;
-    let mut second = PersistentVideoGeneratorTool::new(
+    let mut second = video_rate_limit_tool(
         generator,
-        NoopMediaStore,
         storage.clone(),
         rate_limit_locks,
-        TurnId::new(),
         user("discord", Some("guild-1"), "user-2"),
-        ProviderName::new("grok_video"),
         rate_limit,
     );
     second.max_polls = 0;

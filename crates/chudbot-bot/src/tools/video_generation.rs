@@ -8,6 +8,9 @@
 
 use super::*;
 
+pub(crate) const DEFAULT_VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(2);
+pub(crate) const DEFAULT_VIDEO_MAX_POLLS: u32 = 600;
+
 /// Runtime client tool for configured video generation.
 ///
 /// `generator` is already routed to the agent's configured provider and default
@@ -23,55 +26,14 @@ pub(crate) struct PersistentVideoGeneratorTool<G, M, S> {
     pub(crate) storage: S,
     /// Runtime-shared locks that close same-scope parallel submit races.
     pub(crate) rate_limit_locks: VideoRateLimitLocks,
-    /// Turn that requested the provider job.
-    pub(crate) turn_id: TurnId,
-    /// User and platform scope used for quota checks.
-    pub(crate) turn_user: UserRef,
-    /// Provider name stored with job rows and status updates.
-    pub(crate) provider: ProviderName,
-    /// Optional active-job quota for this agent binding.
-    pub(crate) rate_limit: Option<VideoGenerationRateLimit>,
-    /// Model-facing tool description advertised in the tool spec.
-    pub(crate) description: String,
+    /// Turn context used for persistence and platform-scoped rate limits.
+    pub(crate) context: RuntimeToolContext,
+    /// Agent-configured video provider/model binding.
+    pub(crate) binding: GenerationBinding,
     /// Delay between provider job polls.
     pub(crate) poll_interval: Duration,
     /// Maximum number of provider polls before the tool returns a timeout.
     pub(crate) max_polls: u32,
-}
-
-impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
-    /// Build a video tool from a configured provider route and turn context.
-    pub(crate) fn new(
-        generator: G,
-        media_store: M,
-        storage: S,
-        rate_limit_locks: VideoRateLimitLocks,
-        turn_id: TurnId,
-        turn_user: UserRef,
-        provider: ProviderName,
-        rate_limit: Option<VideoGenerationRateLimit>,
-    ) -> Self {
-        Self {
-            generator,
-            media_store,
-            storage,
-            rate_limit_locks,
-            turn_id,
-            turn_user,
-            provider,
-            rate_limit,
-            description: "Generate a video, save it to media storage, and return its media URI."
-                .to_string(),
-            poll_interval: Duration::from_secs(2),
-            max_polls: 600,
-        }
-    }
-
-    /// Override the model-facing tool description for a specific binding.
-    pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.description = description.into();
-        self
-    }
 }
 
 impl<G, M, S> PersistentVideoGeneratorTool<G, M, S>
@@ -86,7 +48,7 @@ where
     /// provider schema enforcement can vary.
     pub(crate) fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
-            description: self.description.clone(),
+            description: video_generation_tool_description(&self.binding),
             input_schema: video_tool_schema(),
         }
     }
@@ -95,10 +57,10 @@ where
         name = "tool.generate_video",
         skip_all,
         fields(
-            turn = %self.turn_id,
-            provider = %self.provider,
-            user = %self.turn_user.user_id,
-            scope = ?self.turn_user.guild_id.as_ref().map(ExternalId::as_str),
+            turn = %self.context.turn_id,
+            provider = %self.binding.provider,
+            user = %self.context.turn_user.user_id,
+            scope = ?self.context.turn_user.guild_id.as_ref().map(ExternalId::as_str),
             tool_call = %call.id
         )
     )]
@@ -110,12 +72,12 @@ where
         // or provider state; malformed calls should not consume capacity.
         let request = video_request_from_tool_input(&self.media_store, call.input).await?;
         let prompt = request.prompt.clone();
-        let job_id = if let Some(rate_limit) = &self.rate_limit
-            && !rate_limit.bypasses(&self.turn_user)
+        let job_id = if let Some(rate_limit) = &self.binding.rate_limit
+            && !rate_limit.bypasses(&self.context.turn_user)
         {
             // The in-process lock keeps the active-job count and provider submit
             // atomic for this single-node runtime.
-            let _guard = self.rate_limit_locks.lock(&self.turn_user).await;
+            let _guard = self.rate_limit_locks.lock(&self.context.turn_user).await;
             self.enforce_video_rate_limit(rate_limit).await?;
             self.submit_and_persist_video_job(request, prompt).await?
         } else {
@@ -157,7 +119,7 @@ where
                         .map_err(|error| BotToolError::Media(error.to_string()))?;
                     self.storage
                         .update_video_job(UpdateVideoJob {
-                            provider: self.provider.clone(),
+                            provider: self.binding.provider.clone(),
                             provider_job_id: job_id.as_str().to_string(),
                             status: "done".to_string(),
                             output_uri: Some(media.uri().clone()),
@@ -200,7 +162,7 @@ where
                     let error = format!("video generation failed: {message}");
                     self.storage
                         .update_video_job(UpdateVideoJob {
-                            provider: self.provider.clone(),
+                            provider: self.binding.provider.clone(),
                             provider_job_id: job_id.as_str().to_string(),
                             status: "failed".to_string(),
                             output_uri: None,
@@ -213,7 +175,7 @@ where
                 VideoJobStatus::Expired => {
                     self.storage
                         .update_video_job(UpdateVideoJob {
-                            provider: self.provider.clone(),
+                            provider: self.binding.provider.clone(),
                             provider_job_id: job_id.as_str().to_string(),
                             status: "expired".to_string(),
                             output_uri: None,
@@ -236,7 +198,7 @@ where
         );
         self.storage
             .update_video_job(UpdateVideoJob {
-                provider: self.provider.clone(),
+                provider: self.binding.provider.clone(),
                 provider_job_id: job_id.as_str().to_string(),
                 status: "pending".to_string(),
                 output_uri: None,
@@ -374,8 +336,8 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
         let used = self
             .storage
             .count_active_video_generations(CountActiveVideoGenerations {
-                platform: self.turn_user.platform.clone(),
-                scope_id: self.turn_user.guild_id.clone(),
+                platform: self.context.turn_user.platform.clone(),
+                scope_id: self.context.turn_user.guild_id.clone(),
                 interval_seconds,
             })
             .await
@@ -418,8 +380,8 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
             .map_err(|error| BotToolError::Generator(error.to_string()))?;
         self.storage
             .create_video_job(CreateVideoJob {
-                turn_id: self.turn_id,
-                provider: self.provider.clone(),
+                turn_id: self.context.turn_id,
+                provider: self.binding.provider.clone(),
                 provider_job_id: job_id.as_str().to_string(),
                 prompt,
             })

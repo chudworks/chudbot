@@ -9,6 +9,9 @@ license.workspace = true
 name = "chudbot"
 path = "src/main.rs"
 
+[lints]
+workspace = true
+
 [dependencies]
 chudbot-api = { path = "../chudbot-api" }
 chudbot-anthropic = { path = "../chudbot-anthropic" }

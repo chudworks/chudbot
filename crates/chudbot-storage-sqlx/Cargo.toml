@@ -5,6 +5,9 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 chudbot-api = { path = "../chudbot-api" }
 serde.workspace = true

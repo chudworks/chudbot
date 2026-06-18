@@ -23,7 +23,7 @@ pub(crate) struct TurnExecution {
     pub(crate) agent_name: String,
     /// Agent configuration used to build providers, tools, and model request shape.
     pub(crate) agent_config: AgentConfig,
-    /// Final system prompt, including any conversation-specific guidance.
+    /// Rendered system instructions persisted for this turn.
     pub(crate) system_prompt: String,
     /// Model transcript prepared from stored conversation state and current context.
     pub(crate) transcript: Transcript,
@@ -882,16 +882,20 @@ where
         }
         tracing::debug!("building agent for turn");
         let agent = self.build_agent(
-            &execution.agent_name,
-            &execution.agent_config,
-            execution.system_prompt.clone(),
-            &execution.settings,
-            &execution.reply_to,
-            &execution.turn.user,
-            &execution.turn.user_display_name,
-            execution.conversation.id,
-            execution.turn.id,
-            true,
+            ConversationAgentAssembly {
+                agent_name: &execution.agent_name,
+                agent_config: &execution.agent_config,
+                rendered_system_instructions: execution.system_prompt.clone(),
+                top_level: true,
+            },
+            &ConversationAgentContext {
+                settings: &execution.settings,
+                reply_to: &execution.reply_to,
+                turn_user: &execution.turn.user,
+                turn_user_display_name: &execution.turn.user_display_name,
+                conversation_id: execution.conversation.id,
+                turn_id: execution.turn.id,
+            },
             &mut Vec::new(),
         )?;
         let transcript = std::mem::take(&mut execution.transcript);

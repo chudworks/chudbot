@@ -25,6 +25,12 @@ impl std::fmt::Display for RuntimeToolError {
 
 impl std::error::Error for RuntimeToolError {}
 
+type RuntimeVideoGenerationTool<R> = PersistentVideoGeneratorTool<
+    RoutedVideoGenerator<<R as BotRuntimeTypes>::Videos>,
+    <R as BotRuntimeTypes>::Media,
+    <R as BotRuntimeTypes>::Storage,
+>;
+
 /// One configured agent exposed as a named client tool by its parent executor.
 pub(crate) struct Subagent<B, T = NoClientTools> {
     /// Model-facing tool description.
@@ -65,6 +71,10 @@ where
     }
 
     /// Execute a parent-model tool call by running the nested agent.
+    #[allow(
+        clippy::manual_async_fn,
+        reason = "native async triggers a compiler cycle through recursive subagent executor types"
+    )]
     pub(crate) fn call(
         &self,
         call: ClientToolCall,
@@ -118,6 +128,7 @@ pub(crate) struct RuntimeToolDeps<R: BotRuntimeTypes> {
 }
 
 /// Per-turn context captured by tools that interact with the current conversation.
+#[derive(Debug, Clone)]
 pub(crate) struct RuntimeToolContext {
     /// Channel used when a tool needs the current conversation's default target.
     pub(crate) default_channel: ChannelRef,
@@ -447,27 +458,23 @@ where
         })
     }
 
-    fn video_generation_tool(
-        &self,
-    ) -> Option<PersistentVideoGeneratorTool<RoutedVideoGenerator<R::Videos>, R::Media, R::Storage>>
-    {
-        self.video_generation.as_ref().map(|binding| {
-            PersistentVideoGeneratorTool::new(
-                RoutedVideoGenerator::new(
+    fn video_generation_tool(&self) -> Option<RuntimeVideoGenerationTool<R>> {
+        self.video_generation
+            .as_ref()
+            .map(|binding| PersistentVideoGeneratorTool {
+                generator: RoutedVideoGenerator::new(
                     self.deps.videos.clone(),
                     binding.provider.clone(),
                     binding.model.clone(),
                 ),
-                self.deps.media_store.clone(),
-                self.deps.storage.clone(),
-                self.deps.video_rate_limit_locks.clone(),
-                self.context.turn_id,
-                self.context.turn_user.clone(),
-                binding.provider.clone(),
-                binding.rate_limit.clone(),
-            )
-            .with_description(video_generation_tool_description(binding))
-        })
+                media_store: self.deps.media_store.clone(),
+                storage: self.deps.storage.clone(),
+                rate_limit_locks: self.deps.video_rate_limit_locks.clone(),
+                context: self.context.clone(),
+                binding: binding.clone(),
+                poll_interval: DEFAULT_VIDEO_POLL_INTERVAL,
+                max_polls: DEFAULT_VIDEO_MAX_POLLS,
+            })
     }
 
     fn audio_transcription_tool(

@@ -12,30 +12,51 @@ use crate::*;
 type ConversationAgent<R> =
     Agent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, RuntimeToolExecutor<R>>;
 
+/// Resolved agent plus rendered instructions used to assemble one executable agent.
+pub(crate) struct ConversationAgentAssembly<'a> {
+    /// Config map key used for recursion checks and diagnostics.
+    pub(crate) agent_name: &'a str,
+    /// Static deployment config for the resolved agent.
+    pub(crate) agent_config: &'a AgentConfig,
+    /// Fully rendered system instructions for this top-level turn or subagent.
+    pub(crate) rendered_system_instructions: String,
+    /// Whether this assembled agent is directly answering the user.
+    pub(crate) top_level: bool,
+}
+
+/// Runtime turn context shared by the top-level agent and configured subagents.
+pub(crate) struct ConversationAgentContext<'a> {
+    pub(crate) settings: &'a RuntimeSettings,
+    pub(crate) reply_to: &'a MessageRef,
+    pub(crate) turn_user: &'a UserRef,
+    pub(crate) turn_user_display_name: &'a str,
+    pub(crate) conversation_id: ConversationId,
+    pub(crate) turn_id: TurnId,
+}
+
 impl<R> BotRuntime<R>
 where
     R: BotRuntimeTypes + 'static,
 {
-    /// Build the executable agent used for one turn or subagent call.
+    /// Assemble the executable agent used for one turn or subagent call.
     ///
-    /// `top_level` controls tools that should only be available to the agent
-    /// directly answering the user. `stack` tracks the active agent expansion
+    /// The assembly carries the resolved configured agent plus the already
+    /// rendered system instructions that should be used for this run. `stack`
+    /// tracks the active agent expansion
     /// chain so configured subagent cycles fail during construction instead of
     /// becoming recursive tool calls at runtime.
     pub(crate) fn build_agent(
         &self,
-        agent_name: &str,
-        agent_config: &AgentConfig,
-        system_prompt: String,
-        settings: &RuntimeSettings,
-        reply_to: &MessageRef,
-        turn_user: &UserRef,
-        turn_user_display_name: &str,
-        conversation_id: ConversationId,
-        turn_id: TurnId,
-        top_level: bool,
+        assembly: ConversationAgentAssembly<'_>,
+        context: &ConversationAgentContext<'_>,
         stack: &mut Vec<String>,
     ) -> Result<ConversationAgent<R>, BotError> {
+        let ConversationAgentAssembly {
+            agent_name,
+            agent_config,
+            rendered_system_instructions,
+            top_level,
+        } = assembly;
         self.ensure_agent_services_exist(agent_name, agent_config)?;
 
         // Only the active expansion path is recursive. Sibling subagents may
@@ -48,9 +69,11 @@ where
         }
         stack.push(agent_name.to_string());
 
-        // Start from the static agent config, then layer in runtime-only tool exposure.
+        // Start from the static agent config, replace its base prompt with the
+        // rendered instructions for this run, then layer in runtime-only tool
+        // exposure.
         let mut spec = agent_config.agent_spec(self.config.limits);
-        spec.system_prompt = system_prompt;
+        spec.system_prompt = rendered_system_instructions;
         if top_level && self.agent_memory_enabled(agent_config) {
             ensure_client_tool_enabled(&mut spec.client_tools, memory::LOOKUP_USER_MEMORY_TOOL);
             ensure_client_tool_enabled(&mut spec.client_tools, memory::REMEMBER_USER_MEMORY_TOOL);
@@ -71,29 +94,29 @@ where
                 video_rate_limit_locks: self.video_rate_limit_locks.clone(),
             },
             RuntimeToolContext {
-                default_channel: channel_from_message(reply_to),
-                reply_to: reply_to.clone(),
-                conversation_id,
-                turn_id,
-                turn_user: turn_user.clone(),
-                privacy: settings.privacy.clone(),
+                default_channel: channel_from_message(context.reply_to),
+                reply_to: context.reply_to.clone(),
+                conversation_id: context.conversation_id,
+                turn_id: context.turn_id,
+                turn_user: context.turn_user.clone(),
+                privacy: context.settings.privacy.clone(),
             },
         );
         // Top-level agents get conversation-management tools. Subagents keep a narrower
         // surface and only receive explicitly configured generation/media/subagent tools.
         if top_level {
-            if !matches!(settings.privacy, PrivacyMode::ConversationOnly) {
+            if !matches!(context.settings.privacy, PrivacyMode::ConversationOnly) {
                 tracing::debug!(tool = FETCH_MESSAGES_TOOL, "attaching runtime tool");
                 tool_executor.enabled.fetch_messages = true;
             }
             if self.agent_memory_enabled(agent_config) {
-                let base_key = memory::key_from_user_ref(turn_user);
+                let base_key = memory::key_from_user_ref(context.turn_user);
                 tracing::debug!("attaching user memory tools");
                 tool_executor.enable_memory(MemoryToolContext::new(
                     base_key,
-                    turn_user_display_name.to_string(),
-                    conversation_id,
-                    turn_id,
+                    context.turn_user_display_name.to_string(),
+                    context.conversation_id,
+                    context.turn_id,
                 ));
             }
             tracing::debug!(tool = POST_STATUS_TOOL, "attaching runtime tool");
@@ -150,7 +173,7 @@ where
         for (tool_name, binding) in &agent_config.subagents {
             let (subagent_name, subagent_config) = self
                 .config
-                .agent_or_platform_default(Some(&binding.agent), &reply_to.platform)?;
+                .agent_or_platform_default(Some(&binding.agent), &context.reply_to.platform)?;
             tracing::debug!(
                 tool = %tool_name,
                 subagent = %subagent_name,
@@ -161,16 +184,13 @@ where
             let prompt = self
                 .compose_subagent_system_prompt(subagent_config, &PrivacyMode::ConversationOnly);
             let nested = self.build_agent(
-                &subagent_name,
-                subagent_config,
-                prompt,
-                settings,
-                reply_to,
-                turn_user,
-                turn_user_display_name,
-                conversation_id,
-                turn_id,
-                false,
+                ConversationAgentAssembly {
+                    agent_name: &subagent_name,
+                    agent_config: subagent_config,
+                    rendered_system_instructions: prompt,
+                    top_level: false,
+                },
+                context,
                 stack,
             )?;
             tool_executor.subagents.insert(
