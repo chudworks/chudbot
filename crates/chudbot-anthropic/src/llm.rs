@@ -317,10 +317,16 @@ fn anthropic_stream_event(
                     }
                 }
                 "input_json_delta" => {
-                    let partial = delta
+                    let Some(partial) = delta
                         .get("partial_json")
                         .and_then(Value::as_str)
-                        .unwrap_or("");
+                        .filter(|partial| !partial.is_empty())
+                    else {
+                        return Ok(StreamEventOutcome {
+                            events,
+                            finished: false,
+                        });
+                    };
                     block.input_json.push_str(partial);
                     if block.raw.get("type").and_then(Value::as_str) == Some("tool_use") {
                         block.emitted_client_delta = true;
@@ -1483,6 +1489,62 @@ mod tests {
         assert_eq!(calls[0].input["limit"], 30);
         assert_eq!(output.usage[0].input_tokens, Some(20));
         assert_eq!(output.usage[0].output_tokens, Some(12));
+    }
+
+    #[test]
+    fn empty_input_json_delta_does_not_mark_tool_delta_emitted() {
+        let provider = ProviderName::new("anthropic");
+        let requested_model = ModelId::new("claude-sonnet-4-6");
+        let pricing = AnthropicPricing::default();
+        let mut state = AnthropicStreamState::default();
+
+        let start = anthropic_stream_event(
+            ServerSentEvent {
+                event: None,
+                data: json!({
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "fetch_messages",
+                        "input": {}
+                    }
+                })
+                .to_string(),
+            },
+            &provider,
+            &requested_model,
+            &pricing,
+            Instant::now(),
+            &mut state,
+        )
+        .expect("stream event");
+        assert!(start.events.is_empty());
+
+        let delta = anthropic_stream_event(
+            ServerSentEvent {
+                event: None,
+                data: json!({
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": ""
+                    }
+                })
+                .to_string(),
+            },
+            &provider,
+            &requested_model,
+            &pricing,
+            Instant::now(),
+            &mut state,
+        )
+        .expect("stream event");
+
+        assert!(delta.events.is_empty());
+        assert!(!state.blocks.get(&1).unwrap().emitted_client_delta);
     }
 
     #[test]

@@ -245,7 +245,11 @@ fn openai_stream_event(
 
     match event_type {
         "response.output_text.delta" => {
-            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            let Some(delta) = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            else {
                 return Ok(StreamEventOutcome::default());
             };
             state.emitted_text_delta = true;
@@ -258,7 +262,11 @@ fn openai_stream_event(
             })
         }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            let Some(delta) = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            else {
                 return Ok(StreamEventOutcome::default());
             };
             state.emitted_reasoning_delta = true;
@@ -279,7 +287,11 @@ fn openai_stream_event(
             Ok(StreamEventOutcome::default())
         }
         "response.function_call_arguments.delta" => {
-            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            let Some(delta) = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            else {
                 return Ok(StreamEventOutcome::default());
             };
             let key = stream_item_id(&value, "openai_function_call");
@@ -1169,6 +1181,59 @@ mod tests {
         assert_eq!(calls[0].id.as_str(), "call_1");
         assert_eq!(calls[0].input["limit"], 30);
         assert_eq!(output.usage[0].input_tokens, Some(10));
+    }
+
+    #[test]
+    fn empty_responses_deltas_do_not_mark_stream_emitted() {
+        let provider = ProviderName::new("openai");
+        let requested_model = ModelId::new("gpt-5");
+        let pricing = OpenAiPricing::default();
+        let mut state = OpenAiStreamState::default();
+        for data in [
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "",
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "delta": "",
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "fetch_messages",
+                },
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "",
+            }),
+        ] {
+            let outcome = openai_stream_event(
+                ServerSentEvent {
+                    event: None,
+                    data: data.to_string(),
+                },
+                &provider,
+                &requested_model,
+                &pricing,
+                Instant::now(),
+                &mut state,
+            )
+            .expect("stream event");
+            assert!(outcome.events.is_empty());
+            assert!(!outcome.finished);
+        }
+
+        assert!(!state.emitted_text_delta);
+        assert!(!state.emitted_reasoning_delta);
+        assert!(state.streamed_tool_ids.is_empty());
     }
 
     #[test]

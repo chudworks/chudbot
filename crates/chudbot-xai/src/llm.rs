@@ -434,7 +434,11 @@ fn xai_stream_event(
 
     match event_type {
         "response.output_text.delta" => {
-            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            let Some(delta) = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            else {
                 return Ok(StreamEventOutcome::default());
             };
             state.emitted_text_delta = true;
@@ -447,7 +451,11 @@ fn xai_stream_event(
             })
         }
         "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            let Some(delta) = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            else {
                 return Ok(StreamEventOutcome::default());
             };
             state.emitted_reasoning_delta = true;
@@ -468,7 +476,11 @@ fn xai_stream_event(
             Ok(StreamEventOutcome::default())
         }
         "response.function_call_arguments.delta" => {
-            let Some(delta) = value.get("delta").and_then(Value::as_str) else {
+            let Some(delta) = value
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            else {
                 return Ok(StreamEventOutcome::default());
             };
             let key = stream_item_id(&value, "xai_function_call");
@@ -1659,6 +1671,57 @@ mod tests {
         assert_eq!(output.usage[0].cached_input_tokens, Some(3));
         assert_eq!(output.usage[0].output_tokens, Some(1));
         assert_eq!(output.usage[0].total_tokens, Some(42));
+    }
+
+    #[test]
+    fn empty_responses_deltas_do_not_mark_stream_emitted() {
+        let provider = ProviderName::new("xai");
+        let requested_model = ModelId::new("grok-4.3");
+        let mut state = XaiStreamState::default();
+        for data in [
+            json!({
+                "type": "response.output_text.delta",
+                "item_id": "msg_1",
+                "delta": "",
+            }),
+            json!({
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": "rs_1",
+                "delta": "",
+            }),
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "fetch_messages",
+                },
+            }),
+            json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "",
+            }),
+        ] {
+            let outcome = xai_stream_event(
+                ServerSentEvent {
+                    event: None,
+                    data: data.to_string(),
+                },
+                &provider,
+                &requested_model,
+                Instant::now(),
+                &mut state,
+            )
+            .expect("stream event");
+            assert!(outcome.events.is_empty());
+            assert!(!outcome.finished);
+        }
+
+        assert!(!state.emitted_text_delta);
+        assert!(!state.emitted_reasoning_delta);
+        assert!(state.streamed_tool_ids.is_empty());
     }
 
     #[test]
