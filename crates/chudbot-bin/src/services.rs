@@ -146,6 +146,7 @@ impl ConfiguredMediaStore {
                 config.videos_dir.clone(),
                 config.audio_dir.clone(),
                 config.avatars_dir.clone(),
+                config.guild_icons_dir.clone(),
                 config
                     .public_base_url
                     .clone()

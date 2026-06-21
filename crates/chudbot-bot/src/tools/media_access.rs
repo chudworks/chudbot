@@ -1,10 +1,12 @@
 //! Stored-media access tools: `read`, `stat`, `public_url`, and `attach`.
 //!
-//! These tools accept model-facing `file://...` media URIs, not filesystem
-//! paths or arbitrary network URLs. The prefix check keeps the input shape
-//! scoped to stored media, and `MediaStore::media_from_uri` remains the
-//! authority for validating supported storage prefixes, existence, metadata,
-//! and access handles.
+//! These tools accept model-facing stored-media handles, not filesystem paths
+//! or arbitrary network URLs. The runtime executor resolves context-local
+//! handles such as `guild_icon://current` or `user_avatar://current` to stored
+//! `file://...` media URIs before these helpers run. The prefix check here
+//! keeps the concrete input shape scoped to stored media, and
+//! `MediaStore::media_from_uri` remains the authority for validating supported
+//! storage prefixes, existence, metadata, and access handles.
 
 use super::*;
 
@@ -16,7 +18,7 @@ use super::*;
 /// never serializes file bytes into the tool result.
 pub(crate) fn read_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Read a stored Chudbot image asset by file:// URI. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, and arbitrary filesystem paths are rejected. The tool returns metadata and makes the image visible to the next model step, but never returns raw bytes.".to_string(),
+        description: "Read a stored Chudbot image asset by file:// URI, the current Discord guild icon by guild_icon://current / guild.icon_uri, or a cached user avatar by user_avatar://current / user_avatar://<user_id> / an avatar_uri value from message context. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, and arbitrary filesystem paths are rejected. The tool returns metadata and makes the image visible to the next model step, but never returns raw bytes.".to_string(),
         input_schema: asset_uri_tool_schema(),
     }
 }
@@ -28,7 +30,7 @@ pub(crate) fn read_asset_spec() -> ClientToolSpec {
 /// inspect any stored media category without loading bytes.
 pub(crate) fn stat_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Validate a stored Chudbot media URI and return whether it exists with MIME type and size metadata. This only checks media storage; it does not read or return file bytes.".to_string(),
+        description: "Validate a stored Chudbot media URI, the current Discord guild icon by guild_icon://current / guild.icon_uri, or a cached user avatar by user_avatar://current / user_avatar://<user_id> / an avatar_uri value from message context, and return whether it exists with MIME type and size metadata. This only checks media storage; it does not read or return file bytes.".to_string(),
         input_schema: asset_uri_tool_schema(),
     }
 }
@@ -41,7 +43,7 @@ pub(crate) fn stat_asset_spec() -> ClientToolSpec {
 /// read or attachment.
 pub(crate) fn public_url_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Resolve a supported stored Chudbot media URI to its configured public URL when one is available. Images, videos, audio, and avatars are supported; unknown/non-media MIME types are rejected. This only returns metadata and a URL; it does not read or return file bytes.".to_string(),
+        description: "Resolve a supported stored Chudbot media URI, the current Discord guild icon by guild_icon://current / guild.icon_uri, or a cached user avatar by user_avatar://current / user_avatar://<user_id> / an avatar_uri value from message context, to its configured public URL when one is available. Images, videos, audio, avatars, and guild icons are supported; unknown/non-media MIME types are rejected. This only returns metadata and a URL; it does not read or return file bytes.".to_string(),
         input_schema: asset_uri_tool_schema(),
     }
 }
@@ -54,7 +56,7 @@ pub(crate) fn public_url_asset_spec() -> ClientToolSpec {
 /// loads bytes only when preparing the platform reply.
 pub(crate) fn attach_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Attach an existing stored Chudbot image asset to the final platform reply. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, public URLs, and arbitrary filesystem paths are rejected. The tool queues the image for final delivery and never returns raw bytes.".to_string(),
+        description: "Attach an existing stored Chudbot image asset, the current Discord guild icon by guild_icon://current / guild.icon_uri, or a cached user avatar by user_avatar://current / user_avatar://<user_id> / an avatar_uri value from message context, to the final platform reply. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, public URLs, and arbitrary filesystem paths are rejected. The tool queues the image for final delivery and never returns raw bytes.".to_string(),
         input_schema: asset_uri_tool_schema(),
     }
 }
@@ -67,7 +69,7 @@ pub(crate) fn asset_uri_tool_schema() -> ToolInputSchema {
     ToolInputSchema::object([ToolInputField::required(
         "uri",
         ToolInputValueSchema::string().description(
-            "A stored Chudbot file:// media URI such as file://images/abc.jpg, file://videos/abc.mp4, file://audio/abc.ogg, or file://avatars/abc.png. Do not pass local filesystem paths or public URLs.",
+            "A stored Chudbot file:// media URI such as file://images/abc.jpg, file://videos/abc.mp4, file://audio/abc.ogg, file://avatars/abc.png, or file://guild-icons/abc.png. In Discord guild channels, guild_icon://current and guild.icon_uri resolve to the current guild icon. user_avatar://current, user_avatar://<user_id>, and avatar_uri values from message context resolve to cached avatars on the current platform. Do not pass local filesystem paths or public URLs.",
         ),
     )])
 }

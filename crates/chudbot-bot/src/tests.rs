@@ -1978,6 +1978,8 @@ async fn stat_asset_reports_missing_uri_without_error_result() {
 #[test_case(MediaCategory::Image, "IMAGE/WEBP", true ; "case insensitive webp")]
 #[test_case(MediaCategory::Image, "image/gif", false ; "unsupported image mime")]
 #[test_case(MediaCategory::Image, "video/mp4", false ; "image category with video mime")]
+#[test_case(MediaCategory::Avatar, "image/png", true ; "avatar")]
+#[test_case(MediaCategory::GuildIcon, "image/png", true ; "guild icon")]
 #[test_case(MediaCategory::Video, "video/mp4", false ; "video category")]
 #[test_case(MediaCategory::Audio, "audio/ogg", false ; "audio category")]
 fn model_transcript_media_support_matches_llm_image_inputs(

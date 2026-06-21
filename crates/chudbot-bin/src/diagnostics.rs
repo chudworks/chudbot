@@ -714,6 +714,7 @@ const STORAGE_LOCAL_KEYS: &[&str] = &[
     "videos_dir",
     "audio_dir",
     "avatars_dir",
+    "guild_icons_dir",
     "public_base_url",
 ];
 const STORAGE_S3_KEYS: &[&str] = &[

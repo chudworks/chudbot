@@ -93,6 +93,8 @@ pub enum MediaCategory {
     Audio,
     /// Avatar/user media.
     Avatar,
+    /// Guild/workspace icon media.
+    GuildIcon,
     /// Any other caller-defined media class.
     ///
     /// Backends that use this as a path or object-store prefix should still
@@ -111,6 +113,7 @@ impl MediaCategory {
             Self::Video => "videos",
             Self::Audio => "audio",
             Self::Avatar => "avatars",
+            Self::GuildIcon => "guild-icons",
             Self::Other(prefix) => prefix.as_str(),
         }
     }

@@ -75,8 +75,8 @@ pub use transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptT
 // Platform adapters normalize external messaging systems into bot events,
 // messages, commands, replies, reactions, and history fetches.
 pub use platform::{
-    AttachmentRef, FetchMessages, MessagePlatform, OutgoingAttachment, PlatformCommand,
-    PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
+    AttachmentRef, FetchMessages, GuildProfile, MessagePlatform, OutgoingAttachment,
+    PlatformCommand, PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
     PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
     PlatformCommandResponseTarget, PlatformCommandValue, PlatformEvent, PlatformMessage,
     PlatformMessageReference, PlatformMessageRelationship, PlatformReaction, PlatformReady,
@@ -91,10 +91,10 @@ pub use storage::{
     CreateVideoJob, FinishTurn, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
     MemoryTurnWindow, MessageLink, ModelStepKind, ModelStepTrace, NewUserMemoryDiaryEntry,
     NewUserMemoryDocumentRevision, NewUserMemoryEvent, OpenConversation, PrivacyMode, ResolveAgent,
-    RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob, Turn, TurnAsset,
-    TurnSnapshot, TurnStatus, UpdateVideoJob, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
-    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext,
-    UserMemoryJob, UserMemoryKey, UserMemoryTurn,
+    RetryTurn, RuntimeSettings, SaveTurnInput, StoredGuildProfile, StoredUserProfile,
+    StoredVideoJob, Turn, TurnAsset, TurnSnapshot, TurnStatus, UpdateVideoJob,
+    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
+    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
 };
 
 // Model contracts cover both static model configuration and one provider

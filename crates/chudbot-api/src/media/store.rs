@@ -76,8 +76,8 @@ pub trait MediaStore: Send + Sync {
     /// schemes and prefixes they own, reject unsafe names, and avoid loading
     /// bytes until the returned [`super::MediaRef`] is asked to do so.
     ///
-    /// Examples of local-store URIs are `file://images/abc123.png` and
-    /// `file://audio/abc123.ogg`.
+    /// Examples of local-store URIs are `file://images/abc123.png`,
+    /// `file://audio/abc123.ogg`, and `file://guild-icons/abc123.png`.
     fn media_from_uri(
         &self,
         uri: &MediaUri,

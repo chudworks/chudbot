@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use chudbot_api::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ChannelRef, ContextItem, Conversation,
     ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
-    CountActiveVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, MediaUri,
+    CountActiveVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, GuildProfile, MediaUri,
     MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, MessageLink,
     MessageRef, ModelId, ModelStepKind, ModelStepTrace, NewUserMemoryDiaryEntry,
     NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName,
@@ -1297,6 +1297,84 @@ impl BotStorage for SqlxStorage {
         Ok(result.rows_affected() > 0)
     }
 
+    async fn upsert_guild(&self, guild: GuildProfile) -> Result<(), Self::Error> {
+        sqlx::query(
+            "INSERT INTO platform_channels \
+               (message_provider, channel, channel_kind, display_name, icon_hash, icon_url, last_seen_at) \
+             VALUES ($1, $2, 'workspace', $3, $4, $5, now()) \
+             ON CONFLICT (message_provider, channel) DO UPDATE \
+               SET channel_kind = 'workspace', \
+                   display_name = EXCLUDED.display_name, \
+                   icon_media_uri = CASE \
+                       WHEN EXCLUDED.icon_hash IS NOT NULL \
+                            AND platform_channels.icon_hash IS NOT DISTINCT FROM EXCLUDED.icon_hash \
+                       THEN platform_channels.icon_media_uri \
+                       ELSE NULL \
+                   END, \
+                   icon_hash = EXCLUDED.icon_hash, \
+                   icon_url = EXCLUDED.icon_url, \
+                   last_seen_at = now()",
+        )
+        .bind(guild.platform.as_str())
+        .bind(guild_scope(guild.guild_id.as_str()))
+        .bind(&guild.name)
+        .bind(&guild.icon_hash)
+        .bind(&guild.icon_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn load_guild_icon(
+        &self,
+        platform: PlatformName,
+        guild_id: ExternalId,
+    ) -> Result<Option<MediaUri>, Self::Error> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT icon_media_uri FROM platform_channels \
+              WHERE message_provider = $1 AND channel = $2",
+        )
+        .bind(platform.as_str())
+        .bind(guild_scope(guild_id.as_str()))
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value| value.flatten().map(MediaUri::new))
+        .map_err(SqlxStorageError::Sqlx)
+    }
+
+    async fn set_guild_icon(
+        &self,
+        platform: PlatformName,
+        guild_id: ExternalId,
+        icon_hash: String,
+        icon: MediaUri,
+    ) -> Result<(), Self::Error> {
+        let mut tx = self.pool.begin().await?;
+        upsert_media_asset(&mut tx, icon.as_str()).await?;
+        let result = sqlx::query(
+            "UPDATE platform_channels \
+                SET icon_media_uri = $4, last_seen_at = now() \
+              WHERE message_provider = $1 AND channel = $2 AND icon_hash = $3",
+        )
+        .bind(platform.as_str())
+        .bind(guild_scope(guild_id.as_str()))
+        .bind(&icon_hash)
+        .bind(icon.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        if result.rows_affected() == 0 {
+            tracing::trace!(
+                platform = %platform,
+                guild = %guild_id,
+                icon_hash,
+                uri = %icon,
+                "skipped stale guild icon cache update"
+            );
+        }
+        Ok(())
+    }
+
     async fn upsert_user(&self, user: UserProfile) -> Result<(), Self::Error> {
         let mut tx = self.pool.begin().await?;
         upsert_user(
@@ -1307,7 +1385,17 @@ impl BotStorage for SqlxStorage {
         .await?;
         sqlx::query(
             "UPDATE platform_users \
-                SET username = $3, display_name = $4, avatar_url = $5, is_bot = $6, last_seen_at = now() \
+                SET username = $3, \
+                    display_name = $4, \
+                    avatar_media_uri = CASE \
+                        WHEN $5 IS NOT NULL \
+                             AND platform_users.avatar_url IS NOT DISTINCT FROM $5 \
+                        THEN platform_users.avatar_media_uri \
+                        ELSE NULL \
+                    END, \
+                    avatar_url = $5, \
+                    is_bot = $6, \
+                    last_seen_at = now() \
               WHERE message_provider = $1 AND user_key = $2",
         )
         .bind(user.id.platform.as_str())
@@ -1335,21 +1423,35 @@ impl BotStorage for SqlxStorage {
         .map_err(SqlxStorageError::Sqlx)
     }
 
-    async fn set_user_avatar(&self, user: UserRef, avatar: MediaUri) -> Result<(), Self::Error> {
+    async fn set_user_avatar(
+        &self,
+        user: UserRef,
+        avatar_url: String,
+        avatar: MediaUri,
+    ) -> Result<(), Self::Error> {
         let mut tx = self.pool.begin().await?;
         upsert_user(&mut tx, &user, None).await?;
         upsert_media_asset(&mut tx, avatar.as_str()).await?;
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE platform_users \
-                SET avatar_media_uri = $3, last_seen_at = now() \
-              WHERE message_provider = $1 AND user_key = $2",
+                SET avatar_media_uri = $4, last_seen_at = now() \
+              WHERE message_provider = $1 AND user_key = $2 AND avatar_url = $3",
         )
         .bind(user.platform.as_str())
         .bind(user.user_id.as_str())
+        .bind(&avatar_url)
         .bind(avatar.as_str())
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        if result.rows_affected() == 0 {
+            tracing::trace!(
+                platform = %user.platform,
+                user = %user.user_id,
+                uri = %avatar,
+                "skipped stale avatar cache update"
+            );
+        }
         Ok(())
     }
 
@@ -3251,6 +3353,9 @@ fn media_parts(uri: &str) -> (&'static str, String, &'static str) {
     }
     if let Some(name) = uri.strip_prefix("file://avatars/") {
         return ("avatar", name.to_string(), "image/png");
+    }
+    if let Some(name) = uri.strip_prefix("file://guild-icons/") {
+        return ("guild_icon", name.to_string(), "image/png");
     }
     ("other", uri.to_string(), "application/octet-stream")
 }

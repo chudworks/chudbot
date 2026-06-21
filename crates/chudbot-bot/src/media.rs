@@ -607,8 +607,10 @@ pub(crate) fn replay_asset_belongs_to_user_turn(asset: &TurnAsset) -> bool {
 
 /// Return whether a stored asset can be embedded in a model transcript.
 pub(crate) fn model_transcript_supports_media(media: &dyn chudbot_api::MediaRef) -> bool {
-    matches!(media.category(), MediaCategory::Image)
-        && model_transcript_supports_image_mime_type(media.mime_type())
+    matches!(
+        media.category(),
+        MediaCategory::Image | MediaCategory::Avatar | MediaCategory::GuildIcon
+    ) && model_transcript_supports_image_mime_type(media.mime_type())
 }
 
 /// Return whether an image MIME type is accepted by transcript media blocks.
@@ -629,7 +631,9 @@ pub(crate) fn public_url_supports_media(media: &dyn chudbot_api::MediaRef) -> bo
         .trim()
         .to_ascii_lowercase();
     match media.category() {
-        MediaCategory::Image | MediaCategory::Avatar => mime_type.starts_with("image/"),
+        MediaCategory::Image | MediaCategory::Avatar | MediaCategory::GuildIcon => {
+            mime_type.starts_with("image/")
+        }
         MediaCategory::Video => mime_type.starts_with("video/"),
         MediaCategory::Audio => mime_type.starts_with("audio/"),
         MediaCategory::Other(_) => false,
@@ -638,15 +642,17 @@ pub(crate) fn public_url_supports_media(media: &dyn chudbot_api::MediaRef) -> bo
 
 /// Return whether the `attach` tool may queue a stored asset for reply delivery.
 pub(crate) fn attach_supports_media(media: &dyn chudbot_api::MediaRef) -> bool {
-    matches!(media.category(), MediaCategory::Image)
-        && media
-            .mime_type()
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase()
-            .starts_with("image/")
+    matches!(
+        media.category(),
+        MediaCategory::Image | MediaCategory::Avatar | MediaCategory::GuildIcon
+    ) && media
+        .mime_type()
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("image/")
 }
 
 /// Inject saved audio attachment refs into platform message context JSON.

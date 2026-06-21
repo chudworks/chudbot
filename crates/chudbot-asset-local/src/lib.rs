@@ -1,9 +1,9 @@
 //! Local filesystem media storage for chudbot.
 //!
 //! This backend owns `file://images/...`, `file://videos/...`,
-//! `file://audio/...`, and `file://avatars/...` URIs. The URI is stable and
-//! model-facing; the public URL is deployment-facing and can point at the Axum
-//! static routes today.
+//! `file://audio/...`, `file://avatars/...`, and `file://guild-icons/...`
+//! URIs. The URI is stable and model-facing; the public URL is
+//! deployment-facing and can point at the Axum static routes today.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,6 +28,7 @@ struct LocalMediaStoreInner {
     videos_dir: PathBuf,
     audio_dir: PathBuf,
     avatars_dir: PathBuf,
+    guild_icons_dir: PathBuf,
     public_base_url: Option<String>,
 }
 
@@ -38,17 +39,20 @@ impl LocalMediaStore {
         videos_dir: impl Into<PathBuf>,
         audio_dir: impl Into<PathBuf>,
         avatars_dir: impl Into<PathBuf>,
+        guild_icons_dir: impl Into<PathBuf>,
         public_base_url: Option<String>,
     ) -> Self {
         let images_dir = images_dir.into();
         let videos_dir = videos_dir.into();
         let audio_dir = audio_dir.into();
         let avatars_dir = avatars_dir.into();
+        let guild_icons_dir = guild_icons_dir.into();
         tracing::info!(
             images_dir = %images_dir.display(),
             videos_dir = %videos_dir.display(),
             audio_dir = %audio_dir.display(),
             avatars_dir = %avatars_dir.display(),
+            guild_icons_dir = %guild_icons_dir.display(),
             has_public_base_url = public_base_url.is_some(),
             "created local media store"
         );
@@ -58,6 +62,7 @@ impl LocalMediaStore {
                 videos_dir,
                 audio_dir,
                 avatars_dir,
+                guild_icons_dir,
                 public_base_url,
             }),
         }
@@ -81,6 +86,11 @@ impl LocalMediaStore {
     /// Directory for avatar media.
     pub fn avatars_dir(&self) -> &Path {
         &self.inner.avatars_dir
+    }
+
+    /// Directory for guild icon media.
+    pub fn guild_icons_dir(&self) -> &Path {
+        &self.inner.guild_icons_dir
     }
 
     /// Convert a resolved local media reference to an on-disk path.
@@ -140,6 +150,7 @@ impl LocalMediaStore {
             MediaCategory::Video => Ok(&self.inner.videos_dir),
             MediaCategory::Audio => Ok(&self.inner.audio_dir),
             MediaCategory::Avatar => Ok(&self.inner.avatars_dir),
+            MediaCategory::GuildIcon => Ok(&self.inner.guild_icons_dir),
             MediaCategory::Other(prefix) => Err(MediaError::UnsupportedCategory(prefix.clone())),
         }
     }
@@ -286,6 +297,7 @@ fn parse_local_uri(uri: &MediaUri) -> Result<ParsedLocalUri, MediaError> {
         "videos" => MediaCategory::Video,
         "audio" => MediaCategory::Audio,
         "avatars" => MediaCategory::Avatar,
+        "guild-icons" => MediaCategory::GuildIcon,
         _ => return Err(MediaError::UnsupportedUri(uri.to_string())),
     };
     Ok(ParsedLocalUri {
@@ -312,6 +324,7 @@ fn is_supported_prefix(path: &str) -> bool {
         || path.starts_with("videos/")
         || path.starts_with("audio/")
         || path.starts_with("avatars/")
+        || path.starts_with("guild-icons/")
 }
 
 fn generated_name(extension: Option<&str>, mime_type: &str) -> String {
@@ -529,6 +542,7 @@ mod tests {
             root.join("videos"),
             root.join("audio"),
             root.join("avatars"),
+            root.join("guild-icons"),
             Some("https://chudbot.example.com".to_string()),
         );
 
@@ -580,6 +594,7 @@ mod tests {
             root.join("videos"),
             root.join("audio"),
             root.join("avatars"),
+            root.join("guild-icons"),
             Some("https://chudbot.example.com".to_string()),
         );
 
@@ -610,7 +625,8 @@ mod tests {
 
     #[tokio::test]
     async fn public_url_errors_when_not_configured() {
-        let store = LocalMediaStore::new("images", "videos", "audio", "avatars", None);
+        let store =
+            LocalMediaStore::new("images", "videos", "audio", "avatars", "guild-icons", None);
         let media = store
             .media_from_name(MediaCategory::Image, "abc.png")
             .await
@@ -644,6 +660,7 @@ mod tests {
             root.join("videos"),
             root.join("audio"),
             root.join("avatars"),
+            root.join("guild-icons"),
             None,
         );
 
@@ -676,6 +693,7 @@ mod tests {
             root.join("videos"),
             root.join("audio"),
             root.join("avatars"),
+            root.join("guild-icons"),
             None,
         );
 

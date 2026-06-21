@@ -404,6 +404,7 @@ impl<'de> Deserialize<'de> for StorageConfig {
                 videos_dir: raw.videos_dir,
                 audio_dir: raw.audio_dir,
                 avatars_dir: raw.avatars_dir,
+                guild_icons_dir: raw.guild_icons_dir,
                 public_base_url: raw.public_base_url,
             })),
             StorageKind::S3 => Ok(Self::S3(S3StorageConfig {
@@ -439,6 +440,8 @@ struct RawStorageConfig {
     audio_dir: PathBuf,
     #[serde(default = "default_avatars_dir")]
     avatars_dir: PathBuf,
+    #[serde(default = "default_guild_icons_dir")]
+    guild_icons_dir: PathBuf,
     #[serde(default)]
     bucket: Option<String>,
     #[serde(default)]
@@ -469,6 +472,9 @@ pub struct LocalStorageConfig {
     /// Avatar directory.
     #[serde(default = "default_avatars_dir")]
     pub avatars_dir: PathBuf,
+    /// Guild icon directory.
+    #[serde(default = "default_guild_icons_dir")]
+    pub guild_icons_dir: PathBuf,
     /// Public base URL for media, usually the same host as the web viewer.
     #[serde(default)]
     pub public_base_url: Option<String>,
@@ -481,6 +487,7 @@ impl Default for LocalStorageConfig {
             videos_dir: default_videos_dir(),
             audio_dir: default_audio_dir(),
             avatars_dir: default_avatars_dir(),
+            guild_icons_dir: default_guild_icons_dir(),
             public_base_url: None,
         }
     }
@@ -500,6 +507,10 @@ fn default_audio_dir() -> PathBuf {
 
 fn default_avatars_dir() -> PathBuf {
     PathBuf::from("avatars")
+}
+
+fn default_guild_icons_dir() -> PathBuf {
+    PathBuf::from("guild-icons")
 }
 
 /// S3-compatible media storage config.

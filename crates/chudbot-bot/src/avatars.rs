@@ -63,8 +63,19 @@ where
             return Ok(());
         }
 
+        if self.media_store.media_from_uri(&expected_uri).await.is_ok() {
+            self.storage
+                .set_user_avatar(user.id.clone(), url, expected_uri.clone())
+                .await
+                .map_err(storage_error)?;
+            self.publish_user(user.id);
+            tracing::trace!(uri = %expected_uri, "avatar media already existed");
+            return Ok(());
+        }
+
         // Step 2: fetch the remote bytes after the storage cache check.
-        let response = reqwest::Client::new()
+        let response = self
+            .download_http
             .get(&url)
             .send()
             .await
@@ -93,7 +104,7 @@ where
             .map_err(|error| BotError::AvatarDownload(error.to_string()))?;
         // Step 4: publish after storage points at the new cached media URI.
         self.storage
-            .set_user_avatar(user.id.clone(), media.uri().clone())
+            .set_user_avatar(user.id.clone(), url, media.uri().clone())
             .await
             .map_err(storage_error)?;
         self.publish_user(user.id);

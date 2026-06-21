@@ -120,6 +120,9 @@ pub enum BotError {
     /// Avatar image fetch or upload failed while refreshing agent avatars.
     #[error("avatar download failed: {0}")]
     AvatarDownload(String),
+    /// Guild icon fetch or upload failed while refreshing management metadata.
+    #[error("guild icon download failed: {0}")]
+    GuildIconDownload(String),
 }
 
 /// Convert a platform-adapter error into the bot crate's public error type.

@@ -317,6 +317,7 @@ pub(crate) fn thread_title(execution: &TurnExecution) -> String {
 pub(crate) fn platform_event_kind(event: &PlatformEvent) -> &'static str {
     match event {
         PlatformEvent::Ready { .. } => "ready",
+        PlatformEvent::GuildProfileUpdated { .. } => "guild_profile_updated",
         PlatformEvent::MessageCreated { .. } => "message_created",
         PlatformEvent::ReactionAdded { .. } => "reaction_added",
         PlatformEvent::ReactionRemoved { .. } => "reaction_removed",

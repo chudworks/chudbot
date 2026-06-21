@@ -8,12 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chudbot_api::{
-    AttachmentRef, ChannelRef, ExternalId, FetchMessages, MessagePlatform, MessageRef,
-    OutgoingAttachment, PlatformCommand, PlatformCommandDefinition, PlatformCommandInput,
-    PlatformCommandOption, PlatformCommandOptionKind, PlatformCommandResponse,
-    PlatformCommandResponseTarget, PlatformCommandValue, PlatformEvent, PlatformMessage,
-    PlatformMessageReference, PlatformMessageRelationship, PlatformName, PlatformReaction,
-    PlatformReady, PostedMessage, ReactionKind, SendMessage, UserProfile, UserRef,
+    AttachmentRef, ChannelRef, ExternalId, FetchMessages, GuildProfile, MessagePlatform,
+    MessageRef, OutgoingAttachment, PlatformCommand, PlatformCommandDefinition,
+    PlatformCommandInput, PlatformCommandOption, PlatformCommandOptionKind,
+    PlatformCommandResponse, PlatformCommandResponseTarget, PlatformCommandValue, PlatformEvent,
+    PlatformMessage, PlatformMessageReference, PlatformMessageRelationship, PlatformName,
+    PlatformReaction, PlatformReady, PostedMessage, ReactionKind, SendMessage, UserProfile,
+    UserRef,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -33,9 +34,9 @@ use twilight_model::channel::message::{
 };
 use twilight_model::channel::{ChannelType, Message};
 use twilight_model::gateway::event::Event;
-use twilight_model::gateway::payload::incoming::GuildCreate;
+use twilight_model::gateway::payload::incoming::{GuildCreate, GuildUpdate};
 use twilight_model::gateway::{CloseFrame, GatewayReaction};
-use twilight_model::guild::Permissions;
+use twilight_model::guild::{Guild, PartialGuild, Permissions};
 use twilight_model::http::attachment::Attachment as HttpAttachment;
 use twilight_model::http::interaction::{
     InteractionResponse, InteractionResponseData, InteractionResponseType,
@@ -114,6 +115,7 @@ impl DiscordPlatform {
         let event_flags = EventTypeFlags::MESSAGE_CREATE
             | EventTypeFlags::INTERACTION_CREATE
             | EventTypeFlags::GUILD_CREATE
+            | EventTypeFlags::GUILD_UPDATE
             | EventTypeFlags::REACTION_ADD
             | EventTypeFlags::REACTION_REMOVE;
         let cache = DefaultInMemoryCache::builder()
@@ -287,6 +289,14 @@ impl DiscordPlatform {
                 }
                 Event::GuildCreate(guild) => {
                     log_guild_create(&guild);
+                    if let Some(guild) = guild_profile_from_create(&self.inner.platform, &guild) {
+                        return Ok(PlatformEvent::GuildProfileUpdated { guild });
+                    }
+                }
+                Event::GuildUpdate(guild) => {
+                    log_guild_update(&guild);
+                    let guild = guild_profile_from_update(&self.inner.platform, &guild);
+                    return Ok(PlatformEvent::GuildProfileUpdated { guild });
                 }
                 _ => {}
             }
@@ -812,7 +822,7 @@ fn discord_message_context_json(
         "type": "discord_message",
         "relationship": discord_message_relationship(relationship),
         "platform": message.id.platform.as_str(),
-        "guild": discord_entity_json(
+        "guild": discord_guild_json(
             message.id.guild_id.as_ref(),
             guild_name.as_deref(),
         ),
@@ -833,6 +843,7 @@ fn discord_message_context_json(
                 .display_name
                 .as_deref()
                 .or(author.guild_display_name.as_deref()),
+            "avatar_uri": user_avatar_context_uri(&message.author.id.user_id),
             "is_bot": message.author.is_bot,
         },
         "mentioned_users": message.mentions.iter().map(|mention| {
@@ -845,6 +856,7 @@ fn discord_message_context_json(
             serde_json::json!({
                 "id": mention.user_id.as_str(),
                 "mention": format!("<@{}>", mention.user_id.as_str()),
+                "avatar_uri": user_avatar_context_uri(&mention.user_id),
                 "username": profile
                     .map(|profile| profile.username.as_str())
                     .or(cached.username.as_deref()),
@@ -925,14 +937,23 @@ fn discord_message_relationship(relationship: PlatformMessageRelationship) -> &'
     }
 }
 
-fn discord_entity_json(id: Option<&ExternalId>, name: Option<&str>) -> serde_json::Value {
+fn discord_guild_json(id: Option<&ExternalId>, name: Option<&str>) -> serde_json::Value {
     id.map(|id| {
         serde_json::json!({
             "id": id.as_str(),
             "name": name,
+            "icon_uri": guild_icon_context_uri(id),
         })
     })
     .unwrap_or(serde_json::Value::Null)
+}
+
+fn guild_icon_context_uri(guild_id: &ExternalId) -> String {
+    format!("guild_icon://{}", guild_id.as_str())
+}
+
+fn user_avatar_context_uri(user_id: &ExternalId) -> String {
+    format!("user_avatar://{}", user_id.as_str())
 }
 
 fn platform_reaction(platform: &PlatformName, reaction: GatewayReaction) -> PlatformReaction {
@@ -1215,6 +1236,49 @@ fn avatar_url(user_id: Id<UserMarker>, hash: String) -> String {
 fn default_avatar_url(user_id: Id<UserMarker>) -> String {
     let bucket = (user_id.get() >> 22) % 6;
     format!("https://cdn.discordapp.com/embed/avatars/{bucket}.png")
+}
+
+fn guild_profile_from_create(platform: &PlatformName, event: &GuildCreate) -> Option<GuildProfile> {
+    match event {
+        GuildCreate::Available(guild) => Some(guild_profile_from_guild(platform, guild)),
+        GuildCreate::Unavailable(_) => None,
+    }
+}
+
+fn guild_profile_from_update(platform: &PlatformName, event: &GuildUpdate) -> GuildProfile {
+    guild_profile_from_partial_guild(platform, &event.0)
+}
+
+fn guild_profile_from_guild(platform: &PlatformName, guild: &Guild) -> GuildProfile {
+    let icon_hash = guild.icon.as_ref().map(ToString::to_string);
+    let icon_url = icon_hash
+        .as_deref()
+        .map(|hash| guild_icon_url(guild.id, hash));
+    GuildProfile {
+        platform: platform.clone(),
+        guild_id: external_id(guild.id),
+        name: guild.name.clone(),
+        icon_hash,
+        icon_url,
+    }
+}
+
+fn guild_profile_from_partial_guild(platform: &PlatformName, guild: &PartialGuild) -> GuildProfile {
+    let icon_hash = guild.icon.as_ref().map(ToString::to_string);
+    let icon_url = icon_hash
+        .as_deref()
+        .map(|hash| guild_icon_url(guild.id, hash));
+    GuildProfile {
+        platform: platform.clone(),
+        guild_id: external_id(guild.id),
+        name: guild.name.clone(),
+        icon_hash,
+        icon_url,
+    }
+}
+
+fn guild_icon_url(guild_id: Id<GuildMarker>, hash: &str) -> String {
+    format!("https://cdn.discordapp.com/icons/{guild_id}/{hash}.png?size=128")
 }
 
 fn discord_command(definition: &PlatformCommandDefinition) -> Result<Command, DiscordError> {
@@ -1638,6 +1702,15 @@ fn log_guild_create(event: &GuildCreate) {
     }
 }
 
+fn log_guild_update(event: &GuildUpdate) {
+    tracing::info!(
+        guild_id = %event.id,
+        guild_name = %event.name,
+        has_icon = event.icon.is_some(),
+        "discord guild profile updated"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1896,10 +1969,18 @@ mod tests {
         assert_eq!(value["type"].as_str(), Some("discord_message"));
         assert_eq!(value["relationship"].as_str(), Some("referenced"));
         assert_eq!(value["guild"]["name"].as_str(), Some("Test Guild"));
+        assert_eq!(
+            value["guild"]["icon_uri"].as_str(),
+            Some("guild_icon://222")
+        );
         assert_eq!(value["channel"]["name"].as_str(), Some("general"));
         assert_eq!(
             value["author"]["guild_display_name"].as_str(),
             Some("Robert Guild")
+        );
+        assert_eq!(
+            value["author"]["avatar_uri"].as_str(),
+            Some("user_avatar://444")
         );
         assert_eq!(
             value["attachments"][0]["filename"].as_str(),
@@ -1907,6 +1988,10 @@ mod tests {
         );
         assert!(value["attachments"][0].get("url").is_none());
         assert_eq!(value["mentioned_users"][0]["id"].as_str(), Some("777"));
+        assert_eq!(
+            value["mentioned_users"][0]["avatar_uri"].as_str(),
+            Some("user_avatar://777")
+        );
         assert_eq!(
             value["mentioned_users"][0]["username"].as_str(),
             Some("trollzorftw808")

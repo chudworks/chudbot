@@ -20,6 +20,7 @@ export default defineConfig({
       '/images': 'http://127.0.0.1:1860',
       '/videos': 'http://127.0.0.1:1860',
       '/avatars': 'http://127.0.0.1:1860',
+      '/guild-icons': 'http://127.0.0.1:1860',
     },
   },
   build: {

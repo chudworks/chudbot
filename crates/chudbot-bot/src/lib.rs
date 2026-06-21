@@ -30,6 +30,7 @@ mod commands;
 mod config;
 mod constants;
 mod error;
+mod guilds;
 mod media;
 /// Memory configuration and background job support used by the bot runtime.
 pub mod memory;

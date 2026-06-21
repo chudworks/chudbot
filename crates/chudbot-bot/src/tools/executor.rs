@@ -31,6 +31,9 @@ type RuntimeVideoGenerationTool<R> = PersistentVideoGeneratorTool<
     <R as BotRuntimeTypes>::Storage,
 >;
 
+const GUILD_ICON_URI_PREFIX: &str = "guild_icon://";
+const USER_AVATAR_URI_PREFIX: &str = "user_avatar://";
+
 /// One configured agent exposed as a named client tool by its parent executor.
 pub(crate) struct Subagent<B, T = NoClientTools> {
     /// Model-facing tool description.
@@ -677,10 +680,20 @@ where
         tool.call(call).await.map_err(runtime_tool_execution_error)
     }
 
+    async fn resolve_media_access_call(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolCall, ClientToolExecutorError<RuntimeToolError>> {
+        resolve_media_access_tool_call(&self.deps.storage, &self.context, call)
+            .await
+            .map_err(runtime_tool_execution_error)
+    }
+
     async fn read_asset(
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let call = self.resolve_media_access_call(call).await?;
         read_asset(&self.deps.media_store, call)
             .await
             .map_err(runtime_tool_execution_error)
@@ -690,6 +703,7 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let call = self.resolve_media_access_call(call).await?;
         stat_asset(&self.deps.media_store, call)
             .await
             .map_err(runtime_tool_execution_error)
@@ -699,6 +713,7 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let call = self.resolve_media_access_call(call).await?;
         public_url_asset(&self.deps.media_store, call)
             .await
             .map_err(runtime_tool_execution_error)
@@ -708,6 +723,7 @@ where
         &self,
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let call = self.resolve_media_access_call(call).await?;
         attach_asset(&self.deps.media_store, call)
             .await
             .map_err(runtime_tool_execution_error)
@@ -864,6 +880,115 @@ fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
             "usage": run.all_usage(),
         }),
     }
+}
+
+async fn resolve_media_access_tool_call<S>(
+    storage: &S,
+    context: &RuntimeToolContext,
+    mut call: ClientToolCall,
+) -> Result<ClientToolCall, BotToolError>
+where
+    S: BotStorage,
+{
+    let uri = media_access_uri_from_context(storage, context, &call.input).await?;
+    if let Some(input) = call.input.as_object_mut() {
+        input.insert(
+            "uri".to_string(),
+            serde_json::Value::String(uri.as_str().to_string()),
+        );
+    } else {
+        call.input = serde_json::json!({ "uri": uri.as_str() });
+    }
+    Ok(call)
+}
+
+async fn media_access_uri_from_context<S>(
+    storage: &S,
+    context: &RuntimeToolContext,
+    input: &serde_json::Value,
+) -> Result<MediaUri, BotToolError>
+where
+    S: BotStorage,
+{
+    let uri = tool_required_string(input, "uri")?;
+    if let Some(target) = uri.strip_prefix(GUILD_ICON_URI_PREFIX) {
+        return current_guild_icon_uri(storage, context, target).await;
+    }
+    if let Some(target) = uri.strip_prefix(USER_AVATAR_URI_PREFIX) {
+        return current_user_avatar_uri(storage, context, target).await;
+    }
+    media_uri_from_tool_input(input)
+}
+
+async fn current_guild_icon_uri<S>(
+    storage: &S,
+    context: &RuntimeToolContext,
+    target: &str,
+) -> Result<MediaUri, BotToolError>
+where
+    S: BotStorage,
+{
+    let Some(current_guild) = context.default_channel.guild_id.as_ref() else {
+        return Err(BotToolError::InvalidInput(
+            "`guild_icon://...` is only available inside a guild channel".to_string(),
+        ));
+    };
+
+    if target.is_empty() {
+        return Err(BotToolError::InvalidInput(
+            "`guild_icon://...` must name `current` or the current guild id".to_string(),
+        ));
+    }
+
+    if target != "current" && target != current_guild.as_str() {
+        return Err(BotToolError::InvalidInput(
+            "`guild_icon://...` may only reference the current guild".to_string(),
+        ));
+    }
+
+    storage
+        .load_guild_icon(
+            context.default_channel.platform.clone(),
+            current_guild.clone(),
+        )
+        .await
+        .map_err(|error| BotToolError::Storage(error.to_string()))?
+        .ok_or_else(|| {
+            BotToolError::InvalidInput(
+                "no cached guild icon is available for the current guild".to_string(),
+            )
+        })
+}
+
+async fn current_user_avatar_uri<S>(
+    storage: &S,
+    context: &RuntimeToolContext,
+    target: &str,
+) -> Result<MediaUri, BotToolError>
+where
+    S: BotStorage,
+{
+    let user_id = if target == "current" {
+        context.turn_user.user_id.clone()
+    } else if target.is_empty() {
+        return Err(BotToolError::InvalidInput(
+            "`user_avatar://...` must name `current` or a user id".to_string(),
+        ));
+    } else {
+        ExternalId::new(target)
+    };
+
+    storage
+        .load_user_avatar(UserRef {
+            platform: context.default_channel.platform.clone(),
+            guild_id: context.default_channel.guild_id.clone(),
+            user_id,
+        })
+        .await
+        .map_err(|error| BotToolError::Storage(error.to_string()))?
+        .ok_or_else(|| {
+            BotToolError::InvalidInput("no cached avatar is available for that user id".to_string())
+        })
 }
 
 /// Convert a concrete tool failure into the executor's single error type.

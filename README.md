@@ -22,8 +22,8 @@ bun install
 bun run dev
 ```
 
-Vite serves on `:5173` and proxies `/api`, `/images`, `/videos`, and
-`/avatars` to the Rust server on `127.0.0.1:1860`.
+Vite serves on `:5173` and proxies `/api`, `/images`, `/videos`, `/avatars`,
+and `/guild-icons` to the Rust server on `127.0.0.1:1860`.
 
 Production deploy:
 

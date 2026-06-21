@@ -392,6 +392,7 @@ where
     pub async fn handle_event(&self, event: PlatformEvent) -> Result<BotAction, BotError> {
         let action = match event {
             PlatformEvent::Ready { .. } => Ok(BotAction::Ignored),
+            PlatformEvent::GuildProfileUpdated { guild } => self.handle_guild_profile(guild).await,
             PlatformEvent::MessageCreated { message } => self.handle_message(*message).await,
             PlatformEvent::ReactionAdded { reaction } => {
                 self.handle_reaction(reaction, false).await

@@ -131,7 +131,8 @@ impl S3MediaStore {
             MediaCategory::Image
             | MediaCategory::Video
             | MediaCategory::Audio
-            | MediaCategory::Avatar => Ok(format!("{}/{name}", category.prefix())),
+            | MediaCategory::Avatar
+            | MediaCategory::GuildIcon => Ok(format!("{}/{name}", category.prefix())),
             MediaCategory::Other(prefix) => Err(MediaError::UnsupportedCategory(prefix.clone())),
         }
     }
@@ -317,6 +318,7 @@ fn parse_stored_uri(uri: &MediaUri) -> Result<ParsedStoredUri, MediaError> {
         "videos" => MediaCategory::Video,
         "audio" => MediaCategory::Audio,
         "avatars" => MediaCategory::Avatar,
+        "guild-icons" => MediaCategory::GuildIcon,
         _ => return Err(MediaError::UnsupportedUri(uri.to_string())),
     };
     Ok(ParsedStoredUri {
@@ -343,6 +345,7 @@ fn is_supported_prefix(path: &str) -> bool {
         || path.starts_with("videos/")
         || path.starts_with("audio/")
         || path.starts_with("avatars/")
+        || path.starts_with("guild-icons/")
 }
 
 fn generated_name(extension: Option<&str>, mime_type: &str) -> String {

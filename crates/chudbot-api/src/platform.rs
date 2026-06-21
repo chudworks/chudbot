@@ -402,6 +402,27 @@ pub struct PlatformReady {
     pub bot: UserProfile,
 }
 
+/// Guild/workspace profile as seen by a messaging platform.
+///
+/// The runtime uses this for durable management-panel metadata and cached
+/// platform icon media. `guild_id` remains an opaque platform-owned id even for
+/// adapters whose native vocabulary is server, workspace, team, or room.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GuildProfile {
+    /// Messaging platform.
+    pub platform: PlatformName,
+    /// Platform guild/workspace id.
+    pub guild_id: ExternalId,
+    /// Platform-visible guild/workspace name.
+    pub name: String,
+    /// Platform icon hash or version token, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_hash: Option<String>,
+    /// Fetchable icon URL for the current icon hash, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon_url: Option<String>,
+}
+
 /// Incoming platform event.
 ///
 /// This is the stream consumed by the bot runtime. Events are already
@@ -414,6 +435,11 @@ pub enum PlatformEvent {
     Ready {
         /// Ready payload.
         ready: PlatformReady,
+    },
+    /// Guild/workspace profile created or updated.
+    GuildProfileUpdated {
+        /// Guild/workspace profile payload.
+        guild: GuildProfile,
     },
     /// New message.
     MessageCreated {

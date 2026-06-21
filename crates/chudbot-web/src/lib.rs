@@ -401,6 +401,7 @@ where
         .route("/videos/{name}", get(get_video::<R>))
         .route("/audio/{name}", get(get_audio::<R>))
         .route("/avatars/{name}", get(get_avatar::<R>))
+        .route("/guild-icons/{name}", get(get_guild_icon::<R>))
         .route("/images/{name}", get(get_image::<R>))
         .route("/favicon.ico", get(get_favicon::<R>))
         .route("/og-image", get(get_og_image::<R>))
@@ -1208,6 +1209,17 @@ where
     R: WebRuntimeTypes,
 {
     load_media_response(&state.media_store, MediaCategory::Avatar, &name).await
+}
+
+#[tracing::instrument(name = "web.get_guild_icon", skip_all, fields(name = %name))]
+async fn get_guild_icon<R>(
+    State(state): State<WebState<R>>,
+    Path(name): Path<String>,
+) -> Result<Response, ApiError>
+where
+    R: WebRuntimeTypes,
+{
+    load_media_response(&state.media_store, MediaCategory::GuildIcon, &name).await
 }
 
 #[tracing::instrument(

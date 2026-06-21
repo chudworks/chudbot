@@ -34,7 +34,7 @@ use crate::ids::{
     TurnId, UserRef,
 };
 use crate::media::MediaUri;
-use crate::platform::UserProfile;
+use crate::platform::{GuildProfile, UserProfile};
 use crate::tool::ToolTrace;
 use crate::transcript::{ProviderContinuation, Transcript};
 use crate::usage::{UsageCostQuery, UsageCostRow, UsageRecord};
@@ -656,6 +656,18 @@ pub struct StoredUserProfile {
     pub avatar: Option<MediaUri>,
 }
 
+/// Stored guild/workspace metadata for management read models.
+///
+/// The platform profile carries the latest remote icon hash and URL; `icon` is
+/// the stable Chudbot media URI after the image has been cached locally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredGuildProfile {
+    /// Last platform profile seen for this guild/workspace.
+    pub profile: GuildProfile,
+    /// Cached local guild icon media URI, when downloaded.
+    pub icon: Option<MediaUri>,
+}
+
 /// Platform-neutral key for one user's memory in one workspace/scope.
 ///
 /// The `scope_key` is already normalized by the platform/runtime layer, usually
@@ -1231,6 +1243,31 @@ pub trait BotStorage: Send + Sync {
         selection: AgentSelection,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
 
+    /// Upsert a platform guild/workspace profile.
+    fn upsert_guild(
+        &self,
+        guild: GuildProfile,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Load a guild/workspace's cached icon media URI.
+    fn load_guild_icon(
+        &self,
+        platform: PlatformName,
+        guild_id: ExternalId,
+    ) -> impl Future<Output = Result<Option<MediaUri>, Self::Error>> + Send;
+
+    /// Mark a guild/workspace's cached icon media URI for the current icon hash.
+    ///
+    /// Implementations should ignore the write if the stored guild profile has
+    /// already moved to a different icon hash.
+    fn set_guild_icon(
+        &self,
+        platform: PlatformName,
+        guild_id: ExternalId,
+        icon_hash: String,
+        icon: MediaUri,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
     /// Upsert a platform user profile.
     fn upsert_user(
         &self,
@@ -1243,10 +1280,14 @@ pub trait BotStorage: Send + Sync {
         user: UserRef,
     ) -> impl Future<Output = Result<Option<MediaUri>, Self::Error>> + Send;
 
-    /// Mark a user's cached avatar media URI.
+    /// Mark a user's cached avatar media URI for the current avatar URL.
+    ///
+    /// Implementations should ignore the write if the stored user profile has
+    /// already moved to a different avatar URL.
     fn set_user_avatar(
         &self,
         user: UserRef,
+        avatar_url: String,
         avatar: MediaUri,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
