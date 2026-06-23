@@ -912,12 +912,20 @@ where
 {
     let uri = tool_required_string(input, "uri")?;
     if let Some(target) = uri.strip_prefix(GUILD_ICON_URI_PREFIX) {
-        return current_guild_icon_uri(storage, context, target).await;
+        return canonical_media_access_uri(current_guild_icon_uri(storage, context, target).await?);
     }
     if let Some(target) = uri.strip_prefix(USER_AVATAR_URI_PREFIX) {
-        return current_user_avatar_uri(storage, context, target).await;
+        return canonical_media_access_uri(
+            current_user_avatar_uri(storage, context, target).await?,
+        );
     }
     media_uri_from_tool_input(input)
+}
+
+fn canonical_media_access_uri(uri: MediaUri) -> Result<MediaUri, BotToolError> {
+    canonical_stored_media_uri(&uri).map_err(|_| {
+        BotToolError::InvalidInput("resolved media handle is not a stored media:// URI".to_string())
+    })
 }
 
 async fn current_guild_icon_uri<S>(

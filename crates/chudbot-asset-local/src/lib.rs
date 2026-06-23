@@ -1,7 +1,7 @@
 //! Local filesystem media storage for chudbot.
 //!
-//! This backend owns `file://images/...`, `file://videos/...`,
-//! `file://audio/...`, `file://avatars/...`, and `file://guild-icons/...`
+//! This backend owns `media://images/...`, `media://videos/...`,
+//! `media://audio/...`, `media://avatars/...`, and `media://guild-icons/...`
 //! URIs. The URI is stable and model-facing; the public URL is
 //! deployment-facing and can point at the Axum static routes today.
 
@@ -10,11 +10,10 @@ use std::sync::Arc;
 
 use chudbot_api::{
     BoxedMediaRef, CreateMedia, LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef,
-    MediaStore, MediaUri, PublicMediaUrl,
+    MediaStore, MediaUri, PublicMediaUrl, parse_stored_media_uri, stored_media_served_path,
+    stored_media_uri,
 };
 use uuid::Uuid;
-
-const FILE_SCHEME: &str = "file://";
 
 /// Local filesystem media store.
 #[derive(Debug, Clone)]
@@ -105,7 +104,7 @@ impl LocalMediaStore {
         Ok(path)
     }
 
-    /// Convert a local file media URI to an on-disk path.
+    /// Convert a stored media URI to an on-disk path.
     pub fn local_path_from_uri(&self, uri: &MediaUri) -> Result<PathBuf, MediaError> {
         let ParsedLocalUri { category, name } = parse_local_uri(uri)?;
         let path = self.path_for_name(&category, &name)?;
@@ -284,47 +283,22 @@ struct ParsedLocalUri {
 }
 
 fn parse_local_uri(uri: &MediaUri) -> Result<ParsedLocalUri, MediaError> {
-    let path = uri
-        .as_str()
-        .strip_prefix(FILE_SCHEME)
-        .ok_or_else(|| MediaError::UnsupportedUri(uri.to_string()))?;
-    let (prefix, name) = path
-        .split_once('/')
-        .ok_or_else(|| MediaError::UnsupportedUri(uri.to_string()))?;
-    validate_media_name(name).map_err(|_| MediaError::UnsupportedUri(uri.to_string()))?;
-    let category = match prefix {
-        "images" => MediaCategory::Image,
-        "videos" => MediaCategory::Video,
-        "audio" => MediaCategory::Audio,
-        "avatars" => MediaCategory::Avatar,
-        "guild-icons" => MediaCategory::GuildIcon,
-        _ => return Err(MediaError::UnsupportedUri(uri.to_string())),
-    };
+    let parsed = parse_stored_media_uri(uri)?;
+    validate_media_name(&parsed.name).map_err(|_| MediaError::UnsupportedUri(uri.to_string()))?;
     Ok(ParsedLocalUri {
-        category,
-        name: name.to_string(),
+        category: parsed.category,
+        name: parsed.name,
     })
 }
 
 fn media_uri(category: &MediaCategory, name: &str) -> MediaUri {
-    MediaUri::new(format!("{FILE_SCHEME}{}/{name}", category.prefix()))
+    stored_media_uri(category, name)
 }
 
 fn public_url_from_base(base: Option<&str>, uri: &MediaUri) -> Option<PublicMediaUrl> {
-    let path = uri.as_str().strip_prefix(FILE_SCHEME)?;
-    if !is_supported_prefix(path) {
-        return None;
-    }
+    let path = stored_media_served_path(uri).ok()?;
     let base = base?.trim_end_matches('/');
     Some(PublicMediaUrl::new(format!("{base}/{path}")))
-}
-
-fn is_supported_prefix(path: &str) -> bool {
-    path.starts_with("images/")
-        || path.starts_with("videos/")
-        || path.starts_with("audio/")
-        || path.starts_with("avatars/")
-        || path.starts_with("guild-icons/")
 }
 
 fn generated_name(extension: Option<&str>, mime_type: &str) -> String {
@@ -506,10 +480,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_url_maps_file_uri_to_served_path() {
+    fn public_url_maps_stored_uri_to_served_path() {
         let url = public_url_from_base(
             Some("https://chudbot.example.com/"),
-            &MediaUri::new("file://images/abc.png"),
+            &MediaUri::new("media://images/abc.png"),
         )
         .unwrap();
         assert_eq!(url.as_str(), "https://chudbot.example.com/images/abc.png");
@@ -561,7 +535,7 @@ mod tests {
         assert_eq!(media.name(), "sample.png");
         assert_eq!(media.mime_type(), "image/png");
         assert_eq!(media.size_bytes(), 11);
-        assert_eq!(media.uri().as_str(), "file://images/sample.png");
+        assert_eq!(media.uri().as_str(), "media://images/sample.png");
         assert_eq!(
             media.public_url().await.unwrap().as_str(),
             "https://chudbot.example.com/images/sample.png"
@@ -570,15 +544,21 @@ mod tests {
         let by_uri = store.media_from_uri(media.uri()).await.unwrap();
         assert_eq!(by_uri.name(), "sample.png");
 
+        let by_legacy_uri = store
+            .media_from_uri(&MediaUri::new("file://images/sample.png"))
+            .await
+            .unwrap();
+        assert_eq!(by_legacy_uri.uri().as_str(), "media://images/sample.png");
+
         let by_name = store
             .media_from_name(MediaCategory::Image, "sample.png")
             .await
             .unwrap();
-        assert_eq!(by_name.uri().as_str(), "file://images/sample.png");
+        assert_eq!(by_name.uri().as_str(), "media://images/sample.png");
 
         let loaded = media.load().await.unwrap();
         assert_eq!(loaded.bytes, b"image bytes");
-        assert_eq!(loaded.media.uri().as_str(), "file://images/sample.png");
+        assert_eq!(loaded.media.uri().as_str(), "media://images/sample.png");
 
         fs::remove_dir_all(root).ok();
     }
@@ -610,7 +590,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(media.category(), &MediaCategory::Audio);
-        assert_eq!(media.uri().as_str(), "file://audio/voice.webm");
+        assert_eq!(media.uri().as_str(), "media://audio/voice.webm");
         assert_eq!(media.mime_type(), "audio/webm");
         assert_eq!(
             media.public_url().await.unwrap().as_str(),
@@ -638,7 +618,7 @@ mod tests {
             metadata: MediaMetadata {
                 category: MediaCategory::Image,
                 name: "abc.png".to_string(),
-                uri: MediaUri::new("file://images/abc.png"),
+                uri: MediaUri::new("media://images/abc.png"),
                 mime_type: "image/png".to_string(),
                 size_bytes: 10,
             },

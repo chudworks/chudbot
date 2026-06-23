@@ -281,25 +281,31 @@ function assetKind(asset: TurnAsset): 'image' | 'video' | 'audio' | null {
   return null;
 }
 
-// These mirror the file-backed media URI shape exposed by `chudbot-api`.
+// These mirror the stored media URI shape exposed by `chudbot-api`.
 // Duplicated here because the frontend is the only place that needs them in JS.
 function isImageUri(s: string): boolean {
-  return s.startsWith('file://images/');
+  return storedMediaPath(s)?.startsWith('images/') ?? false;
 }
 function isVideoUri(s: string): boolean {
-  return s.startsWith('file://videos/');
+  return storedMediaPath(s)?.startsWith('videos/') ?? false;
 }
 function isAudioUri(s: string): boolean {
-  return s.startsWith('file://audio/');
+  return storedMediaPath(s)?.startsWith('audio/') ?? false;
 }
 function toWebPath(s: string): string {
-  return s.startsWith('file://') ? '/' + s.slice('file://'.length) : s;
+  const path = storedMediaPath(s);
+  return path ? '/' + path : s;
 }
 
 function avatarPathFromUri(uri: string | null | undefined): string | null {
-  return uri?.startsWith('file://avatars/')
-    ? uri.slice('file://avatars/'.length)
-    : null;
+  const path = uri ? storedMediaPath(uri) : null;
+  return path?.startsWith('avatars/') ? path.slice('avatars/'.length) : null;
+}
+
+function storedMediaPath(uri: string): string | null {
+  if (uri.startsWith('media://')) return uri.slice('media://'.length);
+  if (uri.startsWith('file://')) return uri.slice('file://'.length);
+  return null;
 }
 
 function userKey(user: { platform: string; guild_id: string | null; user_id: string }): string {

@@ -379,7 +379,7 @@ where
                     .map(|model| format!(" and model `{model}`"))
                     .unwrap_or_default()
             ));
-            out.push_str("- Platform message JSON may include `audio_attachments` or attachment `audio_uri` fields. Use transcribe_audio with those file://audio/... URIs when the user's audio is relevant.\n");
+            out.push_str("- Platform message JSON may include `audio_attachments` or attachment `audio_uri` fields. Use transcribe_audio with those media://audio/... URIs when the user's audio is relevant.\n");
         }
         if !agent.subagents.is_empty() {
             out.push_str("- Specialist subagents are available as tools.\n");
@@ -391,7 +391,7 @@ where
         }
         if policy.final_reply_attach() {
             out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, visually inspected with read, and explicitly attached to the final platform reply with attach. read and attach only accept verified stored image assets, never return file bytes, and reject videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths. attach deduplicates with generated media already queued for the final reply.\n");
-            out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, file:// URIs, filenames, or markdown media links in user-facing text.\n");
+            out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, media:// URIs, filenames, or markdown media links in user-facing text.\n");
             out.push_str("- Slow work (video generation, subagent calls, research) SHOULD be narrated with calls to the post_status_message tool.\n");
         } else {
             out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, and visually inspected with read. read only accepts verified stored image assets, never returns file bytes, and rejects videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths.\n");

@@ -49,7 +49,7 @@ pub(crate) enum BotToolError {
 /// interpreted as media-store URIs and resolved through [`MediaStore`], which is
 /// the trust boundary for stored assets. This permissive split is for provider
 /// input references only; user-facing media access tools apply stricter
-/// `file://` validation before calling the store.
+/// stored-media validation before calling the store.
 pub(crate) async fn resolve_tool_media_arg<M>(
     media_store: &M,
     category: MediaCategory,

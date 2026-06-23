@@ -477,7 +477,7 @@ pub(crate) fn video_tool_schema() -> ToolInputSchema {
         ),
         ToolInputField::optional(
             "image",
-            ToolInputValueSchema::string().description("Optional media URI or public URL for an image to animate. Use file:// media URIs from prior tool results; do not invent local filesystem paths."),
+            ToolInputValueSchema::string().description("Optional media URI or public URL for an image to animate. Use media:// media URIs from prior tool results; do not invent local filesystem paths."),
         ),
         ToolInputField::optional(
             "duration_seconds",

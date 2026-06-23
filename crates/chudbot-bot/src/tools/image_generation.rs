@@ -244,7 +244,7 @@ pub(crate) fn image_tool_schema() -> ToolInputSchema {
         "Optional list of 1-3 existing images to edit, restyle, transform, vary, or combine. ",
         "Prefer this when the user refers to an image already visible in the conversation, ",
         "such as \"this image\", \"the image above\", or \"make it...\". Use exact ",
-        "file://images/... URIs from prior tool results, generated-media notes, or image ",
+        "media://images/... URIs from prior tool results, generated-media notes, or image ",
         "attachment reference notes; public https URLs also work. Never invent paths. For ",
         "2-3 references, refer to them in the prompt as <IMAGE_0>, <IMAGE_1>, etc. in this ",
         "array's order."

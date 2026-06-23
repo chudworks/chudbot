@@ -58,7 +58,7 @@ where
         url: String,
     ) -> Result<(), BotError> {
         let name = guild_icon_media_name(&guild, &icon_hash);
-        let expected_uri = MediaUri::new(format!("file://guild-icons/{name}"));
+        let expected_uri = stored_media_uri(&MediaCategory::GuildIcon, &name);
         if self
             .storage
             .load_guild_icon(guild.platform.clone(), guild.guild_id.clone())

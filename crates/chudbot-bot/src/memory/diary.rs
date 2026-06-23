@@ -311,7 +311,7 @@ mod tests {
             image_context: Vec::new(),
             audio_transcriptions: vec![UserMemoryAudioTranscription {
                 tool_trace_id: 42,
-                audio_uri: Some("file://audio/voice.ogg".to_string()),
+                audio_uri: Some("media://audio/voice.ogg".to_string()),
                 text: "I am allergic to coconut.".to_string(),
                 language: Some("en".to_string()),
                 duration_seconds: Some(3.25),
@@ -321,7 +321,7 @@ mod tests {
         let input = diary_input(&key, None, &[turn]);
 
         assert!(input.contains("Audio transcriptions:"));
-        assert!(input.contains("file://audio/voice.ogg"));
+        assert!(input.contains("media://audio/voice.ogg"));
         assert!(input.contains("language: en"));
         assert!(input.contains("duration_seconds: 3.25"));
         assert!(input.contains("I am allergic to coconut."));

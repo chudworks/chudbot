@@ -196,7 +196,7 @@ pub(crate) fn audio_transcription_tool_schema() -> ToolInputSchema {
         ToolInputField::required(
             "audio_uri",
             ToolInputValueSchema::string().description(
-                "A file://audio/... URI from the message JSON audio_attachments or attachment audio_uri field.",
+                "A media://audio/... URI from the message JSON audio_attachments or attachment audio_uri field.",
             ),
         ),
         ToolInputField::optional(

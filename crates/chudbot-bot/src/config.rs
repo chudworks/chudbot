@@ -501,7 +501,7 @@ impl BotConfig {
 /// Build the model-facing description for an agent's image generation tool.
 ///
 /// The text explains the media reference contract because generated and
-/// uploaded images are addressed by internal `file://images/...` URIs, not by
+/// uploaded images are addressed by internal `media://images/...` URIs, not by
 /// public URLs or guessed filenames.
 pub(crate) fn image_generation_tool_description(
     provider: &ProviderName,
@@ -516,7 +516,7 @@ pub(crate) fn image_generation_tool_description(
             "Use this whenever the user asks for an image, picture, drawing, illustration, ",
             "infographic, or other visual.\n\n",
             "To edit, restyle, transform, make a variation of, or combine images already ",
-            "visible in the conversation, pass their exact `file://images/...` URI(s) in ",
+            "visible in the conversation, pass their exact `media://images/...` URI(s) in ",
             "`reference_images`. This is the expected path for requests like \"turn this ",
             "image into...\", \"make the image...\", \"use the previous image\", or ",
             "\"here's a different version\". User-uploaded images are listed in image ",

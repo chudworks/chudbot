@@ -375,7 +375,7 @@ fn default_trust_forwarded_for() -> bool {
 /// Media storage backend config.
 ///
 /// Existing configs omit `kind` and continue to use local filesystem storage.
-/// S3 is selected with `kind = "s3"` and keeps the same `file://...` media URI
+/// S3 is selected with `kind = "s3"` and keeps the same `media://...` media URI
 /// surface while persisting bytes in the configured bucket.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

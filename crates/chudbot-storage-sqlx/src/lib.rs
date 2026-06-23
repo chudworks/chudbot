@@ -9,16 +9,17 @@ use std::collections::BTreeMap;
 use chudbot_api::{
     AgentSelection, BeginTurn, BotStorage, ChannelLink, ChannelRef, ContextItem, Conversation,
     ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
-    CountActiveVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, GuildProfile, MediaUri,
-    MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, MessageLink,
-    MessageRef, ModelId, ModelStepKind, ModelStepTrace, NewUserMemoryDiaryEntry,
-    NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName, PrivacyMode, ProviderName,
-    ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput, StoredUserProfile, StoredVideoJob,
-    ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob,
-    UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UsageSubject,
-    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
-    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
-    UserProfile, UserRef,
+    CountActiveVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, GuildProfile,
+    MediaCategory, MediaUri, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
+    MemoryTurnWindow, MessageLink, MessageRef, ModelId, ModelStepKind, ModelStepTrace,
+    NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName,
+    PrivacyMode, ProviderName, ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput,
+    StoredUserProfile, StoredVideoJob, ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot,
+    TurnStatus, UpdateVideoJob, UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope,
+    UsageRecord, UsageSubject, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
+    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext,
+    UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserProfile, UserRef, canonical_stored_media_uri,
+    is_stored_media_uri, parse_stored_media_uri,
 };
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -1349,6 +1350,7 @@ impl BotStorage for SqlxStorage {
         icon_hash: String,
         icon: MediaUri,
     ) -> Result<(), Self::Error> {
+        let icon = canonical_media_uri(&icon)?;
         let mut tx = self.pool.begin().await?;
         upsert_media_asset(&mut tx, icon.as_str()).await?;
         let result = sqlx::query(
@@ -1429,6 +1431,7 @@ impl BotStorage for SqlxStorage {
         avatar_url: String,
         avatar: MediaUri,
     ) -> Result<(), Self::Error> {
+        let avatar = canonical_media_uri(&avatar)?;
         let mut tx = self.pool.begin().await?;
         upsert_user(&mut tx, &user, None).await?;
         upsert_media_asset(&mut tx, avatar.as_str()).await?;
@@ -1533,8 +1536,13 @@ impl BotStorage for SqlxStorage {
     }
 
     async fn update_video_job(&self, input: UpdateVideoJob) -> Result<(), Self::Error> {
+        let output_uri = input
+            .output_uri
+            .as_ref()
+            .map(canonical_media_uri)
+            .transpose()?;
         let mut tx = self.pool.begin().await?;
-        if let Some(uri) = &input.output_uri {
+        if let Some(uri) = &output_uri {
             upsert_media_asset(&mut tx, uri.as_str()).await?;
         }
         let updated: Option<(Uuid, Option<Uuid>)> = sqlx::query_as(
@@ -1546,12 +1554,12 @@ impl BotStorage for SqlxStorage {
         )
         .bind(input.provider.as_str())
         .bind(&input.status)
-        .bind(input.output_uri.as_ref().map(MediaUri::as_str))
+        .bind(output_uri.as_ref().map(MediaUri::as_str))
         .bind(&input.error)
         .bind(&input.provider_job_id)
         .fetch_optional(&mut *tx)
         .await?;
-        if let (Some(uri), Some((turn_id, attempt_id))) = (&input.output_uri, updated) {
+        if let (Some(uri), Some((turn_id, attempt_id))) = (&output_uri, updated) {
             insert_turn_asset(
                 &mut tx,
                 TurnAssetInsert {
@@ -2312,7 +2320,8 @@ async fn load_memory_image_context(
            LEFT JOIN media_assets m ON m.uri = a.media_uri \
           WHERE a.turn_id = ANY($1) \
             AND a.replayable \
-            AND (m.category = 'image' OR m.mime_type LIKE 'image/%' OR a.media_uri LIKE 'file://images/%') \
+            AND (m.category = 'image' OR m.mime_type LIKE 'image/%' \
+                 OR a.media_uri LIKE 'media://images/%' OR a.media_uri LIKE 'file://images/%') \
           ORDER BY a.turn_id, a.ordinal, a.id",
     )
     .bind(turn_ids)
@@ -2402,7 +2411,7 @@ fn audio_uri_from_tool_request(request: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|uri| !uri.is_empty())
-        .map(str::to_string)
+        .and_then(|uri| canonical_media_uri_string(uri).ok())
 }
 
 fn optional_non_empty_string(value: Option<&Value>) -> Option<String> {
@@ -2477,6 +2486,9 @@ pub enum SqlxStorageError {
     /// Stored model step kind was malformed.
     #[error("invalid model step kind: {0}")]
     InvalidModelStepKind(String),
+    /// Stored media URI was malformed.
+    #[error("invalid media uri: {0}")]
+    InvalidMediaUri(String),
 }
 
 struct ToolTraceFields {
@@ -2525,7 +2537,7 @@ fn tool_trace_media_asset(fields: &ToolTraceFields) -> Option<(String, String)> 
     let response = fields.response.as_ref()?;
     let uri = media_uri_from_value(response)?;
     Some((
-        uri.to_string(),
+        uri,
         fields
             .tool_name
             .clone()
@@ -2546,13 +2558,14 @@ fn normalized_client_tool_response(trace: &chudbot_api::ClientToolTrace) -> Valu
     }
 }
 
-fn media_uri_from_value(value: &Value) -> Option<&str> {
+fn media_uri_from_value(value: &Value) -> Option<String> {
     if let Some(uri) = value
         .get("uri")
         .or_else(|| value.get("image_uri"))
         .or_else(|| value.get("video_uri"))
         .and_then(Value::as_str)
-        .filter(|uri| uri.starts_with("file://"))
+        .filter(|uri| is_stored_media_uri(uri))
+        .and_then(|uri| canonical_media_uri_string(uri).ok())
     {
         return Some(uri);
     }
@@ -2674,11 +2687,12 @@ async fn insert_context_item(
             )
         })
         .unwrap_or((None, None, None));
-    let media_uri = item
-        .content
-        .starts_with("file://")
-        .then_some(item.content.as_str());
-    if let Some(uri) = media_uri {
+    let media_uri = if is_stored_media_uri(&item.content) {
+        Some(canonical_media_uri_string(&item.content)?)
+    } else {
+        None
+    };
+    if let Some(uri) = media_uri.as_deref() {
         upsert_media_asset(tx, uri).await?;
     }
     let context_item_id: i64 = sqlx::query_scalar(
@@ -2695,16 +2709,16 @@ async fn insert_context_item(
     .bind(provider)
     .bind(channel)
     .bind(message)
-    .bind(media_uri)
+    .bind(media_uri.as_deref())
     .fetch_one(&mut **tx)
     .await?;
-    if item.content.starts_with("file://") {
+    if let Some(uri) = media_uri.as_deref() {
         insert_turn_asset(
             tx,
             TurnAssetInsert {
                 turn_id,
                 attempt_id: Some(attempt_id),
-                uri: &item.content,
+                uri,
                 source: &item.source,
                 context_item_id: Some(context_item_id),
                 tool_trace_id: None,
@@ -2730,7 +2744,8 @@ async fn insert_turn_asset(
     tx: &mut Transaction<'_, Postgres>,
     asset: TurnAssetInsert<'_>,
 ) -> Result<(), SqlxStorageError> {
-    upsert_media_asset(tx, asset.uri).await?;
+    let uri = canonical_media_uri_string(asset.uri)?;
+    upsert_media_asset(tx, &uri).await?;
     sqlx::query(
         "INSERT INTO turn_assets \
            (turn_id, attempt_id, media_uri, source, replayable, context_item_id, tool_trace_id, ordinal) \
@@ -2743,7 +2758,7 @@ async fn insert_turn_asset(
     )
     .bind(asset.turn_id.0)
     .bind(asset.attempt_id)
-    .bind(asset.uri)
+    .bind(uri.as_str())
     .bind(asset.source)
     .bind(asset.context_item_id)
     .bind(asset.tool_trace_id)
@@ -2795,14 +2810,11 @@ async fn insert_input_block(
     let (kind, text, media_uri, payload) = match block {
         chudbot_api::ContentBlock::Text { text } => ("text", Some(text), None, Value::Null),
         chudbot_api::ContentBlock::Media { media } => {
-            let uri = media.uri().to_string();
+            let mut metadata = media.metadata().clone();
+            metadata.uri = canonical_media_uri(&metadata.uri)?;
+            let uri = metadata.uri.to_string();
             upsert_media_asset(tx, &uri).await?;
-            (
-                "media",
-                None,
-                Some(uri),
-                serde_json::to_value(media.metadata())?,
-            )
+            ("media", None, Some(uri), serde_json::to_value(metadata)?)
         }
         chudbot_api::ContentBlock::ClientToolCall(call) => {
             ("client_tool_call", None, None, serde_json::to_value(call)?)
@@ -2840,12 +2852,13 @@ async fn upsert_media_asset(
     tx: &mut Transaction<'_, Postgres>,
     uri: &str,
 ) -> Result<(), SqlxStorageError> {
-    let (category, name, mime) = media_parts(uri);
+    let uri = canonical_media_uri_string(uri)?;
+    let (category, name, mime) = media_parts(&uri);
     sqlx::query(
         "INSERT INTO media_assets (uri, category, name, mime_type, size_bytes) \
          VALUES ($1, $2, $3, $4, 0) ON CONFLICT DO NOTHING",
     )
-    .bind(uri)
+    .bind(uri.as_str())
     .bind(category)
     .bind(name)
     .bind(mime)
@@ -3341,23 +3354,27 @@ fn selection_channel_key(guild: Option<&str>, channel: &str) -> String {
     format!("channel:{channel}")
 }
 
+fn canonical_media_uri(uri: &MediaUri) -> Result<MediaUri, SqlxStorageError> {
+    canonical_stored_media_uri(uri)
+        .map_err(|_| SqlxStorageError::InvalidMediaUri(uri.as_str().to_string()))
+}
+
+fn canonical_media_uri_string(uri: &str) -> Result<String, SqlxStorageError> {
+    canonical_media_uri(&MediaUri::new(uri)).map(|uri| uri.to_string())
+}
+
 fn media_parts(uri: &str) -> (&'static str, String, &'static str) {
-    if let Some(name) = uri.strip_prefix("file://images/") {
-        return ("image", name.to_string(), "image/png");
+    let Ok(parsed) = parse_stored_media_uri(&MediaUri::new(uri)) else {
+        return ("other", uri.to_string(), "application/octet-stream");
+    };
+    match parsed.category {
+        MediaCategory::Image => ("image", parsed.name, "image/png"),
+        MediaCategory::Video => ("video", parsed.name, "video/mp4"),
+        MediaCategory::Audio => ("audio", parsed.name, "audio/ogg"),
+        MediaCategory::Avatar => ("avatar", parsed.name, "image/png"),
+        MediaCategory::GuildIcon => ("guild_icon", parsed.name, "image/png"),
+        MediaCategory::Other(_) => ("other", parsed.name, "application/octet-stream"),
     }
-    if let Some(name) = uri.strip_prefix("file://videos/") {
-        return ("video", name.to_string(), "video/mp4");
-    }
-    if let Some(name) = uri.strip_prefix("file://audio/") {
-        return ("audio", name.to_string(), "audio/ogg");
-    }
-    if let Some(name) = uri.strip_prefix("file://avatars/") {
-        return ("avatar", name.to_string(), "image/png");
-    }
-    if let Some(name) = uri.strip_prefix("file://guild-icons/") {
-        return ("guild_icon", name.to_string(), "image/png");
-    }
-    ("other", uri.to_string(), "application/octet-stream")
 }
 
 /// Common row shape for turn usage and background memory-job usage.
@@ -3586,7 +3603,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_trace_media_asset_finds_nested_client_result_uri() {
+    fn tool_trace_media_asset_canonicalizes_nested_legacy_client_result_uri() {
         let fields = ToolTraceFields {
             trace_kind: "client",
             tool_name: Some("generate_image".to_string()),
@@ -3610,7 +3627,7 @@ mod tests {
         assert_eq!(
             tool_trace_media_asset(&fields),
             Some((
-                "file://images/generated.png".to_string(),
+                "media://images/generated.png".to_string(),
                 "generate_image".to_string()
             ))
         );
@@ -3662,7 +3679,7 @@ mod tests {
         assert_eq!(transcription.tool_trace_id, 42);
         assert_eq!(
             transcription.audio_uri.as_deref(),
-            Some("file://audio/voice.ogg")
+            Some("media://audio/voice.ogg")
         );
         assert_eq!(transcription.text, "I am allergic to coconut.");
         assert_eq!(transcription.language.as_deref(), Some("en"));

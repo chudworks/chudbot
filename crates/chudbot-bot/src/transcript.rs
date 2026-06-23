@@ -127,7 +127,7 @@ where
 
     /// Convert context items into provider-ready content blocks.
     ///
-    /// Stored `file://` handles are resolved through the media store and only
+    /// Stored media handles are resolved through the media store and only
     /// model-supported media is passed through; unsupported or missing media is
     /// skipped with logging instead of failing the whole transcript assembly.
     pub(crate) async fn context_blocks_from_items(
@@ -136,7 +136,7 @@ where
     ) -> Vec<ContentBlock> {
         let mut blocks = Vec::new();
         for item in context {
-            if item.content.starts_with("file://") {
+            if is_stored_media_uri(&item.content) {
                 match self
                     .media_store
                     .media_from_uri(&MediaUri::new(item.content.clone()))
@@ -233,19 +233,25 @@ where
             // duplicate the same model-visible attachment.
             let mut replayed_media = replay_context
                 .iter()
-                .filter(|item| item.content.starts_with("file://"))
-                .map(|item| item.content.clone())
+                .filter(|item| is_stored_media_uri(&item.content))
+                .map(|item| {
+                    canonical_stored_media_uri(&MediaUri::new(item.content.clone()))
+                        .unwrap_or_else(|_| MediaUri::new(item.content.clone()))
+                        .to_string()
+                })
                 .collect::<Vec<_>>();
             let mut generated_media_refs = Vec::new();
             let mut generated_media_blocks = Vec::new();
             for asset in &turn.replay_assets {
+                let asset_uri = canonical_stored_media_uri(&asset.uri)
+                    .unwrap_or_else(|_| MediaUri::new(asset.uri.as_str().to_string()));
                 if replayed_media
                     .iter()
-                    .any(|uri| uri.as_str() == asset.uri.as_str())
+                    .any(|uri| uri.as_str() == asset_uri.as_str())
                 {
                     continue;
                 }
-                match self.media_store.media_from_uri(&asset.uri).await {
+                match self.media_store.media_from_uri(&asset_uri).await {
                     Ok(media) => {
                         if !model_transcript_supports_media(media.as_ref()) {
                             tracing::debug!(
@@ -257,14 +263,14 @@ where
                             );
                             continue;
                         }
-                        replayed_media.push(asset.uri.as_str().to_string());
+                        replayed_media.push(asset_uri.as_str().to_string());
                         if replay_asset_belongs_to_user_turn(asset) {
                             user_turn.blocks.push(ContentBlock::Media { media });
                         } else {
                             // Generated media is replayed as a follow-up user
                             // turn so later image-edit requests can reference
                             // prior assistant outputs.
-                            generated_media_refs.push(asset.uri.as_str().to_string());
+                            generated_media_refs.push(asset_uri.as_str().to_string());
                             generated_media_blocks.push(ContentBlock::Media { media });
                         }
                     }
@@ -585,7 +591,13 @@ pub(crate) async fn media_reply_refs_from_transcript(transcript: &Transcript) ->
                 }
                 continue;
             };
-            push_unique_string(&mut out, media.uri().as_str());
+            let canonical_uri = canonical_stored_media_uri(media.uri()).ok();
+            if let Some(canonical_uri) = canonical_uri.as_ref() {
+                push_unique_string(&mut out, canonical_uri.as_str());
+            }
+            if canonical_uri.as_ref() != Some(media.uri()) {
+                push_unique_string(&mut out, media.uri().as_str());
+            }
             if let Ok(public_url) = media.public_url().await {
                 push_unique_string(&mut out, public_url.as_str());
             }

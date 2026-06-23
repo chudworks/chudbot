@@ -1,7 +1,7 @@
 //! S3-compatible media storage for chudbot.
 //!
-//! This backend preserves chudbot's existing model-facing `file://...` media
-//! handles while storing bytes in an S3 bucket. The AWS SDK client is built
+//! This backend preserves chudbot's model-facing stored-media handles while
+//! storing bytes in an S3 bucket. The AWS SDK client is built
 //! lazily, so credentials and region are resolved through the standard AWS
 //! environment/profile chains only when the backend is first used.
 
@@ -14,12 +14,11 @@ use aws_sdk_s3::config::Region;
 use aws_sdk_s3::primitives::ByteStream;
 use chudbot_api::{
     BoxedMediaRef, CreateMedia, LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef,
-    MediaStore, MediaUri, PublicMediaUrl,
+    MediaStore, MediaUri, PublicMediaUrl, parse_stored_media_uri, stored_media_served_path,
+    stored_media_uri,
 };
 use tokio::sync::OnceCell;
 use uuid::Uuid;
-
-const FILE_SCHEME: &str = "file://";
 
 /// S3-compatible media store.
 #[derive(Debug, Clone)]
@@ -305,47 +304,22 @@ struct ParsedStoredUri {
 }
 
 fn parse_stored_uri(uri: &MediaUri) -> Result<ParsedStoredUri, MediaError> {
-    let path = uri
-        .as_str()
-        .strip_prefix(FILE_SCHEME)
-        .ok_or_else(|| MediaError::UnsupportedUri(uri.to_string()))?;
-    let (prefix, name) = path
-        .split_once('/')
-        .ok_or_else(|| MediaError::UnsupportedUri(uri.to_string()))?;
-    validate_media_name(name).map_err(|_| MediaError::UnsupportedUri(uri.to_string()))?;
-    let category = match prefix {
-        "images" => MediaCategory::Image,
-        "videos" => MediaCategory::Video,
-        "audio" => MediaCategory::Audio,
-        "avatars" => MediaCategory::Avatar,
-        "guild-icons" => MediaCategory::GuildIcon,
-        _ => return Err(MediaError::UnsupportedUri(uri.to_string())),
-    };
+    let parsed = parse_stored_media_uri(uri)?;
+    validate_media_name(&parsed.name).map_err(|_| MediaError::UnsupportedUri(uri.to_string()))?;
     Ok(ParsedStoredUri {
-        category,
-        name: name.to_string(),
+        category: parsed.category,
+        name: parsed.name,
     })
 }
 
 fn media_uri(category: &MediaCategory, name: &str) -> MediaUri {
-    MediaUri::new(format!("{FILE_SCHEME}{}/{name}", category.prefix()))
+    stored_media_uri(category, name)
 }
 
 fn public_url_from_base(base: Option<&str>, uri: &MediaUri) -> Option<PublicMediaUrl> {
-    let path = uri.as_str().strip_prefix(FILE_SCHEME)?;
-    if !is_supported_prefix(path) {
-        return None;
-    }
+    let path = stored_media_served_path(uri).ok()?;
     let base = base?.trim_end_matches('/');
     Some(PublicMediaUrl::new(format!("{base}/{path}")))
-}
-
-fn is_supported_prefix(path: &str) -> bool {
-    path.starts_with("images/")
-        || path.starts_with("videos/")
-        || path.starts_with("audio/")
-        || path.starts_with("avatars/")
-        || path.starts_with("guild-icons/")
 }
 
 fn generated_name(extension: Option<&str>, mime_type: &str) -> String {
@@ -527,14 +501,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_url_maps_file_uri_to_served_path() {
+    fn public_url_maps_stored_uri_to_served_path() {
         let url = public_url_from_base(
+            Some("https://assets.chudbot.example.com/"),
+            &MediaUri::new("media://images/abc.png"),
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://assets.chudbot.example.com/images/abc.png"
+        );
+
+        let legacy = public_url_from_base(
             Some("https://assets.chudbot.example.com/"),
             &MediaUri::new("file://images/abc.png"),
         )
         .unwrap();
         assert_eq!(
-            url.as_str(),
+            legacy.as_str(),
             "https://assets.chudbot.example.com/images/abc.png"
         );
     }

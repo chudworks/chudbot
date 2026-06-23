@@ -40,8 +40,10 @@ pub use generation::{
 // Runtime references, serializable metadata, URL handles, and shared access
 // errors. These types let traces store stable references instead of raw bytes.
 pub use reference::{
-    BoxedMediaRef, MediaCategory, MediaError, MediaMetadata, MediaRef, MediaUri, PublicMediaUrl,
-    UrlMediaRef,
+    BoxedMediaRef, LEGACY_FILE_MEDIA_SCHEME, MediaCategory, MediaError, MediaMetadata, MediaRef,
+    MediaUri, PublicMediaUrl, STORED_MEDIA_SCHEME, StoredMediaUri, UrlMediaRef,
+    canonical_stored_media_uri, is_stored_media_uri, parse_stored_media_uri,
+    stored_media_served_path, stored_media_uri,
 };
 
 // Store persistence contracts. These turn newly created bytes or stable URIs

@@ -17,10 +17,16 @@ use thiserror::Error;
 
 use super::LoadedMedia;
 
+/// Canonical scheme for stored media identities.
+pub const STORED_MEDIA_SCHEME: &str = "media://";
+
+/// Legacy scheme accepted for stored media identities during migration.
+pub const LEGACY_FILE_MEDIA_SCHEME: &str = "file://";
+
 /// Stable model-facing URI for a media item.
 ///
 /// A media URI is identity, not necessarily a fetch URL. Stored media commonly
-/// uses backend-owned forms such as `file://images/abc123.png`; URL-backed
+/// uses backend-owned forms such as `media://images/abc123.png`; URL-backed
 /// media may use the original public URL as its URI.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -45,6 +51,70 @@ impl std::fmt::Display for MediaUri {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Parsed stored-media URI components.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredMediaUri {
+    /// Media category encoded in the URI prefix.
+    pub category: MediaCategory,
+    /// Storage-local media name.
+    pub name: String,
+}
+
+/// Return the canonical stored-media URI for a category/name pair.
+pub fn stored_media_uri(category: &MediaCategory, name: &str) -> MediaUri {
+    MediaUri::new(format!("{STORED_MEDIA_SCHEME}{}/{name}", category.prefix()))
+}
+
+/// Return whether a string uses a supported stored-media URI scheme.
+pub fn is_stored_media_uri(value: &str) -> bool {
+    value.starts_with(STORED_MEDIA_SCHEME) || value.starts_with(LEGACY_FILE_MEDIA_SCHEME)
+}
+
+/// Parse a stored-media URI, accepting both canonical and legacy schemes.
+pub fn parse_stored_media_uri(uri: &MediaUri) -> Result<StoredMediaUri, MediaError> {
+    let path = stored_media_path(uri.as_str())
+        .ok_or_else(|| MediaError::UnsupportedUri(uri.to_string()))?;
+    let (prefix, name) = path
+        .split_once('/')
+        .ok_or_else(|| MediaError::UnsupportedUri(uri.to_string()))?;
+    if !stored_media_name_is_safe(name) {
+        return Err(MediaError::UnsupportedUri(uri.to_string()));
+    }
+    let category = MediaCategory::from_prefix(prefix)
+        .ok_or_else(|| MediaError::UnsupportedUri(uri.to_string()))?;
+    Ok(StoredMediaUri {
+        category,
+        name: name.to_string(),
+    })
+}
+
+/// Canonicalize a stored-media URI to `media://...`.
+pub fn canonical_stored_media_uri(uri: &MediaUri) -> Result<MediaUri, MediaError> {
+    let parsed = parse_stored_media_uri(uri)?;
+    Ok(stored_media_uri(&parsed.category, &parsed.name))
+}
+
+/// Return the web-served path for a stored-media URI, without a leading slash.
+pub fn stored_media_served_path(uri: &MediaUri) -> Result<String, MediaError> {
+    let parsed = parse_stored_media_uri(uri)?;
+    Ok(format!("{}/{}", parsed.category.prefix(), parsed.name))
+}
+
+fn stored_media_path(value: &str) -> Option<&str> {
+    value
+        .strip_prefix(STORED_MEDIA_SCHEME)
+        .or_else(|| value.strip_prefix(LEGACY_FILE_MEDIA_SCHEME))
+}
+
+fn stored_media_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains('\\')
+        && name != "."
+        && name != ".."
+        && !name.chars().any(char::is_control)
 }
 
 /// Public URL providers can fetch.
@@ -115,6 +185,18 @@ impl MediaCategory {
             Self::Avatar => "avatars",
             Self::GuildIcon => "guild-icons",
             Self::Other(prefix) => prefix.as_str(),
+        }
+    }
+
+    /// Parse a built-in stored-media prefix.
+    pub fn from_prefix(prefix: &str) -> Option<Self> {
+        match prefix {
+            "images" => Some(Self::Image),
+            "videos" => Some(Self::Video),
+            "audio" => Some(Self::Audio),
+            "avatars" => Some(Self::Avatar),
+            "guild-icons" => Some(Self::GuildIcon),
+            _ => None,
         }
     }
 }

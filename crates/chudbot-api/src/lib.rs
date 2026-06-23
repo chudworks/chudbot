@@ -128,8 +128,9 @@ pub use media::{
     AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
     AudioTranscriptionRequest, BoxedMediaRef, CreateMedia, GeneratedImage, GeneratedVideo,
     ImageGenerator, ImageRequest, LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef,
-    MediaStore, MediaUri, PublicMediaUrl, UrlMediaRef, VideoGenerator, VideoJobStatus, VideoMeta,
-    VideoRequest,
+    MediaStore, MediaUri, PublicMediaUrl, StoredMediaUri, UrlMediaRef, VideoGenerator,
+    VideoJobStatus, VideoMeta, VideoRequest, canonical_stored_media_uri, is_stored_media_uri,
+    parse_stored_media_uri, stored_media_served_path, stored_media_uri,
 };
 
 // Usage records and aggregate query shapes let model, tool, media, and nested

@@ -258,7 +258,7 @@ impl MediaStore for NoopMediaStore {
         name: &str,
     ) -> Result<BoxedMediaRef, MediaError> {
         Err(MediaError::UnsupportedUri(format!(
-            "file://{}/{name}",
+            "media://{}/{name}",
             category.prefix()
         )))
     }
@@ -276,7 +276,7 @@ impl MediaStore for RecordingMediaStore {
         let name = input
             .name
             .unwrap_or_else(|| format!("generated.{}", category.prefix()));
-        let uri = MediaUri::new(format!("memory://{}/{name}", category.prefix()));
+        let uri = MediaUri::new(format!("media://{}/{name}", category.prefix()));
         let mime_type = input
             .mime_type
             .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -313,7 +313,7 @@ impl MediaStore for RecordingMediaStore {
         name: &str,
     ) -> Result<BoxedMediaRef, MediaError> {
         self.media_from_uri(&MediaUri::new(format!(
-            "memory://{}/{name}",
+            "media://{}/{name}",
             category.prefix()
         )))
         .await
@@ -445,7 +445,7 @@ async fn image_generation_tool_saves_media_and_returns_uri() {
     let ClientToolResultContent::Json { value } = output.result else {
         panic!("expected json tool result");
     };
-    assert_eq!(value["uri"], "memory://images/generated.images");
+    assert_eq!(value["uri"], "media://images/generated.images");
     assert_eq!(value["mime_type"], "image/png");
     assert!(value.get("public_url").is_none());
     assert!(
@@ -1665,7 +1665,7 @@ impl MediaStore for ReplyMediaStore {
         name: &str,
     ) -> Result<BoxedMediaRef, MediaError> {
         self.media_from_uri(&MediaUri::new(format!(
-            "file://{}/{name}",
+            "media://{}/{name}",
             category.prefix()
         )))
         .await
@@ -1677,13 +1677,13 @@ impl MediaStore for ReplyMediaStore {
 #[test]
 fn strips_generated_media_markdown_from_reply_text() {
     let trace = generated_image_trace(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     );
     let refs = generated_media_reply_refs(&[trace]);
 
     let reply = strip_generated_media_refs(
-        "Worm generated.\n\n![image](https://chud.example/images/generated.jpg)\n\nfile://images/generated.jpg",
+        "Worm generated.\n\n![image](https://chud.example/images/generated.jpg)\n\nmedia://images/generated.jpg",
         &refs,
     );
 
@@ -1693,7 +1693,7 @@ fn strips_generated_media_markdown_from_reply_text() {
 #[test]
 fn generated_media_strip_preserves_unrelated_links() {
     let trace = generated_image_trace(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     );
     let refs = generated_media_reply_refs(&[trace]);
@@ -1711,7 +1711,7 @@ fn generated_media_strip_preserves_unrelated_links() {
 
 #[tokio::test]
 async fn oversized_generated_video_uses_public_url_fallback() {
-    let uri = "file://videos/generated.mp4";
+    let uri = "media://videos/generated.mp4";
     let public_url = "https://chud.example/videos/generated.mp4";
     let trace = generated_video_trace(uri, public_url);
     let store = ReplyMediaStore::new(ReplyMediaRef::video(
@@ -1743,7 +1743,7 @@ fn appends_generated_media_public_urls_to_reply_text() {
 // for reply attachment, or reported as unavailable without leaking bytes.
 #[tokio::test]
 async fn read_asset_exposes_supported_image_without_returning_bytes() {
-    let uri = "file://images/generated.jpg";
+    let uri = "media://images/generated.jpg";
     let store = ReplyMediaStore::new(ReplyMediaRef::image(
         uri,
         "https://chud.example/images/generated.jpg",
@@ -1776,8 +1776,33 @@ async fn read_asset_exposes_supported_image_without_returning_bytes() {
 }
 
 #[tokio::test]
+async fn read_asset_accepts_legacy_file_uri_and_returns_canonical_uri() {
+    let canonical = "media://images/generated.jpg";
+    let store = ReplyMediaStore::new(ReplyMediaRef::image(
+        canonical,
+        "https://chud.example/images/generated.jpg",
+    ));
+
+    let output = read_asset(
+        &store,
+        ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new(READ_ASSET_TOOL),
+            input: json!({ "uri": "file://images/generated.jpg" }),
+        },
+    )
+    .await
+    .expect("legacy stored image URI should be readable");
+
+    let ClientToolResultContent::Json { value } = &output.result else {
+        panic!("expected json result");
+    };
+    assert_eq!(value["uri"], canonical);
+}
+
+#[tokio::test]
 async fn read_asset_does_not_queue_final_reply_attachment() {
-    let uri = "file://images/generated.jpg";
+    let uri = "media://images/generated.jpg";
     let store = ReplyMediaStore::new(ReplyMediaRef::image(
         uri,
         "https://chud.example/images/generated.jpg",
@@ -1812,7 +1837,7 @@ async fn read_asset_does_not_queue_final_reply_attachment() {
 
 #[tokio::test]
 async fn read_asset_rejects_video_without_loading_bytes() {
-    let uri = "file://videos/generated.mp4";
+    let uri = "media://videos/generated.mp4";
     let store = ReplyMediaStore::new(ReplyMediaRef::video(
         uri,
         42,
@@ -1837,7 +1862,7 @@ async fn read_asset_rejects_video_without_loading_bytes() {
 
 #[tokio::test]
 async fn read_asset_rejects_unsupported_image_mime_without_returning_public_url() {
-    let uri = "file://images/upload.pdf";
+    let uri = "media://images/upload.pdf";
     let store = ReplyMediaStore::new(ReplyMediaRef::image_with_mime(
         uri,
         "application/pdf",
@@ -1878,7 +1903,7 @@ async fn read_asset_rejects_unsupported_image_mime_without_returning_public_url(
 
 #[tokio::test]
 async fn attach_asset_queues_supported_image_without_returning_bytes() {
-    let uri = "file://images/generated.jpg";
+    let uri = "media://images/generated.jpg";
     let store = ReplyMediaStore::new(ReplyMediaRef::image(
         uri,
         "https://chud.example/images/generated.jpg",
@@ -1909,7 +1934,7 @@ async fn attach_asset_queues_supported_image_without_returning_bytes() {
 
 #[tokio::test]
 async fn attach_asset_rejects_video() {
-    let uri = "file://videos/generated.mp4";
+    let uri = "media://videos/generated.mp4";
     let store = ReplyMediaStore::new(ReplyMediaRef::video(
         uri,
         42,
@@ -1934,7 +1959,7 @@ async fn attach_asset_rejects_video() {
 
 #[tokio::test]
 async fn explicit_attach_deduplicates_with_automatic_generated_attachment() {
-    let uri = "file://images/generated.jpg";
+    let uri = "media://images/generated.jpg";
     let public_url = "https://chud.example/images/generated.jpg";
     let store = ReplyMediaStore::new(ReplyMediaRef::image(uri, public_url));
     let traces = vec![generated_image_trace(uri, public_url), attach_trace(uri)];
@@ -1949,7 +1974,7 @@ async fn explicit_attach_deduplicates_with_automatic_generated_attachment() {
 #[tokio::test]
 async fn stat_asset_reports_missing_uri_without_error_result() {
     let store = ReplyMediaStore::new(ReplyMediaRef::image(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     ));
 
@@ -1958,7 +1983,7 @@ async fn stat_asset_reports_missing_uri_without_error_result() {
         ClientToolCall {
             id: ToolUseId::new("call-1"),
             name: ToolName::new(STAT_ASSET_TOOL),
-            input: json!({ "uri": "file://images/missing.jpg" }),
+            input: json!({ "uri": "media://images/missing.jpg" }),
         },
     )
     .await
@@ -1970,7 +1995,7 @@ async fn stat_asset_reports_missing_uri_without_error_result() {
         panic!("expected json result");
     };
     assert_eq!(value["exists"], false);
-    assert_eq!(value["uri"], "file://images/missing.jpg");
+    assert_eq!(value["uri"], "media://images/missing.jpg");
 }
 
 #[test_case(MediaCategory::Image, "image/png", true ; "png image")]
@@ -1991,7 +2016,7 @@ fn model_transcript_media_support_matches_llm_image_inputs(
         metadata: MediaMetadata {
             category,
             name: "media.bin".to_string(),
-            uri: MediaUri::new("file://media/generated.bin"),
+            uri: MediaUri::new("media://media/generated.bin"),
             mime_type: mime_type.to_string(),
             size_bytes: 42,
         },
@@ -2029,7 +2054,7 @@ fn injects_audio_refs_into_message_json() {
             { "filename": "voice.ogg" }
         ]
     });
-    let audio = PromptMediaRef::boxed_audio("file://audio/voice.ogg");
+    let audio = PromptMediaRef::boxed_audio("media://audio/voice.ogg");
     let saved = StoredAttachmentMedia {
         attachment_index: 1,
         media: audio,
@@ -2037,10 +2062,10 @@ fn injects_audio_refs_into_message_json() {
 
     inject_audio_attachment_refs(&mut value, &[saved]);
 
-    assert_eq!(value["audio_attachments"][0], "file://audio/voice.ogg");
+    assert_eq!(value["audio_attachments"][0], "media://audio/voice.ogg");
     assert_eq!(
         value["attachments"][1]["audio_uri"],
-        "file://audio/voice.ogg"
+        "media://audio/voice.ogg"
     );
     assert!(value["attachments"][0].get("audio_uri").is_none());
 }
@@ -2146,7 +2171,7 @@ fn automatic_audio_context_omits_audio_uri_when_hidden_from_model() {
 #[tokio::test]
 async fn transcript_media_refs_are_sanitized_from_replies() {
     let media = PromptMediaRef::boxed(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     );
     let transcript = Transcript {
@@ -2168,12 +2193,12 @@ async fn transcript_media_refs_are_sanitized_from_replies() {
     assert_eq!(
         refs,
         vec![
-            "file://images/generated.jpg".to_string(),
+            "media://images/generated.jpg".to_string(),
             "https://chud.example/images/generated.jpg".to_string()
         ]
     );
     let reply = strip_generated_media_refs(
-        "Done.\n\nhttps://chud.example/images/generated.jpg\nfile://images/generated.jpg",
+        "Done.\n\nhttps://chud.example/images/generated.jpg\nmedia://images/generated.jpg",
         &refs,
     );
 
@@ -2183,7 +2208,7 @@ async fn transcript_media_refs_are_sanitized_from_replies() {
 #[tokio::test]
 async fn transcript_reply_refs_include_replayed_tool_result_media() {
     let trace = generated_image_trace(
-        "file://videos/generated.mp4",
+        "media://videos/generated.mp4",
         "https://chud.example/videos/generated.mp4",
     );
     let mut transcript = Transcript::new();
@@ -2191,13 +2216,13 @@ async fn transcript_reply_refs_include_replayed_tool_result_media() {
 
     let refs = media_reply_refs_from_transcript(&transcript).await;
 
-    assert_eq!(refs, vec!["file://videos/generated.mp4".to_string()]);
+    assert_eq!(refs, vec!["media://videos/generated.mp4".to_string()]);
 }
 
 #[test]
 fn client_tool_trace_replays_as_call_then_result() {
     let trace = generated_image_trace(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     );
     let mut transcript = Transcript::new();
@@ -2218,13 +2243,13 @@ fn client_tool_trace_replays_as_call_then_result() {
     let ClientToolResultContent::Json { value } = &result.content else {
         panic!("expected json result");
     };
-    assert_eq!(value["uri"], "file://images/generated.jpg");
+    assert_eq!(value["uri"], "media://images/generated.jpg");
 }
 
 #[test]
 fn model_step_replay_uses_provider_continuations_and_matching_tool_results() {
     let trace = generated_image_trace(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     );
     let provider = ProviderName::new("xai");
@@ -2300,7 +2325,7 @@ fn model_step_replay_uses_provider_continuations_and_matching_tool_results() {
 #[test]
 fn model_step_replay_matches_anthropic_tool_use_results() {
     let trace = generated_image_trace(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     );
     let provider = ProviderName::new("anthropic");
@@ -2354,11 +2379,11 @@ fn model_step_replay_matches_anthropic_tool_use_results() {
 fn generated_media_replays_after_assistant_message() {
     let turn_id = TurnId::new();
     let trace = generated_image_trace(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     );
     let media = PromptMediaRef::boxed(
-        "file://images/generated.jpg",
+        "media://images/generated.jpg",
         "https://chud.example/images/generated.jpg",
     );
     let mut transcript = Transcript::new();
@@ -2372,7 +2397,7 @@ fn generated_media_replays_after_assistant_message() {
     append_generated_media_replay(
         &mut transcript,
         turn_id,
-        vec!["file://images/generated.jpg".to_string()],
+        vec!["media://images/generated.jpg".to_string()],
         vec![ContentBlock::Media { media }],
     );
 
@@ -2392,7 +2417,7 @@ fn generated_media_replays_after_assistant_message() {
     else {
         panic!("expected generated media replay note and media");
     };
-    assert!(text.contains("file://images/generated.jpg"));
+    assert!(text.contains("media://images/generated.jpg"));
     assert!(text.contains("reference_images"));
 }
 
@@ -2403,7 +2428,7 @@ fn generated_media_replays_after_assistant_message() {
 #[test_case("generate_image", false ; "generated image")]
 fn replay_asset_user_turn_ownership(source: &str, expected: bool) {
     let asset = TurnAsset {
-        uri: MediaUri::new("file://images/image.jpg"),
+        uri: MediaUri::new("media://images/image.jpg"),
         turn_id: TurnId::new(),
         source: source.to_string(),
         mime_type: Some("image/jpeg".to_string()),

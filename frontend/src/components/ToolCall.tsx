@@ -113,8 +113,8 @@ function resultContentValue(content: ClientToolResultContent): unknown {
 
 type MediaRef = { kind: 'image' | 'video' | 'audio'; uri: string; path: string };
 
-/** Walk the value, collecting any string that looks like a
- *  `file://images/...`, `file://videos/...`, or `file://audio/...` URI. */
+/** Walk the value, collecting any string that looks like a stored image,
+ *  video, or audio URI. */
 function collectMediaUris(value: unknown): MediaRef[] {
   const out: MediaRef[] = [];
   const seen = new Set<string>();
@@ -124,11 +124,12 @@ function collectMediaUris(value: unknown): MediaRef[] {
 
 function walk(value: unknown, out: MediaRef[], seen: Set<string>) {
   if (typeof value === 'string') {
-    if (value.startsWith('file://images/')) {
+    const path = storedMediaPath(value);
+    if (path?.startsWith('images/')) {
       pushMediaRef(out, seen, 'image', value);
-    } else if (value.startsWith('file://videos/')) {
+    } else if (path?.startsWith('videos/')) {
       pushMediaRef(out, seen, 'video', value);
-    } else if (value.startsWith('file://audio/')) {
+    } else if (path?.startsWith('audio/')) {
       pushMediaRef(out, seen, 'audio', value);
     }
     return;
@@ -150,7 +151,15 @@ function pushMediaRef(
 ) {
   if (seen.has(uri)) return;
   seen.add(uri);
-  out.push({ kind, uri, path: '/' + uri.slice('file://'.length) });
+  const path = storedMediaPath(uri);
+  if (!path) return;
+  out.push({ kind, uri, path: '/' + path });
+}
+
+function storedMediaPath(uri: string): string | null {
+  if (uri.startsWith('media://')) return uri.slice('media://'.length);
+  if (uri.startsWith('file://')) return uri.slice('file://'.length);
+  return null;
 }
 
 function prettyJson(value: unknown): string {

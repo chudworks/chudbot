@@ -531,20 +531,24 @@ pub(crate) fn media_uris_from_tool_traces(trace: &[ToolTrace]) -> Vec<MediaUri> 
             .or_else(|| trace.trace_response.get("image_uri"))
             .or_else(|| trace.trace_response.get("video_uri"))
             .and_then(serde_json::Value::as_str)
-            .filter(|uri| uri.starts_with("file://"))
+            .and_then(canonical_stored_media_uri_from_str)
         else {
             continue;
         };
 
         // Step 3: preserve first-seen order while deduplicating generated media
         // and explicit `attach` calls that reference the same stored asset.
-        if seen.iter().any(|seen| seen == uri) {
+        if seen.iter().any(|seen| seen == uri.as_str()) {
             continue;
         }
         seen.push(uri.to_string());
-        out.push(MediaUri::new(uri));
+        out.push(uri);
     }
     out
+}
+
+fn canonical_stored_media_uri_from_str(uri: &str) -> Option<MediaUri> {
+    canonical_stored_media_uri(&MediaUri::new(uri)).ok()
 }
 
 /// Collect media references that should be removed from assistant reply text.

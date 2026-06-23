@@ -41,7 +41,7 @@ pub(crate) use chudbot_api::{
     TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef,
     UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UserProfile,
     UserRef, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
-    collect_agent_run,
+    canonical_stored_media_uri, collect_agent_run, is_stored_media_uri, stored_media_uri,
 };
 
 // Small helper crates used broadly enough that local imports would add noise.

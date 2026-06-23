@@ -1739,12 +1739,12 @@ mod tests {
     #[test]
     fn viewer_trace_keeps_distinct_trace_payload() {
         let trace_payload = json!({
-            "uri": "file://images/generated.png",
+            "uri": "media://images/generated.png",
             "public_url": "https://media.example/generated.png"
         });
         let view = client_trace_view(
             ClientToolResultContent::Json {
-                value: json!({ "uri": "file://images/generated.png" }),
+                value: json!({ "uri": "media://images/generated.png" }),
             },
             trace_payload.clone(),
         );

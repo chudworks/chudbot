@@ -1599,7 +1599,7 @@ mod tests {
     #[tokio::test]
     async fn loadable_media_is_inlined_instead_of_sent_as_url() {
         let media = LoadablePublicMediaRef::new(
-            "file://images/stored.png",
+            "media://images/stored.png",
             "https://chud.example/media/images/stored.png",
             "image/png",
             b"image bytes".to_vec(),

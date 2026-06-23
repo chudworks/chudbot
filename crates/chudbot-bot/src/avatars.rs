@@ -48,7 +48,7 @@ where
     ) -> Result<(), BotError> {
         // Step 1: derive the exact media URI storage should hold for this URL.
         let name = avatar_media_name(&user, &url);
-        let expected_uri = MediaUri::new(format!("file://avatars/{name}"));
+        let expected_uri = stored_media_uri(&MediaCategory::Avatar, &name);
         // The local avatar media path is deterministic, so URI equality is the
         // freshness check. This avoids repeated downloads on every user event.
         if self

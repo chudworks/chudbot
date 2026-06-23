@@ -51,8 +51,8 @@ frontend_dir = "frontend-build"
 
 [storage]
 # Local media directories. The database stores stable URIs such as
-# file://images/<name>, file://videos/<name>, file://audio/<name>,
-# file://avatars/<name>, and file://guild-icons/<name>.
+# media://images/<name>, media://videos/<name>, media://audio/<name>,
+# media://avatars/<name>, and media://guild-icons/<name>.
 kind = "local"
 images_dir = "images"
 videos_dir = "videos"
@@ -64,7 +64,7 @@ guild_icons_dir = "guild-icons"
 public_base_url = "http://localhost:1860"
 
 # S3-compatible media storage. The stored URIs still use the same
-# file://images/<name> shape; only the configured backend changes where bytes
+# media://images/<name> shape; only the configured backend changes where bytes
 # are persisted and loaded. Credentials are loaded by the AWS SDK, so set
 # AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, IAM role credentials, or
 # another standard AWS provider before running Chudbot.
@@ -126,7 +126,7 @@ admins = [
 # Optional deployment-wide policy prepended before each agent's own prompt.
 extra_system_prompt = """
 This bot runs in a private Discord server. Follow Discord platform policy and
-do not reveal internal ids, file:// URIs, or implementation details unless the
+do not reveal internal ids, media:// URIs, or implementation details unless the
 operator explicitly asks for them.
 """
 # Usually left empty; chudbot-bin fills this from its package version.

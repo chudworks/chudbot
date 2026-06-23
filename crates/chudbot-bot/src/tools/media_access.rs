@@ -3,8 +3,8 @@
 //! These tools accept model-facing stored-media handles, not filesystem paths
 //! or arbitrary network URLs. The runtime executor resolves context-local
 //! handles such as `guild_icon://current` or `user_avatar://current` to stored
-//! `file://...` media URIs before these helpers run. The prefix check here
-//! keeps the concrete input shape scoped to stored media, and
+//! `media://...` media URIs before these helpers run. The parser here keeps the
+//! concrete input shape scoped to stored media, and
 //! `MediaStore::media_from_uri` remains the authority for validating supported
 //! storage prefixes, existence, metadata, and access handles.
 
@@ -18,7 +18,7 @@ use super::*;
 /// never serializes file bytes into the tool result.
 pub(crate) fn read_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Read a stored Chudbot image asset by file:// URI, the current Discord guild icon by guild_icon://current / guild.icon_uri, or a cached user avatar by user_avatar://current / user_avatar://<user_id> / an avatar_uri value from message context. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, and arbitrary filesystem paths are rejected. The tool returns metadata and makes the image visible to the next model step, but never returns raw bytes.".to_string(),
+        description: "Read a stored Chudbot image asset by media:// URI, the current Discord guild icon by guild_icon://current / guild.icon_uri, or a cached user avatar by user_avatar://current / user_avatar://<user_id> / an avatar_uri value from message context. Only verified image assets already in media storage are accepted; videos, audio, PDFs, unknown MIME types, and arbitrary filesystem paths are rejected. The tool returns metadata and makes the image visible to the next model step, but never returns raw bytes.".to_string(),
         input_schema: asset_uri_tool_schema(),
     }
 }
@@ -69,7 +69,7 @@ pub(crate) fn asset_uri_tool_schema() -> ToolInputSchema {
     ToolInputSchema::object([ToolInputField::required(
         "uri",
         ToolInputValueSchema::string().description(
-            "A stored Chudbot file:// media URI such as file://images/abc.jpg, file://videos/abc.mp4, file://audio/abc.ogg, file://avatars/abc.png, or file://guild-icons/abc.png. In Discord guild channels, guild_icon://current and guild.icon_uri resolve to the current guild icon. user_avatar://current, user_avatar://<user_id>, and avatar_uri values from message context resolve to cached avatars on the current platform. Do not pass local filesystem paths or public URLs.",
+            "A stored Chudbot media:// URI such as media://images/abc.jpg, media://videos/abc.mp4, media://audio/abc.ogg, media://avatars/abc.png, or media://guild-icons/abc.png. In Discord guild channels, guild_icon://current and guild.icon_uri resolve to the current guild icon. user_avatar://current, user_avatar://<user_id>, and avatar_uri values from message context resolve to cached avatars on the current platform. Do not pass local filesystem paths or public URLs.",
         ),
     )])
 }
@@ -87,7 +87,7 @@ where
     M: MediaStore,
 {
     let uri = media_uri_from_tool_input(&call.input)?;
-    // The store lookup is the trust boundary between a syntactic file:// URI
+    // The store lookup is the trust boundary between a syntactic media:// URI
     // and a real, supported media object.
     let media = media_store
         .media_from_uri(&uri)
@@ -310,17 +310,16 @@ where
 ///
 /// This is only a coarse scope check. It prevents public URLs and local path
 /// strings from entering the tool flow, while the media store decides whether a
-/// `file://...` value names a supported Chudbot media asset.
+/// `media://...` value names a supported Chudbot media asset. Legacy stored
+/// `file://...` values are accepted here only so old traces/configured values
+/// can be replayed and are immediately canonicalized before execution.
 pub(crate) fn media_uri_from_tool_input(
     input: &serde_json::Value,
 ) -> Result<MediaUri, BotToolError> {
     let uri = tool_required_string(input, "uri")?;
-    if !uri.starts_with("file://") {
-        return Err(BotToolError::InvalidInput(
-            "`uri` must be a stored file:// media URI".to_string(),
-        ));
-    }
-    Ok(MediaUri::new(uri))
+    canonical_stored_media_uri(&MediaUri::new(uri)).map_err(|_| {
+        BotToolError::InvalidInput("`uri` must be a stored media:// media URI".to_string())
+    })
 }
 
 /// Build the common JSON result shape for media access tools.
