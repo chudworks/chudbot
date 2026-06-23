@@ -35,18 +35,15 @@ pub(crate) use chudbot_api::{
     PlatformCommandOption, PlatformCommandOptionChoice, PlatformCommandOptionKind,
     PlatformCommandResponse, PlatformCommandValue, PlatformEvent, PlatformMessage,
     PlatformMessageReference, PlatformMessageRelationship, PlatformName, PlatformReaction,
-    PrivacyMode, ProviderName, ReactionKind, ResolveAgent, RuntimeSettings, SamplingNumber,
-    SamplingOptions, SaveTurnInput, SendMessage, StoredVideoJob, ThreadRequest, ToolInputField,
-    ToolInputSchema, ToolInputValueSchema, ToolName, ToolTrace, ToolUseId, Transcript,
-    TranscriptTurn, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef,
-    UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UserProfile,
-    UserRef, VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
+    ProviderName, ReactionKind, ResolveAgent, SamplingNumber, SamplingOptions, SaveTurnInput,
+    SendMessage, StoredVideoJob, ThreadRequest, ToolInputField, ToolInputSchema,
+    ToolInputValueSchema, ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn,
+    TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageCostGrouping,
+    UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UserProfile, UserRef,
+    VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
     canonical_stored_media_uri, collect_agent_run, is_stored_media_uri, stored_media_uri,
 };
 
-// Small helper crates used broadly enough that local imports would add noise.
-/// Serialization derives and bounds used by trace, tool, and command payloads.
-pub(crate) use serde::Serialize;
 /// Error derive used by crate-local error types.
 pub(crate) use thiserror::Error;
 /// Timestamp type used in stored conversations, turns, jobs, and usage rows.

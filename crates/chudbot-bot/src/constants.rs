@@ -83,12 +83,6 @@ pub(crate) const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 // linked by public URL instead of uploaded.
 pub(crate) const MAX_OUTGOING_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
 
-/// Smallest channel-history fetch size accepted by the privacy command.
-pub(crate) const HISTORY_SIZE_MIN: i64 = 1;
-
-/// Largest channel-history fetch size accepted by the privacy command.
-pub(crate) const HISTORY_SIZE_MAX: i64 = 100;
-
 /// Maximum stored/displayed conversation title length after title generation.
 pub(crate) const TITLE_MAX_CHARS: usize = 80;
 

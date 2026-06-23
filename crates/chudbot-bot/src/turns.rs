@@ -1,9 +1,9 @@
-//! Message-to-turn orchestration: privacy checks, context preparation, execution, and retries.
+//! Message-to-turn orchestration: wake-up checks, context preparation, execution, and retries.
 //!
 //! This module is the platform-neutral path from an incoming platform event to
 //! a stored conversation turn. It decides whether a message should wake the
-//! bot, resolves privacy and agent configuration, records the durable turn
-//! input, runs the selected agent, and posts the terminal platform reply.
+//! bot, resolves agent configuration, records the durable turn input, runs the
+//! selected agent, and posts the terminal platform reply.
 //!
 //! Reaction handlers live here too because retry and stop/resume requests share
 //! the same invariants: retries replay the original turn instead of creating a
@@ -27,8 +27,6 @@ pub(crate) struct TurnExecution {
     pub(crate) system_prompt: String,
     /// Model transcript prepared from stored conversation state and current context.
     pub(crate) transcript: Transcript,
-    /// Runtime privacy/opt-in settings captured for this turn.
-    pub(crate) settings: RuntimeSettings,
     /// Platform message that assistant output should reply to.
     pub(crate) reply_to: MessageRef,
     /// Whether this turn opened the conversation and should include first-reply behavior.
@@ -138,33 +136,7 @@ where
             return Ok(BotAction::Ignored);
         }
 
-        // Load runtime policy before deciding whether this message may bind to
-        // a conversation or expose surrounding channel context.
-        let settings = self.runtime_settings(&message).await?;
-        tracing::debug!(
-            privacy = privacy_mode_kind(&settings.privacy),
-            user_opted_in = settings.user_opted_in,
-            "loaded runtime settings"
-        );
-
-        // Existing conversation state is part of the privacy decision: a
-        // thread or quoted reply can be valid even when the literal event
-        // channel differs from the configured channel-only scope.
         let existing = self.lookup_existing_conversation(&message).await?;
-        if !self
-            .privacy_allows_message_channel(
-                &settings.privacy,
-                &message.id,
-                existing.as_ref().map(|existing| &existing.snapshot),
-            )
-            .await?
-        {
-            tracing::debug!(
-                privacy = privacy_mode_kind(&settings.privacy),
-                "privacy mode rejected message channel"
-            );
-            return Ok(BotAction::Ignored);
-        }
         if let Some(snapshot) = &existing
             && snapshot.snapshot.conversation.stopped_at.is_some()
         {
@@ -255,7 +227,6 @@ where
             .process_mentioned_message(
                 message,
                 existing.map(|existing| existing.snapshot),
-                settings,
                 resolved_agent,
                 incoming_audio,
             )
@@ -311,14 +282,13 @@ where
     /// Create or continue a conversation and persist the complete turn input.
     ///
     /// This is the durable boundary for a message that has already passed the
-    /// wake-up and privacy gates. It runs moderation, opens a conversation when
-    /// needed, begins the user turn, records platform context and transcript
-    /// input, then delegates terminal execution to `execute_turn`.
+    /// wake-up gates. It runs moderation, opens a conversation when needed,
+    /// begins the user turn, records platform context and transcript input,
+    /// then delegates terminal execution to `execute_turn`.
     pub(crate) async fn process_mentioned_message(
         &self,
         message: PlatformMessage,
         existing: Option<ConversationSnapshot>,
-        settings: RuntimeSettings,
         resolved_agent: Option<(String, AgentConfig)>,
         incoming_audio: IncomingAudioContext,
     ) -> Result<BotAction, BotError> {
@@ -353,8 +323,7 @@ where
         let (snapshot, is_new) = match existing {
             Some(snapshot) => (snapshot, false),
             None => {
-                let system_instructions =
-                    self.compose_system_prompt(&agent_config, &settings.privacy, None);
+                let system_instructions = self.compose_system_prompt(&agent_config, None);
                 let snapshot = self
                     .storage
                     .open_conversation(OpenConversation {
@@ -382,11 +351,8 @@ where
             tracing::field::display(snapshot.conversation.id),
         );
         tracing::Span::current().record("is_new", is_new);
-        let system_instructions = self.compose_system_prompt(
-            &agent_config,
-            &settings.privacy,
-            Some(snapshot.conversation.id),
-        );
+        let system_instructions =
+            self.compose_system_prompt(&agent_config, Some(snapshot.conversation.id));
 
         // Begin the durable turn before assembling context so every saved
         // context item, transcript, trace, and platform reply has one owner.
@@ -429,7 +395,7 @@ where
         let preflight_tool_traces = incoming_audio.tool_traces();
         let preflight_usage = incoming_audio.usage_records();
         let turn_context = self
-            .prepare_turn_context(&message, &settings, &snapshot.conversation, incoming_audio)
+            .prepare_turn_context(&message, &snapshot.conversation, incoming_audio)
             .await?;
         let prompt_snapshot = self
             .storage
@@ -476,7 +442,6 @@ where
             agent_config,
             system_prompt: system_instructions,
             transcript,
-            settings,
             reply_to: message.id,
             is_new,
             preflight_tool_traces,
@@ -636,21 +601,11 @@ where
             model = %agent_config.model.id,
             "prepared turn retry"
         );
-        // Retry transcripts come from the stored conversation, not a new fetch
-        // of channel history, so privacy is narrowed to the conversation itself.
-        let settings = RuntimeSettings {
-            privacy: PrivacyMode::ConversationOnly,
-            user_opted_in: true,
-        };
         let system_instructions = turn_snapshot
             .system_instructions
             .clone()
             .unwrap_or_else(|| {
-                self.compose_system_prompt(
-                    &agent_config,
-                    &settings.privacy,
-                    Some(retry.conversation.conversation.id),
-                )
+                self.compose_system_prompt(&agent_config, Some(retry.conversation.conversation.id))
             });
         let stored_context = replayable_context_items(&turn_snapshot.context);
         let has_stored_context = !stored_context.is_empty();
@@ -709,7 +664,6 @@ where
                 agent_config,
                 system_prompt: system_instructions,
                 transcript,
-                settings,
                 reply_to: retry_user_message.clone(),
                 is_new: false,
                 preflight_tool_traces: Vec::new(),
@@ -889,7 +843,6 @@ where
                 top_level: true,
             },
             &ConversationAgentContext {
-                settings: &execution.settings,
                 reply_to: &execution.reply_to,
                 turn_user: &execution.turn.user,
                 turn_user_display_name: &execution.turn.user_display_name,
@@ -1298,31 +1251,6 @@ where
         TypingIndicator { stop, task }
     }
 
-    /// Load the privacy mode and opt-in flag that apply to this message author.
-    pub(crate) async fn runtime_settings(
-        &self,
-        message: &PlatformMessage,
-    ) -> Result<RuntimeSettings, BotError> {
-        let settings = self
-            .storage
-            .runtime_settings(
-                message.id.platform.clone(),
-                guild_key(&message.id),
-                message.author.id.user_id.as_str().to_string(),
-            )
-            .await
-            .map_err(storage_error)?;
-        tracing::trace!(
-            platform = %message.id.platform,
-            guild = ?message.id.guild_id,
-            user = %message.author.id.user_id,
-            privacy = privacy_mode_kind(&settings.privacy),
-            opted_in = settings.user_opted_in,
-            "runtime settings loaded"
-        );
-        Ok(settings)
-    }
-
     /// Resolve the channel key used by channel-scoped agent overrides.
     ///
     /// Platform threads inherit their parent channel's agent setting. If the
@@ -1341,43 +1269,6 @@ where
                 channel
             }
         }
-    }
-
-    /// Check whether the message channel is allowed under the active privacy mode.
-    ///
-    /// Only `channel_only` constrains the channel here. Existing conversations
-    /// are allowed to continue from linked thread/reply surfaces, while new work
-    /// must match either the configured channel or its platform parent.
-    pub(crate) async fn privacy_allows_message_channel(
-        &self,
-        mode: &PrivacyMode,
-        message: &MessageRef,
-        existing: Option<&ConversationSnapshot>,
-    ) -> Result<bool, BotError> {
-        let PrivacyMode::ChannelOnly {
-            channel: allowed, ..
-        } = mode
-        else {
-            return Ok(true);
-        };
-        let actual = channel_from_message(message);
-        if &actual == allowed {
-            return Ok(true);
-        }
-        if existing.is_some() {
-            tracing::debug!(
-                actual_channel = %actual.channel_id,
-                allowed_channel = %allowed.channel_id,
-                "allowing channel_only message because it continues an existing conversation"
-            );
-            return Ok(true);
-        }
-        let parent = self
-            .platforms
-            .parent_channel(actual)
-            .await
-            .map_err(platform_error)?;
-        Ok(&parent == allowed)
     }
 
     #[tracing::instrument(
@@ -1531,13 +1422,12 @@ where
 
     /// Build persisted context items for the quoted message and current message.
     ///
-    /// Quoted user messages are included only when privacy allows them. Quoted
+    /// Quoted messages are included when the platform supplies them. Quoted
     /// assistant replies from the same conversation are skipped because the
     /// transcript already replays those assistant turns.
     pub(crate) async fn prepare_turn_context(
         &self,
         message: &PlatformMessage,
-        settings: &RuntimeSettings,
         conversation: &Conversation,
         incoming_audio: IncomingAudioContext,
     ) -> Result<PreparedTurnContext, BotError> {
@@ -1547,9 +1437,6 @@ where
         // Quoted context is useful for reply semantics, but must not duplicate
         // an assistant answer already present in the conversation transcript.
         if let Some(referenced) = message.referenced_message()
-            && self
-                .quoted_message_allowed(referenced, settings, conversation)
-                .await?
             && !self
                 .quoted_assistant_message_already_replays(referenced, conversation)
                 .await?
@@ -1697,52 +1584,6 @@ where
             *position += 1;
         }
         Ok(())
-    }
-
-    /// Decide whether a referenced message may be included as quoted context.
-    ///
-    /// Open and channel-only modes allow quoted context. Conversation-only mode
-    /// suppresses it. Opt-in mode allows bot messages, messages already linked
-    /// to this conversation, or opted-in guild users.
-    pub(crate) async fn quoted_message_allowed(
-        &self,
-        referenced: &PlatformMessage,
-        settings: &RuntimeSettings,
-        conversation: &Conversation,
-    ) -> Result<bool, BotError> {
-        match &settings.privacy {
-            PrivacyMode::Open { .. } | PrivacyMode::ChannelOnly { .. } => Ok(true),
-            PrivacyMode::ConversationOnly => Ok(false),
-            PrivacyMode::OptIn => {
-                if referenced.author.is_bot {
-                    return Ok(true);
-                }
-                if self
-                    .storage
-                    .load_conversation(ConversationLookup::Channel {
-                        channel: channel_from_message(&referenced.id),
-                    })
-                    .await
-                    .map_err(storage_error)?
-                    .as_ref()
-                    .is_some_and(|snapshot| snapshot.conversation.id == conversation.id)
-                {
-                    return Ok(true);
-                }
-                let Some(guild) = referenced.id.guild_id.as_ref() else {
-                    return Ok(false);
-                };
-                self.storage
-                    .user_privacy(
-                        referenced.id.platform.clone(),
-                        guild.as_str().to_string(),
-                        referenced.author.id.user_id.as_str().to_string(),
-                    )
-                    .await
-                    .map_err(storage_error)
-                    .map(|opted_in| opted_in.unwrap_or(false))
-            }
-        }
     }
 
     /// Check whether a quoted assistant message is already present in transcript history.

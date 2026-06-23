@@ -577,7 +577,7 @@ For retries:
 - This lets forget/correction take effect between the original attempt and the
   retry.
 
-## Privacy and Scope
+## Memory Scope And Web Exposure
 
 Default scope:
 
@@ -637,7 +637,7 @@ Behavior tests to add:
 
 - False memories: mitigated by storing provenance, confidence, claim status,
   and prompt wording that treats rows as stored claims.
-- Privacy leakage: mitigated by guild-scoped defaults and explicit
+- Cross-scope leakage: mitigated by guild-scoped defaults and explicit
   deployment-wide visibility.
 - Latency: one embedding call per eligible incoming turn. Start with small
   top-k and simple query text before adding caches.

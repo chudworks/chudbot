@@ -142,8 +142,6 @@ pub(crate) struct RuntimeToolContext {
     pub(in crate::tools) turn_id: TurnId,
     /// User who triggered the turn, used for scoped memory and rate limits.
     pub(in crate::tools) turn_user: UserRef,
-    /// Privacy mode that gates history-fetch behavior for this turn.
-    pub(in crate::tools) privacy: PrivacyMode,
 }
 
 impl RuntimeToolContext {
@@ -157,7 +155,6 @@ impl RuntimeToolContext {
         conversation_id: ConversationId,
         turn_id: TurnId,
         turn_user: UserRef,
-        privacy: PrivacyMode,
     ) -> Self {
         let default_channel = channel_from_message(&reply_to);
         Self {
@@ -166,7 +163,6 @@ impl RuntimeToolContext {
             conversation_id,
             turn_id,
             turn_user,
-            privacy,
         }
     }
 }
@@ -175,7 +171,7 @@ bitflags::bitflags! {
     /// Dynamic tool exposure toggles for one agent run.
     #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
     pub(crate) struct RuntimeToolFlags: u16 {
-        /// Allow the model to fetch platform history according to privacy rules.
+        /// Allow the model to fetch platform history visible to the platform adapter.
         const FETCH_MESSAGES = 1 << 0;
         /// Allow the model to post progress/status updates in the reply channel.
         const POST_STATUS = 1 << 1;
@@ -491,12 +487,10 @@ where
 
     // Tool wrappers are built lazily so the executor stores services and flags,
     // not one field per possible tool.
-    fn fetch_messages_tool(&self) -> FetchMessagesTool<R::Platforms, R::Storage> {
+    fn fetch_messages_tool(&self) -> FetchMessagesTool<R::Platforms> {
         FetchMessagesTool {
             platforms: self.deps.platforms.clone(),
-            storage: self.deps.storage.clone(),
             default_channel: self.context.default_channel.clone(),
-            privacy: self.context.privacy.clone(),
         }
     }
 

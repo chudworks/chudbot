@@ -26,7 +26,6 @@ pub(crate) struct ConversationAgentAssembly<'a> {
 
 /// Runtime turn context shared by the top-level agent and configured subagents.
 pub(crate) struct ConversationAgentContext<'a> {
-    pub(crate) settings: &'a RuntimeSettings,
     pub(crate) reply_to: &'a MessageRef,
     pub(crate) turn_user: &'a UserRef,
     pub(crate) turn_user_display_name: &'a str,
@@ -39,20 +38,18 @@ pub(crate) struct ConversationAgentContext<'a> {
 struct ConversationToolPolicy {
     top_level: bool,
     memory_enabled: bool,
-    privacy_allows_history: bool,
 }
 
 impl ConversationToolPolicy {
-    fn new(top_level: bool, memory_enabled: bool, privacy: &PrivacyMode) -> Self {
+    fn new(top_level: bool, memory_enabled: bool) -> Self {
         Self {
             top_level,
             memory_enabled,
-            privacy_allows_history: !matches!(privacy, PrivacyMode::ConversationOnly),
         }
     }
 
     fn fetch_messages(self) -> bool {
-        self.privacy_allows_history
+        true
     }
 
     fn memory_lookup(self) -> bool {
@@ -95,11 +92,8 @@ where
             rendered_system_instructions,
             top_level,
         } = assembly;
-        let policy = ConversationToolPolicy::new(
-            top_level,
-            self.agent_memory_enabled(agent_config),
-            &context.settings.privacy,
-        );
+        let policy =
+            ConversationToolPolicy::new(top_level, self.agent_memory_enabled(agent_config));
         self.ensure_conversation_agent_services_exist(agent_name, agent_config, policy)?;
 
         // Only the active expansion path is recursive. Sibling subagents may
@@ -143,7 +137,6 @@ where
                 context.conversation_id,
                 context.turn_id,
                 context.turn_user.clone(),
-                context.settings.privacy.clone(),
             ),
         );
         // Conversation helpers are available to both top-level agents and
@@ -232,8 +225,7 @@ where
                 model = %subagent_config.model.id,
                 "attaching subagent tool"
             );
-            let prompt =
-                self.compose_subagent_system_prompt(subagent_config, &context.settings.privacy);
+            let prompt = self.compose_subagent_system_prompt(subagent_config);
             let nested = self.build_conversation_agent(
                 ConversationAgentAssembly {
                     agent_name: &subagent_name,
@@ -266,29 +258,24 @@ where
     pub(crate) fn compose_system_prompt(
         &self,
         agent: &AgentConfig,
-        privacy: &PrivacyMode,
         conversation_id: Option<ConversationId>,
     ) -> String {
         self.compose_system_prompt_inner(
             agent,
-            ConversationToolPolicy::new(true, self.agent_memory_enabled(agent), privacy),
+            ConversationToolPolicy::new(true, self.agent_memory_enabled(agent)),
             conversation_id,
         )
     }
 
     /// Compose the narrower system prompt used by subagent tools.
     ///
-    /// Subagents receive the conversation's privacy-scoped context guidance and
-    /// read-only memory lookup guidance, but not final media delivery guidance,
-    /// memory-write instructions, or a conversation trace URL.
-    pub(crate) fn compose_subagent_system_prompt(
-        &self,
-        agent: &AgentConfig,
-        privacy: &PrivacyMode,
-    ) -> String {
+    /// Subagents receive read-only memory lookup guidance, but not final media
+    /// delivery guidance, memory-write instructions, or a conversation trace
+    /// URL.
+    pub(crate) fn compose_subagent_system_prompt(&self, agent: &AgentConfig) -> String {
         self.compose_system_prompt_inner(
             agent,
-            ConversationToolPolicy::new(false, self.agent_memory_enabled(agent), privacy),
+            ConversationToolPolicy::new(false, self.agent_memory_enabled(agent)),
             None,
         )
     }
@@ -333,8 +320,8 @@ where
             ));
         }
 
-        // Capability guidance is assembled from config and privacy mode. The
-        // executor built above still decides whether a tool call is permitted.
+        // Capability guidance is assembled from config. The executor built
+        // above still decides whether a tool call is permitted.
         out.push_str("Capabilities this turn:\n");
         if !agent.model.server_tools.is_empty() {
             out.push_str("- Provider-side tools configured on this model.\n");
@@ -567,29 +554,18 @@ mod tests {
 
     #[test]
     fn conversation_tool_policy_keeps_delivery_and_memory_writes_top_level() {
-        let top_level =
-            ConversationToolPolicy::new(true, true, &PrivacyMode::Open { history_size: 20 });
+        let top_level = ConversationToolPolicy::new(true, true);
         assert!(top_level.fetch_messages());
         assert!(top_level.memory_lookup());
         assert!(top_level.memory_writes());
         assert!(top_level.generated_media_tools());
         assert!(top_level.final_reply_attach());
 
-        let subagent =
-            ConversationToolPolicy::new(false, true, &PrivacyMode::Open { history_size: 20 });
+        let subagent = ConversationToolPolicy::new(false, true);
         assert!(subagent.fetch_messages());
         assert!(subagent.memory_lookup());
         assert!(!subagent.memory_writes());
         assert!(!subagent.generated_media_tools());
         assert!(!subagent.final_reply_attach());
-    }
-
-    #[test]
-    fn conversation_tool_policy_honors_conversation_only_privacy_for_all_roles() {
-        let top_level = ConversationToolPolicy::new(true, true, &PrivacyMode::ConversationOnly);
-        let subagent = ConversationToolPolicy::new(false, true, &PrivacyMode::ConversationOnly);
-
-        assert!(!top_level.fetch_messages());
-        assert!(!subagent.fetch_messages());
     }
 }

@@ -159,11 +159,8 @@ async fn run(
             // before opening durable connections or spawning long-lived tasks.
             config.validate_all(&source)?;
 
-            // Storage is shared by the bot and web viewer. The default privacy
-            // fallback is attached before the runtime starts handling turns.
-            let storage = SqlxStorage::connect(&config.database.url)
-                .await?
-                .with_default_privacy(config.default_privacy.clone());
+            // Storage is shared by the bot and web viewer.
+            let storage = SqlxStorage::connect(&config.database.url).await?;
 
             // Register the git build once per deployment and expose the
             // monotonic app-version id to bot replies, traces, and viewer UI.

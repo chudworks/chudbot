@@ -13,13 +13,12 @@ use chudbot_api::{
     MediaCategory, MediaUri, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
     MemoryTurnWindow, MessageLink, MessageRef, ModelId, ModelStepKind, ModelStepTrace,
     NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName,
-    PrivacyMode, ProviderName, ResolveAgent, RetryTurn, RuntimeSettings, SaveTurnInput,
-    StoredUserProfile, StoredVideoJob, ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot,
-    TurnStatus, UpdateVideoJob, UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope,
-    UsageRecord, UsageSubject, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
-    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext,
-    UserMemoryJob, UserMemoryKey, UserMemoryTurn, UserProfile, UserRef, canonical_stored_media_uri,
-    is_stored_media_uri, parse_stored_media_uri,
+    ProviderName, ResolveAgent, RetryTurn, SaveTurnInput, StoredUserProfile, StoredVideoJob,
+    ToolTrace, Turn, TurnAsset, TurnId, TurnRole, TurnSnapshot, TurnStatus, UpdateVideoJob,
+    UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UsageSubject,
+    UserMemoryAudioTranscription, UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent,
+    UserMemoryEventKind, UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
+    UserProfile, UserRef, canonical_stored_media_uri, is_stored_media_uri, parse_stored_media_uri,
 };
 use serde_json::Value;
 use sqlx::postgres::PgPoolOptions;
@@ -34,7 +33,6 @@ static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 #[derive(Debug, Clone)]
 pub struct SqlxStorage {
     pool: PgPool,
-    default_privacy: PrivacyMode,
     app_version_id: Option<i32>,
 }
 
@@ -60,7 +58,6 @@ impl SqlxStorage {
         tracing::info!("connected SQLx storage");
         Ok(Self {
             pool,
-            default_privacy: PrivacyMode::OptIn,
             app_version_id: None,
         })
     }
@@ -69,15 +66,8 @@ impl SqlxStorage {
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
-            default_privacy: PrivacyMode::OptIn,
             app_version_id: None,
         }
-    }
-
-    /// Override the fallback privacy mode when no database row exists.
-    pub fn with_default_privacy(mut self, privacy: PrivacyMode) -> Self {
-        self.default_privacy = privacy;
-        self
     }
 
     /// Stamp newly written conversations, turns, and attempts with an app
@@ -978,104 +968,6 @@ impl BotStorage for SqlxStorage {
             "SELECT agent_name FROM provider_agent_selections WHERE message_provider = $1",
         )
         .bind(provider)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(SqlxStorageError::Sqlx)
-    }
-
-    async fn runtime_settings(
-        &self,
-        message_provider: PlatformName,
-        guild_key: Option<String>,
-        user_key: String,
-    ) -> Result<RuntimeSettings, Self::Error> {
-        let channel = guild_key
-            .as_deref()
-            .map(guild_scope)
-            .unwrap_or_else(|| "global".to_string());
-        let privacy = sqlx::query_scalar::<_, Value>(
-            "SELECT privacy_mode FROM privacy_settings \
-              WHERE message_provider = $1 AND channel = $2",
-        )
-        .bind(message_provider.as_str())
-        .bind(&channel)
-        .fetch_optional(&self.pool)
-        .await?
-        .map(serde_json::from_value)
-        .transpose()?
-        .unwrap_or_else(|| self.default_privacy.clone());
-        let user_opted_in = sqlx::query_scalar::<_, bool>(
-            "SELECT opted_in FROM user_privacy \
-              WHERE message_provider = $1 AND channel = $2 AND user_key = $3",
-        )
-        .bind(message_provider.as_str())
-        .bind(&channel)
-        .bind(&user_key)
-        .fetch_optional(&self.pool)
-        .await?
-        .unwrap_or(false);
-        Ok(RuntimeSettings {
-            privacy,
-            user_opted_in,
-        })
-    }
-
-    async fn set_privacy_mode(
-        &self,
-        message_provider: PlatformName,
-        guild_key: String,
-        privacy: PrivacyMode,
-    ) -> Result<(), Self::Error> {
-        let privacy = serde_json::to_value(privacy)?;
-        sqlx::query(
-            "INSERT INTO privacy_settings (message_provider, channel, privacy_mode) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (message_provider, channel) DO UPDATE \
-               SET privacy_mode = EXCLUDED.privacy_mode",
-        )
-        .bind(message_provider.as_str())
-        .bind(guild_scope(&guild_key))
-        .bind(privacy)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn set_user_privacy(
-        &self,
-        message_provider: PlatformName,
-        guild_key: String,
-        user_key: String,
-        opted_in: bool,
-    ) -> Result<(), Self::Error> {
-        sqlx::query(
-            "INSERT INTO user_privacy (message_provider, channel, user_key, opted_in) \
-             VALUES ($1, $2, $3, $4) \
-             ON CONFLICT (message_provider, channel, user_key) DO UPDATE \
-               SET opted_in = EXCLUDED.opted_in",
-        )
-        .bind(message_provider.as_str())
-        .bind(guild_scope(&guild_key))
-        .bind(&user_key)
-        .bind(opted_in)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    async fn user_privacy(
-        &self,
-        message_provider: PlatformName,
-        guild_key: String,
-        user_key: String,
-    ) -> Result<Option<bool>, Self::Error> {
-        sqlx::query_scalar(
-            "SELECT opted_in FROM user_privacy \
-              WHERE message_provider = $1 AND channel = $2 AND user_key = $3",
-        )
-        .bind(message_provider.as_str())
-        .bind(guild_scope(&guild_key))
-        .bind(&user_key)
         .fetch_optional(&self.pool)
         .await
         .map_err(SqlxStorageError::Sqlx)

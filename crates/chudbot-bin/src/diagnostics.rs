@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chudbot_api::{PrivacyMode, ProviderName, SamplingNumber};
+use chudbot_api::{ProviderName, SamplingNumber};
 use chudbot_bot::{GenerationBinding, TranscriptionBinding, VideoGenerationRateLimit};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -688,7 +688,6 @@ const ROOT_KEYS: &[&str] = &[
     "logging",
     "bot",
     "memory",
-    "default_privacy",
     "llm",
     "image",
     "video",
@@ -738,11 +737,7 @@ const MEMORY_KEYS: &[&str] = &[
     "retry_backoff_seconds",
     "max_job_attempts",
 ];
-const DEFAULT_PRIVACY_OPEN_KEYS: &[&str] = &["mode", "history_size"];
-const DEFAULT_PRIVACY_CHANNEL_ONLY_KEYS: &[&str] = &["mode", "channel", "history_size"];
-const DEFAULT_PRIVACY_NO_HISTORY_KEYS: &[&str] = &["mode"];
 const USER_REF_KEYS: &[&str] = &["platform", "guild_id", "user_id"];
-const CHANNEL_REF_KEYS: &[&str] = &["platform", "guild_id", "channel_id"];
 const BOT_KEYS: &[&str] = &[
     "web_base_url",
     "default_agent",
@@ -868,39 +863,8 @@ fn validate_unexpected_keys(
         }
     }
     validate_known_keys(source, diagnostics, &[key("memory")], MEMORY_KEYS);
-    validate_default_privacy_unexpected_keys(&config.default_privacy, source, diagnostics);
     validate_bot_unexpected_keys(config, source, diagnostics);
     validate_runtime_provider_unexpected_keys(config, source, diagnostics);
-}
-
-fn validate_default_privacy_unexpected_keys(
-    privacy: &PrivacyMode,
-    source: &ConfigSource,
-    diagnostics: &mut Vec<ConfigDiagnostic>,
-) {
-    let path = [key("default_privacy")];
-    match privacy {
-        PrivacyMode::Open { .. } => {
-            validate_known_keys(source, diagnostics, &path, DEFAULT_PRIVACY_OPEN_KEYS);
-        }
-        PrivacyMode::ChannelOnly { .. } => {
-            validate_known_keys(
-                source,
-                diagnostics,
-                &path,
-                DEFAULT_PRIVACY_CHANNEL_ONLY_KEYS,
-            );
-            validate_known_keys(
-                source,
-                diagnostics,
-                &child_path(&path, "channel"),
-                CHANNEL_REF_KEYS,
-            );
-        }
-        PrivacyMode::OptIn | PrivacyMode::ConversationOnly => {
-            validate_known_keys(source, diagnostics, &path, DEFAULT_PRIVACY_NO_HISTORY_KEYS);
-        }
-    }
 }
 
 fn validate_bot_unexpected_keys(
@@ -2457,11 +2421,6 @@ provider = "stale"
 max_diary_output_tokens = 1024
 max_profile_output_tokens = 2048
 
-[default_privacy]
-mode = "open"
-history_size = 20
-channel = { platform = "discord", guild_id = "1", channel_id = "2" }
-
 [bot]
 web_base_url = "http://localhost:1860"
 default_agent = "default"
@@ -2521,7 +2480,6 @@ provider = "openai"
         assert!(rendered.contains("unexpected config key `memory.provider`"));
         assert!(rendered.contains("unexpected config key `memory.max_diary_output_tokens`"));
         assert!(rendered.contains("unexpected config key `memory.max_profile_output_tokens`"));
-        assert!(rendered.contains("unexpected config section `default_privacy.channel`"));
         assert!(rendered.contains("unexpected config key `bot.admins[0].nickname`"));
         assert!(rendered.contains("unexpected config key `bot.agents.default.persona`"));
         assert!(rendered.contains("unexpected config key `bot.agents.default.model.model_typo`"));

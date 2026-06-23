@@ -654,10 +654,7 @@ Compaction should be resilient and idempotent:
   transaction.
 - Mark the job complete only after the durable memory rows have been written.
 
-## Privacy And Web Exposure
-
-The current privacy system is intentionally out of scope for this design
-because it is expected to be replaced. Do not build memory around it.
+## Memory Web Exposure
 
 Still avoid adding public web APIs for raw memory or memory documents in the
 first pass. The trace viewer is unauthenticated, so memory debugging should stay

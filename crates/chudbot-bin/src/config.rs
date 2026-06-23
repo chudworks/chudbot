@@ -16,7 +16,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use chudbot_api::{ModelId, PrivacyMode, ProviderName, SamplingNumber};
+use chudbot_api::{ModelId, ProviderName, SamplingNumber};
 use chudbot_bot::{BotConfig, MemoryConfig};
 use chudbot_web::WebConfig;
 use serde::de::Deserializer;
@@ -48,9 +48,6 @@ pub struct RuntimeConfig {
     /// User-memory runtime config.
     #[serde(default)]
     pub memory: MemoryConfig,
-    /// Deployment fallback privacy mode before a guild stores an override.
-    #[serde(default = "default_privacy")]
-    pub default_privacy: PrivacyMode,
     /// Named LLM provider configs keyed by provider registry name.
     #[serde(default)]
     pub llm: BTreeMap<ProviderName, LlmProviderConfig>,
@@ -148,10 +145,6 @@ fn default_log_filter() -> String {
 
 fn default_log_ansi() -> bool {
     true
-}
-
-fn default_privacy() -> PrivacyMode {
-    PrivacyMode::OptIn
 }
 
 impl RuntimeConfig {

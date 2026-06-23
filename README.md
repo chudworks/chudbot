@@ -34,9 +34,8 @@ Production deploy:
 ## Configuration
 
 Copy `config.example.toml` to `config.toml`. The example is the reference for
-all supported options: logging, database, web serving, storage, default
-privacy, named providers, platforms, agents, media generation bindings, memory,
-and subagents.
+all supported options: logging, database, web serving, storage, named
+providers, platforms, agents, media generation bindings, memory, and subagents.
 
 The runtime is agent-first. Agents select named provider services and model
 specs; provider credentials live under `[llm.*]`, `[image.*]`, and `[video.*]`.

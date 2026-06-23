@@ -144,15 +144,6 @@ thread_threshold_lines = 20
 # absent, [bot].default_agent is used.
 agent = "default"
 
-[default_privacy]
-# Deployment fallback before a server stores an override through /chudbot-mode.
-# Variants:
-#   mode = "open"; history_size = 20
-#   mode = "channel_only"; channel = { platform = "discord", guild_id = "123", channel_id = "456" }; history_size = 20
-#   mode = "opt_in"
-#   mode = "conversation_only"
-mode = "opt_in"
-
 [platforms.discord]
 kind = "discord"
 token = "DISCORD_BOT_TOKEN"

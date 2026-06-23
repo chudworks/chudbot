@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS privacy_settings CASCADE;
+DROP TABLE IF EXISTS user_privacy CASCADE;

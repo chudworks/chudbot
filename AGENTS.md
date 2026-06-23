@@ -14,7 +14,7 @@ Workspace crates:
 - `chudbot-api`: provider-neutral contracts for ids, transcripts, tools,
   agents, media, platform events, storage, live events, usage, and retry.
 - `chudbot-bot`: platform-neutral bot orchestration: event handling,
-  conversations, turns, privacy, commands, agent/tool wiring, title/avatar
+  conversations, turns, commands, agent/tool wiring, title/avatar
   jobs, and user-facing reply behavior.
 - `chudbot-discord`: Twilight platform implementation. No Twilight types leak
   into `chudbot-api`.
@@ -79,8 +79,6 @@ The config is agent-first:
 - `[llm.<name>]`, `[image.<name>]`, `[video.<name>]`, and
   `[platforms.<name>]` define named runtime services.
 - `[bot.platforms.<platform>]` binds a platform to its default agent.
-- `[default_privacy]` is the deployment fallback before a guild stores a
-  runtime override.
 - `[logging]` owns tracing setup. Do not add env-only logging controls.
 
 Use `agent`, not `persona`, in new code, docs, config, commands, and frontend
@@ -91,14 +89,11 @@ text.
 Discord is only the I/O surface. Conversation state lives in Postgres and is
 looked up by platform message/channel links.
 
-Privacy modes:
+Chudbot does not maintain a separate context-access policy. Platform permissions
+decide what messages and history the bot can see; anything visible to the
+configured platform integration is eligible model context.
 
-- `open`: fetch channel history.
-- `channel_only`: fetch only the configured channel.
-- `opt_in`: default; non-opted-in fetched messages are redacted.
-- `conversation_only`: no history-fetch tool.
-
-Slash commands are `/chudbot-privacy`, `/chudbot-mode`, and `/chudbot-agent`.
+Slash commands are `/chudbot-agent`.
 
 The web viewer is unauthenticated. Security relies on unguessable UUIDs plus
 the web layer's no-index/crawler controls. Do not add route-listing or

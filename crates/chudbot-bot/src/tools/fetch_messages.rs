@@ -1,33 +1,26 @@
-//! `fetch_messages` client tool and privacy redaction.
+//! `fetch_messages` client tool.
 //!
-//! This is the model-facing channel-history tool. The runtime executor omits it
-//! for `conversation_only` privacy; this module still owns the per-call channel
-//! boundary, defensive page-size handling, and opt-in redaction before messages
-//! are shaped for the model.
+//! This is the model-facing channel-history tool. Platform adapters decide what
+//! history is visible to the bot; this module owns per-call platform/guild
+//! scoping, defensive page-size handling, and transcript shaping.
 
 use super::*;
 
-/// Tool for fetching recent platform messages subject to runtime privacy mode.
+/// Tool for fetching recent platform messages.
 ///
 /// Calls are anchored to the current turn's platform and guild. Input may only
-/// choose a channel id within that scope, and `channel_only` privacy rejects
-/// any request outside the configured channel before a platform fetch runs.
-pub(crate) struct FetchMessagesTool<P, S> {
+/// choose a channel id within that scope before a platform fetch runs.
+pub(crate) struct FetchMessagesTool<P> {
     /// Platform registry used to fetch and render messages from the active
     /// platform implementation.
     pub(crate) platforms: P,
-    /// Storage backend consulted for per-user opt-in state during redaction.
-    pub(crate) storage: S,
     /// Channel associated with the current conversation turn.
     pub(crate) default_channel: ChannelRef,
-    /// Effective runtime privacy mode for this turn.
-    pub(crate) privacy: PrivacyMode,
 }
 
-impl<P, S> FetchMessagesTool<P, S>
+impl<P> FetchMessagesTool<P>
 where
     P: MessagePlatformRegistry + Clone,
-    S: BotStorage + Clone,
 {
     /// Describes the model-facing tool contract.
     ///
@@ -60,8 +53,7 @@ where
         }
     }
 
-    /// Executes the fetch, applies privacy policy, and returns transcript-ready
-    /// message context JSON.
+    /// Executes the fetch and returns transcript-ready message context JSON.
     #[tracing::instrument(
         name = "tool.fetch_messages",
         skip_all,
@@ -69,7 +61,6 @@ where
             tool_call = %call.id,
             default_platform = %self.default_channel.platform,
             default_channel = %self.default_channel.channel_id,
-            privacy = privacy_mode_kind(&self.privacy),
         )
     )]
     pub(crate) async fn call(
@@ -77,23 +68,6 @@ where
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, BotToolError> {
         let channel = requested_channel(&self.default_channel, &call.input)?;
-        // `requested_channel` keeps the platform and guild fixed; this check
-        // enforces the narrower channel boundary when the deployment selected
-        // channel-only history access.
-        if let PrivacyMode::ChannelOnly {
-            channel: allowed, ..
-        } = &self.privacy
-            && &channel != allowed
-        {
-            tracing::warn!(
-                requested_channel = %channel.channel_id,
-                allowed_channel = %allowed.channel_id,
-                "fetch_messages rejected by channel_only privacy mode"
-            );
-            return Err(BotToolError::InvalidInput(
-                "fetch_messages is limited to the configured channel".to_string(),
-            ));
-        }
         // Clamp defensively even though the schema advertises the same bounds.
         // Direct callers and some providers can still deliver out-of-range JSON.
         let limit = call
@@ -115,8 +89,6 @@ where
                 channel_id: channel.channel_id.clone(),
                 message_id: message_id.into(),
             });
-        // Fetch raw platform messages first; bot-specific privacy shaping is
-        // applied below so platform adapters do not need storage policy logic.
         let messages = self
             .platforms
             .fetch_messages(FetchMessages {
@@ -126,8 +98,6 @@ where
             })
             .await
             .map_err(|error| BotToolError::Platform(error.to_string()))?;
-        let messages =
-            redact_messages_for_privacy(&self.storage, &self.privacy, &channel, messages).await?;
         tracing::info!(
             messages = messages.len(),
             limit,
@@ -155,52 +125,4 @@ where
             usage: Vec::new(),
         })
     }
-}
-
-/// Applies opt-in privacy redaction to fetched platform messages.
-///
-/// Non-opted-in authors keep their message envelope but lose content, mentions,
-/// attachments, and reply/reference data so the model can see that history
-/// existed without seeing private user-authored material. Other privacy modes
-/// either constrain the fetch before this point or pass through unchanged.
-pub(crate) async fn redact_messages_for_privacy<S>(
-    storage: &S,
-    privacy: &PrivacyMode,
-    channel: &ChannelRef,
-    messages: Vec<PlatformMessage>,
-) -> Result<Vec<PlatformMessage>, BotToolError>
-where
-    S: BotStorage,
-{
-    if !matches!(privacy, PrivacyMode::OptIn) {
-        return Ok(messages);
-    }
-    // Opt-in settings are guild-scoped. Without a guild id there is no stored
-    // opt-in state to consult, so the already-fetched messages pass through.
-    let Some(guild_id) = channel.guild_id.as_ref() else {
-        return Ok(messages);
-    };
-    let mut redacted = Vec::with_capacity(messages.len());
-    for mut message in messages {
-        let opted_in = storage
-            .user_privacy(
-                channel.platform.clone(),
-                guild_id.as_str().to_string(),
-                message.author.id.user_id.as_str().to_string(),
-            )
-            .await
-            .map_err(|error| BotToolError::Storage(error.to_string()))?
-            .unwrap_or(false);
-        if !opted_in {
-            // Preserve ordering and message metadata, but remove fields that
-            // can carry private user content or private referenced context.
-            message.content = "[redacted: user has not opted in]".to_string();
-            message.mentions.clear();
-            message.mention_profiles.clear();
-            message.attachments.clear();
-            message.reference = PlatformMessageReference::None;
-        }
-        redacted.push(message);
-    }
-    Ok(redacted)
 }

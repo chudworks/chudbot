@@ -41,31 +41,6 @@ use crate::usage::{UsageCostQuery, UsageCostRow, UsageRecord};
 
 // Conversation lifecycle, trace replay, and runtime policy DTOs.
 
-/// Privacy mode for context gathering before a model request.
-///
-/// The runtime interprets these modes when choosing how much platform history
-/// to fetch. Storage only persists the selected policy and user opt-in state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "mode", rename_all = "snake_case")]
-pub enum PrivacyMode {
-    /// Fetch history visible in the active channel.
-    Open {
-        /// Maximum platform messages to include.
-        history_size: u32,
-    },
-    /// Fetch history only from a configured channel.
-    ChannelOnly {
-        /// Allowed channel.
-        channel: ChannelRef,
-        /// Maximum platform messages to include.
-        history_size: u32,
-    },
-    /// Fetch history, but redact messages for users who have not opted in.
-    OptIn,
-    /// Rebuild context only from stored conversation turns.
-    ConversationOnly,
-}
-
 /// Durable handles that can identify a conversation.
 ///
 /// Message and channel lookups go through storage-owned link tables so platform
@@ -565,15 +540,6 @@ pub enum AgentSelection {
         /// Messaging platform/provider name.
         message_provider: PlatformName,
     },
-}
-
-/// Settings needed to decide privacy/context for an incoming message.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RuntimeSettings {
-    /// Effective privacy mode.
-    pub privacy: PrivacyMode,
-    /// Whether the acting user opted in.
-    pub user_opted_in: bool,
 }
 
 // Media generation, viewer profile, and user-memory DTOs.
@@ -1183,46 +1149,13 @@ pub trait BotStorage: Send + Sync {
         turn_id: TurnId,
     ) -> impl Future<Output = Result<Vec<MessageLink>, Self::Error>> + Send;
 
-    // Runtime policy and user/profile metadata.
+    // Runtime user/profile metadata.
 
     /// Resolve the effective agent name for a turn.
     fn resolve_agent(
         &self,
         input: ResolveAgent,
     ) -> impl Future<Output = Result<Option<String>, Self::Error>> + Send;
-
-    /// Load effective runtime settings for a guild/user pair.
-    fn runtime_settings(
-        &self,
-        message_provider: PlatformName,
-        guild_key: Option<String>,
-        user_key: String,
-    ) -> impl Future<Output = Result<RuntimeSettings, Self::Error>> + Send;
-
-    /// Set guild/workspace privacy mode.
-    fn set_privacy_mode(
-        &self,
-        message_provider: PlatformName,
-        guild_key: String,
-        privacy: PrivacyMode,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Set a user's opt-in status for a guild/workspace.
-    fn set_user_privacy(
-        &self,
-        message_provider: PlatformName,
-        guild_key: String,
-        user_key: String,
-        opted_in: bool,
-    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Load a user's opt-in status for a guild/workspace.
-    fn user_privacy(
-        &self,
-        message_provider: PlatformName,
-        guild_key: String,
-        user_key: String,
-    ) -> impl Future<Output = Result<Option<bool>, Self::Error>> + Send;
 
     /// Load one scoped agent selection.
     fn load_agent_selection(

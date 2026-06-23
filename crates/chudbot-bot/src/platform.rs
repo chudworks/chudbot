@@ -364,16 +364,6 @@ pub(crate) fn conversation_event_kind(kind: ConversationEventKind) -> &'static s
     }
 }
 
-/// Return the stable tracing label for a privacy mode.
-pub(crate) fn privacy_mode_kind(mode: &PrivacyMode) -> &'static str {
-    match mode {
-        PrivacyMode::Open { .. } => "open",
-        PrivacyMode::ChannelOnly { .. } => "channel_only",
-        PrivacyMode::OptIn => "opt_in",
-        PrivacyMode::ConversationOnly => "conversation_only",
-    }
-}
-
 /// Return the stable tracing label for a platform message reference payload.
 pub(crate) fn platform_message_reference_kind(
     reference: &PlatformMessageReference,

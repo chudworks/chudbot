@@ -112,8 +112,8 @@ pub struct PlatformMessage {
 ///
 /// Some platforms include the quoted message inline, while others only include
 /// its id or require a separate fetch that the adapter may choose not to do.
-/// Keeping both cases explicit lets privacy and transcript code distinguish
-/// "known target" from "available context".
+/// Keeping both cases explicit lets transcript code distinguish "known target"
+/// from "available context".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "message", rename_all = "snake_case")]
 pub enum PlatformMessageReference {
@@ -532,9 +532,8 @@ pub struct PostedMessage {
 
 /// Fetch recent messages from a platform channel.
 ///
-/// Used by history tools and privacy-aware context gathering. The adapter
-/// returns messages in the order expected by the caller for that fetch
-/// operation; it does not persist them.
+/// Used by history tools. The adapter returns messages in the order expected by
+/// the caller for that fetch operation; it does not persist them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchMessages {
     /// Channel to fetch.
@@ -634,8 +633,8 @@ pub trait MessagePlatform: Send + Sync {
     /// Resolve a platform channel's parent, if any.
     ///
     /// Thread-like channels should return their parent conversation scope so
-    /// runtime settings can inherit from the right channel. Non-thread channels
-    /// can return themselves.
+    /// channel-scoped runtime behavior can inherit from the right channel.
+    /// Non-thread channels can return themselves.
     fn parent_channel(
         &self,
         channel: ChannelRef,

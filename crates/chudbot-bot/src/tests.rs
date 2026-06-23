@@ -775,7 +775,6 @@ fn video_rate_limit_tool<G>(
             ConversationId::new(),
             TurnId::new(),
             turn_user,
-            PrivacyMode::ConversationOnly,
         ),
         binding: GenerationBinding {
             provider: ProviderName::new("grok_video"),
