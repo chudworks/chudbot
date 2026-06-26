@@ -8,6 +8,8 @@
 
 use super::*;
 
+use dashmap::DashMap;
+
 pub(crate) const DEFAULT_VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub(crate) const DEFAULT_VIDEO_MAX_POLLS: u32 = 600;
 
@@ -271,7 +273,7 @@ where
 /// Video quotas are scoped to the platform workspace/server when one exists.
 /// Platform-only scopes use `None`, which still serializes all calls on that
 /// platform together.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct VideoRateLimitLockKey {
     /// Messaging platform that owns the video-generation scope.
     pub(crate) platform: PlatformName,
@@ -297,18 +299,14 @@ impl VideoRateLimitLockKey {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VideoRateLimitLocks {
     /// Lazily-created async mutexes keyed by platform scope.
-    pub(crate) inner: Arc<Mutex<BTreeMap<VideoRateLimitLockKey, Arc<AsyncMutex<()>>>>>,
+    pub(crate) inner: Arc<DashMap<VideoRateLimitLockKey, Arc<AsyncMutex<()>>>>,
 }
 
 impl VideoRateLimitLocks {
     /// Acquire the async mutex for the caller's platform scope.
     pub(crate) async fn lock(&self, user: &UserRef) -> OwnedMutexGuard<()> {
         let lock = {
-            let mut locks = self
-                .inner
-                .lock()
-                .expect("video rate limit lock map mutex poisoned");
-            locks
+            self.inner
                 .entry(VideoRateLimitLockKey::from_user(user))
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone()

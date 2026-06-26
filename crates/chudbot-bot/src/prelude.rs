@@ -12,7 +12,7 @@
 /// signatures.
 pub(crate) use std::collections::{BTreeMap, BTreeSet};
 pub(crate) use std::future::Future;
-pub(crate) use std::sync::{Arc, Mutex};
+pub(crate) use std::sync::Arc;
 pub(crate) use std::time::Duration;
 
 /// Provider-neutral Chudbot contracts shared by the orchestration modules.
