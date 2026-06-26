@@ -27,6 +27,7 @@ serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
 toml = "0.9"
 base64 = "0.22"
 futures = "0.3"
+dashmap = "6"
 moka = { version = "0.12", features = ["future"] }
 
 [workspace.dependencies.unicode-properties]

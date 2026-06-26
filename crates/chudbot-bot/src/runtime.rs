@@ -7,6 +7,8 @@
 
 use std::ops::Deref;
 
+use dashmap::DashMap;
+
 use crate::prelude::*;
 use crate::*;
 
@@ -140,7 +142,7 @@ pub struct BotRuntimeParts<R: BotRuntimeTypes> {
 /// that guarantee by holding the returned [`TurnCancellationGuard`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TurnCancellations {
-    inner: Arc<Mutex<BTreeMap<ConversationId, BTreeMap<TurnId, CancellationToken>>>>,
+    inner: Arc<DashMap<(ConversationId, TurnId), CancellationToken>>,
 }
 
 impl TurnCancellations {
@@ -151,12 +153,7 @@ impl TurnCancellations {
         turn_id: TurnId,
     ) -> TurnCancellationGuard {
         let token = CancellationToken::new();
-        self.inner
-            .lock()
-            .expect("turn cancellation mutex poisoned")
-            .entry(conversation_id)
-            .or_default()
-            .insert(turn_id, token.clone());
+        self.inner.insert((conversation_id, turn_id), token.clone());
         TurnCancellationGuard {
             registry: self.clone(),
             conversation_id,
@@ -167,26 +164,21 @@ impl TurnCancellations {
 
     /// Remove a turn from the registry after it finishes or is abandoned.
     pub(crate) fn unregister(&self, conversation_id: ConversationId, turn_id: TurnId) {
-        let mut inner = self.inner.lock().expect("turn cancellation mutex poisoned");
-        if let Some(turns) = inner.get_mut(&conversation_id) {
-            turns.remove(&turn_id);
-            if turns.is_empty() {
-                inner.remove(&conversation_id);
-            }
-        }
+        self.inner.remove(&(conversation_id, turn_id));
     }
 
     /// Cancel every currently registered turn in a conversation.
     pub(crate) fn cancel_conversation(&self, conversation_id: ConversationId) -> usize {
-        // Clone tokens while holding the mutex, then cancel outside the map
-        // borrow so waking waiters never extends the registry critical section.
+        // Clone tokens before cancelling so waking waiters never extends the
+        // registry critical section held by DashMap shard guards.
         let tokens = self
             .inner
-            .lock()
-            .expect("turn cancellation mutex poisoned")
-            .get(&conversation_id)
-            .map(|turns| turns.values().cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
+            .iter()
+            .filter_map(|entry| {
+                let (entry_conversation_id, _) = *entry.key();
+                (entry_conversation_id == conversation_id).then(|| entry.value().clone())
+            })
+            .collect::<Vec<_>>();
         let count = tokens.len();
         for token in tokens {
             token.cancel();
@@ -631,4 +623,41 @@ pub(crate) async fn drain_background_tasks(tracker: &TaskTracker, timeout: Durat
         timeout_ms = timeout.as_millis(),
         "background task drain timed out"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn turn_cancellations_cancel_only_matching_conversation() {
+        let registry = TurnCancellations::default();
+        let conversation_id = ConversationId::new();
+        let other_conversation_id = ConversationId::new();
+
+        let first = registry.register(conversation_id, TurnId::new());
+        let second = registry.register(conversation_id, TurnId::new());
+        let other = registry.register(other_conversation_id, TurnId::new());
+        let first_token = first.token();
+        let second_token = second.token();
+        let other_token = other.token();
+
+        assert_eq!(registry.cancel_conversation(conversation_id), 2);
+        assert!(first_token.is_cancelled());
+        assert!(second_token.is_cancelled());
+        assert!(!other_token.is_cancelled());
+    }
+
+    #[test]
+    fn turn_cancellation_guard_unregisters_on_drop() {
+        let registry = TurnCancellations::default();
+        let conversation_id = ConversationId::new();
+        let token = {
+            let guard = registry.register(conversation_id, TurnId::new());
+            guard.token()
+        };
+
+        assert_eq!(registry.cancel_conversation(conversation_id), 0);
+        assert!(!token.is_cancelled());
+    }
 }

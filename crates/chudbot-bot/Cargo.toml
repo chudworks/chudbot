@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 bitflags.workspace = true
 chudbot-api = { path = "../chudbot-api" }
+dashmap.workspace = true
 futures.workspace = true
 reqwest.workspace = true
 serde.workspace = true
