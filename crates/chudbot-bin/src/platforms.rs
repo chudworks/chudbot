@@ -12,8 +12,8 @@ use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
 use chudbot_api::{
-    ChannelRef, FetchMessages, MessagePlatform, MessagePlatformRegistry, MessageRef,
-    PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
+    ChannelRef, FetchMessages, MessagePlatform, MessagePlatformEvents, MessagePlatformRegistry,
+    MessageRef, PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
     PlatformMessageRelationship, PostedMessage, ReactionKind, SendMessage, UserProfile,
 };
 use futures::FutureExt;
@@ -25,24 +25,25 @@ use crate::errors::ConfiguredPlatformError;
 
 /// Concrete named message-platform registry used by `ConfiguredBotRuntime`.
 ///
-/// Clones share the same platform clients and event receiver. Runtime code uses
-/// this value through [`MessagePlatformRegistry`], so no Twilight or Discord
-/// types cross into `chudbot-bot`.
+/// Clones share the same platform clients for outbound operations. Runtime code
+/// uses this value through [`MessagePlatformRegistry`], so no Twilight or
+/// Discord types cross into `chudbot-bot`.
 #[derive(Clone)]
 pub struct ConfiguredMessagePlatforms {
     inner: Arc<ConfiguredMessagePlatformsInner>,
+}
+
+/// Unique platform event stream used by the bot runtime.
+pub struct ConfiguredMessagePlatformEvents {
+    platforms: ConfiguredMessagePlatforms,
+    events: tokio::sync::mpsc::Receiver<Result<PlatformEvent, ConfiguredPlatformError>>,
+    event_pumps: Vec<PlatformEventPump>,
 }
 
 /// Shared registry state behind cheap runtime clones.
 struct ConfiguredMessagePlatformsInner {
     /// Discord adapters keyed by deployment-configured platform name.
     discord: BTreeMap<chudbot_api::PlatformName, ConfiguredDiscordPlatform>,
-    /// Fan-in receiver for events from every configured platform pump.
-    events: tokio::sync::Mutex<
-        tokio::sync::mpsc::Receiver<Result<PlatformEvent, ConfiguredPlatformError>>,
-    >,
-    /// Owned pump tasks so shutdown can join or abort them exactly once.
-    event_pumps: tokio::sync::Mutex<Vec<PlatformEventPump>>,
 }
 
 /// Concrete Discord adapter stored under one configured platform name.
@@ -185,66 +186,67 @@ fn log_event_pump_join_result(platform: &chudbot_api::PlatformName, result: Resu
     }
 }
 
-impl ConfiguredMessagePlatforms {
-    /// Connect every `[platforms.<name>]` service and build the runtime registry.
-    ///
-    /// Each configured platform is connected once, stored by its configured
-    /// name, and given an event pump that forwards into one shared receiver.
-    /// `[bot.platforms.<name>]` agent bindings remain in `BotConfig`; the
-    /// platform name is the join key between those runtime bindings and this
-    /// concrete transport registry.
-    #[tracing::instrument(
-        name = "platform_registry.connect",
-        skip_all,
-        fields(platforms = config.len())
-    )]
-    pub async fn connect_from_config(
-        config: &BTreeMap<chudbot_api::PlatformName, MessagePlatformConfig>,
-    ) -> Result<Self, ConfiguredPlatformError> {
-        let mut discord = BTreeMap::new();
-        let mut event_pumps = Vec::new();
-        let (events_tx, events) = tokio::sync::mpsc::channel(256);
-        for (name, platform) in config {
-            match platform {
-                MessagePlatformConfig::Discord {
-                    token,
-                    dev_guild_id,
-                } => {
-                    // Discord is the current concrete integration boundary:
-                    // this is where configured names become Twilight-backed
-                    // clients while the rest of the runtime keeps using
-                    // chudbot-api contracts.
-                    if dev_guild_id.is_some() {
-                        tracing::warn!(
-                            platform = %name,
-                            "discord dev_guild_id is ignored; commands register globally"
-                        );
-                    }
-                    let platform = chudbot_discord::DiscordPlatform::connect_named(
-                        name.clone(),
-                        token.clone(),
-                    )
-                    .await?;
-                    tracing::info!(platform = %name, kind = "discord", "registered platform");
-                    event_pumps.push(spawn_discord_event_pump(
-                        name.clone(),
-                        platform.clone(),
-                        events_tx.clone(),
-                    ));
-                    discord.insert(name.clone(), ConfiguredDiscordPlatform { platform });
+/// Connect every `[platforms.<name>]` service and build the runtime handles.
+///
+/// Each configured platform is connected once, stored by its configured name,
+/// and given an event pump that forwards into one shared receiver.
+/// `[bot.platforms.<name>]` agent bindings remain in `BotConfig`; the platform
+/// name is the join key between those runtime bindings and these concrete
+/// transport handles.
+#[tracing::instrument(
+    name = "platform_registry.connect",
+    skip_all,
+    fields(platforms = config.len())
+)]
+pub async fn connect_configured_message_platforms(
+    config: &BTreeMap<chudbot_api::PlatformName, MessagePlatformConfig>,
+) -> Result<(ConfiguredMessagePlatforms, ConfiguredMessagePlatformEvents), ConfiguredPlatformError>
+{
+    let mut discord = BTreeMap::new();
+    let mut event_pumps = Vec::new();
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(256);
+    for (name, platform) in config {
+        match platform {
+            MessagePlatformConfig::Discord {
+                token,
+                dev_guild_id,
+            } => {
+                // Discord is the current concrete integration boundary:
+                // this is where configured names become Twilight-backed
+                // clients while the rest of the runtime keeps using
+                // chudbot-api contracts.
+                if dev_guild_id.is_some() {
+                    tracing::warn!(
+                        platform = %name,
+                        "discord dev_guild_id is ignored; commands register globally"
+                    );
                 }
+                let platform =
+                    chudbot_discord::DiscordPlatform::connect_named(name.clone(), token.clone())
+                        .await?;
+                tracing::info!(platform = %name, kind = "discord", "registered platform");
+                event_pumps.push(spawn_discord_event_pump(
+                    name.clone(),
+                    platform.clone(),
+                    events_tx.clone(),
+                ));
+                discord.insert(name.clone(), ConfiguredDiscordPlatform { platform });
             }
         }
-        drop(events_tx);
-        Ok(Self {
-            inner: Arc::new(ConfiguredMessagePlatformsInner {
-                discord,
-                events: tokio::sync::Mutex::new(events),
-                event_pumps: tokio::sync::Mutex::new(event_pumps),
-            }),
-        })
     }
+    drop(events_tx);
+    let platforms = ConfiguredMessagePlatforms {
+        inner: Arc::new(ConfiguredMessagePlatformsInner { discord }),
+    };
+    let platform_events = ConfiguredMessagePlatformEvents {
+        platforms: platforms.clone(),
+        events: events_rx,
+        event_pumps,
+    };
+    Ok((platforms, platform_events))
+}
 
+impl ConfiguredMessagePlatforms {
     /// Look up the concrete Discord adapter named by a neutral platform ref.
     fn discord(
         &self,
@@ -255,24 +257,23 @@ impl ConfiguredMessagePlatforms {
             .get(platform)
             .ok_or_else(|| ConfiguredPlatformError::Missing(platform.clone()))
     }
+}
 
+impl ConfiguredMessagePlatformEvents {
     /// Request graceful shutdown for all platform clients and their pumps.
-    async fn shutdown_platforms(&self) -> Result<(), ConfiguredPlatformError> {
-        if self.inner.discord.is_empty() {
+    async fn shutdown_platforms(&mut self) -> Result<(), ConfiguredPlatformError> {
+        if self.platforms.inner.discord.is_empty() {
             return Ok(());
         }
 
-        for (name, configured) in &self.inner.discord {
+        for (name, configured) in &self.platforms.inner.discord {
             tracing::debug!(platform = %name, "requesting message platform shutdown");
             configured.platform.request_shutdown();
         }
 
-        // Take the task handles out of shared state so repeated shutdown calls
-        // from cloned registries cannot attempt to join the same pumps twice.
-        let mut handles = {
-            let mut event_pumps = self.inner.event_pumps.lock().await;
-            std::mem::take(&mut *event_pumps)
-        };
+        // Take the task handles so repeated shutdown calls cannot attempt to
+        // join the same pumps twice.
+        let mut handles = std::mem::take(&mut self.event_pumps);
         if handles.is_empty() {
             return Ok(());
         }
@@ -319,6 +320,26 @@ impl ConfiguredMessagePlatforms {
     }
 }
 
+impl MessagePlatformEvents for ConfiguredMessagePlatformEvents {
+    type Error = ConfiguredPlatformError;
+
+    async fn next_event(&mut self) -> Result<PlatformEvent, Self::Error> {
+        if self.platforms.inner.discord.is_empty() {
+            return Err(ConfiguredPlatformError::Empty);
+        }
+        // `BotRuntime` consumes one merged stream regardless of how many
+        // concrete platform clients are configured.
+        self.events
+            .recv()
+            .await
+            .unwrap_or(Err(ConfiguredPlatformError::EventsClosed))
+    }
+
+    async fn shutdown(&mut self) -> Result<(), Self::Error> {
+        self.shutdown_platforms().await
+    }
+}
+
 /// Runtime-facing registry implementation.
 ///
 /// The bot runtime calls this trait with neutral refs such as `PlatformName`,
@@ -349,25 +370,6 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
                 .map_err(ConfiguredPlatformError::Discord)?;
         }
         Ok(())
-    }
-
-    async fn next_event(&self) -> Result<PlatformEvent, Self::Error> {
-        if self.inner.discord.is_empty() {
-            return Err(ConfiguredPlatformError::Empty);
-        }
-        // `BotRuntime` consumes one merged stream regardless of how many
-        // concrete platform clients are configured.
-        self.inner
-            .events
-            .lock()
-            .await
-            .recv()
-            .await
-            .unwrap_or(Err(ConfiguredPlatformError::EventsClosed))
-    }
-
-    async fn shutdown(&self) -> Result<(), Self::Error> {
-        self.shutdown_platforms().await
     }
 
     async fn respond_to_command(

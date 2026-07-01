@@ -13,8 +13,9 @@
 //!    image generator, video generator, audio transcriber, or message platform.
 //! 2. Bot, tool, memory, and web code pass the selected name plus a neutral
 //!    request type to the appropriate registry.
-//! 3. The registry implementation owns lookup, fan-out, shutdown, and error
-//!    mapping for the concrete service.
+//! 3. The registry implementation owns lookup, fan-out, and error mapping for
+//!    the concrete service. Unique platform event streams are modeled
+//!    separately because they are single-consumer runtime inputs.
 //!
 //! `contains_*` methods are intentionally part of the contracts so config
 //! validation can report missing references before a request reaches runtime.
@@ -165,15 +166,16 @@ pub trait AudioTranscriberRegistry: Clone + Send + Sync {
 }
 
 // Message platform registries are different from provider registries: they
-// multiplex event streams and route outgoing operations by platform-scoped ids.
+// route outgoing operations by platform-scoped ids, while a separate unique
+// event stream feeds incoming platform activity to the bot runtime.
 
 /// Name-based registry for messaging platform services.
 ///
 /// This sits one level above [`crate::platform::MessagePlatform`]. A concrete
 /// platform implementation owns the transport, command API, and platform
-/// vocabulary; the registry lets bot code work with one merged event stream and
-/// route outgoing operations by the [`PlatformName`] embedded in references such
-/// as [`ChannelRef`] and [`MessageRef`].
+/// vocabulary; the registry lets bot code route outgoing operations by the
+/// [`PlatformName`] embedded in references such as [`ChannelRef`] and
+/// [`MessageRef`].
 pub trait MessagePlatformRegistry: Clone + Send + Sync {
     /// Error type used for lookup failures and concrete platform failures.
     type Error: std::error::Error + Send + Sync + 'static;
@@ -193,24 +195,6 @@ pub trait MessagePlatformRegistry: Clone + Send + Sync {
         &self,
         commands: Vec<PlatformCommandDefinition>,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
-
-    /// Read the next event from any configured platform.
-    ///
-    /// Implementations merge one or more platform event streams into the neutral
-    /// [`PlatformEvent`] enum. A registry with multiple platforms decides its
-    /// own fairness and shutdown behavior.
-    fn next_event(&self) -> impl Future<Output = Result<PlatformEvent, Self::Error>> + Send;
-
-    /// Gracefully stop platform services owned by this registry.
-    ///
-    /// Registries that own gateway pumps or background workers should override
-    /// this. Stateless or externally-owned implementations can use the default
-    /// no-op.
-    fn shutdown(&self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-        // Default to a no-op so simple registries do not need to allocate or
-        // coordinate shutdown machinery they do not own.
-        async { Ok(()) }
-    }
 
     /// Respond to a command invocation.
     ///
@@ -289,4 +273,32 @@ pub trait MessagePlatformRegistry: Clone + Send + Sync {
         &self,
         channel: ChannelRef,
     ) -> impl Future<Output = Result<ChannelRef, Self::Error>> + Send;
+}
+
+/// Single-consumer stream of normalized platform events.
+///
+/// This is split from [`MessagePlatformRegistry`] so cloneable runtime handles
+/// can keep sending platform side effects while the bot event loop owns the
+/// only mutable receiver for incoming activity.
+pub trait MessagePlatformEvents: Send {
+    /// Error type used for stream, shutdown, and concrete platform failures.
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Read the next event from any configured platform.
+    ///
+    /// Implementations merge one or more platform event streams into the neutral
+    /// [`PlatformEvent`] enum. A registry with multiple platforms decides its
+    /// own fairness and shutdown behavior.
+    fn next_event(&mut self) -> impl Future<Output = Result<PlatformEvent, Self::Error>> + Send;
+
+    /// Gracefully stop platform services owned by this event stream.
+    ///
+    /// Event streams that own gateway pumps or background workers should
+    /// override this. Stateless or externally-owned streams can use the default
+    /// no-op.
+    fn shutdown(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        // Default to a no-op so simple streams do not need to allocate or
+        // coordinate shutdown machinery they do not own.
+        async { Ok(()) }
+    }
 }

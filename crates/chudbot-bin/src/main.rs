@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand};
 use config::{LoadedRuntimeConfig, LogFormat, LoggingConfig, LoggingFilterError, RuntimeConfig};
 use diagnostics::render_toml_error_for_stderr;
 use errors::{BinError, ConfigError};
-use platforms::ConfiguredMessagePlatforms;
+use platforms::connect_configured_message_platforms;
 use runtime::run_runtime_services;
 use services::{BootstrapServices, ConfiguredBotRuntime};
 
@@ -182,8 +182,8 @@ async fn run(
 
             // Platforms connect after validation and storage setup so incoming
             // events cannot race ahead of a usable runtime.
-            let platforms =
-                ConfiguredMessagePlatforms::connect_from_config(&config.platforms).await?;
+            let (platforms, platform_events) =
+                connect_configured_message_platforms(&config.platforms).await?;
             let listen = SocketAddr::from_str(&config.web.listen)?;
 
             // The web API also needs the LLM registry for model metadata, so
@@ -214,7 +214,7 @@ async fn run(
             // `runtime.rs` owns the select loop that runs bot and web tasks,
             // fans out cancellation, drains in-flight bot work, and joins both
             // services before returning.
-            run_runtime_services(bot, web, listen).await
+            run_runtime_services(bot, platform_events, web, listen).await
         }
     }
 }

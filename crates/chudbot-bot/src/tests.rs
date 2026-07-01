@@ -484,10 +484,6 @@ impl MessagePlatformRegistry for ReactionRecordingPlatform {
         ))
     }
 
-    async fn next_event(&self) -> Result<PlatformEvent, Self::Error> {
-        Err(TestPlatformError("unexpected next_event".to_string()))
-    }
-
     async fn respond_to_command(
         &self,
         _response: PlatformCommandResponse,

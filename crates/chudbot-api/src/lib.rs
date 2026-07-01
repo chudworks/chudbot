@@ -150,6 +150,6 @@ pub use events::{ConversationEventKind, EventSink, LiveEvent, NoopEventSink};
 // Named service registries are the thin dispatch layer used by config-driven
 // runtime wiring; they route requests to already-constructed providers.
 pub use registries::{
-    AudioTranscriberRegistry, ImageGeneratorRegistry, LlmProviderRegistry, MessagePlatformRegistry,
-    VideoGeneratorRegistry,
+    AudioTranscriberRegistry, ImageGeneratorRegistry, LlmProviderRegistry, MessagePlatformEvents,
+    MessagePlatformRegistry, VideoGeneratorRegistry,
 };

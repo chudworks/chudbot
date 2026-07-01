@@ -18,7 +18,7 @@ use crate::*;
 /// event implementations. The binary crate supplies those concrete types while
 /// this crate keeps orchestration static and provider-neutral.
 pub trait BotRuntimeTypes {
-    /// Registry that owns platform I/O such as Discord gateway events.
+    /// Registry that performs cloneable platform I/O such as replies and history fetches.
     type Platforms: MessagePlatformRegistry + Clone + Send + Sync + 'static;
     /// Durable storage implementation for conversations, turns, settings, and jobs.
     type Storage: BotStorage + Clone + Send + Sync + 'static;
@@ -76,7 +76,7 @@ where
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct BotRuntimeInner<R: BotRuntimeTypes> {
-    /// Platform registry that supplies events and sends platform-side effects.
+    /// Cloneable platform registry used for platform-side effects.
     pub(crate) platforms: R::Platforms,
     /// Durable storage used by turn handling, commands, and background jobs.
     pub(crate) storage: R::Storage,
@@ -114,7 +114,7 @@ pub struct BotRuntimeInner<R: BotRuntimeTypes> {
 /// `chudbot-bin` and platform-neutral orchestration in `chudbot-bot`.
 #[derive(Debug)]
 pub struct BotRuntimeParts<R: BotRuntimeTypes> {
-    /// Message platform registry that receives events and performs platform I/O.
+    /// Message platform registry that performs cloneable platform I/O.
     pub platforms: R::Platforms,
     /// Durable bot storage for conversations, turns, settings, and jobs.
     pub storage: R::Storage,
@@ -301,11 +301,17 @@ where
             drain_timeout_ms = options.drain_timeout.as_millis(),
         )
     )]
-    pub async fn run_with_options(
-        &self,
+    pub async fn run_with_options<E>(
+        self,
+        mut platform_events: E,
         shutdown: CancellationToken,
         options: BotRunOptions,
-    ) -> Result<(), BotError> {
+    ) -> Result<(), BotError>
+    where
+        E: MessagePlatformEvents<Error = <R::Platforms as MessagePlatformRegistry>::Error>
+            + Send
+            + 'static,
+    {
         // 1. Register command definitions before accepting user events so new
         // platform sessions expose the expected slash-command surface.
         self.platforms
@@ -334,7 +340,7 @@ where
                 }
                 // 5. Platform errors stop auxiliary memory work and surface as
                 // runtime errors; normal shutdown events just break intake.
-                event = self.platforms.next_event() => {
+                event = platform_events.next_event() => {
                     let event = match event {
                         Ok(event) => event,
                         Err(error) => {
@@ -352,7 +358,7 @@ where
                     }
                     // 6. Event work uses a cheap runtime clone and reports its
                     // result through the JoinSet for centralized logging.
-                    let runtime = (*self).clone();
+                    let runtime = self.clone();
                     tasks.spawn(async move {
                         let event_name = platform_event_kind(&event);
                         let result = runtime.handle_event(event).await;
@@ -367,7 +373,7 @@ where
         memory_shutdown.cancel();
         drain_event_tasks(&mut tasks, options.drain_timeout).await;
         drain_background_tasks(&self.background, options.drain_timeout).await;
-        self.platforms.shutdown().await.map_err(platform_error)?;
+        platform_events.shutdown().await.map_err(platform_error)?;
         tracing::info!("bot event loop stopped");
         Ok(())
     }

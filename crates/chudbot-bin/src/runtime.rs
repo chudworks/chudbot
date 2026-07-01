@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use chudbot_api::{MessagePlatformEvents, MessagePlatformRegistry};
 use chudbot_bot::{BotRunOptions, BotRuntime, BotRuntimeTypes};
 use chudbot_web::{WebRuntimeTypes, WebState};
 use tokio::task::JoinError;
@@ -15,6 +16,10 @@ use crate::errors::BinError;
 /// shutdown, then join both tasks before returning an error to `main`.
 pub async fn run_runtime_services<R>(
     bot: BotRuntime<R>,
+    platform_events: impl MessagePlatformEvents<
+        Error = <R::Platforms as MessagePlatformRegistry>::Error,
+    > + Send
+    + 'static,
     web: WebState<R>,
     listen: SocketAddr,
 ) -> Result<(), BinError>
@@ -33,6 +38,7 @@ where
     // join path can treat bot and web results uniformly.
     let mut bot_task = tokio::spawn(async move {
         bot.run_with_options(
+            platform_events,
             bot_shutdown,
             BotRunOptions {
                 drain_timeout: SHUTDOWN_GRACE_PERIOD,
