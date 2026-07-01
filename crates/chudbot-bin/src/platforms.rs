@@ -11,9 +11,10 @@ use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use chudbot_api::MessagePlatform;
 use chudbot_api::{
-    ChannelRef, FetchMessages, MessagePlatform, MessagePlatformEvents, MessagePlatformRegistry,
-    MessageRef, PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
+    ChannelRef, FetchMessages, MessagePlatformEvents, MessagePlatformRegistry, MessageRef,
+    PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
     PlatformMessageRelationship, PostedMessage, ReactionKind, SendMessage, UserProfile,
 };
 use futures::FutureExt;
@@ -202,7 +203,9 @@ pub async fn connect_configured_message_platforms(
     config: &BTreeMap<chudbot_api::PlatformName, MessagePlatformConfig>,
 ) -> Result<(ConfiguredMessagePlatforms, ConfiguredMessagePlatformEvents), ConfiguredPlatformError>
 {
-    let mut discord = BTreeMap::new();
+    let mut inner = ConfiguredMessagePlatformsInner {
+        discord: BTreeMap::new(),
+    };
     let mut event_pumps = Vec::new();
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(256);
     for (name, platform) in config {
@@ -230,13 +233,15 @@ pub async fn connect_configured_message_platforms(
                     platform.clone(),
                     events_tx.clone(),
                 ));
-                discord.insert(name.clone(), ConfiguredDiscordPlatform { platform });
+                inner
+                    .discord
+                    .insert(name.clone(), ConfiguredDiscordPlatform { platform });
             }
         }
     }
     drop(events_tx);
     let platforms = ConfiguredMessagePlatforms {
-        inner: Arc::new(ConfiguredMessagePlatformsInner { discord }),
+        inner: Arc::new(inner),
     };
     let platform_events = ConfiguredMessagePlatformEvents {
         platforms: platforms.clone(),

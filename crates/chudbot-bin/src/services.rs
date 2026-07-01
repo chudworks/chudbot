@@ -9,25 +9,64 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(feature = "xai")]
+use chudbot_api::AudioTranscriber;
+#[cfg(any(feature = "gemini", feature = "openai", feature = "xai"))]
+use chudbot_api::ImageGenerator;
+#[cfg(any(
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "openai",
+    feature = "openai-compat",
+    feature = "xai"
+))]
+use chudbot_api::LlmBackend;
+#[cfg(any(feature = "gemini", feature = "xai"))]
+use chudbot_api::VideoGenerator;
 use chudbot_api::{
-    AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
-    BoxedMediaRef, CreateMedia, GeneratedImage, ImageGenerator, ImageGeneratorRegistry,
-    ImageRequest, LlmBackend, LlmProviderRegistry, MediaCategory, MediaError, MediaStore, MediaUri,
-    ModelId, ModelInfo, ModelInfoRequest, ModelStepEvent, ModelStepRequest, ProviderName,
-    VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
+    AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest, BoxedMediaRef,
+    CreateMedia, GeneratedImage, ImageGeneratorRegistry, ImageRequest, LlmProviderRegistry,
+    MediaCategory, MediaError, MediaStore, MediaUri, ModelId, ModelInfo, ModelInfoRequest,
+    ModelStepEvent, ModelStepRequest, ProviderName, VideoGeneratorRegistry, VideoJobId,
+    VideoJobStatus, VideoRequest,
 };
 use chudbot_asset_local::LocalMediaStore;
+#[cfg(feature = "s3")]
 use chudbot_asset_s3::S3MediaStore;
 use chudbot_bot::BotRuntimeTypes;
 use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::{EventBus, WebConfig, WebRuntimeTypes};
-use futures::{Stream, StreamExt, TryStreamExt};
+#[cfg(any(
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "openai",
+    feature = "openai-compat",
+    feature = "xai"
+))]
+use futures::TryStreamExt;
+use futures::{Stream, StreamExt};
 use moka::future::Cache;
+#[cfg(any(
+    test,
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "openai",
+    feature = "openai-compat",
+    feature = "xai"
+))]
 use serde_json::json;
 
+#[cfg(any(
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "openai",
+    feature = "openai-compat",
+    feature = "xai"
+))]
+use crate::config::LlmModelInfoConfig;
 use crate::config::{
-    AudioProviderConfig, ImageProviderConfig, LlmModelInfoConfig, LlmProviderConfig, RuntimeConfig,
-    StorageConfig, VideoProviderConfig,
+    AudioProviderConfig, ImageProviderConfig, LlmProviderConfig, RuntimeConfig, StorageConfig,
+    VideoProviderConfig,
 };
 use crate::errors::{
     BinError, ConfiguredAudioError, ConfiguredImageError, ConfiguredLlmError, ConfiguredVideoError,
@@ -101,14 +140,14 @@ impl BootstrapServices {
         // Media links should resolve through the public web surface. A storage
         // override wins, otherwise generated links point at the bot web base URL.
         let media_store =
-            ConfiguredMediaStore::from_config(&config.storage, config.bot.web_base_url.as_str());
+            ConfiguredMediaStore::from_config(&config.storage, config.bot.web_base_url.as_str())?;
 
         // Provider names come from the TOML table keys. Agent assembly later
         // routes model and tool calls through these registries by that name.
-        let llms = ConfiguredLlmProviders::from_config(&config.llm);
-        let images = ConfiguredImageGenerators::from_config(&config.image);
-        let videos = ConfiguredVideoGenerators::from_config(&config.video);
-        let audio = ConfiguredAudioTranscribers::from_config(&config.audio);
+        let llms = ConfiguredLlmProviders::from_config(&config.llm)?;
+        let images = ConfiguredImageGenerators::from_config(&config.image)?;
+        let videos = ConfiguredVideoGenerators::from_config(&config.video)?;
+        let audio = ConfiguredAudioTranscribers::from_config(&config.audio)?;
         tracing::info!(
             llm_providers = llms.configured_count(),
             image_providers = images.configured_count(),
@@ -135,13 +174,17 @@ pub enum ConfiguredMediaStore {
     /// Local filesystem media store.
     Local(LocalMediaStore),
     /// S3-compatible media store.
+    #[cfg(feature = "s3")]
     S3(S3MediaStore),
 }
 
 impl ConfiguredMediaStore {
-    fn from_config(config: &StorageConfig, fallback_public_base_url: &str) -> Self {
+    fn from_config(
+        config: &StorageConfig,
+        fallback_public_base_url: &str,
+    ) -> Result<Self, BinError> {
         match config {
-            StorageConfig::Local(config) => Self::Local(LocalMediaStore::new(
+            StorageConfig::Local(config) => Ok(Self::Local(LocalMediaStore::new(
                 config.images_dir.clone(),
                 config.videos_dir.clone(),
                 config.audio_dir.clone(),
@@ -151,17 +194,30 @@ impl ConfiguredMediaStore {
                     .public_base_url
                     .clone()
                     .or_else(|| Some(fallback_public_base_url.to_string())),
-            )),
-            StorageConfig::S3(config) => Self::S3(S3MediaStore::new(
-                config.bucket.clone(),
-                config.region.clone(),
-                config.endpoint_url.clone(),
-                config.force_path_style,
-                config
-                    .public_base_url
-                    .clone()
-                    .or_else(|| Some(fallback_public_base_url.to_string())),
-            )),
+            ))),
+            StorageConfig::S3(config) => {
+                #[cfg(feature = "s3")]
+                {
+                    Ok(Self::S3(S3MediaStore::new(
+                        config.bucket.clone(),
+                        config.region.clone(),
+                        config.endpoint_url.clone(),
+                        config.force_path_style,
+                        config
+                            .public_base_url
+                            .clone()
+                            .or_else(|| Some(fallback_public_base_url.to_string())),
+                    )))
+                }
+                #[cfg(not(feature = "s3"))]
+                {
+                    let _ = config;
+                    Err(BinError::FeatureDisabled {
+                        component: "S3 media storage",
+                        feature: "s3",
+                    })
+                }
+            }
         }
     }
 }
@@ -170,6 +226,7 @@ impl MediaStore for ConfiguredMediaStore {
     async fn create_media(&self, input: CreateMedia) -> Result<BoxedMediaRef, MediaError> {
         match self {
             Self::Local(store) => store.create_media(input).await,
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.create_media(input).await,
         }
     }
@@ -177,6 +234,7 @@ impl MediaStore for ConfiguredMediaStore {
     async fn media_from_uri(&self, uri: &MediaUri) -> Result<BoxedMediaRef, MediaError> {
         match self {
             Self::Local(store) => store.media_from_uri(uri).await,
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.media_from_uri(uri).await,
         }
     }
@@ -188,6 +246,7 @@ impl MediaStore for ConfiguredMediaStore {
     ) -> Result<BoxedMediaRef, MediaError> {
         match self {
             Self::Local(store) => store.media_from_name(category, name).await,
+            #[cfg(feature = "s3")]
             Self::S3(store) => store.media_from_name(category, name).await,
         }
     }
@@ -213,10 +272,15 @@ pub struct ConfiguredLlmProviders {
 #[derive(Debug, Default)]
 struct ConfiguredLlmProvidersInner {
     /// Provider clients grouped by backend crate so dispatch can call concrete implementations.
+    #[cfg(feature = "anthropic")]
     anthropic: BTreeMap<ProviderName, chudbot_anthropic::AnthropicClient>,
+    #[cfg(feature = "gemini")]
     gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
+    #[cfg(feature = "openai")]
     openai: BTreeMap<ProviderName, chudbot_openai::OpenAiClient>,
+    #[cfg(feature = "openai-compat")]
     openai_compat: BTreeMap<ProviderName, chudbot_openai_compat::OpenAiCompatClient>,
+    #[cfg(feature = "xai")]
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
     /// Operator-supplied model metadata used before provider discovery.
     model_info: BTreeMap<ProviderName, BTreeMap<ModelId, ModelInfo>>,
@@ -243,139 +307,269 @@ impl ConfiguredLlmProviders {
         skip_all,
         fields(providers = config.len())
     )]
-    fn from_config(config: &BTreeMap<ProviderName, LlmProviderConfig>) -> Self {
-        let mut providers = ConfiguredLlmProvidersInner::default();
-        for (name, provider) in config {
-            // Model metadata has the same shape for every backend, so extract it
-            // before branching into provider-specific client construction.
-            let model_info = configured_model_info(provider);
-            let model_info_fallbacks = model_info.len();
-            match provider {
-                LlmProviderConfig::Anthropic {
-                    api_key,
-                    base_url,
-                    pricing,
-                    ..
-                } => {
-                    let mut client =
-                        chudbot_anthropic::AnthropicClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
-                    }
-                    if !pricing.is_empty() {
-                        client = client.with_token_pricing(pricing.clone());
-                    }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "anthropic",
-                        base_url_override = base_url.is_some(),
-                        pricing_overrides = pricing.len(),
-                        model_info_fallbacks,
-                        "registered LLM provider"
-                    );
-                    providers.anthropic.insert(name.clone(), client);
-                }
-                LlmProviderConfig::OpenAi {
-                    api_key,
-                    base_url,
-                    pricing,
-                    ..
-                } => {
-                    let mut client =
-                        chudbot_openai::OpenAiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
-                    }
-                    if !pricing.is_empty() {
-                        client = client.with_token_pricing(pricing.clone());
-                    }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "openai",
-                        base_url_override = base_url.is_some(),
-                        pricing_overrides = pricing.len(),
-                        model_info_fallbacks,
-                        "registered LLM provider"
-                    );
-                    providers.openai.insert(name.clone(), client);
-                }
-                LlmProviderConfig::OpenAiCompat {
-                    base_url, api_key, ..
-                } => {
-                    // OpenAI-compatible gateways are often local or self-hosted:
-                    // the API root is required, while authentication is optional.
-                    let mut client = chudbot_openai_compat::OpenAiCompatClient::new(
-                        name.clone(),
-                        base_url.clone(),
-                    );
-                    if let Some(api_key) = api_key {
-                        client = client.with_api_key(api_key.clone());
-                    }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "openai_compat",
-                        auth_configured = api_key.is_some(),
-                        model_info_fallbacks,
-                        "registered LLM provider"
-                    );
-                    providers.openai_compat.insert(name.clone(), client);
-                }
-                LlmProviderConfig::Gemini {
-                    api_key, base_url, ..
-                } => {
-                    let mut client =
-                        chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
-                    }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "gemini",
-                        base_url_override = base_url.is_some(),
-                        model_info_fallbacks,
-                        "registered LLM provider"
-                    );
-                    providers.gemini.insert(name.clone(), client);
-                }
-                LlmProviderConfig::Xai {
-                    api_key,
-                    base_url,
-                    dump_dir,
-                    ..
-                } => {
-                    let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
-                    }
-                    if let Some(dump_dir) = dump_dir {
-                        client = client.with_dump_dir(dump_dir.clone());
-                    }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "xai",
-                        base_url_override = base_url.is_some(),
-                        dump_enabled = dump_dir.is_some(),
-                        model_info_fallbacks,
-                        "registered LLM provider"
-                    );
-                    providers.xai.insert(name.clone(), client);
-                }
+    fn from_config(config: &BTreeMap<ProviderName, LlmProviderConfig>) -> Result<Self, BinError> {
+        #[cfg(not(any(
+            feature = "anthropic",
+            feature = "gemini",
+            feature = "openai",
+            feature = "openai-compat",
+            feature = "xai"
+        )))]
+        {
+            if let Some(provider) = config.values().next() {
+                return Err(disabled_llm_provider_error(provider));
             }
-            if !model_info.is_empty() {
-                providers.model_info.insert(name.clone(), model_info);
-            }
+            Ok(Self {
+                inner: Arc::new(ConfiguredLlmProvidersInner::default()),
+            })
         }
-        Self {
-            inner: Arc::new(providers),
+
+        #[cfg(any(
+            feature = "anthropic",
+            feature = "gemini",
+            feature = "openai",
+            feature = "openai-compat",
+            feature = "xai"
+        ))]
+        {
+            let mut providers = ConfiguredLlmProvidersInner::default();
+            for (name, provider) in config {
+                // Model metadata has the same shape for every backend, so extract it
+                // before branching into provider-specific client construction.
+                let model_info = configured_model_info(provider);
+                let model_info_fallbacks = model_info.len();
+                match provider {
+                    LlmProviderConfig::Anthropic {
+                        api_key,
+                        base_url,
+                        pricing,
+                        ..
+                    } => {
+                        #[cfg(feature = "anthropic")]
+                        {
+                            let mut client = chudbot_anthropic::AnthropicClient::new(
+                                name.clone(),
+                                api_key.clone(),
+                            );
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            if !pricing.is_empty() {
+                                client = client.with_token_pricing(
+                                    pricing
+                                        .iter()
+                                        .map(|(model, pricing)| (model.clone(), (*pricing).into()))
+                                        .collect(),
+                                );
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "anthropic",
+                                base_url_override = base_url.is_some(),
+                                pricing_overrides = pricing.len(),
+                                model_info_fallbacks,
+                                "registered LLM provider"
+                            );
+                            providers.anthropic.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "anthropic"))]
+                        {
+                            let _ = (api_key, base_url, pricing);
+                            return Err(BinError::FeatureDisabled {
+                                component: "Anthropic LLM provider",
+                                feature: "anthropic",
+                            });
+                        }
+                    }
+                    LlmProviderConfig::OpenAi {
+                        api_key,
+                        base_url,
+                        pricing,
+                        ..
+                    } => {
+                        #[cfg(feature = "openai")]
+                        {
+                            let mut client =
+                                chudbot_openai::OpenAiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            if !pricing.is_empty() {
+                                client = client.with_token_pricing(
+                                    pricing
+                                        .iter()
+                                        .map(|(model, pricing)| (model.clone(), (*pricing).into()))
+                                        .collect(),
+                                );
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "openai",
+                                base_url_override = base_url.is_some(),
+                                pricing_overrides = pricing.len(),
+                                model_info_fallbacks,
+                                "registered LLM provider"
+                            );
+                            providers.openai.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "openai"))]
+                        {
+                            let _ = (api_key, base_url, pricing);
+                            return Err(BinError::FeatureDisabled {
+                                component: "OpenAI LLM provider",
+                                feature: "openai",
+                            });
+                        }
+                    }
+                    LlmProviderConfig::OpenAiCompat {
+                        base_url, api_key, ..
+                    } => {
+                        #[cfg(feature = "openai-compat")]
+                        {
+                            // OpenAI-compatible gateways are often local or self-hosted:
+                            // the API root is required, while authentication is optional.
+                            let mut client = chudbot_openai_compat::OpenAiCompatClient::new(
+                                name.clone(),
+                                base_url.clone(),
+                            );
+                            if let Some(api_key) = api_key {
+                                client = client.with_api_key(api_key.clone());
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "openai_compat",
+                                auth_configured = api_key.is_some(),
+                                model_info_fallbacks,
+                                "registered LLM provider"
+                            );
+                            providers.openai_compat.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "openai-compat"))]
+                        {
+                            let _ = (base_url, api_key);
+                            return Err(BinError::FeatureDisabled {
+                                component: "OpenAI-compatible LLM provider",
+                                feature: "openai-compat",
+                            });
+                        }
+                    }
+                    LlmProviderConfig::Gemini {
+                        api_key, base_url, ..
+                    } => {
+                        #[cfg(feature = "gemini")]
+                        {
+                            let mut client =
+                                chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "gemini",
+                                base_url_override = base_url.is_some(),
+                                model_info_fallbacks,
+                                "registered LLM provider"
+                            );
+                            providers.gemini.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "gemini"))]
+                        {
+                            let _ = (api_key, base_url);
+                            return Err(BinError::FeatureDisabled {
+                                component: "Gemini LLM provider",
+                                feature: "gemini",
+                            });
+                        }
+                    }
+                    LlmProviderConfig::Xai {
+                        api_key,
+                        base_url,
+                        dump_dir,
+                        ..
+                    } => {
+                        #[cfg(feature = "xai")]
+                        {
+                            let mut client =
+                                chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            if let Some(dump_dir) = dump_dir {
+                                client = client.with_dump_dir(dump_dir.clone());
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "xai",
+                                base_url_override = base_url.is_some(),
+                                dump_enabled = dump_dir.is_some(),
+                                model_info_fallbacks,
+                                "registered LLM provider"
+                            );
+                            providers.xai.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "xai"))]
+                        {
+                            let _ = (api_key, base_url, dump_dir);
+                            return Err(BinError::FeatureDisabled {
+                                component: "xAI LLM provider",
+                                feature: "xai",
+                            });
+                        }
+                    }
+                }
+                if !model_info.is_empty() {
+                    providers.model_info.insert(name.clone(), model_info);
+                }
+            }
+            Ok(Self {
+                inner: Arc::new(providers),
+            })
         }
     }
 
     pub(crate) fn configured_count(&self) -> usize {
-        self.inner.anthropic.len()
-            + self.inner.gemini.len()
-            + self.inner.openai.len()
-            + self.inner.openai_compat.len()
-            + self.inner.xai.len()
+        #[cfg(not(any(
+            feature = "anthropic",
+            feature = "gemini",
+            feature = "openai",
+            feature = "openai-compat",
+            feature = "xai"
+        )))]
+        {
+            0
+        }
+
+        #[cfg(any(
+            feature = "anthropic",
+            feature = "gemini",
+            feature = "openai",
+            feature = "openai-compat",
+            feature = "xai"
+        ))]
+        {
+            let mut count = 0;
+            #[cfg(feature = "anthropic")]
+            {
+                count += self.inner.anthropic.len();
+            }
+            #[cfg(feature = "gemini")]
+            {
+                count += self.inner.gemini.len();
+            }
+            #[cfg(feature = "openai")]
+            {
+                count += self.inner.openai.len();
+            }
+            #[cfg(feature = "openai-compat")]
+            {
+                count += self.inner.openai_compat.len();
+            }
+            #[cfg(feature = "xai")]
+            {
+                count += self.inner.xai.len();
+            }
+            count
+        }
     }
 
     /// Fetch metadata from the named backend after config overrides and cache lookup miss.
@@ -384,30 +578,46 @@ impl ConfiguredLlmProviders {
         provider: &ProviderName,
         request: ModelInfoRequest,
     ) -> Result<Option<ModelInfo>, ConfiguredLlmError> {
+        #[cfg(not(any(
+            feature = "anthropic",
+            feature = "gemini",
+            feature = "openai",
+            feature = "openai-compat",
+            feature = "xai"
+        )))]
+        {
+            let _ = request;
+        }
+
+        #[cfg(feature = "anthropic")]
         if let Some(client) = self.inner.anthropic.get(provider) {
             tracing::debug!(kind = "anthropic", "fetching model metadata");
             return LlmBackend::fetch_model_info(client, request)
                 .await
                 .map_err(ConfiguredLlmError::Anthropic);
         }
+        #[cfg(feature = "openai")]
         if let Some(client) = self.inner.openai.get(provider) {
             tracing::debug!(kind = "openai", "fetching model metadata");
             return LlmBackend::fetch_model_info(client, request)
                 .await
                 .map_err(ConfiguredLlmError::OpenAi);
         }
+        #[cfg(feature = "openai-compat")]
         if let Some(client) = self.inner.openai_compat.get(provider) {
             tracing::debug!(kind = "openai_compat", "fetching model metadata");
             return LlmBackend::fetch_model_info(client, request)
                 .await
                 .map_err(ConfiguredLlmError::OpenAiCompat);
         }
+        #[cfg(feature = "gemini")]
         if let Some(client) = self.inner.gemini.get(provider) {
             tracing::debug!(kind = "gemini", "fetching model metadata");
             return LlmBackend::fetch_model_info(client, request)
                 .await
                 .map_err(ConfiguredLlmError::Gemini);
         }
+        #[cfg(feature = "xai")]
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "fetching model metadata");
             return LlmBackend::fetch_model_info(client, request)
@@ -423,13 +633,50 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
     type Error = ConfiguredLlmError;
 
     fn contains_provider(&self, provider: &ProviderName) -> bool {
-        let contains = self.inner.anthropic.contains_key(provider)
-            || self.inner.gemini.contains_key(provider)
-            || self.inner.openai.contains_key(provider)
-            || self.inner.openai_compat.contains_key(provider)
-            || self.inner.xai.contains_key(provider);
-        tracing::trace!(provider = %provider, contains, "checking LLM provider registry");
-        contains
+        #[cfg(not(any(
+            feature = "anthropic",
+            feature = "gemini",
+            feature = "openai",
+            feature = "openai-compat",
+            feature = "xai"
+        )))]
+        {
+            let _ = provider;
+            false
+        }
+
+        #[cfg(any(
+            feature = "anthropic",
+            feature = "gemini",
+            feature = "openai",
+            feature = "openai-compat",
+            feature = "xai"
+        ))]
+        {
+            let mut contains = false;
+            #[cfg(feature = "anthropic")]
+            {
+                contains = contains || self.inner.anthropic.contains_key(provider);
+            }
+            #[cfg(feature = "gemini")]
+            {
+                contains = contains || self.inner.gemini.contains_key(provider);
+            }
+            #[cfg(feature = "openai")]
+            {
+                contains = contains || self.inner.openai.contains_key(provider);
+            }
+            #[cfg(feature = "openai-compat")]
+            {
+                contains = contains || self.inner.openai_compat.contains_key(provider);
+            }
+            #[cfg(feature = "xai")]
+            {
+                contains = contains || self.inner.xai.contains_key(provider);
+            }
+            tracing::trace!(provider = %provider, contains, "checking LLM provider registry");
+            contains
+        }
     }
 
     #[tracing::instrument(
@@ -442,32 +689,48 @@ impl LlmProviderRegistry for ConfiguredLlmProviders {
         provider: &'a ProviderName,
         request: ModelStepRequest,
     ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + 'a {
+        #[cfg(not(any(
+            feature = "anthropic",
+            feature = "gemini",
+            feature = "openai",
+            feature = "openai-compat",
+            feature = "xai"
+        )))]
+        {
+            let _ = request;
+        }
+
         // Agents call through `RoutedLlmBackend`; by this point the provider
         // name is the route key and the request shape is already final.
+        #[cfg(feature = "anthropic")]
         if let Some(client) = self.inner.anthropic.get(provider) {
             tracing::debug!(kind = "anthropic", "dispatching model step");
             return LlmBackend::step(client, request)
                 .map_err(ConfiguredLlmError::Anthropic)
                 .boxed();
         }
+        #[cfg(feature = "openai")]
         if let Some(client) = self.inner.openai.get(provider) {
             tracing::debug!(kind = "openai", "dispatching model step");
             return LlmBackend::step(client, request)
                 .map_err(ConfiguredLlmError::OpenAi)
                 .boxed();
         }
+        #[cfg(feature = "openai-compat")]
         if let Some(client) = self.inner.openai_compat.get(provider) {
             tracing::debug!(kind = "openai_compat", "dispatching model step");
             return LlmBackend::step(client, request)
                 .map_err(ConfiguredLlmError::OpenAiCompat)
                 .boxed();
         }
+        #[cfg(feature = "gemini")]
         if let Some(client) = self.inner.gemini.get(provider) {
             tracing::debug!(kind = "gemini", "dispatching model step");
             return LlmBackend::step(client, request)
                 .map_err(ConfiguredLlmError::Gemini)
                 .boxed();
         }
+        #[cfg(feature = "xai")]
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching model step");
             return LlmBackend::step(client, request)
@@ -524,7 +787,46 @@ impl ConfiguredLlmProviders {
     }
 }
 
+#[cfg(not(any(
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "openai",
+    feature = "openai-compat",
+    feature = "xai"
+)))]
+fn disabled_llm_provider_error(provider: &LlmProviderConfig) -> BinError {
+    match provider {
+        LlmProviderConfig::Anthropic { .. } => BinError::FeatureDisabled {
+            component: "Anthropic LLM provider",
+            feature: "anthropic",
+        },
+        LlmProviderConfig::Xai { .. } => BinError::FeatureDisabled {
+            component: "xAI LLM provider",
+            feature: "xai",
+        },
+        LlmProviderConfig::OpenAi { .. } => BinError::FeatureDisabled {
+            component: "OpenAI LLM provider",
+            feature: "openai",
+        },
+        LlmProviderConfig::OpenAiCompat { .. } => BinError::FeatureDisabled {
+            component: "OpenAI-compatible LLM provider",
+            feature: "openai-compat",
+        },
+        LlmProviderConfig::Gemini { .. } => BinError::FeatureDisabled {
+            component: "Gemini LLM provider",
+            feature: "gemini",
+        },
+    }
+}
+
 /// Collect configured metadata entries that contain at least one usable limit.
+#[cfg(any(
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "openai",
+    feature = "openai-compat",
+    feature = "xai"
+))]
 fn configured_model_info(provider: &LlmProviderConfig) -> BTreeMap<ModelId, ModelInfo> {
     provider
         .model_info()
@@ -536,6 +838,13 @@ fn configured_model_info(provider: &LlmProviderConfig) -> BTreeMap<ModelId, Mode
 }
 
 /// Convert one config entry into provider-neutral model metadata.
+#[cfg(any(
+    feature = "anthropic",
+    feature = "gemini",
+    feature = "openai",
+    feature = "openai-compat",
+    feature = "xai"
+))]
 fn configured_model_info_entry(model: &ModelId, info: &LlmModelInfoConfig) -> Option<ModelInfo> {
     // Empty entries are ignored so partially prepared config tables do not
     // mask provider discovery with an all-`None` override.
@@ -623,8 +932,11 @@ pub struct ConfiguredImageGenerators {
 #[derive(Debug, Default)]
 struct ConfiguredImageGeneratorsInner {
     /// Provider clients grouped by backend crate for direct generator dispatch.
+    #[cfg(feature = "gemini")]
     gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
+    #[cfg(feature = "openai")]
     openai: BTreeMap<ProviderName, chudbot_openai::OpenAiClient>,
+    #[cfg(feature = "xai")]
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
 }
 
@@ -646,68 +958,142 @@ impl ConfiguredImageGenerators {
         skip_all,
         fields(providers = config.len())
     )]
-    fn from_config(config: &BTreeMap<ProviderName, ImageProviderConfig>) -> Self {
-        let mut providers = ConfiguredImageGeneratorsInner::default();
-        for (name, provider) in config {
-            match provider {
-                ImageProviderConfig::OpenAi {
-                    api_key,
-                    base_url,
-                    pricing,
-                } => {
-                    let mut client =
-                        chudbot_openai::OpenAiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
+    fn from_config(config: &BTreeMap<ProviderName, ImageProviderConfig>) -> Result<Self, BinError> {
+        #[cfg(not(any(feature = "gemini", feature = "openai", feature = "xai")))]
+        {
+            if let Some(provider) = config.values().next() {
+                return Err(disabled_image_provider_error(provider));
+            }
+            Ok(Self {
+                inner: Arc::new(ConfiguredImageGeneratorsInner::default()),
+            })
+        }
+
+        #[cfg(any(feature = "gemini", feature = "openai", feature = "xai"))]
+        {
+            let mut providers = ConfiguredImageGeneratorsInner::default();
+            for (name, provider) in config {
+                match provider {
+                    ImageProviderConfig::OpenAi {
+                        api_key,
+                        base_url,
+                        pricing,
+                    } => {
+                        #[cfg(feature = "openai")]
+                        {
+                            let mut client =
+                                chudbot_openai::OpenAiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            if !pricing.is_empty() {
+                                client = client.with_image_pricing(
+                                    pricing
+                                        .iter()
+                                        .map(|(model, pricing)| (model.clone(), (*pricing).into()))
+                                        .collect(),
+                                );
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "openai",
+                                base_url_override = base_url.is_some(),
+                                pricing_overrides = pricing.len(),
+                                "registered image provider"
+                            );
+                            providers.openai.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "openai"))]
+                        {
+                            let _ = (api_key, base_url, pricing);
+                            return Err(BinError::FeatureDisabled {
+                                component: "OpenAI image provider",
+                                feature: "openai",
+                            });
+                        }
                     }
-                    if !pricing.is_empty() {
-                        client = client.with_image_pricing(pricing.clone());
+                    ImageProviderConfig::Xai { api_key, base_url } => {
+                        #[cfg(feature = "xai")]
+                        {
+                            let mut client =
+                                chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "xai",
+                                base_url_override = base_url.is_some(),
+                                "registered image provider"
+                            );
+                            providers.xai.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "xai"))]
+                        {
+                            let _ = (api_key, base_url);
+                            return Err(BinError::FeatureDisabled {
+                                component: "xAI image provider",
+                                feature: "xai",
+                            });
+                        }
                     }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "openai",
-                        base_url_override = base_url.is_some(),
-                        pricing_overrides = pricing.len(),
-                        "registered image provider"
-                    );
-                    providers.openai.insert(name.clone(), client);
-                }
-                ImageProviderConfig::Xai { api_key, base_url } => {
-                    let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
+                    ImageProviderConfig::Gemini { api_key, base_url } => {
+                        #[cfg(feature = "gemini")]
+                        {
+                            let mut client =
+                                chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "gemini",
+                                base_url_override = base_url.is_some(),
+                                "registered image provider"
+                            );
+                            providers.gemini.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "gemini"))]
+                        {
+                            let _ = (api_key, base_url);
+                            return Err(BinError::FeatureDisabled {
+                                component: "Gemini image provider",
+                                feature: "gemini",
+                            });
+                        }
                     }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "xai",
-                        base_url_override = base_url.is_some(),
-                        "registered image provider"
-                    );
-                    providers.xai.insert(name.clone(), client);
-                }
-                ImageProviderConfig::Gemini { api_key, base_url } => {
-                    let mut client =
-                        chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
-                    }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "gemini",
-                        base_url_override = base_url.is_some(),
-                        "registered image provider"
-                    );
-                    providers.gemini.insert(name.clone(), client);
                 }
             }
-        }
-        Self {
-            inner: Arc::new(providers),
+            Ok(Self {
+                inner: Arc::new(providers),
+            })
         }
     }
 
     pub(crate) fn configured_count(&self) -> usize {
-        self.inner.gemini.len() + self.inner.openai.len() + self.inner.xai.len()
+        #[cfg(not(any(feature = "gemini", feature = "openai", feature = "xai")))]
+        {
+            let _ = &self.inner;
+            0
+        }
+
+        #[cfg(any(feature = "gemini", feature = "openai", feature = "xai"))]
+        {
+            let mut count = 0;
+            #[cfg(feature = "gemini")]
+            {
+                count += self.inner.gemini.len();
+            }
+            #[cfg(feature = "openai")]
+            {
+                count += self.inner.openai.len();
+            }
+            #[cfg(feature = "xai")]
+            {
+                count += self.inner.xai.len();
+            }
+            count
+        }
     }
 }
 
@@ -715,11 +1101,31 @@ impl ImageGeneratorRegistry for ConfiguredImageGenerators {
     type Error = ConfiguredImageError;
 
     fn contains_generator(&self, provider: &ProviderName) -> bool {
-        let contains = self.inner.gemini.contains_key(provider)
-            || self.inner.openai.contains_key(provider)
-            || self.inner.xai.contains_key(provider);
-        tracing::trace!(provider = %provider, contains, "checking image provider registry");
-        contains
+        #[cfg(not(any(feature = "gemini", feature = "openai", feature = "xai")))]
+        {
+            let _ = &self.inner;
+            let _ = provider;
+            false
+        }
+
+        #[cfg(any(feature = "gemini", feature = "openai", feature = "xai"))]
+        {
+            let mut contains = false;
+            #[cfg(feature = "gemini")]
+            {
+                contains = contains || self.inner.gemini.contains_key(provider);
+            }
+            #[cfg(feature = "openai")]
+            {
+                contains = contains || self.inner.openai.contains_key(provider);
+            }
+            #[cfg(feature = "xai")]
+            {
+                contains = contains || self.inner.xai.contains_key(provider);
+            }
+            tracing::trace!(provider = %provider, contains, "checking image provider registry");
+            contains
+        }
     }
 
     #[tracing::instrument(
@@ -732,20 +1138,28 @@ impl ImageGeneratorRegistry for ConfiguredImageGenerators {
         provider: &ProviderName,
         request: ImageRequest,
     ) -> Result<GeneratedImage, Self::Error> {
+        #[cfg(not(any(feature = "gemini", feature = "openai", feature = "xai")))]
+        {
+            let _ = request;
+        }
+
         // The routed image tool already applied any binding-level default
         // model; this registry only selects the named concrete provider.
+        #[cfg(feature = "openai")]
         if let Some(client) = self.inner.openai.get(provider) {
             tracing::debug!(kind = "openai", "dispatching image generation");
             return ImageGenerator::generate_image(client, request)
                 .await
                 .map_err(ConfiguredImageError::OpenAi);
         }
+        #[cfg(feature = "gemini")]
         if let Some(client) = self.inner.gemini.get(provider) {
             tracing::debug!(kind = "gemini", "dispatching image generation");
             return ImageGenerator::generate_image(client, request)
                 .await
                 .map_err(ConfiguredImageError::Gemini);
         }
+        #[cfg(feature = "xai")]
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching image generation");
             return ImageGenerator::generate_image(client, request)
@@ -754,6 +1168,24 @@ impl ImageGeneratorRegistry for ConfiguredImageGenerators {
         }
         tracing::warn!("requested image provider is missing from registry");
         Err(ConfiguredImageError::Missing(provider.clone()))
+    }
+}
+
+#[cfg(not(any(feature = "gemini", feature = "openai", feature = "xai")))]
+fn disabled_image_provider_error(provider: &ImageProviderConfig) -> BinError {
+    match provider {
+        ImageProviderConfig::OpenAi { .. } => BinError::FeatureDisabled {
+            component: "OpenAI image provider",
+            feature: "openai",
+        },
+        ImageProviderConfig::Xai { .. } => BinError::FeatureDisabled {
+            component: "xAI image provider",
+            feature: "xai",
+        },
+        ImageProviderConfig::Gemini { .. } => BinError::FeatureDisabled {
+            component: "Gemini image provider",
+            feature: "gemini",
+        },
     }
 }
 
@@ -769,7 +1201,9 @@ pub struct ConfiguredVideoGenerators {
 #[derive(Debug, Default)]
 struct ConfiguredVideoGeneratorsInner {
     /// Provider clients grouped by backend crate for direct video dispatch.
+    #[cfg(feature = "gemini")]
     gemini: BTreeMap<ProviderName, chudbot_gemini::GeminiClient>,
+    #[cfg(feature = "xai")]
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
 }
 
@@ -791,46 +1225,100 @@ impl ConfiguredVideoGenerators {
         skip_all,
         fields(providers = config.len())
     )]
-    fn from_config(config: &BTreeMap<ProviderName, VideoProviderConfig>) -> Self {
-        let mut providers = ConfiguredVideoGeneratorsInner::default();
-        for (name, provider) in config {
-            match provider {
-                VideoProviderConfig::Xai { api_key, base_url } => {
-                    let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
+    fn from_config(config: &BTreeMap<ProviderName, VideoProviderConfig>) -> Result<Self, BinError> {
+        #[cfg(not(any(feature = "gemini", feature = "xai")))]
+        {
+            if let Some(provider) = config.values().next() {
+                return Err(disabled_video_provider_error(provider));
+            }
+            Ok(Self {
+                inner: Arc::new(ConfiguredVideoGeneratorsInner::default()),
+            })
+        }
+
+        #[cfg(any(feature = "gemini", feature = "xai"))]
+        {
+            let mut providers = ConfiguredVideoGeneratorsInner::default();
+            for (name, provider) in config {
+                match provider {
+                    VideoProviderConfig::Xai { api_key, base_url } => {
+                        #[cfg(feature = "xai")]
+                        {
+                            let mut client =
+                                chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "xai",
+                                base_url_override = base_url.is_some(),
+                                "registered video provider"
+                            );
+                            providers.xai.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "xai"))]
+                        {
+                            let _ = (api_key, base_url);
+                            return Err(BinError::FeatureDisabled {
+                                component: "xAI video provider",
+                                feature: "xai",
+                            });
+                        }
                     }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "xai",
-                        base_url_override = base_url.is_some(),
-                        "registered video provider"
-                    );
-                    providers.xai.insert(name.clone(), client);
-                }
-                VideoProviderConfig::Gemini { api_key, base_url } => {
-                    let mut client =
-                        chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
+                    VideoProviderConfig::Gemini { api_key, base_url } => {
+                        #[cfg(feature = "gemini")]
+                        {
+                            let mut client =
+                                chudbot_gemini::GeminiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "gemini",
+                                base_url_override = base_url.is_some(),
+                                "registered video provider"
+                            );
+                            providers.gemini.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "gemini"))]
+                        {
+                            let _ = (api_key, base_url);
+                            return Err(BinError::FeatureDisabled {
+                                component: "Gemini video provider",
+                                feature: "gemini",
+                            });
+                        }
                     }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "gemini",
-                        base_url_override = base_url.is_some(),
-                        "registered video provider"
-                    );
-                    providers.gemini.insert(name.clone(), client);
                 }
             }
-        }
-        Self {
-            inner: Arc::new(providers),
+            Ok(Self {
+                inner: Arc::new(providers),
+            })
         }
     }
 
     pub(crate) fn configured_count(&self) -> usize {
-        self.inner.gemini.len() + self.inner.xai.len()
+        #[cfg(not(any(feature = "gemini", feature = "xai")))]
+        {
+            let _ = &self.inner;
+            0
+        }
+
+        #[cfg(any(feature = "gemini", feature = "xai"))]
+        {
+            let mut count = 0;
+            #[cfg(feature = "gemini")]
+            {
+                count += self.inner.gemini.len();
+            }
+            #[cfg(feature = "xai")]
+            {
+                count += self.inner.xai.len();
+            }
+            count
+        }
     }
 }
 
@@ -838,10 +1326,27 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
     type Error = ConfiguredVideoError;
 
     fn contains_generator(&self, provider: &ProviderName) -> bool {
-        let contains =
-            self.inner.gemini.contains_key(provider) || self.inner.xai.contains_key(provider);
-        tracing::trace!(provider = %provider, contains, "checking video provider registry");
-        contains
+        #[cfg(not(any(feature = "gemini", feature = "xai")))]
+        {
+            let _ = &self.inner;
+            let _ = provider;
+            false
+        }
+
+        #[cfg(any(feature = "gemini", feature = "xai"))]
+        {
+            let mut contains = false;
+            #[cfg(feature = "gemini")]
+            {
+                contains = contains || self.inner.gemini.contains_key(provider);
+            }
+            #[cfg(feature = "xai")]
+            {
+                contains = contains || self.inner.xai.contains_key(provider);
+            }
+            tracing::trace!(provider = %provider, contains, "checking video provider registry");
+            contains
+        }
     }
 
     #[tracing::instrument(
@@ -854,14 +1359,21 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
         provider: &ProviderName,
         request: VideoRequest,
     ) -> Result<VideoJobId, Self::Error> {
+        #[cfg(not(any(feature = "gemini", feature = "xai")))]
+        {
+            let _ = request;
+        }
+
         // The returned job ID is opaque; callers keep using this provider name
         // for later status checks and downloads.
+        #[cfg(feature = "xai")]
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching video submit");
             return VideoGenerator::submit_video(client, request)
                 .await
                 .map_err(ConfiguredVideoError::Xai);
         }
+        #[cfg(feature = "gemini")]
         if let Some(client) = self.inner.gemini.get(provider) {
             tracing::debug!(kind = "gemini", "dispatching video submit");
             return VideoGenerator::submit_video(client, request)
@@ -878,11 +1390,18 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
         provider: &ProviderName,
         job: VideoJobId,
     ) -> Result<VideoJobStatus, Self::Error> {
+        #[cfg(not(any(feature = "gemini", feature = "xai")))]
+        {
+            let _ = job;
+        }
+
+        #[cfg(feature = "xai")]
         if let Some(client) = self.inner.xai.get(provider) {
             return VideoGenerator::check_video(client, job)
                 .await
                 .map_err(ConfiguredVideoError::Xai);
         }
+        #[cfg(feature = "gemini")]
         if let Some(client) = self.inner.gemini.get(provider) {
             return VideoGenerator::check_video(client, job)
                 .await
@@ -898,11 +1417,18 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
         provider: &ProviderName,
         url: String,
     ) -> Result<Vec<u8>, Self::Error> {
+        #[cfg(not(any(feature = "gemini", feature = "xai")))]
+        {
+            let _ = url;
+        }
+
+        #[cfg(feature = "xai")]
         if let Some(client) = self.inner.xai.get(provider) {
             return VideoGenerator::download_video(client, url)
                 .await
                 .map_err(ConfiguredVideoError::Xai);
         }
+        #[cfg(feature = "gemini")]
         if let Some(client) = self.inner.gemini.get(provider) {
             return VideoGenerator::download_video(client, url)
                 .await
@@ -910,6 +1436,20 @@ impl VideoGeneratorRegistry for ConfiguredVideoGenerators {
         }
         tracing::warn!("requested video provider is missing from registry");
         Err(ConfiguredVideoError::Missing(provider.clone()))
+    }
+}
+
+#[cfg(not(any(feature = "gemini", feature = "xai")))]
+fn disabled_video_provider_error(provider: &VideoProviderConfig) -> BinError {
+    match provider {
+        VideoProviderConfig::Xai { .. } => BinError::FeatureDisabled {
+            component: "xAI video provider",
+            feature: "xai",
+        },
+        VideoProviderConfig::Gemini { .. } => BinError::FeatureDisabled {
+            component: "Gemini video provider",
+            feature: "gemini",
+        },
     }
 }
 
@@ -925,6 +1465,7 @@ pub struct ConfiguredAudioTranscribers {
 #[derive(Debug, Default)]
 struct ConfiguredAudioTranscribersInner {
     /// Provider clients grouped by backend crate for direct transcription dispatch.
+    #[cfg(feature = "xai")]
     xai: BTreeMap<ProviderName, chudbot_xai::XaiClient>,
 }
 
@@ -943,32 +1484,66 @@ impl ConfiguredAudioTranscribers {
         skip_all,
         fields(providers = config.len())
     )]
-    fn from_config(config: &BTreeMap<ProviderName, AudioProviderConfig>) -> Self {
-        let mut providers = ConfiguredAudioTranscribersInner::default();
-        for (name, provider) in config {
-            match provider {
-                AudioProviderConfig::Xai { api_key, base_url } => {
-                    let mut client = chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
-                    if let Some(base_url) = base_url {
-                        client = client.with_base_url(base_url.clone());
+    fn from_config(config: &BTreeMap<ProviderName, AudioProviderConfig>) -> Result<Self, BinError> {
+        #[cfg(not(feature = "xai"))]
+        {
+            if let Some(provider) = config.values().next() {
+                return Err(disabled_audio_provider_error(provider));
+            }
+            Ok(Self {
+                inner: Arc::new(ConfiguredAudioTranscribersInner::default()),
+            })
+        }
+
+        #[cfg(feature = "xai")]
+        {
+            let mut providers = ConfiguredAudioTranscribersInner::default();
+            for (name, provider) in config {
+                match provider {
+                    AudioProviderConfig::Xai { api_key, base_url } => {
+                        #[cfg(feature = "xai")]
+                        {
+                            let mut client =
+                                chudbot_xai::XaiClient::new(name.clone(), api_key.clone());
+                            if let Some(base_url) = base_url {
+                                client = client.with_base_url(base_url.clone());
+                            }
+                            tracing::info!(
+                                provider = %name,
+                                kind = "xai",
+                                base_url_override = base_url.is_some(),
+                                "registered audio transcription provider"
+                            );
+                            providers.xai.insert(name.clone(), client);
+                        }
+                        #[cfg(not(feature = "xai"))]
+                        {
+                            let _ = (api_key, base_url);
+                            return Err(BinError::FeatureDisabled {
+                                component: "xAI audio provider",
+                                feature: "xai",
+                            });
+                        }
                     }
-                    tracing::info!(
-                        provider = %name,
-                        kind = "xai",
-                        base_url_override = base_url.is_some(),
-                        "registered audio transcription provider"
-                    );
-                    providers.xai.insert(name.clone(), client);
                 }
             }
-        }
-        Self {
-            inner: Arc::new(providers),
+            Ok(Self {
+                inner: Arc::new(providers),
+            })
         }
     }
 
     pub(crate) fn configured_count(&self) -> usize {
-        self.inner.xai.len()
+        #[cfg(not(feature = "xai"))]
+        {
+            let _ = &self.inner;
+            0
+        }
+
+        #[cfg(feature = "xai")]
+        {
+            self.inner.xai.len()
+        }
     }
 }
 
@@ -976,9 +1551,19 @@ impl AudioTranscriberRegistry for ConfiguredAudioTranscribers {
     type Error = ConfiguredAudioError;
 
     fn contains_transcriber(&self, provider: &ProviderName) -> bool {
-        let contains = self.inner.xai.contains_key(provider);
-        tracing::trace!(provider = %provider, contains, "checking audio provider registry");
-        contains
+        #[cfg(not(feature = "xai"))]
+        {
+            let _ = &self.inner;
+            let _ = provider;
+            false
+        }
+
+        #[cfg(feature = "xai")]
+        {
+            let contains = self.inner.xai.contains_key(provider);
+            tracing::trace!(provider = %provider, contains, "checking audio provider registry");
+            contains
+        }
     }
 
     #[tracing::instrument(
@@ -991,8 +1576,14 @@ impl AudioTranscriberRegistry for ConfiguredAudioTranscribers {
         provider: &ProviderName,
         request: AudioTranscriptionRequest,
     ) -> Result<AudioTranscription, Self::Error> {
+        #[cfg(not(feature = "xai"))]
+        {
+            let _ = request;
+        }
+
         // Agent bindings have already chosen the provider and optional model;
         // this layer only fans out to the concrete transcriber implementation.
+        #[cfg(feature = "xai")]
         if let Some(client) = self.inner.xai.get(provider) {
             tracing::debug!(kind = "xai", "dispatching audio transcription");
             return AudioTranscriber::transcribe_audio(client, request)
@@ -1004,10 +1595,21 @@ impl AudioTranscriberRegistry for ConfiguredAudioTranscribers {
     }
 }
 
+#[cfg(not(feature = "xai"))]
+fn disabled_audio_provider_error(provider: &AudioProviderConfig) -> BinError {
+    match provider {
+        AudioProviderConfig::Xai { .. } => BinError::FeatureDisabled {
+            component: "xAI audio provider",
+            feature: "xai",
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "anthropic")]
     #[test]
     fn configured_llm_provider_name_is_recorded_backend_name() {
         let provider = ProviderName::new("claude");
@@ -1021,7 +1623,7 @@ mod tests {
             },
         )]);
 
-        let registry = ConfiguredLlmProviders::from_config(&config);
+        let registry = ConfiguredLlmProviders::from_config(&config).expect("LLM registry");
         let client = registry
             .inner
             .anthropic
@@ -1031,6 +1633,13 @@ mod tests {
         assert_eq!(LlmBackend::backend_name(client), &provider);
     }
 
+    #[cfg(all(
+        feature = "anthropic",
+        feature = "gemini",
+        feature = "openai",
+        feature = "openai-compat",
+        feature = "xai"
+    ))]
     #[test]
     fn configured_llm_model_info_fallback_is_loaded_for_every_provider_kind() {
         let provider = ProviderName::new("claude");
@@ -1094,7 +1703,7 @@ mod tests {
             ),
         ]);
 
-        let registry = ConfiguredLlmProviders::from_config(&config);
+        let registry = ConfiguredLlmProviders::from_config(&config).expect("LLM registry");
         for provider in [
             &provider,
             &xai_provider,
@@ -1111,6 +1720,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "openai-compat")]
     #[tokio::test]
     async fn configured_llm_model_info_is_returned_without_provider_lookup() {
         let provider = ProviderName::new("local");
@@ -1130,7 +1740,7 @@ mod tests {
             },
         )]);
 
-        let registry = ConfiguredLlmProviders::from_config(&config);
+        let registry = ConfiguredLlmProviders::from_config(&config).expect("LLM registry");
         let info = LlmProviderRegistry::fetch_model_info(
             &registry,
             &provider,
@@ -1213,6 +1823,7 @@ mod tests {
         assert_ne!(without_options, with_options);
     }
 
+    #[cfg(feature = "xai")]
     #[test]
     fn configured_media_provider_names_are_recorded_backend_names() {
         let image_provider = ProviderName::new("grok_images");
@@ -1223,7 +1834,7 @@ mod tests {
                 base_url: None,
             },
         )]);
-        let images = ConfiguredImageGenerators::from_config(&image_config);
+        let images = ConfiguredImageGenerators::from_config(&image_config).expect("image registry");
         let image_client = images
             .inner
             .xai
@@ -1239,7 +1850,7 @@ mod tests {
                 base_url: None,
             },
         )]);
-        let videos = ConfiguredVideoGenerators::from_config(&video_config);
+        let videos = ConfiguredVideoGenerators::from_config(&video_config).expect("video registry");
         let video_client = videos
             .inner
             .xai
@@ -1255,7 +1866,8 @@ mod tests {
                 base_url: None,
             },
         )]);
-        let audio = ConfiguredAudioTranscribers::from_config(&audio_config);
+        let audio =
+            ConfiguredAudioTranscribers::from_config(&audio_config).expect("audio registry");
         let audio_client = audio
             .inner
             .xai

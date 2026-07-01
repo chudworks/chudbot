@@ -12,10 +12,8 @@ mod platforms;
 mod runtime;
 mod services;
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::str::FromStr;
 use std::time::Duration;
 
 use chudbot_bot::{BotRuntime, BotRuntimeParts};
@@ -27,7 +25,8 @@ use diagnostics::render_toml_error_for_stderr;
 use errors::{BinError, ConfigError};
 use platforms::connect_configured_message_platforms;
 use runtime::run_runtime_services;
-use services::{BootstrapServices, ConfiguredBotRuntime};
+use services::BootstrapServices;
+use services::ConfiguredBotRuntime;
 
 /// Git version injected by `build.rs`.
 const VERSION: &str = env!("GIT_VERSION");
@@ -142,81 +141,87 @@ async fn run(
             );
             Ok(())
         }
-        Command::Migrate => {
-            // Migrations need only a usable database URL. They do not require
-            // provider credentials, platform tokens, or agent references to be
-            // runnable.
-            config.validate_database()?;
-            let storage = SqlxStorage::connect(&config.database.url).await?;
-            storage.run_migrations().await?;
-            tracing::info!("migrations applied");
-            Ok(())
-        }
-        Command::Serve => {
-            let mut config = config;
-
-            // Serve is the full runtime path: validate every static reference
-            // before opening durable connections or spawning long-lived tasks.
-            config.validate_all(&source)?;
-
-            // Storage is shared by the bot and web viewer.
-            let storage = SqlxStorage::connect(&config.database.url).await?;
-
-            // Register the git build once per deployment and expose the
-            // monotonic app-version id to bot replies, traces, and viewer UI.
-            let app_version = storage.register_app_version(VERSION).await?;
-            config.bot.version = format!("v{}", app_version.id);
-            tracing::info!(
-                version_number = app_version.id,
-                git_version = %app_version.git_version,
-                first_seen = %app_version.first_seen_at,
-                "resolved build version"
-            );
-
-            // Build concrete provider/media registries from named config
-            // entries. These are cheap Arc-backed registries until individual
-            // requests call a provider.
-            let mut services = BootstrapServices::build(&config)?;
-            services.web.version = format!("{} ({VERSION})", config.bot.version);
-            let storage = storage.with_app_version_id(app_version.id);
-
-            // Platforms connect after validation and storage setup so incoming
-            // events cannot race ahead of a usable runtime.
-            let (platforms, platform_events) =
-                connect_configured_message_platforms(&config.platforms).await?;
-            let listen = SocketAddr::from_str(&config.web.listen)?;
-
-            // The web API also needs the LLM registry for model metadata, so
-            // keep a clone before moving the concrete registries into the bot.
-            let llms = services.llms.clone();
-            let bot = BotRuntime::<ConfiguredBotRuntime>::new(
-                BotRuntimeParts::<ConfiguredBotRuntime> {
-                    platforms,
-                    storage: storage.clone(),
-                    media_store: services.media_store.clone(),
-                    llms: services.llms,
-                    images: services.images,
-                    videos: services.videos,
-                    audio: services.audio,
-                    events: services.events.clone(),
-                    memory: config.memory,
-                },
-                config.bot,
-            );
-            let web = WebState::<ConfiguredBotRuntime>::new(
-                storage,
-                services.media_store,
-                llms,
-                services.events,
-                services.web,
-            );
-
-            // `runtime.rs` owns the select loop that runs bot and web tasks,
-            // fans out cancellation, drains in-flight bot work, and joins both
-            // services before returning.
-            run_runtime_services(bot, platform_events, web, listen).await
-        }
+        Command::Migrate => migrate_storage(&config).await,
+        Command::Serve => serve(config, source).await,
     }
+}
+
+async fn migrate_storage(config: &RuntimeConfig) -> Result<(), BinError> {
+    // Migrations need only a usable database URL. They do not require provider
+    // credentials, platform tokens, or agent references to be runnable.
+    config.validate_database()?;
+    let storage = SqlxStorage::connect(&config.database.url).await?;
+    storage.run_migrations().await?;
+    tracing::info!("migrations applied");
+    Ok(())
+}
+
+async fn serve(
+    mut config: RuntimeConfig,
+    source: diagnostics::ConfigSource,
+) -> Result<(), BinError> {
+    use std::net::SocketAddr;
+    use std::str::FromStr;
+
+    // Serve is the full runtime path: validate every static reference before
+    // opening durable connections or spawning long-lived tasks.
+    config.validate_all(&source)?;
+
+    // Storage is shared by the bot and web viewer.
+    let storage = SqlxStorage::connect(&config.database.url).await?;
+
+    // Register the git build once per deployment and expose the monotonic
+    // app-version id to bot replies, traces, and viewer UI.
+    let app_version = storage.register_app_version(VERSION).await?;
+    config.bot.version = format!("v{}", app_version.id);
+    tracing::info!(
+        version_number = app_version.id,
+        git_version = %app_version.git_version,
+        first_seen = %app_version.first_seen_at,
+        "resolved build version"
+    );
+
+    // Build concrete provider/media registries from named config entries. These
+    // are cheap Arc-backed registries until individual requests call a provider.
+    let mut services = BootstrapServices::build(&config)?;
+    services.web.version = format!("{} ({VERSION})", config.bot.version);
+    let storage = storage.with_app_version_id(app_version.id);
+
+    // Platforms connect after validation and storage setup so incoming events
+    // cannot race ahead of a usable runtime.
+    let (platforms, platform_events) =
+        connect_configured_message_platforms(&config.platforms).await?;
+    let listen = SocketAddr::from_str(&config.web.listen)?;
+
+    // The web API also needs the LLM registry for model metadata, so keep a
+    // clone before moving the concrete registries into the bot.
+    let llms = services.llms.clone();
+    let bot = BotRuntime::<ConfiguredBotRuntime>::new(
+        BotRuntimeParts::<ConfiguredBotRuntime> {
+            platforms,
+            storage: storage.clone(),
+            media_store: services.media_store.clone(),
+            llms: services.llms,
+            images: services.images,
+            videos: services.videos,
+            audio: services.audio,
+            events: services.events.clone(),
+            memory: config.memory,
+        },
+        config.bot,
+    );
+    let web = WebState::<ConfiguredBotRuntime>::new(
+        storage,
+        services.media_store,
+        llms,
+        services.events,
+        services.web,
+    );
+
+    // `runtime.rs` owns the select loop that runs bot and web tasks, fans out
+    // cancellation, drains in-flight bot work, and joins both services before
+    // returning.
+    run_runtime_services(bot, platform_events, web, listen).await
 }
 
 /// Emit the common startup record once tracing is installed.

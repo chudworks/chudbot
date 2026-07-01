@@ -563,7 +563,7 @@ pub enum LlmProviderConfig {
         base_url: Option<String>,
         /// Optional per-model text-token pricing overrides.
         #[serde(default)]
-        pricing: BTreeMap<ModelId, chudbot_openai::OpenAiTokenPricing>,
+        pricing: BTreeMap<ModelId, OpenAiTokenPricingConfig>,
         /// Optional per-model metadata fallback.
         #[serde(default)]
         model_info: BTreeMap<ModelId, LlmModelInfoConfig>,
@@ -577,7 +577,7 @@ pub enum LlmProviderConfig {
         base_url: Option<String>,
         /// Optional per-model text-token pricing overrides.
         #[serde(default)]
-        pricing: BTreeMap<ModelId, chudbot_anthropic::AnthropicTokenPricing>,
+        pricing: BTreeMap<ModelId, AnthropicTokenPricingConfig>,
         /// Optional per-model metadata fallback.
         #[serde(default)]
         model_info: BTreeMap<ModelId, LlmModelInfoConfig>,
@@ -613,6 +613,13 @@ impl LlmProviderConfig {
     /// Services use these entries before asking the remote provider, which is
     /// useful for local gateways or models whose context limits are not exposed
     /// by the upstream API.
+    #[cfg(any(
+        feature = "anthropic",
+        feature = "gemini",
+        feature = "openai",
+        feature = "openai-compat",
+        feature = "xai"
+    ))]
     pub(crate) fn model_info(&self) -> &BTreeMap<ModelId, LlmModelInfoConfig> {
         match self {
             Self::Xai { model_info, .. }
@@ -655,7 +662,7 @@ pub enum ImageProviderConfig {
         base_url: Option<String>,
         /// Optional per-model image-token pricing overrides.
         #[serde(default)]
-        pricing: BTreeMap<ModelId, chudbot_openai::OpenAiImagePricing>,
+        pricing: BTreeMap<ModelId, OpenAiImagePricingConfig>,
     },
     /// xAI image generation provider.
     Xai {
@@ -715,6 +722,98 @@ pub enum AudioProviderConfig {
         #[serde(default)]
         base_url: Option<String>,
     },
+}
+
+/// Anthropic text-token pricing config for one model, in USD per 1M tokens.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct AnthropicTokenPricingConfig {
+    /// Uncached input token price in USD per 1M tokens.
+    pub input_usd_per_million_tokens: f64,
+    /// 5-minute cache write token price in USD per 1M tokens.
+    #[serde(default)]
+    pub cache_creation_5m_usd_per_million_tokens: Option<f64>,
+    /// 1-hour cache write token price in USD per 1M tokens.
+    #[serde(default)]
+    pub cache_creation_1h_usd_per_million_tokens: Option<f64>,
+    /// Cache hit/read token price in USD per 1M tokens.
+    #[serde(default)]
+    pub cache_read_usd_per_million_tokens: Option<f64>,
+    /// Output token price in USD per 1M tokens.
+    pub output_usd_per_million_tokens: f64,
+}
+
+#[cfg(feature = "anthropic")]
+impl From<AnthropicTokenPricingConfig> for chudbot_anthropic::AnthropicTokenPricing {
+    fn from(value: AnthropicTokenPricingConfig) -> Self {
+        Self {
+            input_usd_per_million_tokens: value.input_usd_per_million_tokens,
+            cache_creation_5m_usd_per_million_tokens: value
+                .cache_creation_5m_usd_per_million_tokens,
+            cache_creation_1h_usd_per_million_tokens: value
+                .cache_creation_1h_usd_per_million_tokens,
+            cache_read_usd_per_million_tokens: value.cache_read_usd_per_million_tokens,
+            output_usd_per_million_tokens: value.output_usd_per_million_tokens,
+        }
+    }
+}
+
+/// OpenAI text-token pricing config for one model, in USD per 1M tokens.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OpenAiTokenPricingConfig {
+    /// Uncached input token price in USD per 1M tokens.
+    pub input_usd_per_million_tokens: f64,
+    /// Cached input token price in USD per 1M tokens.
+    #[serde(default)]
+    pub cached_input_usd_per_million_tokens: Option<f64>,
+    /// Output token price in USD per 1M tokens.
+    pub output_usd_per_million_tokens: f64,
+}
+
+#[cfg(feature = "openai")]
+impl From<OpenAiTokenPricingConfig> for chudbot_openai::OpenAiTokenPricing {
+    fn from(value: OpenAiTokenPricingConfig) -> Self {
+        Self {
+            input_usd_per_million_tokens: value.input_usd_per_million_tokens,
+            cached_input_usd_per_million_tokens: value.cached_input_usd_per_million_tokens,
+            output_usd_per_million_tokens: value.output_usd_per_million_tokens,
+        }
+    }
+}
+
+/// OpenAI image-token pricing config for one model, in USD per 1M tokens.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct OpenAiImagePricingConfig {
+    /// Text input token price in USD per 1M tokens.
+    pub text_input_usd_per_million_tokens: f64,
+    /// Cached text input token price in USD per 1M tokens.
+    #[serde(default)]
+    pub cached_text_input_usd_per_million_tokens: Option<f64>,
+    /// Image input token price in USD per 1M tokens.
+    pub image_input_usd_per_million_tokens: f64,
+    /// Cached image input token price in USD per 1M tokens.
+    #[serde(default)]
+    pub cached_image_input_usd_per_million_tokens: Option<f64>,
+    /// Image output token price in USD per 1M tokens.
+    pub image_output_usd_per_million_tokens: f64,
+    /// Text output token price in USD per 1M tokens, when the model reports it.
+    #[serde(default)]
+    pub text_output_usd_per_million_tokens: Option<f64>,
+}
+
+#[cfg(feature = "openai")]
+impl From<OpenAiImagePricingConfig> for chudbot_openai::OpenAiImagePricing {
+    fn from(value: OpenAiImagePricingConfig) -> Self {
+        Self {
+            text_input_usd_per_million_tokens: value.text_input_usd_per_million_tokens,
+            cached_text_input_usd_per_million_tokens: value
+                .cached_text_input_usd_per_million_tokens,
+            image_input_usd_per_million_tokens: value.image_input_usd_per_million_tokens,
+            cached_image_input_usd_per_million_tokens: value
+                .cached_image_input_usd_per_million_tokens,
+            image_output_usd_per_million_tokens: value.image_output_usd_per_million_tokens,
+            text_output_usd_per_million_tokens: value.text_output_usd_per_million_tokens,
+        }
+    }
 }
 
 /// Concrete message-platform service config for one entry in `[platforms.<name>]`.

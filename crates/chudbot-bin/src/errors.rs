@@ -26,18 +26,23 @@ pub enum ConfiguredLlmError {
     #[error("provider `{0}` is not available in this runtime")]
     Missing(ProviderName),
     /// Anthropic model metadata or model-step request failed.
+    #[cfg(feature = "anthropic")]
     #[error(transparent)]
     Anthropic(#[from] chudbot_anthropic::AnthropicError),
     /// Gemini model metadata or model-step request failed.
+    #[cfg(feature = "gemini")]
     #[error(transparent)]
     Gemini(#[from] chudbot_gemini::GeminiError),
     /// OpenAI model metadata or model-step request failed.
+    #[cfg(feature = "openai")]
     #[error(transparent)]
     OpenAi(#[from] chudbot_openai::OpenAiError),
     /// OpenAI-compatible model metadata or model-step request failed.
+    #[cfg(feature = "openai-compat")]
     #[error(transparent)]
     OpenAiCompat(#[from] chudbot_openai_compat::OpenAiCompatError),
     /// xAI model metadata or model-step request failed.
+    #[cfg(feature = "xai")]
     #[error(transparent)]
     Xai(#[from] chudbot_xai::XaiError),
 }
@@ -53,12 +58,15 @@ pub enum ConfiguredImageError {
     #[error("image provider `{0}` is not available in this runtime")]
     Missing(ProviderName),
     /// Gemini image generation failed.
+    #[cfg(feature = "gemini")]
     #[error(transparent)]
     Gemini(#[from] chudbot_gemini::GeminiError),
     /// OpenAI image generation failed.
+    #[cfg(feature = "openai")]
     #[error(transparent)]
     OpenAi(#[from] chudbot_openai::OpenAiError),
     /// xAI image generation failed.
+    #[cfg(feature = "xai")]
     #[error(transparent)]
     Xai(#[from] chudbot_xai::XaiError),
 }
@@ -73,9 +81,11 @@ pub enum ConfiguredVideoError {
     #[error("video provider `{0}` is not available in this runtime")]
     Missing(ProviderName),
     /// Gemini video submit, status, or download failed.
+    #[cfg(feature = "gemini")]
     #[error(transparent)]
     Gemini(#[from] chudbot_gemini::GeminiError),
     /// xAI video submit, status, or download failed.
+    #[cfg(feature = "xai")]
     #[error(transparent)]
     Xai(#[from] chudbot_xai::XaiError),
 }
@@ -90,6 +100,7 @@ pub enum ConfiguredAudioError {
     #[error("audio provider `{0}` is not available in this runtime")]
     Missing(ProviderName),
     /// xAI audio transcription failed.
+    #[cfg(feature = "xai")]
     #[error(transparent)]
     Xai(#[from] chudbot_xai::XaiError),
 }
@@ -152,6 +163,15 @@ pub enum BinError {
     /// User-memory runtime config failed validation.
     #[error(transparent)]
     MemoryConfig(#[from] chudbot_bot::memory::MemoryConfigError),
+    /// The selected command or config requires a backend omitted from this build.
+    #[allow(dead_code)]
+    #[error("{component} requires the `{feature}` build feature")]
+    FeatureDisabled {
+        /// Command or config component requiring the feature.
+        component: &'static str,
+        /// Cargo feature that must be enabled.
+        feature: &'static str,
+    },
     /// A spawned long-running service task failed to join cleanly.
     #[error("{task} service task join failed: {source}")]
     TaskJoin {

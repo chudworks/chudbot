@@ -825,6 +825,7 @@ pub(crate) fn validate_runtime_config(
     validate_database(config, source, &mut diagnostics);
     validate_logging(config, source, &mut diagnostics);
     validate_storage(config, source, &mut diagnostics);
+    validate_enabled_features(config, source, &mut diagnostics);
     validate_bot_config(config, source, &mut diagnostics);
     validate_sampling_number_literals(config, source, &mut diagnostics);
     validate_memory_durations(config, source, &mut diagnostics);
@@ -1382,6 +1383,182 @@ fn invalid_storage_string_diagnostic(
         &[key("storage"), key(field)],
         &[key("storage")],
         "empty storage setting",
+    ))
+}
+
+fn validate_enabled_features(
+    config: &RuntimeConfig,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    if matches!(config.storage, StorageConfig::S3(_)) && !cfg!(feature = "s3") {
+        diagnostics.push(disabled_feature_diagnostic(
+            source,
+            "S3 media storage",
+            "s3",
+            &[key("storage"), key("kind")],
+            &[key("storage")],
+        ));
+    }
+
+    for (provider_name, provider) in &config.llm {
+        let provider_path = [key("llm"), key(provider_name.as_str())];
+        match provider {
+            LlmProviderConfig::Anthropic { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "Anthropic LLM provider",
+                provider_name.as_str(),
+                "anthropic",
+                &provider_path,
+            ),
+            LlmProviderConfig::Xai { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "xAI LLM provider",
+                provider_name.as_str(),
+                "xai",
+                &provider_path,
+            ),
+            LlmProviderConfig::OpenAi { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "OpenAI LLM provider",
+                provider_name.as_str(),
+                "openai",
+                &provider_path,
+            ),
+            LlmProviderConfig::OpenAiCompat { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "OpenAI-compatible LLM provider",
+                provider_name.as_str(),
+                "openai-compat",
+                &provider_path,
+            ),
+            LlmProviderConfig::Gemini { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "Gemini LLM provider",
+                provider_name.as_str(),
+                "gemini",
+                &provider_path,
+            ),
+        }
+    }
+
+    for (provider_name, provider) in &config.image {
+        let provider_path = [key("image"), key(provider_name.as_str())];
+        match provider {
+            ImageProviderConfig::OpenAi { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "OpenAI image provider",
+                provider_name.as_str(),
+                "openai",
+                &provider_path,
+            ),
+            ImageProviderConfig::Xai { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "xAI image provider",
+                provider_name.as_str(),
+                "xai",
+                &provider_path,
+            ),
+            ImageProviderConfig::Gemini { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "Gemini image provider",
+                provider_name.as_str(),
+                "gemini",
+                &provider_path,
+            ),
+        }
+    }
+
+    for (provider_name, provider) in &config.video {
+        let provider_path = [key("video"), key(provider_name.as_str())];
+        match provider {
+            VideoProviderConfig::Xai { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "xAI video provider",
+                provider_name.as_str(),
+                "xai",
+                &provider_path,
+            ),
+            VideoProviderConfig::Gemini { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "Gemini video provider",
+                provider_name.as_str(),
+                "gemini",
+                &provider_path,
+            ),
+        }
+    }
+
+    for (provider_name, provider) in &config.audio {
+        let provider_path = [key("audio"), key(provider_name.as_str())];
+        match provider {
+            AudioProviderConfig::Xai { .. } => validate_provider_feature(
+                source,
+                diagnostics,
+                "xAI audio provider",
+                provider_name.as_str(),
+                "xai",
+                &provider_path,
+            ),
+        }
+    }
+}
+
+fn validate_provider_feature(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    component: &'static str,
+    provider_name: &str,
+    feature: &'static str,
+    provider_path: &[PathPart<'_>],
+) {
+    if feature_is_enabled(feature) {
+        return;
+    }
+    diagnostics.push(disabled_feature_diagnostic(
+        source,
+        &format!("{component} `{provider_name}`"),
+        feature,
+        &child_path(provider_path, "kind"),
+        provider_path,
+    ));
+}
+
+fn feature_is_enabled(feature: &str) -> bool {
+    match feature {
+        "anthropic" => cfg!(feature = "anthropic"),
+        "gemini" => cfg!(feature = "gemini"),
+        "openai" => cfg!(feature = "openai"),
+        "openai-compat" => cfg!(feature = "openai-compat"),
+        "s3" => cfg!(feature = "s3"),
+        "xai" => cfg!(feature = "xai"),
+        _ => false,
+    }
+}
+
+fn disabled_feature_diagnostic(
+    source: &ConfigSource,
+    component: &str,
+    feature: &'static str,
+    path: &[PathPart<'_>],
+    fallback_path: &[PathPart<'_>],
+) -> ConfigDiagnostic {
+    ConfigDiagnostic::new(format!(
+        "{component} requires the `{feature}` build feature"
+    ))
+    .with_label(source.primary_label(path, fallback_path, "feature disabled for this build"))
+    .with_help(format!(
+        "rebuild with `--features {feature}` or remove this config entry"
     ))
 }
 

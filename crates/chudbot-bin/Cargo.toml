@@ -12,19 +12,41 @@ path = "src/main.rs"
 [lints]
 workspace = true
 
+[features]
+default = [
+    "anthropic",
+    "openai",
+    "openai-compat",
+    "xai",
+]
+anthropic = ["dep:chudbot-anthropic"]
+full = [
+    "anthropic",
+    "gemini",
+    "openai",
+    "openai-compat",
+    "s3",
+    "xai",
+]
+gemini = ["dep:chudbot-gemini"]
+openai = ["dep:chudbot-openai"]
+openai-compat = ["dep:chudbot-openai-compat"]
+s3 = ["dep:chudbot-asset-s3"]
+xai = ["dep:chudbot-xai"]
+
 [dependencies]
 chudbot-api = { path = "../chudbot-api" }
-chudbot-anthropic = { path = "../chudbot-anthropic" }
+chudbot-anthropic = { path = "../chudbot-anthropic", optional = true }
 chudbot-asset-local = { path = "../chudbot-asset-local" }
-chudbot-asset-s3 = { path = "../chudbot-asset-s3" }
+chudbot-asset-s3 = { path = "../chudbot-asset-s3", optional = true }
 chudbot-bot = { path = "../chudbot-bot" }
 chudbot-discord = { path = "../chudbot-discord" }
-chudbot-gemini = { path = "../chudbot-gemini" }
-chudbot-openai = { path = "../chudbot-openai" }
-chudbot-openai-compat = { path = "../chudbot-openai-compat" }
+chudbot-gemini = { path = "../chudbot-gemini", optional = true }
+chudbot-openai = { path = "../chudbot-openai", optional = true }
+chudbot-openai-compat = { path = "../chudbot-openai-compat", optional = true }
 chudbot-storage-sqlx = { path = "../chudbot-storage-sqlx" }
 chudbot-web = { path = "../chudbot-web" }
-chudbot-xai = { path = "../chudbot-xai" }
+chudbot-xai = { path = "../chudbot-xai", optional = true }
 futures.workspace = true
 moka.workspace = true
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "tls12", "logging", "std"] }
