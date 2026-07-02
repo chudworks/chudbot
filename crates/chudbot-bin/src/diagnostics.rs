@@ -2255,20 +2255,41 @@ fn validate_web(
     source: &ConfigSource,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
-    if let Err(error) = SocketAddr::from_str(&config.web.listen) {
+    let listen_path = [key("web"), key("listen")];
+    let addresses = config.web.listen.addresses();
+    if addresses.is_empty() {
         diagnostics.push(
-            ConfigDiagnostic::new(format!(
-                "invalid web listen address `{}`",
-                config.web.listen
-            ))
-            .with_label(source.primary_label(
-                &[key("web"), key("listen")],
-                &[key("web")],
-                "invalid socket address",
-            ))
-            .with_note(error.to_string())
-            .with_help("use `IP:PORT`, for example `127.0.0.1:1860`"),
+            ConfigDiagnostic::new("web listen address list must not be empty")
+                .with_label(source.primary_label(
+                    &listen_path,
+                    &[key("web")],
+                    "empty listen address list",
+                ))
+                .with_help("omit `listen` to use the default or provide at least one `IP:PORT`"),
         );
+        return;
+    }
+
+    for (address_index, address) in addresses.iter().enumerate() {
+        if let Err(error) = SocketAddr::from_str(address) {
+            let address_path = if config.web.listen.is_multiple() {
+                indexed_path(&listen_path, address_index)
+            } else {
+                listen_path.to_vec()
+            };
+            diagnostics.push(
+                ConfigDiagnostic::new(format!("invalid web listen address `{address}`"))
+                    .with_label(source.primary_label(
+                        &address_path,
+                        &listen_path,
+                        "invalid socket address",
+                    ))
+                    .with_note(error.to_string())
+                    .with_help(
+                        "use `IP:PORT`, for example `127.0.0.1:1860`, or a list of `IP:PORT` strings",
+                    ),
+            );
+        }
     }
 }
 
@@ -2777,6 +2798,72 @@ api_key = "key"
 
         assert!(matches!(config.storage, StorageConfig::Local(_)));
         assert!(rendered.contains("unexpected config key `storage.bucket`"));
+    }
+
+    #[test]
+    fn web_listen_array_reports_invalid_item() {
+        let input = r#"
+[database]
+url = "postgres://localhost/db"
+
+[web]
+listen = ["127.0.0.1:1860", "not-a-socket"]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+
+[bot.agents.default]
+provider = "openai"
+system_prompt = "hi"
+model = { id = "gpt-test" }
+
+[llm.openai]
+kind = "openai"
+api_key = "key"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
+        let report = validate_runtime_config(&config, &source).unwrap_err();
+        let rendered = report.render();
+
+        assert!(rendered.contains("invalid web listen address `not-a-socket`"));
+        assert!(rendered.contains("\"not-a-socket\""));
+    }
+
+    #[test]
+    fn web_listen_array_must_not_be_empty() {
+        let input = r#"
+[database]
+url = "postgres://localhost/db"
+
+[web]
+listen = []
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+
+[bot.agents.default]
+provider = "openai"
+system_prompt = "hi"
+model = { id = "gpt-test" }
+
+[llm.openai]
+kind = "openai"
+api_key = "key"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
+        let report = validate_runtime_config(&config, &source).unwrap_err();
+        let rendered = report.render();
+
+        assert!(rendered.contains("web listen address list must not be empty"));
+        assert!(rendered.contains("listen = []"));
     }
 
     #[test]

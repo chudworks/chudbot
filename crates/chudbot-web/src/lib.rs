@@ -346,33 +346,71 @@ impl EventSink for EventBus {
     name = "web.run_until_shutdown",
     skip_all,
     fields(
-        listen = %listen,
+        listen = ?listen,
+        listener_count = listen.len(),
         frontend_dir = %state.config.frontend_dir.display(),
     )
 )]
 pub async fn run_until_shutdown<R, F>(
     state: WebState<R>,
-    listen: SocketAddr,
+    listen: Vec<SocketAddr>,
     shutdown: F,
 ) -> Result<(), WebServerError>
 where
     R: WebRuntimeTypes,
     F: Future<Output = ()> + Send + 'static,
 {
-    let listener = tokio::net::TcpListener::bind(listen).await?;
+    if listen.is_empty() {
+        return Err(WebServerError::NoListeners);
+    }
+
+    let mut listeners = Vec::with_capacity(listen.len());
+    for address in listen {
+        let listener = tokio::net::TcpListener::bind(address)
+            .await
+            .map_err(|source| WebServerError::Bind {
+                listen: address,
+                source,
+            })?;
+        listeners.push((address, listener));
+    }
+
     let shutdown_token = CancellationToken::new();
     let state = state.with_shutdown_token(shutdown_token.clone());
-    tracing::info!("web server listening");
-    axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown.await;
-        shutdown_token.cancel();
-        tracing::info!("web server shutdown requested");
-    })
-    .await?;
+
+    let servers = listeners.into_iter().map(|(listen, listener)| {
+        let state = state.clone();
+        let shutdown_token = shutdown_token.clone();
+        async move {
+            tracing::info!(listen = %listen, "web server listening");
+            axum::serve(
+                listener,
+                router(state).into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                shutdown_token.cancelled().await;
+            })
+            .await
+            .map_err(|source| WebServerError::Serve { listen, source })?;
+            tracing::info!(listen = %listen, "web listener stopped");
+            Ok::<(), WebServerError>(())
+        }
+    });
+    let all_servers = futures::future::try_join_all(servers);
+    tokio::pin!(all_servers);
+
+    tokio::select! {
+        _ = shutdown => {
+            shutdown_token.cancel();
+            tracing::info!("web server shutdown requested");
+            all_servers.await?;
+        }
+        result = &mut all_servers => {
+            shutdown_token.cancel();
+            result?;
+        }
+    }
+
     tracing::info!("web server stopped");
     Ok(())
 }
@@ -421,9 +459,27 @@ where
 /// Web server startup error.
 #[derive(Debug, Error)]
 pub enum WebServerError {
-    /// TCP/server I/O failed.
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    /// No TCP listeners were configured.
+    #[error("no web listen addresses configured")]
+    NoListeners,
+    /// TCP listener bind failed.
+    #[error("failed to bind web listener {listen}: {source}")]
+    Bind {
+        /// Socket address that failed to bind.
+        listen: SocketAddr,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// Axum server I/O failed after binding.
+    #[error("web listener {listen} failed: {source}")]
+    Serve {
+        /// Socket address whose server task failed.
+        listen: SocketAddr,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Debug, Error)]

@@ -191,7 +191,14 @@ async fn serve(
     // cannot race ahead of a usable runtime.
     let (platforms, platform_events) =
         connect_configured_message_platforms(&config.platforms).await?;
-    let listen = SocketAddr::from_str(&config.web.listen)?;
+    let listen = config
+        .web
+        .listen
+        .addresses()
+        .iter()
+        .map(String::as_str)
+        .map(SocketAddr::from_str)
+        .collect::<Result<Vec<_>, _>>()?;
 
     // The web API also needs the LLM registry for model metadata, so keep a
     // clone before moving the concrete registries into the bot.

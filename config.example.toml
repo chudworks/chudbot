@@ -27,7 +27,8 @@ format = "pretty"
 ansi = true
 
 [web]
-# Socket address for the Axum web/API server.
+# Socket address for the Axum web/API server. Use a list to bind multiple
+# sockets, for example ["127.0.0.1:1860", "[::1]:1860"].
 listen = "127.0.0.1:1860"
 # Browser tab title prefix used by the React trace viewer.
 title_prefix = "Chudbot - "

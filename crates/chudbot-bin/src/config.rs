@@ -298,6 +298,30 @@ top_p = 0.950
             "0.950"
         );
     }
+
+    #[test]
+    fn web_listen_accepts_single_string() {
+        let input = r#"
+listen = "127.0.0.1:1860"
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+"#;
+        let config = toml::from_str::<WebRuntimeConfig>(input).unwrap();
+
+        assert_eq!(config.listen.addresses(), ["127.0.0.1:1860"]);
+    }
+
+    #[test]
+    fn web_listen_accepts_string_list() {
+        let input = r#"
+listen = ["127.0.0.1:1860", "[::1]:1860"]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+"#;
+        let config = toml::from_str::<WebRuntimeConfig>(input).unwrap();
+
+        assert_eq!(config.listen.addresses(), ["127.0.0.1:1860", "[::1]:1860"]);
+    }
 }
 
 /// Postgres database connection settings.
@@ -314,9 +338,9 @@ pub struct DatabaseConfig {
 /// and `[bot].web_base_url` are available.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebRuntimeConfig {
-    /// Socket address to listen on.
+    /// Socket address or addresses to listen on.
     #[serde(default = "default_listen")]
-    pub listen: String,
+    pub listen: WebListenConfig,
     /// Browser tab title prefix.
     pub title_prefix: String,
     /// Directory containing the built frontend bundle.
@@ -357,8 +381,31 @@ impl WebRuntimeConfig {
     }
 }
 
-fn default_listen() -> String {
-    "127.0.0.1:1860".to_string()
+/// TOML shape for `[web].listen`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum WebListenConfig {
+    /// Backward-compatible single socket address.
+    Single(String),
+    /// Multiple socket addresses.
+    Multiple(Vec<String>),
+}
+
+impl WebListenConfig {
+    pub(crate) fn addresses(&self) -> &[String] {
+        match self {
+            Self::Single(address) => std::slice::from_ref(address),
+            Self::Multiple(addresses) => addresses.as_slice(),
+        }
+    }
+
+    pub(crate) fn is_multiple(&self) -> bool {
+        matches!(self, Self::Multiple(_))
+    }
+}
+
+fn default_listen() -> WebListenConfig {
+    WebListenConfig::Single("127.0.0.1:1860".to_string())
 }
 
 fn default_trust_forwarded_for() -> bool {

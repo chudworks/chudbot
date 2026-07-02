@@ -21,7 +21,7 @@ pub async fn run_runtime_services<R>(
     > + Send
     + 'static,
     web: WebState<R>,
-    listen: SocketAddr,
+    listen: Vec<SocketAddr>,
 ) -> Result<(), BinError>
 where
     R: BotRuntimeTypes + WebRuntimeTypes + 'static,
