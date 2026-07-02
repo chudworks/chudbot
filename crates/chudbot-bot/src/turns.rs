@@ -864,48 +864,54 @@ where
         let events = agent.run(transcript);
         let run = tokio::select! {
             biased;
+            // Admin stop requests cancel the in-flight provider stream and mark
+            // this turn terminal without posting a model reply.
             () = cancel_token.cancelled() => {
                 tracing::info!("turn cancelled before agent completed");
-                None
-            }
-            run = collect_agent_run(events) => Some(run),
-        };
-        typing.stop().await;
-        let Some(run) = run else {
-            self.storage
-                .finish_turn(FinishTurn::Cancelled {
+                typing.stop().await;
+                self.storage
+                    .finish_turn(FinishTurn::Cancelled {
+                        turn_id: execution.turn.id,
+                        reason: "cancelled by admin stop reaction".to_string(),
+                        usage: execution.usage_with_preflight(Vec::new()),
+                    })
+                    .await
+                    .map_err(storage_error)?;
+                self.publish_conversation(
+                    execution.conversation.id,
+                    ConversationEventKind::TurnUpdated,
+                );
+                return Ok(BotAction::CancelledTurn {
+                    conversation_id: execution.conversation.id,
                     turn_id: execution.turn.id,
-                    reason: "cancelled by admin stop reaction".to_string(),
-                    usage: execution.usage_with_preflight(Vec::new()),
-                })
-                .await
-                .map_err(storage_error)?;
-            self.publish_conversation(
-                execution.conversation.id,
-                ConversationEventKind::TurnUpdated,
-            );
-            return Ok(BotAction::CancelledTurn {
-                conversation_id: execution.conversation.id,
-                turn_id: execution.turn.id,
-            });
-        };
-        // Provider errors before an `AgentRun` still need a terminal storage
-        // state so retry controls and the trace viewer remain consistent.
-        let run = match run {
-            Ok(run) => run,
-            Err(error) => {
-                tracing::warn!(error = %error, "agent failed before producing run output");
-                let message = error.to_string();
-                if error_indicates_safety_refusal(&message) {
-                    return self
-                        .refuse_turn(&execution, "refused by upstream safety")
-                        .await;
+                });
+            }
+            // Normal provider completion yields the collected run; setup or
+            // stream errors before that run still need terminal turn storage.
+            run = collect_agent_run(events) => {
+                typing.stop().await;
+                // Provider errors before an `AgentRun` still need a terminal
+                // storage state so retry controls and the trace viewer remain
+                // consistent.
+                match run {
+                    Ok(run) => run,
+                    Err(error) => {
+                        tracing::warn!(error = %error, "agent failed before producing run output");
+                        let message = error.to_string();
+                        if error_indicates_safety_refusal(&message) {
+                            return self
+                                .refuse_turn(&execution, "refused by upstream safety")
+                                .await;
+                        }
+                        return self
+                            .fail_turn(&execution, format!("model failed: {message}"))
+                            .await;
+                    }
                 }
-                return self
-                    .fail_turn(&execution, format!("model failed: {message}"))
-                    .await;
             }
         };
+        // The turn is no longer cancellable through the admin stop registry
+        // once the provider run has finished and outcome handling is local.
         drop(cancel_guard);
         tracing::debug!(
             outcome = run.outcome.kind(),
@@ -975,15 +981,42 @@ where
                 let text = append_generated_media_public_urls(text, &generated_media.public_urls);
                 let content = self.format_reply(&text, execution.is_new, execution.conversation.id);
                 let rendered_lines = rendered_line_count(&content);
-                let open_thread = should_thread(
+                let mut attempted_title_generation = false;
+                let open_thread = if should_thread(
                     execution.is_new,
                     &content,
                     self.config.thread_threshold_chars,
                     self.config.thread_threshold_lines,
-                )
-                .then(|| ThreadRequest {
-                    title: thread_title(&execution),
-                });
+                ) {
+                    attempted_title_generation = true;
+                    // Generate the conversation title now so Discord can use
+                    // the AI title when opening the thread. This also suppresses
+                    // the later background title job for this first turn.
+                    let title = match self
+                        .generate_title(
+                            execution.conversation.id,
+                            &execution.agent_name,
+                            Some(TitleGenerationInput {
+                                user_content: execution.turn.user_content.clone(),
+                                assistant_content: content.clone(),
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(Some(title)) => title,
+                        Ok(None) => thread_title(&execution),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "failed to generate title for new platform thread"
+                            );
+                            thread_title(&execution)
+                        }
+                    };
+                    Some(ThreadRequest { title })
+                } else {
+                    None
+                };
                 let posted = self
                     .platforms
                     .send_message(SendMessage {
@@ -1054,7 +1087,10 @@ where
                     execution.conversation.id,
                     ConversationEventKind::TurnUpdated,
                 );
-                if execution.turn.ordinal == 0 && execution.conversation.title.is_none() {
+                if execution.turn.ordinal == 0
+                    && execution.conversation.title.is_none()
+                    && !attempted_title_generation
+                {
                     self.spawn_title_generation(
                         execution.conversation.id,
                         execution.agent_name.clone(),

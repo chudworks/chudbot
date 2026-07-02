@@ -1,13 +1,28 @@
 //! Conversation-title system-agent resolution and execution.
 //!
-//! Titles are generated after the first completed user-visible turn, but the
-//! title model call is kept out of that turn's reply path. The background job
-//! reloads the stored conversation, builds a tiny one-turn transcript from the
-//! first completed exchange, and stores a cleaned display title for the trace
-//! viewer.
+//! The first long platform reply may synchronously generate a title for its
+//! thread name; otherwise a background job reloads the first completed exchange
+//! and stores a cleaned display title for the trace viewer.
 
 use crate::prelude::*;
 use crate::*;
+
+/// Conversation excerpt supplied by a caller that has the first exchange in
+/// memory before it has been persisted as a completed turn.
+#[derive(Debug, Clone)]
+pub(crate) struct TitleGenerationInput {
+    pub(crate) user_content: String,
+    pub(crate) assistant_content: String,
+}
+
+impl TitleGenerationInput {
+    fn prompt(self) -> String {
+        format!(
+            "User said:\n{}\n\nAssistant replied:\n{}",
+            self.user_content, self.assistant_content
+        )
+    }
+}
 
 /// Startup-cached resolver for the reserved conversation-title agent.
 ///
@@ -137,7 +152,10 @@ where
     ) {
         let runtime = (*self).clone();
         spawn_background_task(&self.background, "title generation", async move {
-            if let Err(error) = runtime.generate_title(conversation_id, &agent_name).await {
+            if let Err(error) = runtime
+                .generate_title(conversation_id, &agent_name, None)
+                .await
+            {
                 tracing::warn!(
                     conversation = %conversation_id,
                     agent = %agent_name,
@@ -150,16 +168,18 @@ where
 
     /// Generate and persist a title when the stored conversation is still untitled.
     ///
-    /// The model sees only a synthetic user turn containing the first completed
-    /// user message and stored assistant reply. It does not see the full stored
-    /// trace, prior platform history, or any live client tools, and its run is
-    /// not appended as another conversation turn. The trace viewer learns about
-    /// the result only through the stored title and a `TitleUpdated` event.
+    /// The model sees only a synthetic user turn containing the first exchange:
+    /// either the caller-provided first reply or the first completed turn
+    /// loaded from storage. It does not see the full stored trace, prior
+    /// platform history, or any live client tools, and its run is not appended
+    /// as another conversation turn. The trace viewer learns about the result
+    /// only through the stored title and a `TitleUpdated` event.
     pub(crate) async fn generate_title(
         &self,
         conversation_id: ConversationId,
         agent_name: &str,
-    ) -> Result<(), BotError> {
+        input: Option<TitleGenerationInput>,
+    ) -> Result<Option<String>, BotError> {
         let Some(snapshot) = self
             .storage
             .load_conversation(ConversationLookup::Id {
@@ -172,30 +192,33 @@ where
         };
         // Re-check after loading; background jobs can race with another title
         // writer or with a manually titled conversation.
-        if snapshot.conversation.title.is_some() {
+        if let Some(title) = snapshot.conversation.title.clone() {
             tracing::debug!("conversation title already exists; skipping");
-            return Ok(());
+            return Ok(Some(title));
         }
-        let Some(first) = snapshot
-            .turns
-            .iter()
-            .find(|turn| matches!(turn.turn.status, chudbot_api::TurnStatus::Completed))
-        else {
-            tracing::debug!("no completed turns available for title generation");
-            return Ok(());
-        };
+        let title_input =
+            match input {
+                Some(input) => input,
+                None => {
+                    let Some(first) = snapshot.turns.iter().find(|turn| {
+                        matches!(turn.turn.status, chudbot_api::TurnStatus::Completed)
+                    }) else {
+                        tracing::debug!("no completed turns available for title generation");
+                        return Ok(None);
+                    };
+                    TitleGenerationInput {
+                        user_content: first.turn.user_content.clone(),
+                        assistant_content: first.turn.assistant_content.clone().unwrap_or_default(),
+                    }
+                }
+            };
         let agent =
             self.conversation_title_agent(agent_name, &snapshot.conversation.channel.platform)?;
-        // Use the stored assistant text, not the raw model answer. On the first
-        // reply this can include the Discord full-trace footer, so the title
-        // prompt must be strong enough to ignore reply chrome.
-        let user_text = format!(
-            "User said:\n{}\n\nAssistant replied:\n{}",
-            first.turn.user_content,
-            first.turn.assistant_content.as_deref().unwrap_or("")
-        );
         let mut transcript = Transcript::new();
-        transcript.push(TranscriptTurn::text(TurnRole::User, user_text));
+        // Use the platform-ready assistant text, not the raw model answer. On
+        // the first reply this can include the Discord full-trace footer, so
+        // the title prompt must be strong enough to ignore reply chrome.
+        transcript.push(TranscriptTurn::text(TurnRole::User, title_input.prompt()));
         let agent_runtime = self.system_agent(agent);
         let run = collect_agent_run(agent_runtime.run(transcript))
             .await
@@ -229,7 +252,7 @@ where
         if title.is_empty() {
             // Empty titles are a model-quality issue, not a conversation failure.
             tracing::warn!(raw = %raw, "title generation returned empty title");
-            return Ok(());
+            return Ok(None);
         }
         self.storage
             .set_conversation_title(conversation_id, title.clone())
@@ -237,7 +260,7 @@ where
             .map_err(storage_error)?;
         self.publish_conversation(conversation_id, ConversationEventKind::TitleUpdated);
         tracing::info!(title = %title, "conversation title set");
-        Ok(())
+        Ok(Some(title))
     }
 
     /// Resolve the cached title-agent config for the active conversation.
