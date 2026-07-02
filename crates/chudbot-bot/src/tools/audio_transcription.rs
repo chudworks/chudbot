@@ -134,8 +134,9 @@ where
 /// `audio_uri` is the primary input field and `audio` is an alias. The selected
 /// value is resolved as stored audio through `MediaStore`; this is the trust
 /// boundary that rejects unsupported categories and invalid stored-media
-/// references before any provider request is built. Optional language,
-/// keyterms, and model fields are validated with the shared tool helpers.
+/// references before any provider request is built. Optional language and
+/// keyterms fields are validated with the shared tool helpers; the transcription
+/// model always comes from the operator-configured binding.
 pub(crate) async fn audio_transcription_request_from_tool_input<M>(
     media_store: &M,
     input: serde_json::Value,
@@ -164,7 +165,9 @@ where
         audio,
         language: tool_optional_string(&input, "language")?,
         keyterms,
-        model: tool_optional_string(&input, "model")?.map(ModelId::new),
+        // The configured binding owns model selection; a model-supplied id
+        // would override the operator's choice with an unvalidated string.
+        model: None,
     })
 }
 
@@ -208,11 +211,6 @@ pub(crate) fn audio_transcription_tool_schema() -> ToolInputSchema {
             "keyterms",
             ToolInputValueSchema::array(ToolInputValueSchema::string())
                 .description("Optional key terms to bias transcription toward."),
-        ),
-        ToolInputField::optional(
-            "model",
-            ToolInputValueSchema::string()
-                .description("Optional provider-specific transcription model id."),
         ),
     ])
 }

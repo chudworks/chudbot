@@ -109,6 +109,30 @@ pub(crate) fn tool_optional_string(
         .ok_or_else(|| BotToolError::InvalidInput(format!("`{field}` must be a string")))
 }
 
+/// Read an optional string field constrained to configured allowed values.
+///
+/// An empty `allowed` list keeps the field free-form for bindings whose
+/// accepted values are not configured. Matching is exact (case-sensitive)
+/// because providers treat these strings as opaque identifiers; the error
+/// lists the allowed values so the model can self-correct on the next step.
+pub(crate) fn tool_optional_string_enum(
+    input: &serde_json::Value,
+    field: &str,
+    allowed: &[String],
+) -> Result<Option<String>, BotToolError> {
+    let value = tool_optional_string(input, field)?;
+    if let Some(value) = &value
+        && !allowed.is_empty()
+        && !allowed.iter().any(|candidate| candidate == value)
+    {
+        return Err(BotToolError::InvalidInput(format!(
+            "`{field}` `{value}` is not supported by the configured provider; allowed values: {}",
+            allowed.join(", ")
+        )));
+    }
+    Ok(value)
+}
+
 /// Read an optional string-or-string-array field from tool input.
 ///
 /// Several model-facing schemas accept both a scalar convenience form and an

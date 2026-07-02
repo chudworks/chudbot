@@ -111,7 +111,7 @@ memory = true
 
 [bot.agents.memory_diary]
 provider = "grok"
-system_prompt = "..."
+instructions = "..."
 
 [bot.agents.memory_diary.model]
 id = "grok-4.3"
@@ -121,7 +121,7 @@ max_output_tokens = 1024
 
 [bot.agents.memory_compact]
 provider = "grok"
-system_prompt = "..."
+instructions = "..."
 
 [bot.agents.memory_compact.model]
 id = "grok-4.3"
@@ -451,10 +451,10 @@ separate `ContextItem` containing the compact memory document.
 
 ## Discord-Facing Prompt Guidance
 
-Memory should change the Discord-facing agent's composed system prompt when
+Memory should change the Discord-facing agent's composed instructions when
 global memory is enabled and the selected agent has `memory = true`.
 
-Update `compose_system_prompt` in `chudbot-bot` so the capabilities section says
+Update `compose_agent_instruction_parts` in `chudbot-bot` so the capabilities section says
 that user memory is available. Add a dedicated operational section before the
 agent's configured prompt, for example:
 
@@ -493,7 +493,7 @@ Memory behavior:
 ```
 
 Keep this text in bot-owned code, near the memory module, so the behavior of the
-tools and the instructions evolve together. `compose_system_prompt` should call a
+tools and the instructions evolve together. `compose_agent_instruction_parts` should call a
 small helper such as `memory::prompt_guidance()` instead of embedding a large
 string directly in the already-large `lib.rs`.
 

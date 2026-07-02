@@ -18,7 +18,6 @@ export interface Conversation {
   initial_model: string;
   agent_name: string;
   provider: string;
-  system_instructions: string;
   title: string | null;
   stopped_at: string | null;
   stopped_by: UserRef | null;
@@ -26,12 +25,35 @@ export interface Conversation {
 
 export interface TurnView {
   turn: Turn;
-  system_instructions: string | null;
+  agent_instructions: AgentInstructionSnapshot | null;
   context: ContextItem[];
   tool_trace: ToolTrace[];
   replay_assets: TurnAsset[];
   usage: UsageRecord[];
   reasoning: TurnReasoning;
+}
+
+export type AgentInstructionSnapshot =
+  | { kind: 'legacy_text'; text: string }
+  | { kind: 'parts'; parts: AgentInstructionPartSnapshot[] };
+
+export interface AgentInstructionPartSnapshot {
+  key: string;
+  ordinal: number;
+  text: string;
+}
+
+export function agentInstructionText(instructions: AgentInstructionSnapshot | null): string | null {
+  if (!instructions) {
+    return null;
+  }
+  if (instructions.kind === 'legacy_text') {
+    return instructions.text;
+  }
+  return instructions.parts
+    .filter((part) => part.text.length > 0)
+    .map((part) => part.text)
+    .join('');
 }
 
 export interface Turn {

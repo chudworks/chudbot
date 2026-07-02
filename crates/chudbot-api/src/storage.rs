@@ -98,11 +98,6 @@ pub struct Conversation {
     pub agent_name: String,
     /// Provider selected when this conversation was opened.
     pub provider: ProviderName,
-    /// Frozen system/developer instructions for this conversation.
-    ///
-    /// Existing conversations always load this from storage. Static app config
-    /// changes only affect conversations opened after the change.
-    pub system_instructions: String,
     /// Optional title.
     pub title: Option<String>,
     /// Stop timestamp.
@@ -121,8 +116,14 @@ pub struct Conversation {
 pub struct TurnSnapshot {
     /// Turn metadata.
     pub turn: Turn,
-    /// System/developer instructions used for this attempt/turn.
-    pub system_instructions: Option<String>,
+    /// Effective agent instructions used for this attempt/turn.
+    ///
+    /// Storage derives this by walking backward through the conversation's
+    /// saved input transcript and finding the latest marked agent-instructions
+    /// system turn. Missing values are possible for corrupt attempts and let
+    /// retry callers defensively recompose current instructions.
+    #[serde(default)]
+    pub agent_instructions: Option<AgentInstructionSnapshot>,
     /// Novel context items captured for this turn.
     pub context: Vec<ContextItem>,
     /// Tool/server/grounding trace events.
@@ -134,6 +135,63 @@ pub struct TurnSnapshot {
     pub replay_assets: Vec<TurnAsset>,
     /// Usage/cost accumulated by this turn.
     pub usage: Vec<UsageRecord>,
+}
+
+/// Effective agent instructions at a turn boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AgentInstructionSnapshot {
+    /// Legacy monolithic prompt text from pre-partitioned history.
+    LegacyText {
+        /// Full prompt text.
+        text: String,
+    },
+    /// Modern labeled prompt parts.
+    Parts {
+        /// Prompt parts in assembly order.
+        parts: Vec<AgentInstructionPartSnapshot>,
+    },
+}
+
+impl AgentInstructionSnapshot {
+    /// Return display text matching the provider-visible joined instructions.
+    pub fn display_text(&self) -> String {
+        match self {
+            Self::LegacyText { text } => text.clone(),
+            Self::Parts { parts } => parts
+                .iter()
+                .filter(|part| !part.text.is_empty())
+                .map(|part| part.text.as_str())
+                .collect(),
+        }
+    }
+
+    /// Return labeled parts when this snapshot is modern.
+    pub fn parts(&self) -> Option<&[AgentInstructionPartSnapshot]> {
+        match self {
+            Self::Parts { parts } => Some(parts),
+            Self::LegacyText { .. } => None,
+        }
+    }
+
+    /// Return legacy text when this snapshot came from monolithic history.
+    pub fn legacy_text(&self) -> Option<&str> {
+        match self {
+            Self::LegacyText { text } => Some(text),
+            Self::Parts { .. } => None,
+        }
+    }
+}
+
+/// One effective labeled agent-instruction part at a turn boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInstructionPartSnapshot {
+    /// Stable part key, such as `operational_context` or `persona`.
+    pub key: String,
+    /// Stable assembly order for the part.
+    pub ordinal: i32,
+    /// Current text for this part. Empty text clears an inherited part.
+    pub text: String,
 }
 
 /// Provider model-step trace for replay and audit.
@@ -312,8 +370,6 @@ pub struct OpenConversation {
     pub agent_name: String,
     /// Provider.
     pub provider: ProviderName,
-    /// Frozen conversation instructions.
-    pub system_instructions: String,
     /// Optional title.
     pub title: Option<String>,
 }
@@ -342,9 +398,8 @@ pub struct BeginTurn {
 /// Save the prompt/context metadata for a turn before the model runs.
 ///
 /// This call marks the boundary between runtime prompt assembly and provider
-/// execution. Implementations may persist both normalized context rows and the
-/// optional transcript snapshot, but callers must not assume every backend
-/// stores the transcript verbatim.
+/// execution. The transcript is required because it is the authoritative record
+/// of the exact model input, including the marked system-instructions turn.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SaveTurnInput {
     /// Turn id.
@@ -355,17 +410,14 @@ pub struct SaveTurnInput {
     pub provider: ProviderName,
     /// Model.
     pub model: ModelId,
-    /// System/developer instructions.
-    pub system_instructions: String,
     /// Context items.
     pub context: Vec<ContextItem>,
     /// Initial transcript assembled from the context.
     ///
     /// This is skipped during serialization because it is a runtime convenience,
-    /// not part of the portable storage DTO. Some stores persist only the
-    /// normalized context rows above.
+    /// not part of the portable storage DTO.
     #[serde(skip)]
-    pub transcript: Option<Transcript>,
+    pub transcript: Transcript,
 }
 
 /// Terminal update for a turn.
@@ -1078,8 +1130,8 @@ pub trait BotStorage: Send + Sync {
         input: BeginTurn,
     ) -> impl Future<Output = Result<Turn, Self::Error>> + Send;
 
-    /// Persist the turn's resolved agent, system prompt, and model-facing
-    /// context before the agent runs.
+    /// Persist the turn's resolved agent, model-facing context, and exact input
+    /// transcript before the agent runs.
     fn save_turn_input(
         &self,
         input: SaveTurnInput,

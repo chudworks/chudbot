@@ -386,7 +386,7 @@ mod tests {
     fn test_agent_config(provider: &str, model: &str) -> AgentConfig {
         AgentConfig {
             provider: ProviderName::new(provider),
-            system_prompt: "configured prompt".to_string(),
+            instructions: "configured prompt".to_string(),
             model: ModelSpec {
                 id: ModelId::new(model),
                 server_tools: BTreeSet::new(),

@@ -72,13 +72,44 @@ fn generated_tool_schemas_advertise_canonical_input_fields() {
     assert!(audio["properties"].get("audio").is_none());
     assert!(audio["properties"].get("keyterm").is_none());
 
-    let image = image_tool_schema().json_schema();
+    let image = image_tool_schema(&[]).json_schema();
     assert!(image["properties"].get("reference_images").is_some());
     assert!(image["properties"].get("references").is_none());
+    // Model selection is operator-owned; the schema must not offer it.
+    assert!(image["properties"].get("model").is_none());
+    assert!(image["properties"]["aspect_ratio"].get("enum").is_none());
 
-    let video = video_tool_schema().json_schema();
+    let ratios = vec!["1:1".to_string(), "16:9".to_string()];
+    let image = image_tool_schema(&ratios).json_schema();
+    assert_eq!(
+        image["properties"]["aspect_ratio"]["enum"],
+        json!(["1:1", "16:9"])
+    );
+
+    let video = video_tool_schema(&test_generation_binding()).json_schema();
     assert!(video["properties"].get("image").is_some());
     assert!(video["properties"].get("image_url").is_none());
+    assert!(video["properties"].get("model").is_none());
+    assert_eq!(
+        video["properties"]["aspect_ratio"]["enum"],
+        json!(["16:9", "9:16"])
+    );
+    assert_eq!(
+        video["properties"]["resolution"]["enum"],
+        json!(["480p", "720p"])
+    );
+}
+
+// Shared binding fixture for schema and parser tests that need configured
+// aspect-ratio/resolution allowlists.
+fn test_generation_binding() -> GenerationBinding {
+    GenerationBinding {
+        provider: ProviderName::new("grok_video"),
+        model: ModelId::new("grok-video-test"),
+        aspect_ratios: vec!["16:9".to_string(), "9:16".to_string()],
+        resolutions: vec!["480p".to_string(), "720p".to_string()],
+        rate_limit: None,
+    }
 }
 
 #[test]
@@ -400,11 +431,66 @@ async fn image_generation_rejects_more_than_three_reference_images() {
                 "https://example.com/4.png"
             ]
         }),
+        &[],
     )
     .await
     .unwrap_err();
 
     assert!(matches!(error, BotToolError::InvalidInput(message) if message.contains("at most 3")));
+}
+
+#[tokio::test]
+async fn media_generation_parsers_enforce_allowlists_and_ignore_model_overrides() {
+    let ratios = vec!["1:1".to_string(), "16:9".to_string()];
+    let error = image_request_from_tool_input(
+        &NoopMediaStore,
+        json!({ "prompt": "draw this", "aspect_ratio": "21:9" }),
+        &ratios,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, BotToolError::InvalidInput(message) if message.contains("allowed values: 1:1, 16:9"))
+    );
+
+    // A model-supplied model id must not override the configured binding.
+    let request = image_request_from_tool_input(
+        &NoopMediaStore,
+        json!({ "prompt": "draw this", "aspect_ratio": "16:9", "model": "grok-2-image" }),
+        &ratios,
+    )
+    .await
+    .expect("valid image input parses");
+    assert_eq!(request.aspect_ratio.as_deref(), Some("16:9"));
+    assert!(request.model.is_none());
+
+    let binding = test_generation_binding();
+    let error = video_request_from_tool_input(
+        &NoopMediaStore,
+        json!({ "prompt": "animate this", "resolution": "1080p" }),
+        &binding,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, BotToolError::InvalidInput(message) if message.contains("allowed values: 480p, 720p"))
+    );
+
+    let request = video_request_from_tool_input(
+        &NoopMediaStore,
+        json!({
+            "prompt": "animate this",
+            "aspect_ratio": "9:16",
+            "resolution": "720p",
+            "model": "sora-2"
+        }),
+        &binding,
+    )
+    .await
+    .expect("valid video input parses");
+    assert_eq!(request.aspect_ratio.as_deref(), Some("9:16"));
+    assert_eq!(request.resolution.as_deref(), Some("720p"));
+    assert!(request.model.is_none());
 }
 
 #[tokio::test]
@@ -775,6 +861,8 @@ fn video_rate_limit_tool<G>(
         binding: GenerationBinding {
             provider: ProviderName::new("grok_video"),
             model: ModelId::new("grok-video-test"),
+            aspect_ratios: Vec::new(),
+            resolutions: Vec::new(),
             rate_limit,
         },
         poll_interval: DEFAULT_VIDEO_POLL_INTERVAL,
@@ -911,6 +999,8 @@ fn rejects_invalid_video_rate_limit_config() {
     let binding = GenerationBinding {
         provider: ProviderName::new("grok_video"),
         model: ModelId::new("grok-imagine-video"),
+        aspect_ratios: Vec::new(),
+        resolutions: Vec::new(),
         rate_limit: Some(VideoGenerationRateLimit {
             limit: 0,
             interval: "4h".to_string(),
@@ -939,7 +1029,7 @@ fn test_model_spec(model: &str) -> ModelSpec {
 fn test_agent_config(provider: &str, model: &str) -> AgentConfig {
     AgentConfig {
         provider: ProviderName::new(provider),
-        system_prompt: "test prompt".to_string(),
+        instructions: "test prompt".to_string(),
         model: test_model_spec(model),
         server_tools: None,
         client_tools: None,
@@ -964,7 +1054,7 @@ fn test_bot_config() -> BotConfig {
         agents,
         admins: Vec::new(),
         platforms: BTreeMap::new(),
-        extra_system_prompt: None,
+        extra_agent_instructions: None,
         version: String::new(),
         limits: AgentLimits::default(),
         thread_threshold_chars: DEFAULT_THREAD_THRESHOLD_CHARS,
@@ -1112,7 +1202,7 @@ async fn subagent_exposes_spec_and_executes_nested_agent() {
     };
     let agent = Agent::new(
         test_llm_model(backend),
-        AgentSpec::new("expert"),
+        AgentSpec::from_legacy_prompt_text("expert"),
         NoClientTools,
     );
 
@@ -1142,10 +1232,13 @@ async fn subagent_exposes_spec_and_executes_nested_agent() {
 
     let inputs = requests.lock().unwrap();
     assert_eq!(inputs.len(), 1);
-    assert_eq!(inputs[0].transcript.instructions.as_deref(), Some("expert"));
-    assert_eq!(inputs[0].transcript.turns.len(), 1);
+    assert_eq!(
+        inputs[0].transcript.leading_system_text().as_deref(),
+        Some("expert")
+    );
+    assert_eq!(inputs[0].transcript.turns.len(), 2);
     assert_text_block(
-        &inputs[0].transcript.turns[0],
+        &inputs[0].transcript.turns[1],
         TurnRole::User,
         "Which total-market ETF is best?",
     );
@@ -1166,7 +1259,7 @@ async fn subagent_ignores_registration_name() {
     };
     let agent = Agent::new(
         test_llm_model(backend),
-        AgentSpec::new("expert"),
+        AgentSpec::from_legacy_prompt_text("expert"),
         NoClientTools,
     );
     let subagent = Subagent::new("Ask the OpenAI expert.", agent);
@@ -1353,7 +1446,7 @@ fn linked_assistant_message_replays_only_for_same_conversation() {
 }
 
 #[test]
-fn replayable_context_items_drop_memory_context() {
+fn noted_memory_user_keys_extract_memory_note_sources() {
     let platform_item = chudbot_api::ContextItem {
         position: 0,
         source: "platform:message:message-1".to_string(),
@@ -1363,17 +1456,289 @@ fn replayable_context_items_drop_memory_context() {
     };
     let memory_item = chudbot_api::ContextItem {
         position: 1,
-        source: "memory:user:user-1".to_string(),
-        role: "user".to_string(),
-        content: "Background memory for the current user.".to_string(),
+        source: "memory:user:123456789012345678".to_string(),
+        role: "system".to_string(),
+        content: "User memory note.".to_string(),
         message: None,
     };
 
-    let replayable = replayable_context_items(&[platform_item.clone(), memory_item]);
+    let noted = noted_memory_user_keys([&platform_item, &memory_item]);
 
-    assert_eq!(replayable.len(), 1);
-    assert_eq!(replayable[0].source, platform_item.source);
-    assert_eq!(replayable[0].content, platform_item.content);
+    assert_eq!(noted.len(), 1);
+    assert!(noted.contains("123456789012345678"));
+}
+
+#[test]
+fn persisted_agent_instructions_lead_saved_transcript() {
+    let mut transcript = Transcript::new();
+    transcript.id = Some("conversation-1".to_string());
+    transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+    transcript.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    assert!(insert_legacy_agent_instruction_change_before_current_turn(
+        &mut transcript,
+        "test prompt",
+        None,
+        TurnId::new(),
+    ));
+
+    assert_eq!(transcript.turns.len(), 3);
+    assert!(chudbot_api::is_agent_instructions_turn(
+        &transcript.turns[0]
+    ));
+    assert_eq!(
+        transcript.leading_system_text().as_deref(),
+        Some("test prompt")
+    );
+    assert_eq!(
+        transcript.turns[0]
+            .metadata
+            .get("id")
+            .and_then(|id| id.as_str()),
+        Some("chudbot_conversation_conversation-1_system")
+    );
+    assert_text_block(&transcript.turns[1], TurnRole::System, "memory note");
+    assert_text_block(&transcript.turns[2], TurnRole::User, "hello");
+}
+
+#[test]
+fn persisted_agent_instructions_are_recorded_only_on_change() {
+    let mut unchanged = Transcript::new();
+    unchanged.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    assert!(!insert_legacy_agent_instruction_change_before_current_turn(
+        &mut unchanged,
+        "test prompt",
+        Some("test prompt"),
+        TurnId::new(),
+    ));
+    assert_eq!(unchanged.turns.len(), 1);
+
+    let mut changed = Transcript::new();
+    changed.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    assert!(insert_legacy_agent_instruction_change_before_current_turn(
+        &mut changed,
+        "new prompt",
+        Some("old prompt"),
+        TurnId::new(),
+    ));
+    assert_eq!(changed.leading_system_text().as_deref(), Some("new prompt"));
+
+    let mut initially_empty = Transcript::new();
+    initially_empty.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    assert!(!insert_legacy_agent_instruction_change_before_current_turn(
+        &mut initially_empty,
+        "",
+        None,
+        TurnId::new(),
+    ));
+    assert_eq!(initially_empty.turns.len(), 1);
+
+    let mut cleared = Transcript::new();
+    cleared.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    assert!(insert_legacy_agent_instruction_change_before_current_turn(
+        &mut cleared,
+        "",
+        Some("old prompt"),
+        TurnId::new(),
+    ));
+    assert!(chudbot_api::is_agent_instructions_turn(&cleared.turns[0]));
+    assert_text_block(&cleared.turns[0], TurnRole::System, "");
+}
+
+#[test]
+fn agent_instruction_part_changes_are_recorded_by_key() {
+    let mut transcript = Transcript::new();
+    transcript.id = Some("conversation-1".to_string());
+    transcript.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    let current_parts = vec![
+        RenderedAgentInstructionPart::new(2, "capabilities", "new capabilities"),
+        RenderedAgentInstructionPart::new(0, "operator_policy", "same policy"),
+        RenderedAgentInstructionPart::new(3, "persona", ""),
+    ];
+    let previous_parts = vec![
+        AgentInstructionPartSnapshot {
+            key: "operator_policy".to_string(),
+            ordinal: 0,
+            text: "same policy".to_string(),
+        },
+        AgentInstructionPartSnapshot {
+            key: "capabilities".to_string(),
+            ordinal: 2,
+            text: "old capabilities".to_string(),
+        },
+        AgentInstructionPartSnapshot {
+            key: "persona".to_string(),
+            ordinal: 3,
+            text: "old persona".to_string(),
+        },
+    ];
+
+    let inserted = insert_agent_instruction_part_changes_before_current_turn(
+        &mut transcript,
+        &current_parts,
+        StoredAgentInstructionState::LabeledParts(&previous_parts),
+        TurnId::new(),
+    );
+
+    assert_eq!(inserted, 2);
+    assert_eq!(transcript.turns.len(), 3);
+    assert_text_block(&transcript.turns[0], TurnRole::System, "new capabilities");
+    assert_eq!(
+        transcript.turns[0]
+            .metadata
+            .get(chudbot_api::AGENT_INSTRUCTIONS_PART_KEY_METADATA_KEY)
+            .and_then(|key| key.as_str()),
+        Some("capabilities")
+    );
+    assert_text_block(&transcript.turns[1], TurnRole::System, "");
+    assert_eq!(
+        transcript.turns[1]
+            .metadata
+            .get(chudbot_api::AGENT_INSTRUCTIONS_PART_KEY_METADATA_KEY)
+            .and_then(|key| key.as_str()),
+        Some("persona")
+    );
+    assert_text_block(&transcript.turns[2], TurnRole::User, "hello");
+}
+
+#[test]
+fn agent_instruction_part_changes_preserve_prior_prompt_prefix() {
+    let current_turn_id = TurnId::new();
+    let mut transcript = Transcript::new();
+    transcript.id = Some("conversation-1".to_string());
+    transcript.push(agent_instruction_part_turn(
+        transcript.id.as_deref(),
+        "operator_policy",
+        0,
+        "old policy".to_string(),
+    ));
+    transcript.push(TranscriptTurn::text(TurnRole::User, "first user"));
+    transcript.push(TranscriptTurn::text(TurnRole::Assistant, "first answer"));
+    let mut current_user = TranscriptTurn::text(TurnRole::User, "current user");
+    current_user.metadata =
+        transcript_message_metadata(turn_transcript_message_id(current_turn_id, "user"));
+    transcript.push(current_user);
+
+    let current_parts = vec![RenderedAgentInstructionPart::new(
+        0,
+        "operator_policy",
+        "new policy",
+    )];
+    let previous_parts = vec![AgentInstructionPartSnapshot {
+        key: "operator_policy".to_string(),
+        ordinal: 0,
+        text: "old policy".to_string(),
+    }];
+
+    let inserted = insert_agent_instruction_part_changes_before_current_turn(
+        &mut transcript,
+        &current_parts,
+        StoredAgentInstructionState::LabeledParts(&previous_parts),
+        current_turn_id,
+    );
+
+    assert_eq!(inserted, 1);
+    assert_text_block(&transcript.turns[0], TurnRole::System, "old policy");
+    assert_text_block(&transcript.turns[1], TurnRole::User, "first user");
+    assert_text_block(&transcript.turns[2], TurnRole::Assistant, "first answer");
+    assert_text_block(&transcript.turns[3], TurnRole::System, "new policy");
+    let expected_update_id =
+        turn_agent_instruction_message_id(current_turn_id, Some("operator_policy"));
+    assert_eq!(
+        transcript.turns[3]
+            .metadata
+            .get("id")
+            .and_then(|id| id.as_str()),
+        Some(expected_update_id.as_str())
+    );
+    assert_text_block(&transcript.turns[4], TurnRole::User, "current user");
+}
+
+// Fixtures for memory-note candidate selection over one platform message.
+fn note_profile(user_id: &str, name: &str, is_bot: bool) -> chudbot_api::UserProfile {
+    chudbot_api::UserProfile {
+        id: UserRef {
+            platform: PlatformName::new("discord"),
+            guild_id: Some(ExternalId::new("guild-1")),
+            user_id: ExternalId::new(user_id),
+        },
+        username: name.to_string(),
+        name: None,
+        display_name: Some(name.to_string()),
+        avatar_url: None,
+        is_bot,
+    }
+}
+
+fn note_message(author: chudbot_api::UserProfile, message_id: &str) -> PlatformMessage {
+    PlatformMessage {
+        id: MessageRef {
+            platform: PlatformName::new("discord"),
+            guild_id: Some(ExternalId::new("guild-1")),
+            channel_id: ExternalId::new("channel-1"),
+            message_id: ExternalId::new(message_id),
+        },
+        author,
+        content: "hello".to_string(),
+        mentions: Vec::new(),
+        mention_profiles: Vec::new(),
+        reference: chudbot_api::PlatformMessageReference::None,
+        attachments: Vec::new(),
+        created_at: OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+#[test]
+fn memory_note_candidates_cover_author_quoted_and_mentions_without_bots() {
+    let quoted = note_message(note_profile("200", "Quoted Quinn", false), "message-0");
+    let mut message = note_message(note_profile("100", "Author Alice", false), "message-1");
+    message.reference = chudbot_api::PlatformMessageReference::Hydrated(Box::new(quoted));
+    let mentioned = note_profile("300", "Mentioned Mia", false);
+    let bot = note_profile("400", "Chudbot", true);
+    // The author mention and an unhydrated mention must not add candidates.
+    message.mentions = vec![
+        mentioned.id.clone(),
+        bot.id.clone(),
+        note_profile("100", "Author Alice", false).id,
+        UserRef {
+            platform: PlatformName::new("discord"),
+            guild_id: Some(ExternalId::new("guild-1")),
+            user_id: ExternalId::new("500"),
+        },
+    ];
+    message.mention_profiles = vec![mentioned, bot];
+
+    let candidates = memory_note_candidates(&message);
+
+    let summary: Vec<(&str, &str)> = candidates
+        .iter()
+        .map(|candidate| (candidate.user.user_id.as_str(), candidate.reason))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("100", "they sent a message in this conversation"),
+            ("200", "their message was quoted"),
+            ("300", "they were mentioned"),
+        ]
+    );
+    assert_eq!(candidates[0].display_name, "Author Alice");
+    assert_eq!(candidates[1].display_name, "Quoted Quinn");
+    assert_eq!(candidates[2].display_name, "Mentioned Mia");
+}
+
+#[test]
+fn memory_note_candidates_skip_bot_authors_and_bot_quotes() {
+    let quoted = note_message(note_profile("200", "Other Bot", true), "message-0");
+    let mut message = note_message(note_profile("100", "Chudbot", true), "message-1");
+    message.reference = chudbot_api::PlatformMessageReference::Hydrated(Box::new(quoted));
+
+    assert!(memory_note_candidates(&message).is_empty());
 }
 
 #[test]
@@ -2173,7 +2538,6 @@ async fn transcript_media_refs_are_sanitized_from_replies() {
     );
     let transcript = Transcript {
         id: None,
-        instructions: None,
         turns: vec![TranscriptTurn {
             role: TurnRole::User,
             blocks: vec![

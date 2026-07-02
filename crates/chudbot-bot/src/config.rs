@@ -42,9 +42,9 @@ pub struct BotConfig {
     #[serde(default)]
     pub platforms: BTreeMap<PlatformName, PlatformBinding>,
     /// Optional operator-wide policy text.
-    #[serde(default)]
-    pub extra_system_prompt: Option<String>,
-    /// Build/version label included in the operational system prompt.
+    #[serde(default, alias = "extra_system_prompt")]
+    pub extra_agent_instructions: Option<String>,
+    /// Build/version label included in the operational instructions.
     #[serde(default)]
     pub version: String,
     /// Default model/tool loop limits for agents that do not override them.
@@ -68,13 +68,14 @@ fn default_thread_threshold_lines() -> usize {
     DEFAULT_THREAD_THRESHOLD_LINES
 }
 
-/// One named agent: prompt, provider/model, tool exposure, and subagents.
+/// One named agent: instructions, provider/model, tool exposure, and subagents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// LLM provider registry key.
     pub provider: ProviderName,
-    /// System prompt / agent instructions.
-    pub system_prompt: String,
+    /// Agent instructions.
+    #[serde(alias = "system_prompt")]
+    pub instructions: String,
     /// Model config used for this agent.
     pub model: ModelSpec,
     /// Optional server-tool restriction for this agent. `None` means all
@@ -103,21 +104,6 @@ pub struct AgentConfig {
     /// Subagents exposed as named client-side tools.
     #[serde(default)]
     pub subagents: BTreeMap<ToolName, SubagentBinding>,
-}
-
-impl AgentConfig {
-    /// Convert this configured agent into the provider-neutral runtime spec.
-    ///
-    /// Provider/model selection stays outside `AgentSpec`; the spec contains the
-    /// instructions, loop limits, and tool exposure that are common to all LLM
-    /// backends.
-    pub(crate) fn agent_spec(&self, default_limits: AgentLimits) -> AgentSpec {
-        let mut spec = AgentSpec::new(self.system_prompt.clone())
-            .with_limits(self.limits.unwrap_or(default_limits));
-        spec.server_tools = self.server_tools.clone();
-        spec.client_tools = self.client_tools.clone();
-        spec
-    }
 }
 
 /// Platform default binding.
@@ -176,10 +162,14 @@ impl SystemAgentConfig {
         agent: &AgentConfig,
         default_limits: AgentLimits,
     ) -> Self {
+        let mut spec = AgentSpec::from_legacy_prompt_text(agent.instructions.clone())
+            .with_limits(agent.limits.unwrap_or(default_limits));
+        spec.server_tools = agent.server_tools.clone();
+        spec.client_tools = agent.client_tools.clone();
         Self {
             name,
             provider: agent.provider.clone(),
-            spec: agent.agent_spec(default_limits),
+            spec,
             model: agent.model.clone(),
         }
     }
@@ -188,14 +178,14 @@ impl SystemAgentConfig {
     pub(crate) fn from_parts(
         name: impl Into<String>,
         provider: ProviderName,
-        system_prompt: impl Into<String>,
+        instructions: impl Into<String>,
         model: ModelSpec,
         limits: AgentLimits,
     ) -> Self {
         Self {
             name: name.into(),
             provider,
-            spec: AgentSpec::new(system_prompt).with_limits(limits),
+            spec: AgentSpec::from_legacy_prompt_text(instructions).with_limits(limits),
             model,
         }
     }
@@ -233,8 +223,8 @@ impl SystemAgentConfig {
             top_p = ?self.model.sampling.top_p,
             image_encoding = ?self.model.image_encoding,
             provider_options = ?self.model.provider_options.as_ref().map(|options| &options.value),
-            system_prompt_chars = self.spec.system_prompt.chars().count(),
-            system_prompt = %self.spec.system_prompt,
+            agent_instruction_chars = agent_spec_instruction_text(&self.spec).chars().count(),
+            agent_instructions = %agent_spec_instruction_text(&self.spec),
             "using default system agent inherited from agent"
         );
     }
@@ -255,11 +245,21 @@ impl SystemAgentConfig {
             top_p = ?self.model.sampling.top_p,
             image_encoding = ?self.model.image_encoding,
             provider_options = ?self.model.provider_options.as_ref().map(|options| &options.value),
-            system_prompt_chars = self.spec.system_prompt.chars().count(),
-            system_prompt = %self.spec.system_prompt,
+            agent_instruction_chars = agent_spec_instruction_text(&self.spec).chars().count(),
+            agent_instructions = %agent_spec_instruction_text(&self.spec),
             "{message}"
         );
     }
+}
+
+fn agent_spec_instruction_text(spec: &AgentSpec) -> String {
+    let mut parts = spec.agent_instruction_parts.clone();
+    parts.sort_by_key(|part| part.ordinal);
+    parts
+        .into_iter()
+        .map(|part| part.text)
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Binding from an agent to a media-generation provider and default model.
@@ -273,6 +273,19 @@ pub struct GenerationBinding {
     pub provider: ProviderName,
     /// Provider-specific image/video model id or tier.
     pub model: ModelId,
+    /// Aspect-ratio values accepted by the configured provider/model.
+    ///
+    /// When non-empty, the model-facing tool schema advertises these as an
+    /// enum and runtime parsing rejects other values, so the model cannot
+    /// invent provider-invalid ratios. Empty keeps the field free-form.
+    #[serde(default)]
+    pub aspect_ratios: Vec<String>,
+    /// Resolution values accepted by the configured video provider/model.
+    ///
+    /// Video-generation bindings only; validation rejects it elsewhere. The
+    /// same enum/free-form behavior as [`Self::aspect_ratios`] applies.
+    #[serde(default)]
+    pub resolutions: Vec<String>,
     /// Optional active-video rate limit for this video-generation binding.
     #[serde(default)]
     pub rate_limit: Option<VideoGenerationRateLimit>,
@@ -536,9 +549,25 @@ pub(crate) fn image_generation_tool_description(
 }
 
 /// Build the model-facing description for an agent's video generation tool.
+///
+/// Like the image description, usage rules live in the tool description
+/// because the model re-reads it on every tool-choice decision.
 pub(crate) fn video_generation_tool_description(binding: &GenerationBinding) -> String {
     let mut description = format!(
-        "Generate a video with the configured `{}` video provider and `{}` model, save it to media storage, and return its media URI.",
+        concat!(
+            "Generate a video with the configured `{}` video provider and `{}` model, ",
+            "save it to media storage, and return its media URI.\n\n",
+            "Use this whenever the user asks for a video, animation, clip, or moving ",
+            "version of something. To animate an existing image, pass its exact ",
+            "`media://images/...` URI (or public https URL) as `image`; user-uploaded ",
+            "images are listed in image attachment reference notes and generated images ",
+            "in prior tool results. Never invent or guess paths.\n\n",
+            "Video generation takes minutes: post a short post_status_message update ",
+            "before calling this tool so the user knows work is underway.\n\n",
+            "Generated media is attached to the final platform reply automatically. ",
+            "Do not paste media URIs, filenames, public URLs, or markdown media links ",
+            "in user-facing text."
+        ),
         binding.provider, binding.model
     );
     if let Some(limit) = &binding.rate_limit {
@@ -581,9 +610,47 @@ pub(crate) fn validate_generation_binding(
             message: "model is empty".to_string(),
         });
     }
-    if let Some(rate_limit) = &binding.rate_limit {
+    // Advertised option lists become model-facing schema enums, so an empty
+    // string entry would advertise an unusable value.
+    if binding
+        .aspect_ratios
+        .iter()
+        .any(|value| value.trim().is_empty())
+    {
+        tracing::warn!(agent = %agent_name, field, "media generation aspect_ratios entry is empty");
+        return Err(BotError::InvalidGenerationBinding {
+            agent: agent_name.to_string(),
+            field,
+            message: "aspect_ratios entries must not be empty".to_string(),
+        });
+    }
+    if !binding.resolutions.is_empty() {
         // Keep the shared config struct narrow at runtime: image bindings can
         // deserialize the field for diagnostics, but validation rejects it.
+        if field != "video_generation" {
+            tracing::warn!(agent = %agent_name, field, "resolutions configured on non-video generation binding");
+            return Err(BotError::InvalidGenerationBinding {
+                agent: agent_name.to_string(),
+                field,
+                message: "resolutions is only supported on video_generation".to_string(),
+            });
+        }
+        if binding
+            .resolutions
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            tracing::warn!(agent = %agent_name, field, "media generation resolutions entry is empty");
+            return Err(BotError::InvalidGenerationBinding {
+                agent: agent_name.to_string(),
+                field,
+                message: "resolutions entries must not be empty".to_string(),
+            });
+        }
+    }
+    if let Some(rate_limit) = &binding.rate_limit {
+        // Same shared-shape rule as `resolutions`: only video bindings may
+        // configure the active-job rate limit.
         if field != "video_generation" {
             tracing::warn!(agent = %agent_name, field, "rate limit configured on non-video generation binding");
             return Err(BotError::InvalidGenerationBinding {

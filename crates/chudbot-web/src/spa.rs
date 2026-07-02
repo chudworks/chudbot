@@ -291,7 +291,6 @@ mod tests {
             initial_model: "grok-4".into(),
             agent_name: "chud".to_string(),
             provider: "xai".into(),
-            system_instructions: String::new(),
             title: title.map(str::to_string),
             stopped_at: None,
             stopped_by: None,

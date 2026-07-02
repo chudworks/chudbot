@@ -38,29 +38,85 @@ pub struct Transcript {
     /// but it is not a provider response id and should not be parsed for
     /// semantics.
     pub id: Option<String>,
-    /// App-owned system/developer instructions for this transcript.
-    ///
-    /// Provider crates decide how to map these instructions into their native
-    /// roles. For example, one provider may send them as a system prompt while
-    /// another maps them to a developer instruction field.
-    pub instructions: Option<String>,
     /// Ordered model-visible turns.
     ///
     /// The order of this vector is the order the backend should receive.
+    /// System instructions are represented as [`TurnRole::System`] turns
+    /// rather than a separate field. Bot transcripts persist those turns as
+    /// conversation history; standalone agents may have them inserted from
+    /// [`crate::agent::AgentSpec`] before provider execution. Provider crates
+    /// that only accept instructions as a dedicated request field hoist leading
+    /// instruction turns via [`Self::leading_system_turn`].
     pub turns: Vec<TranscriptTurn>,
 }
 
 impl Transcript {
-    /// Build an empty transcript with no id, instructions, or turns.
+    /// Build an empty transcript with no id or turns.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Return the leading system turn, if any.
+    ///
+    /// Providers whose APIs accept instructions only as a dedicated request
+    /// field (Anthropic `system`, Gemini `systemInstruction`) hoist this turn
+    /// out of the message stream and skip it while rendering the remaining
+    /// turns. Later system turns are runtime notes and stay in the stream.
+    pub fn leading_system_turn(&self) -> Option<&TranscriptTurn> {
+        self.turns
+            .first()
+            .filter(|turn| turn.role == TurnRole::System)
+    }
+
+    /// Number of leading system turns that should be hoisted by providers with
+    /// a single top-level system/instructions field.
+    ///
+    /// Modern agent instructions may be represented by several leading marked
+    /// system turns. Runtime system notes such as memory are not marked; when
+    /// they follow marked instructions they stay in the message stream.
+    pub fn leading_system_turn_count(&self) -> usize {
+        let Some(first) = self.leading_system_turn() else {
+            return 0;
+        };
+        if is_agent_instruction_turn(first) {
+            self.turns
+                .iter()
+                .take_while(|turn| turn.role == TurnRole::System && is_agent_instruction_turn(turn))
+                .count()
+        } else {
+            1
+        }
+    }
+
+    /// Concatenated text content of the leading system turn.
+    ///
+    /// Modern part-keyed prompts may have several leading marked system turns;
+    /// those are joined in order. Runtime system notes following marked
+    /// instructions are not included.
+    pub fn leading_system_text(&self) -> Option<String> {
+        let count = self.leading_system_turn_count();
+        if count == 0 {
+            return None;
+        }
+        let text = self
+            .turns
+            .iter()
+            .take(count)
+            .flat_map(|turn| {
+                turn.blocks.iter().filter_map(|block| match block {
+                    ContentBlock::Text { text } if !text.is_empty() => Some(text.as_str()),
+                    _ => None,
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Build a transcript containing a single user text turn.
     ///
-    /// This is a narrow test/helper constructor. Production callers usually set
-    /// instructions and append a history assembled from storage and platform
-    /// context.
+    /// This is a narrow test/helper constructor. Production callers usually
+    /// append a history assembled from storage and platform context.
     pub fn from_user_text(text: impl Into<String>) -> Self {
         let mut transcript = Self::new();
         // Keep the helper behavior identical to hand-building a transcript and
@@ -77,6 +133,13 @@ impl Transcript {
     pub fn push(&mut self, turn: TranscriptTurn) {
         self.turns.push(turn);
     }
+}
+
+fn is_agent_instruction_turn(turn: &TranscriptTurn) -> bool {
+    turn.metadata
+        .get("agent_instructions")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// One model-facing turn in a transcript.
@@ -129,6 +192,16 @@ pub enum TurnRole {
     /// Assistant/model output, including requested client tool calls and
     /// provider continuation blocks.
     Assistant,
+    /// System/developer instructions and runtime-injected system notes.
+    ///
+    /// The leading marked system turn carries agent instructions. Later system
+    /// turns are runtime notes such as automatically loaded user-memory
+    /// documents. Providers without a native mid-conversation system role, such
+    /// as Gemini, lower later system turns to user messages; injected note
+    /// content must therefore be self-describing. Providers with stricter
+    /// placement rules may normalize the order while preserving the same
+    /// effective point in the conversation.
+    System,
 }
 
 /// One ordered piece of content inside a [`TranscriptTurn`].

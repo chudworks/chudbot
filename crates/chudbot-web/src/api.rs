@@ -5,11 +5,11 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use chudbot_api::{
-    BotStorage, ClientToolCall, ClientToolResult, ClientToolResultContent, ContextItem,
-    Conversation, ConversationId, ConversationLookup, ConversationSnapshot, GroundingMetadata,
-    LlmProviderRegistry, MediaUri, ModelId, ModelInfo, ModelInfoRequest, ProviderName,
-    ServerToolUse, ToolTrace, Turn, TurnAsset, TurnReasoning, TurnSnapshot, UsageRecord,
-    UsageSubject, UserRef,
+    AgentInstructionSnapshot, BotStorage, ClientToolCall, ClientToolResult,
+    ClientToolResultContent, ContextItem, Conversation, ConversationId, ConversationLookup,
+    ConversationSnapshot, GroundingMetadata, LlmProviderRegistry, MediaUri, ModelId, ModelInfo,
+    ModelInfoRequest, ProviderName, ServerToolUse, ToolTrace, Turn, TurnAsset, TurnReasoning,
+    TurnSnapshot, UsageRecord, UsageSubject, UserRef,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -79,8 +79,8 @@ impl ModelInfoView {
 #[derive(Debug, Clone, Serialize)]
 pub struct TurnView {
     pub turn: Turn,
-    /// System/developer instructions used for this attempt/turn.
-    pub system_instructions: Option<String>,
+    /// Agent instructions effective for this attempt/turn.
+    pub agent_instructions: Option<AgentInstructionSnapshot>,
     /// Novel context items captured for this turn.
     pub context: Vec<ContextItem>,
     /// Tool/server/grounding trace events.
@@ -99,7 +99,7 @@ impl From<TurnSnapshot> for TurnView {
             TurnReasoning::from_model_steps_and_usage(&snapshot.model_steps, &snapshot.usage);
         Self {
             turn: snapshot.turn,
-            system_instructions: snapshot.system_instructions,
+            agent_instructions: snapshot.agent_instructions,
             context: snapshot.context,
             tool_trace: snapshot
                 .tool_trace

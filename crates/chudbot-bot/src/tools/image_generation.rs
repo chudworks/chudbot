@@ -20,6 +20,8 @@ pub(crate) struct ImageGeneratorTool<G, M> {
     generator: G,
     media_store: M,
     description: String,
+    /// Configured aspect-ratio allowlist advertised as a schema enum.
+    aspect_ratios: Vec<String>,
 }
 
 impl<G, M> ImageGeneratorTool<G, M> {
@@ -33,12 +35,19 @@ impl<G, M> ImageGeneratorTool<G, M> {
                 "are available, save it to media storage, and return its media URI."
             )
             .to_string(),
+            aspect_ratios: Vec::new(),
         }
     }
 
     /// Override the model-facing tool description for a specific binding.
     pub(crate) fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
+        self
+    }
+
+    /// Constrain `aspect_ratio` to the binding's configured allowlist.
+    pub(crate) fn with_aspect_ratios(mut self, aspect_ratios: Vec<String>) -> Self {
+        self.aspect_ratios = aspect_ratios;
         self
     }
 }
@@ -55,7 +64,7 @@ where
     pub(crate) fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: self.description.clone(),
-            input_schema: image_tool_schema(),
+            input_schema: image_tool_schema(&self.aspect_ratios),
         }
     }
 
@@ -70,7 +79,9 @@ where
     ) -> Result<ClientToolOutput, BotToolError> {
         // Validate JSON and resolve reference media before the provider sees
         // the request. Providers receive loaded, image-scoped media handles.
-        let request = image_request_from_tool_input(&self.media_store, call.input).await?;
+        let request =
+            image_request_from_tool_input(&self.media_store, call.input, &self.aspect_ratios)
+                .await?;
         tracing::debug!(
             prompt_chars = request.prompt.chars().count(),
             references = request.references.len(),
@@ -150,12 +161,14 @@ where
 /// Convert model-supplied tool JSON into a provider-neutral image request.
 ///
 /// The parser requires a prompt, accepts `reference_images` or `references`,
-/// enforces the reference count limit, resolves each reference through the media
-/// store as an image, and passes provider-specific `aspect_ratio`/`model`
-/// strings through unchanged.
+/// enforces the reference count limit, resolves each reference through the
+/// media store as an image, and checks `aspect_ratio` against the configured
+/// allowlist. The model cannot choose a model id: the operator-configured
+/// binding always owns model selection, so the routed generator fills it in.
 pub(crate) async fn image_request_from_tool_input<M>(
     media_store: &M,
     input: serde_json::Value,
+    allowed_aspect_ratios: &[String],
 ) -> Result<ImageRequest, BotToolError>
 where
     M: MediaStore,
@@ -185,8 +198,10 @@ where
     Ok(ImageRequest {
         prompt,
         references,
-        aspect_ratio: tool_optional_string(&input, "aspect_ratio")?,
-        model: tool_optional_string(&input, "model")?.map(ModelId::new),
+        aspect_ratio: tool_optional_string_enum(&input, "aspect_ratio", allowed_aspect_ratios)?,
+        // The configured binding owns model selection; a model-supplied id
+        // would override the operator's choice with an unvalidated string.
+        model: None,
     })
 }
 
@@ -235,7 +250,9 @@ fn image_media_model_result_json(
 ///
 /// Keep this aligned with `image_request_from_tool_input`; the schema guides
 /// providers, and the parser remains the authoritative runtime validation.
-pub(crate) fn image_tool_schema() -> ToolInputSchema {
+/// There is intentionally no `model` field: the operator-configured binding
+/// owns model selection, and advertising one invited invalid overrides.
+pub(crate) fn image_tool_schema(aspect_ratios: &[String]) -> ToolInputSchema {
     let prompt_description = concat!(
         "Detailed description of the image to generate or the full desired result when editing ",
         "a reference image."
@@ -262,12 +279,30 @@ pub(crate) fn image_tool_schema() -> ToolInputSchema {
         ),
         ToolInputField::optional(
             "aspect_ratio",
-            ToolInputValueSchema::string().description("Optional provider-specific aspect ratio."),
-        ),
-        ToolInputField::optional(
-            "model",
-            ToolInputValueSchema::string()
-                .description("Optional provider-specific model id or quality tier."),
+            aspect_ratio_schema(
+                aspect_ratios,
+                "Optional aspect ratio for the generated image.",
+            ),
         ),
     ])
+}
+
+/// Build the `aspect_ratio` value schema shared by image and video tools.
+///
+/// A configured allowlist becomes a schema enum so schema-respecting providers
+/// cannot emit provider-invalid ratios; without one the field stays free-form.
+pub(crate) fn aspect_ratio_schema(
+    aspect_ratios: &[String],
+    enum_description: &str,
+) -> ToolInputValueSchema {
+    if aspect_ratios.is_empty() {
+        ToolInputValueSchema::string().description(concat!(
+            "Optional provider-specific aspect ratio such as 16:9. Omit unless the user asks ",
+            "for a specific shape."
+        ))
+    } else {
+        ToolInputValueSchema::string()
+            .enum_values(aspect_ratios.iter().cloned())
+            .description(enum_description)
+    }
 }

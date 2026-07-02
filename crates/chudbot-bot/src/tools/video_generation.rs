@@ -51,7 +51,7 @@ where
     pub(crate) fn spec(&self) -> ClientToolSpec {
         ClientToolSpec {
             description: video_generation_tool_description(&self.binding),
-            input_schema: video_tool_schema(),
+            input_schema: video_tool_schema(&self.binding),
         }
     }
 
@@ -72,7 +72,8 @@ where
     ) -> Result<ClientToolOutput, BotToolError> {
         // Validate JSON and resolve optional input media before touching quota
         // or provider state; malformed calls should not consume capacity.
-        let request = video_request_from_tool_input(&self.media_store, call.input).await?;
+        let request =
+            video_request_from_tool_input(&self.media_store, call.input, &self.binding).await?;
         let prompt = request.prompt.clone();
         let job_id = if let Some(rate_limit) = &self.binding.rate_limit
             && !rate_limit.bypasses(&self.context.turn_user)
@@ -394,11 +395,14 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
 ///
 /// The parser requires a non-empty `prompt`, accepts `image` or `image_url` as
 /// a single optional image reference, bounds `duration_seconds` to the schema's
-/// maximum, and passes provider-specific `aspect_ratio`, `resolution`, and
-/// `model` strings through unchanged.
+/// maximum, and checks `aspect_ratio`/`resolution` against the binding's
+/// configured allowlists. The model cannot choose a model id: the
+/// operator-configured binding always owns model selection, so the routed
+/// generator fills it in.
 pub(crate) async fn video_request_from_tool_input<M>(
     media_store: &M,
     input: serde_json::Value,
+    binding: &GenerationBinding,
 ) -> Result<VideoRequest, BotToolError>
 where
     M: MediaStore,
@@ -416,9 +420,11 @@ where
         prompt,
         image,
         duration_seconds: tool_optional_u8_bounded(&input, "duration_seconds", 15)?,
-        aspect_ratio: tool_optional_string(&input, "aspect_ratio")?,
-        resolution: tool_optional_string(&input, "resolution")?,
-        model: tool_optional_string(&input, "model")?.map(ModelId::new),
+        aspect_ratio: tool_optional_string_enum(&input, "aspect_ratio", &binding.aspect_ratios)?,
+        resolution: tool_optional_string_enum(&input, "resolution", &binding.resolutions)?,
+        // The configured binding owns model selection; a model-supplied id
+        // would override the operator's choice with an unvalidated string.
+        model: None,
     })
 }
 
@@ -466,33 +472,49 @@ pub(crate) fn media_tool_model_result_json(
 /// Return the JSON schema advertised for the `generate_video` tool.
 ///
 /// The schema is deliberately stricter than many provider APIs: it rejects
-/// unknown fields and caps requested duration before provider routing.
-pub(crate) fn video_tool_schema() -> ToolInputSchema {
+/// unknown fields, caps requested duration before provider routing, and
+/// advertises configured aspect-ratio/resolution allowlists as enums. There is
+/// intentionally no `model` field: the operator-configured binding owns model
+/// selection, and advertising one invited invalid overrides.
+pub(crate) fn video_tool_schema(binding: &GenerationBinding) -> ToolInputSchema {
+    let resolution = if binding.resolutions.is_empty() {
+        ToolInputValueSchema::string().description(concat!(
+            "Optional provider-specific resolution such as 480p. Omit to use the provider ",
+            "default."
+        ))
+    } else {
+        ToolInputValueSchema::string()
+            .enum_values(binding.resolutions.iter().cloned())
+            .description("Optional resolution. Omit to use the provider default.")
+    };
     ToolInputSchema::object([
         ToolInputField::required(
             "prompt",
-            ToolInputValueSchema::string().description("The video prompt."),
+            ToolInputValueSchema::string()
+                .description("Description of the video to generate: subject, motion, and style."),
         ),
         ToolInputField::optional(
             "image",
-            ToolInputValueSchema::string().description("Optional media URI or public URL for an image to animate. Use media:// media URIs from prior tool results; do not invent local filesystem paths."),
+            ToolInputValueSchema::string().description(concat!(
+                "Optional image to animate. Use an exact media://images/... URI from prior ",
+                "tool results, generated-media notes, or image attachment reference notes; ",
+                "public https URLs also work. Never invent paths."
+            )),
         ),
         ToolInputField::optional(
             "duration_seconds",
-            ToolInputValueSchema::integer().minimum(1).maximum(15),
+            ToolInputValueSchema::integer()
+                .minimum(1)
+                .maximum(15)
+                .description("Video length in seconds. Omit to use the provider default."),
         ),
         ToolInputField::optional(
             "aspect_ratio",
-            ToolInputValueSchema::string().description("Optional provider-specific aspect ratio."),
+            aspect_ratio_schema(
+                &binding.aspect_ratios,
+                "Optional aspect ratio for the generated video.",
+            ),
         ),
-        ToolInputField::optional(
-            "resolution",
-            ToolInputValueSchema::string()
-                .description("Optional provider-specific resolution or quality tier."),
-        ),
-        ToolInputField::optional(
-            "model",
-            ToolInputValueSchema::string().description("Optional provider-specific model id."),
-        ),
+        ToolInputField::optional("resolution", resolution),
     ])
 }

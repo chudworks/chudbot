@@ -274,7 +274,7 @@ default_agent = "default"
 
 [bot.agents.default]
 provider = "grok"
-system_prompt = "hi"
+instructions = "hi"
 
 [bot.agents.default.model]
 id = "grok-test"
@@ -297,6 +297,37 @@ top_p = 0.950
             serde_json::to_string(sampling.top_p.as_ref().unwrap()).unwrap(),
             "0.950"
         );
+    }
+
+    #[test]
+    fn legacy_instruction_config_keys_are_accepted() {
+        let input = r#"
+[database]
+url = "postgres://localhost/chudbot"
+
+[web]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+extra_system_prompt = "deployment policy"
+
+[bot.agents.default]
+provider = "grok"
+system_prompt = "agent text"
+
+[bot.agents.default.model]
+id = "grok-test"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+
+        assert_eq!(
+            config.bot.extra_agent_instructions.as_deref(),
+            Some("deployment policy")
+        );
+        assert_eq!(config.bot.agents["default"].instructions, "agent text");
     }
 
     #[test]

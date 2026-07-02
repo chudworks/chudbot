@@ -406,22 +406,27 @@ where
                 attach_asset_spec(),
             ));
         }
-        if self.memory_lookup_enabled() {
+        if let Some(memory) = &self.memory {
+            // Full memory mode implies a top-level run, where the author's
+            // memory payload is preloaded into the turn context; the lookup
+            // description steers the model toward other users in that case.
             definitions.push(ClientToolDefinition::new(
                 LOOKUP_USER_MEMORY_TOOL,
-                lookup_user_memory_spec(),
+                lookup_user_memory_spec(memory.lookup_context(), self.memory_writes_enabled()),
             ));
         }
-        if self.memory_writes_enabled() {
+        if let Some(context) = self
+            .memory
+            .as_ref()
+            .and_then(RuntimeMemoryTools::write_context)
+        {
             definitions.push(ClientToolDefinition::new(
                 REMEMBER_USER_MEMORY_TOOL,
-                remember_user_memory_spec(),
+                remember_user_memory_spec(context),
             ));
-        }
-        if self.memory_writes_enabled() {
             definitions.push(ClientToolDefinition::new(
                 FORGET_USER_MEMORY_TOOL,
-                forget_user_memory_spec(),
+                forget_user_memory_spec(context),
             ));
         }
         for (name, subagent) in &self.subagents {
@@ -535,6 +540,7 @@ where
                 &binding.provider,
                 &binding.model,
             ))
+            .with_aspect_ratios(binding.aspect_ratios.clone())
         })
     }
 

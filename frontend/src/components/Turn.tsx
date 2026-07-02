@@ -7,6 +7,7 @@ import type {
   TurnView,
   UserMetadata,
 } from '../types';
+import { agentInstructionText } from '../types';
 import Avatar from './Avatar';
 import RelativeTime from './RelativeTime';
 import ToolCall from './ToolCall';
@@ -14,10 +15,12 @@ import ToolCall from './ToolCall';
 interface Props {
   turnView: TurnView;
   users: Record<string, UserMetadata>;
+  showAgentInstructions: boolean;
 }
 
-export default function Turn({ turnView, users }: Props) {
-  const { turn, system_instructions, context, tool_trace, replay_assets, reasoning } = turnView;
+export default function Turn({ turnView, users, showAgentInstructions }: Props) {
+  const { turn, agent_instructions, context, tool_trace, replay_assets, reasoning } = turnView;
+  const instructionText = agentInstructionText(agent_instructions);
   const user = users[userKey(turn.user)];
   const userLabel = user?.label || turn.user_display_name || 'user';
   const avatarPath = avatarPathFromUri(user?.avatar_media_uri);
@@ -61,21 +64,16 @@ export default function Turn({ turnView, users }: Props) {
         <pre className="turn__content">{turn.user_content}</pre>
       </div>
 
-      {system_instructions && (
-        <details className="context">
-          <summary>System instructions</summary>
-          <pre className="turn__content">{system_instructions}</pre>
+      {/* The model input is one turn stream. Agent instructions are stored per
+          attempt, but the viewer only repeats them when they change. */}
+      {showAgentInstructions && instructionText && (
+        <details className="context context--system">
+          <summary>System turn · agent instructions</summary>
+          <pre className="turn__content">{instructionText}</pre>
         </details>
       )}
 
-      {context.length > 0 && (
-        <details className="context">
-          <summary>Context fed to model ({context.length} items)</summary>
-          {context.map((item, i) => (
-            <ContextItemView key={i} item={item} />
-          ))}
-        </details>
-      )}
+      <ContextPanels context={context} />
 
       {tool_trace.length > 0 && (
         <section className="tools">
@@ -230,12 +228,45 @@ function StatusBadge({ status }: { status: string }) {
   return <span className={cls}>{status}</span>;
 }
 
+// Split the stored context into the injected system turns (memory notes and
+// other runtime notes) and the user-message context, mirroring the separate
+// transcript turns the model receives.
+function ContextPanels({ context }: { context: ContextItem[] }) {
+  const systemItems = context.filter((item) => item.role === 'system');
+  const userItems = context.filter((item) => item.role !== 'system');
+
+  return (
+    <>
+      {systemItems.length > 0 && (
+        <details className="context context--system">
+          <summary>
+            System turn · injected notes ({systemItems.length})
+          </summary>
+          {systemItems.map((item, i) => (
+            <ContextItemView key={i} item={item} />
+          ))}
+        </details>
+      )}
+      {userItems.length > 0 && (
+        <details className="context">
+          <summary>Context fed to model ({userItems.length} items)</summary>
+          {userItems.map((item, i) => (
+            <ContextItemView key={i} item={item} />
+          ))}
+        </details>
+      )}
+    </>
+  );
+}
+
 function ContextItemView({ item }: { item: ContextItem }) {
   const isImage = isImageUri(item.content);
   const isVideo = isVideoUri(item.content);
   const isAudio = isAudioUri(item.content);
+  const className =
+    item.role === 'system' ? 'context-item context-item--system' : 'context-item';
   return (
-    <article className="context-item">
+    <article className={className}>
       <header>
         <span className="context-item__role">{item.role}</span>
         {' · '}

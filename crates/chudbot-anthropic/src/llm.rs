@@ -646,83 +646,142 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 
 /// Render the provider-neutral transcript into Anthropic Messages inputs.
 ///
-/// Instructions become a cached `system` block, prior Anthropic continuations
-/// are replayed verbatim, and fresh Chudbot content blocks are converted into
-/// the closest Anthropic block type.
+/// The leading system turn is hoisted into a cached top-level `system` block
+/// for the stable conversation instructions. Later system turns become native
+/// Anthropic mid-conversation system messages. Chudbot can insert those turns
+/// before the user turn they should affect, so this renderer moves such runs to
+/// immediately after the following user message, matching Anthropic's placement
+/// rules while preserving their effect on the next assistant response. Prior
+/// Anthropic continuations are replayed verbatim, and fresh Chudbot content
+/// blocks are converted into the closest Anthropic block type.
 async fn to_anthropic_messages(
     transcript: &Transcript,
     provider: &ProviderName,
     image_encoding: ImageEncoding,
 ) -> Result<(Option<Value>, Vec<Value>), AnthropicError> {
-    let system = transcript
-        .instructions
-        .as_ref()
-        .filter(|instructions| !instructions.is_empty())
-        .map(|instructions| {
-            json!([{
-                "type": "text",
-                "text": instructions,
-                "cache_control": { "type": "ephemeral" },
-            }])
-        });
+    let system_text = transcript.leading_system_text();
+    let hoisted_turns = transcript.leading_system_turn_count();
+    let system = system_text.map(|instructions| {
+        json!([{
+            "type": "text",
+            "text": instructions,
+            "cache_control": { "type": "ephemeral" },
+        }])
+    });
 
     let mut messages = Vec::new();
-    for turn in &transcript.turns {
-        let role = match turn.role {
-            TurnRole::Assistant => "assistant",
-            TurnRole::User => "user",
-        };
-
-        // A stored continuation supersedes reconstructed blocks for this turn:
-        // Anthropic needs its original response block sequence for pause_turn,
-        // server-tool, and encrypted/thinking-compatible continuations.
-        let mut content = provider_continuation_content(turn, provider);
-
-        if !content.is_empty() {
-            messages.push(json!({ "role": role, "content": content }));
+    let mut pending_system_content = Vec::new();
+    for turn in transcript.turns.iter().skip(hoisted_turns) {
+        let content = anthropic_content_for_turn(turn, provider, image_encoding).await?;
+        if content.is_empty() {
             continue;
         }
 
-        for block in &turn.blocks {
-            match block {
-                ContentBlock::Text { text } if !text.is_empty() => {
-                    content.push(json!({ "type": "text", "text": text }));
-                }
-                ContentBlock::Text { .. } => {}
-                ContentBlock::Media { media } => {
-                    content.push(json!({
-                        "type": "image",
-                        "source": media_source(media.as_ref(), image_encoding).await?,
-                    }));
-                }
-                ContentBlock::ClientToolCall(call) => {
-                    content.push(json!({
-                        "type": "tool_use",
-                        "id": call.id.as_str(),
-                        "name": call.name.as_str(),
-                        "input": call.input.clone(),
-                    }));
-                }
-                ContentBlock::ClientToolResult(result) => {
-                    content.push(tool_result_block(result));
-                }
-                ContentBlock::Continuation(continuation) => {
-                    if &continuation.provider == provider {
-                        tracing::debug!(
-                            provider = %provider,
-                            "skipping empty Anthropic provider continuation",
-                        );
-                    }
+        match turn.role {
+            TurnRole::System => {
+                pending_system_content.extend(content);
+            }
+            TurnRole::User => {
+                messages.push(json!({ "role": "user", "content": content }));
+            }
+            TurnRole::Assistant => {
+                flush_anthropic_system_content(&mut messages, &mut pending_system_content);
+                messages.push(json!({ "role": "assistant", "content": content }));
+            }
+        }
+    }
+    flush_anthropic_system_content(&mut messages, &mut pending_system_content);
+
+    Ok((system, messages))
+}
+
+async fn anthropic_content_for_turn(
+    turn: &chudbot_api::TranscriptTurn,
+    provider: &ProviderName,
+    image_encoding: ImageEncoding,
+) -> Result<Vec<Value>, AnthropicError> {
+    // A stored continuation supersedes reconstructed blocks for this turn:
+    // Anthropic needs its original response block sequence for pause_turn,
+    // server-tool, and encrypted/thinking-compatible continuations.
+    let mut content = provider_continuation_content(turn, provider);
+    if !content.is_empty() {
+        return Ok(content);
+    }
+
+    for block in &turn.blocks {
+        match block {
+            ContentBlock::Text { text } if !text.is_empty() => {
+                content.push(json!({ "type": "text", "text": text }));
+            }
+            ContentBlock::Text { .. } => {}
+            ContentBlock::Media { media } => {
+                content.push(json!({
+                    "type": "image",
+                    "source": media_source(media.as_ref(), image_encoding).await?,
+                }));
+            }
+            ContentBlock::ClientToolCall(call) => {
+                content.push(json!({
+                    "type": "tool_use",
+                    "id": call.id.as_str(),
+                    "name": call.name.as_str(),
+                    "input": call.input.clone(),
+                }));
+            }
+            ContentBlock::ClientToolResult(result) => {
+                content.push(tool_result_block(result));
+            }
+            ContentBlock::Continuation(continuation) => {
+                if &continuation.provider == provider {
+                    tracing::debug!(
+                        provider = %provider,
+                        "skipping empty Anthropic provider continuation",
+                    );
                 }
             }
         }
-
-        if !content.is_empty() {
-            messages.push(json!({ "role": role, "content": content }));
-        }
     }
 
-    Ok((system, messages))
+    Ok(content)
+}
+
+fn flush_anthropic_system_content(
+    messages: &mut Vec<Value>,
+    pending_system_content: &mut Vec<Value>,
+) {
+    if pending_system_content.is_empty() {
+        return;
+    }
+    let content = std::mem::take(pending_system_content);
+    if can_append_anthropic_system_message(messages) {
+        messages.push(json!({ "role": "system", "content": content }));
+    } else {
+        tracing::debug!(
+            "lowering Anthropic system turn to user message because no valid mid-conversation placement exists",
+        );
+        messages.push(json!({ "role": "user", "content": content }));
+    }
+}
+
+fn can_append_anthropic_system_message(messages: &[Value]) -> bool {
+    let Some(previous) = messages.last() else {
+        return false;
+    };
+    match previous.get("role").and_then(Value::as_str) {
+        Some("user") => true,
+        Some("assistant") => assistant_message_ends_with_server_tool_use(previous),
+        _ => false,
+    }
+}
+
+fn assistant_message_ends_with_server_tool_use(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|content| content.last())
+        .and_then(|block| block.get("type"))
+        .and_then(Value::as_str)
+        == Some("server_tool_use")
 }
 
 /// Pull Anthropic continuation blocks out of a transcript turn without editing them.
@@ -1290,6 +1349,127 @@ mod tests {
                 "additionalProperties": false
             })
         );
+    }
+
+    #[test]
+    fn hoists_leading_system_turn_and_keeps_later_system_turns_native() {
+        let provider = ProviderName::new("anthropic");
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+
+        let (system, messages) = futures::executor::block_on(to_anthropic_messages(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
+
+        // The leading system turn becomes the cached top-level system block.
+        let system = system.expect("system block");
+        assert_eq!(system[0]["text"], "be helpful");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        // Later system turns use Anthropic's native mid-conversation system role.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "hi");
+        assert_eq!(messages[1]["role"], "system");
+        assert_eq!(messages[1]["content"][0]["text"], "memory note");
+    }
+
+    #[test]
+    fn moves_system_turns_before_user_to_anthropic_valid_position() {
+        let provider = ProviderName::new("anthropic");
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "first"));
+        transcript.push(TranscriptTurn::text(TurnRole::Assistant, "answer"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "new policy"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "current"));
+
+        let (system, messages) = futures::executor::block_on(to_anthropic_messages(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
+
+        assert!(system.is_some());
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "first");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["text"], "answer");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["text"], "current");
+        assert_eq!(messages[3]["role"], "system");
+        assert_eq!(messages[3]["content"][0]["text"], "new policy");
+        assert_eq!(messages[3]["content"][1]["text"], "memory note");
+    }
+
+    #[test]
+    fn defers_system_flush_until_before_assistant_or_end() {
+        let provider = ProviderName::new("anthropic");
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "first"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "new policy"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "current"));
+        transcript.push(TranscriptTurn::text(TurnRole::Assistant, "answer"));
+
+        let (_, messages) = futures::executor::block_on(to_anthropic_messages(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "system");
+        assert_eq!(messages[2]["content"][0]["text"], "new policy");
+        assert_eq!(messages[3]["role"], "assistant");
+    }
+
+    #[test]
+    fn lowers_unplaceable_system_turn_to_user_message() {
+        let provider = ProviderName::new("anthropic");
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
+        transcript.push(TranscriptTurn::text(TurnRole::Assistant, "answer"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+
+        let (system, messages) = futures::executor::block_on(to_anthropic_messages(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
+
+        assert!(system.is_some());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["text"], "memory note");
+    }
+
+    #[test]
+    fn transcript_without_leading_system_turn_has_no_system_block() {
+        let provider = ProviderName::new("anthropic");
+        let transcript = Transcript::from_user_text("hi");
+
+        let (system, messages) = futures::executor::block_on(to_anthropic_messages(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
+
+        assert!(system.is_none());
+        assert_eq!(messages.len(), 1);
     }
 
     #[test]

@@ -5,10 +5,12 @@
 //! unfused context. Remember and forget append events that the background
 //! memory runtime later folds into profile revisions.
 //!
-//! `crate::memory::PROMPT_GUIDANCE` tells memory-enabled agents to look up the
-//! author and mentioned users proactively, to remember durable facts, and to
-//! record explicit forget requests. The schemas and descriptions in this module
-//! are the provider-neutral tool contract backing that guidance.
+//! The runtime injects persistent memory notes for conversation participants
+//! as system turns (see `BotRuntime::participant_memory_context_items`), so
+//! `crate::memory::PROMPT_GUIDANCE` tells memory-enabled agents to use lookup
+//! only for refreshes and uncovered users, to remember durable facts, and to
+//! record explicit forget requests. The schemas and descriptions in this
+//! module are the provider-neutral tool contract backing that guidance.
 
 use super::*;
 
@@ -96,15 +98,46 @@ pub(crate) enum MemoryToolError {
     Storage(String),
 }
 
+impl MemoryToolContext {
+    /// Human wording for the memory scope used in tool descriptions.
+    pub(crate) fn scope_phrase(&self) -> &'static str {
+        if self.base_key.scope_key.starts_with("guild:") {
+            "in this server"
+        } else {
+            "in direct messages"
+        }
+    }
+}
+
 /// Model-facing spec for reading a user's memory state.
 ///
-/// The prompt guidance tells agents to call this before responding to authors
-/// and newly mentioned users. The result payload is JSON with identity fields,
-/// compact profile metadata/content, pending memory events, and the latest diary
-/// entries.
-pub(crate) fn lookup_user_memory_spec() -> ClientToolSpec {
+/// `notes_auto_injected` is true for top-level turns, where the runtime
+/// injects persistent participant memory notes as system messages; the
+/// description then frames this tool as a refresh/fallback path. The result
+/// payload is JSON with identity fields, compact profile metadata/content,
+/// pending memory events, and the latest diary entries.
+pub(crate) fn lookup_user_memory_spec(
+    context: &MemoryToolContext,
+    notes_auto_injected: bool,
+) -> ClientToolSpec {
+    let scope = context.scope_phrase();
+    let description = if notes_auto_injected {
+        format!(
+            "Re-read the remembered profile, pending memory events, and recent diary entries \
+             for a user {scope}. Memory notes for conversation participants are injected \
+             automatically, so call this only when a user asks you to re-load their memory, \
+             when an injected note seems out of date, or for a user who has no note in this \
+             conversation. Skip bots."
+        )
+    } else {
+        format!(
+            "Look up the remembered profile, pending memory events, and recent diary entries \
+             for the current user or another user id {scope}. Call it at most once per user \
+             per conversation."
+        )
+    };
     ClientToolSpec {
-        description: "Look up the compact remembered profile and recent un-compacted memory events for the current user or another user id in this server.".to_string(),
+        description,
         input_schema: lookup_schema(),
     }
 }
@@ -112,11 +145,16 @@ pub(crate) fn lookup_user_memory_spec() -> ClientToolSpec {
 /// Model-facing spec for appending a durable memory event.
 ///
 /// This does not rewrite the compact profile immediately. It records a
-/// `remember` event with optional tags and confidence so the memory compactor can
-/// merge it into a later profile revision.
-pub(crate) fn remember_user_memory_spec() -> ClientToolSpec {
+/// `remember` event that the memory compactor later merges into a profile
+/// revision.
+pub(crate) fn remember_user_memory_spec(context: &MemoryToolContext) -> ClientToolSpec {
+    let scope = context.scope_phrase();
     ClientToolSpec {
-        description: "Remember a stable preference, relationship, project, correction, recurring fact, or running joke for the current user or a target user id in this server.".to_string(),
+        description: format!(
+            "Remember one stable fact about a user {scope}: a preference, relationship, \
+             project, correction, recurring fact, or running joke. Defaults to the current \
+             message author; pass target_user_id to remember a fact about someone else."
+        ),
         input_schema: remember_schema(),
     }
 }
@@ -125,9 +163,14 @@ pub(crate) fn remember_user_memory_spec() -> ClientToolSpec {
 ///
 /// Forget requests are stored as events too. The compactor interprets them when
 /// deciding what should be removed or no longer trusted in the compact profile.
-pub(crate) fn forget_user_memory_spec() -> ClientToolSpec {
+pub(crate) fn forget_user_memory_spec(context: &MemoryToolContext) -> ClientToolSpec {
+    let scope = context.scope_phrase();
     ClientToolSpec {
-        description: "Record that a remembered fact should be forgotten or no longer used for the current user or a target user id in this server.".to_string(),
+        description: format!(
+            "Record that a remembered fact about a user {scope} should be forgotten or no \
+             longer used. Defaults to the current message author; pass target_user_id to \
+             target someone else."
+        ),
         input_schema: forget_schema(),
     }
 }
@@ -147,20 +190,17 @@ pub(crate) fn forget_user_memory_spec() -> ClientToolSpec {
 ///
 /// Invalid input and storage failures are returned as `Err`; the runtime
 /// executor converts them into model-facing tool errors with `is_error = true`.
-#[tracing::instrument(
-    name = "tool.user_memory.lookup",
-    skip_all,
-    fields(tool_call = %call.id)
-)]
-pub(crate) async fn lookup_user_memory<S>(
+/// Load the model-facing memory payload for one user.
+///
+/// Shared by the `lookup_user_memory` tool and the automatic author-memory
+/// context preload so both surfaces present the same JSON shape.
+pub(crate) async fn user_memory_payload<S>(
     storage: &S,
-    context: &MemoryToolContext,
-    call: ClientToolCall,
-) -> Result<ClientToolOutput, MemoryToolError>
+    key: &UserMemoryKey,
+) -> Result<serde_json::Value, MemoryToolError>
 where
     S: BotStorage,
 {
-    let key = context.target_key(&call.input)?;
     let document = storage
         .load_user_memory_document(key.clone())
         .await
@@ -184,9 +224,9 @@ where
         found_profile = document.is_some(),
         recent_events = events.len(),
         recent_diary_entries = diary_entries.len(),
-        "looked up user memory"
+        "loaded user memory payload"
     );
-    let value = serde_json::json!({
+    Ok(serde_json::json!({
         "message_provider": key.platform,
         "target_user_id": key.user_key,
         "scope_key": key.scope_key,
@@ -201,7 +241,24 @@ where
             .iter()
             .map(memory_diary_entry_trace)
             .collect::<Vec<_>>(),
-    });
+    }))
+}
+
+#[tracing::instrument(
+    name = "tool.user_memory.lookup",
+    skip_all,
+    fields(tool_call = %call.id)
+)]
+pub(crate) async fn lookup_user_memory<S>(
+    storage: &S,
+    context: &MemoryToolContext,
+    call: ClientToolCall,
+) -> Result<ClientToolOutput, MemoryToolError>
+where
+    S: BotStorage,
+{
+    let key = context.target_key(&call.input)?;
+    let value = user_memory_payload(storage, &key).await?;
     Ok(ClientToolOutput {
         result: ClientToolResultContent::Json {
             value: value.clone(),
@@ -271,9 +328,11 @@ where
 
 /// Append a forget request for the current or targeted user.
 ///
-/// The request body is the model/user-facing query, optionally followed by a
-/// reason paragraph. Like `remember_user_memory`, this records an event for the
-/// compactor rather than directly editing the compact profile.
+/// The request body is the model-supplied description of the fact to stop
+/// using, optionally followed by a reason paragraph. Like
+/// `remember_user_memory`, this records an event for the compactor rather than
+/// directly editing the compact profile. The advertised field is `memory` to
+/// mirror the remember tool; `query` remains an accepted legacy alias.
 #[tracing::instrument(
     name = "tool.user_memory.forget",
     skip_all,
@@ -288,7 +347,7 @@ where
     S: BotStorage,
 {
     let key = context.target_key(&call.input)?;
-    let query = required_string(&call.input, "query")?;
+    let memory = required_string_with_alias(&call.input, "memory", "query")?;
     let reason = call
         .input
         .get("reason")
@@ -296,8 +355,8 @@ where
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let body = match reason {
-        Some(reason) => format!("{query}\n\nReason: {reason}"),
-        None => query,
+        Some(reason) => format!("{memory}\n\nReason: {reason}"),
+        None => memory,
     };
     let event = storage
         .append_user_memory_event(NewUserMemoryEvent {
@@ -334,6 +393,20 @@ where
     })
 }
 
+/// Shared schema for the optional memory target field.
+///
+/// The description teaches the model where real ids live in the message JSON
+/// because passing usernames instead of ids is the most common misuse; the
+/// runtime rejects non-numeric targets in [`normalize_target_user_id`].
+fn target_user_id_schema() -> ToolInputValueSchema {
+    ToolInputValueSchema::string().description(
+        "Numeric platform user id of the user this applies to. Omit for the current message \
+         author. Copy the id from `author.id` or `mentioned_users[].id` in the message JSON; \
+         `<@id>` mention syntax is also accepted. Usernames and display names are not \
+         accepted.",
+    )
+}
+
 /// JSON Schema for the lookup tool input.
 ///
 /// The only accepted field is optional `target_user_id`; absent input reads the
@@ -341,54 +414,52 @@ where
 fn lookup_schema() -> ToolInputSchema {
     ToolInputSchema::object([ToolInputField::optional(
         "target_user_id",
-        ToolInputValueSchema::string()
-            .description("Optional platform user id. Defaults to the current author."),
+        target_user_id_schema(),
     )])
 }
 
 /// JSON Schema for appending a `remember` event.
 ///
-/// `memory` is required and must be non-empty after trimming. `tags` and
-/// `confidence` are optional metadata that pass through to the event record.
+/// `memory` is required and must be non-empty after trimming. The parser still
+/// tolerates legacy `tags`/`confidence` metadata, but they are no longer
+/// advertised: the compactor never reads them, so offering them only gave the
+/// model extra ways to construct invalid input.
 fn remember_schema() -> ToolInputSchema {
     ToolInputSchema::object([
-        ToolInputField::optional(
-            "target_user_id",
-            ToolInputValueSchema::string()
-                .description("Optional platform user id. Defaults to the current author."),
-        ),
+        ToolInputField::optional("target_user_id", target_user_id_schema()),
         ToolInputField::required(
             "memory",
-            ToolInputValueSchema::string().description("Stable useful fact to remember."),
-        ),
-        ToolInputField::optional(
-            "tags",
-            ToolInputValueSchema::array(ToolInputValueSchema::string()),
-        ),
-        ToolInputField::optional(
-            "confidence",
-            ToolInputValueSchema::number().minimum(0).maximum(1),
+            ToolInputValueSchema::string().description(
+                "One concise, stable fact written in third person, e.g. \"Prefers Rust over \
+                 Python\" or \"Is building a Discord bot called Chudbot\". For second-hand \
+                 facts, name the source in the text, e.g. \"According to Alice, ...\". Do not \
+                 store transient conversation details or sensitive personal information.",
+            ),
         ),
     ])
 }
 
 /// JSON Schema for appending a `forget` event.
 ///
-/// `query` names what should stop being used. `reason`, when present, is folded
-/// into the event body as explanatory text for later compaction.
+/// `memory` names what should stop being used, mirroring the remember tool's
+/// field name. `reason`, when present, is folded into the event body as
+/// explanatory text for later compaction.
 fn forget_schema() -> ToolInputSchema {
     ToolInputSchema::object([
-        ToolInputField::optional(
-            "target_user_id",
-            ToolInputValueSchema::string()
-                .description("Optional platform user id. Defaults to the current author."),
-        ),
+        ToolInputField::optional("target_user_id", target_user_id_schema()),
         ToolInputField::required(
-            "query",
-            ToolInputValueSchema::string()
-                .description("Description of what should be forgotten or no longer used."),
+            "memory",
+            ToolInputValueSchema::string().description(
+                "Description of the remembered fact that should be forgotten or no longer \
+                 used.",
+            ),
         ),
-        ToolInputField::optional("reason", ToolInputValueSchema::string()),
+        ToolInputField::optional(
+            "reason",
+            ToolInputValueSchema::string().description(
+                "Optional reason, e.g. the user asked for it or the fact turned out wrong.",
+            ),
+        ),
     ])
 }
 
@@ -401,6 +472,21 @@ fn required_string(input: &serde_json::Value, field: &str) -> Result<String, Mem
         .filter(|value| !value.is_empty())
         .map(str::to_string)
         .ok_or_else(|| MemoryToolError::InvalidInput(format!("`{field}` is required")))
+}
+
+/// Read a required string that may arrive under a legacy alias field.
+///
+/// The error names only the advertised field so the model is steered toward
+/// the current schema.
+fn required_string_with_alias(
+    input: &serde_json::Value,
+    field: &str,
+    alias: &str,
+) -> Result<String, MemoryToolError> {
+    required_string(input, field).or_else(|error| match required_string(input, alias) {
+        Ok(value) => Ok(value),
+        Err(_) => Err(error),
+    })
 }
 
 /// Read an optional string-array field, rejecting empty or non-string members.
@@ -454,7 +540,10 @@ fn optional_f32(input: &serde_json::Value, field: &str) -> Result<Option<f32>, M
 /// Normalize the optional target id accepted by model-facing schemas.
 ///
 /// Discord `<@id>` and `<@!id>` mentions are unwrapped because models often copy
-/// mention text from message context into tool arguments.
+/// mention text from message context into tool arguments. Non-numeric targets
+/// are rejected: platform user ids are numeric snowflakes, and accepting a
+/// username would silently read or write a memory namespace no real lookup will
+/// ever hit again.
 fn normalize_target_user_id(input: &str) -> Result<String, MemoryToolError> {
     let trimmed = input.trim();
     let unwrapped = trimmed
@@ -471,6 +560,13 @@ fn normalize_target_user_id(input: &str) -> Result<String, MemoryToolError> {
         return Err(MemoryToolError::InvalidInput(
             "`target_user_id` cannot be empty".to_string(),
         ));
+    }
+    if !unwrapped.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(MemoryToolError::InvalidInput(format!(
+            "`target_user_id` `{unwrapped}` is not a numeric platform user id; copy the id \
+             from `author.id` or `mentioned_users[].id` in the message JSON (or use `<@id>` \
+             mention syntax). Usernames and display names are not accepted."
+        )));
     }
     Ok(unwrapped.to_string())
 }
@@ -612,5 +708,49 @@ mod tests {
             normalize_target_user_id("<@123456789012345678>").unwrap(),
             "123456789012345678"
         );
+    }
+
+    #[test]
+    fn rejects_non_numeric_target_user_ids() {
+        let error = normalize_target_user_id("chud").unwrap_err();
+        assert!(error.to_string().contains("numeric platform user id"));
+        assert!(normalize_target_user_id("<@chud>").is_err());
+        assert!(normalize_target_user_id("").is_err());
+    }
+
+    #[test]
+    fn forget_input_accepts_memory_and_legacy_query_fields() {
+        let memory = serde_json::json!({ "memory": "the pineapple incident" });
+        assert_eq!(
+            required_string_with_alias(&memory, "memory", "query").unwrap(),
+            "the pineapple incident"
+        );
+        let query = serde_json::json!({ "query": "the pineapple incident" });
+        assert_eq!(
+            required_string_with_alias(&query, "memory", "query").unwrap(),
+            "the pineapple incident"
+        );
+        let error = required_string_with_alias(&serde_json::json!({}), "memory", "query")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("`memory` is required"));
+    }
+
+    #[test]
+    fn memory_schemas_advertise_numeric_target_and_no_event_metadata() {
+        let remember = remember_schema().json_schema();
+        assert!(remember["properties"]["tags"].is_null());
+        assert!(remember["properties"]["confidence"].is_null());
+        assert!(
+            remember["properties"]["target_user_id"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("mentioned_users[].id")
+        );
+
+        let forget = forget_schema().json_schema();
+        assert!(forget["properties"]["memory"].is_object());
+        assert!(forget["properties"]["query"].is_null());
+        assert_eq!(forget["required"], serde_json::json!(["memory"]));
     }
 }

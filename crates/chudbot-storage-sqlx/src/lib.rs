@@ -7,10 +7,12 @@
 use std::collections::BTreeMap;
 
 use chudbot_api::{
-    AgentSelection, BeginTurn, BotStorage, ChannelLink, ChannelRef, ContextItem, Conversation,
-    ConversationId, ConversationLookup, ConversationSnapshot, ConversationStop,
-    CountActiveVideoGenerations, CreateVideoJob, ExternalId, FinishTurn, GuildProfile,
-    MediaCategory, MediaUri, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
+    AGENT_INSTRUCTIONS_PART_KEY_METADATA_KEY, AGENT_INSTRUCTIONS_PART_METADATA_KEY,
+    AGENT_INSTRUCTIONS_PART_ORDINAL_METADATA_KEY, AgentInstructionPartSnapshot,
+    AgentInstructionSnapshot, AgentSelection, BeginTurn, BotStorage, ChannelLink, ChannelRef,
+    ContextItem, Conversation, ConversationId, ConversationLookup, ConversationSnapshot,
+    ConversationStop, CountActiveVideoGenerations, CreateVideoJob, ExternalId, FinishTurn,
+    GuildProfile, MediaCategory, MediaUri, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
     MemoryTurnWindow, MessageLink, MessageRef, ModelId, ModelStepKind, ModelStepTrace,
     NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, PlatformName,
     ProviderName, ResolveAgent, RetryTurn, SaveTurnInput, StoredUserProfile, StoredVideoJob,
@@ -45,6 +47,22 @@ pub struct AppVersion {
     pub git_version: String,
     /// First time this build was seen by this database.
     pub first_seen_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PromptStateBoundary {
+    turn_id: TurnId,
+    turn_ordinal: i64,
+    attempt_ordinal: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredPromptMarker {
+    turn_ordinal: i64,
+    attempt_ordinal: i32,
+    part_key: Option<String>,
+    part_ordinal: i32,
+    text: String,
 }
 
 impl SqlxStorage {
@@ -148,8 +166,8 @@ impl SqlxStorage {
         let row = sqlx::query(
             "SELECT id, created_at, message_provider, channel, created_by_user_key, \
                     root_message_provider, root_message_channel, root_message, agent_name, \
-                    llm_provider, llm_model, system_instructions, title, stopped_at, \
-                    stopped_by_provider, stopped_by_user_key \
+                    llm_provider, llm_model, title, stopped_at, stopped_by_provider, \
+                    stopped_by_user_key \
                FROM conversations WHERE id = $1",
         )
         .bind(conversation_id.0)
@@ -168,15 +186,41 @@ impl SqlxStorage {
                     t.user_message_channel, t.user_message, t.user_key, t.user_display_name, \
                     t.user_content, t.assistant_message_provider, t.assistant_message_channel, \
                     t.assistant_message, t.assistant_content, t.status, t.error, \
-                    t.app_version_id, ta.id AS attempt_id, \
-                    ta.system_instructions AS attempt_system_instructions, \
+                    t.app_version_id, ta.id AS attempt_id, ta.attempt_ordinal AS attempt_ordinal, \
+                    ( \
+                        SELECT b.text_content \
+                          FROM turns prompt_turn \
+                          JOIN turn_attempts prompt_attempt \
+                            ON prompt_attempt.turn_id = prompt_turn.id \
+                          JOIN turn_attempt_input_messages m \
+                            ON m.attempt_id = prompt_attempt.id \
+                          JOIN turn_attempt_input_blocks b \
+                            ON b.input_message_id = m.id \
+                         WHERE prompt_turn.conversation_id = t.conversation_id \
+                           AND ( \
+                               prompt_turn.ordinal < t.ordinal \
+                               OR ( \
+                                   prompt_turn.ordinal = t.ordinal \
+                                   AND ta.attempt_ordinal IS NOT NULL \
+                                   AND prompt_attempt.attempt_ordinal <= ta.attempt_ordinal \
+                               ) \
+                           ) \
+                           AND m.role = 'system' \
+                           AND m.metadata->>'agent_instructions' = 'true' \
+                           AND b.block_kind = 'text' \
+                         ORDER BY prompt_turn.ordinal DESC, \
+                                  prompt_attempt.attempt_ordinal DESC, \
+                                  m.ordinal DESC, \
+                                  b.ordinal \
+                         LIMIT 1 \
+                    ) AS attempt_agent_instruction_text, \
                     ta.agent_name, ta.llm_provider, ta.llm_model \
                FROM turns t \
                LEFT JOIN LATERAL ( \
-                    SELECT id, system_instructions, agent_name, llm_provider, llm_model \
-                      FROM turn_attempts \
-                     WHERE turn_id = t.id \
-                     ORDER BY attempt_ordinal DESC \
+                    SELECT a.id, a.attempt_ordinal, a.agent_name, a.llm_provider, a.llm_model \
+                      FROM turn_attempts a \
+                     WHERE a.turn_id = t.id \
+                     ORDER BY a.attempt_ordinal DESC \
                      LIMIT 1 \
                ) ta ON true \
               WHERE t.conversation_id = $1 \
@@ -189,7 +233,9 @@ impl SqlxStorage {
         struct TurnRow {
             turn_id: TurnId,
             attempt_id: Option<Uuid>,
-            system_instructions: Option<String>,
+            turn_ordinal: i64,
+            attempt_ordinal: Option<i32>,
+            legacy_agent_instruction_text: Option<String>,
             row: sqlx::postgres::PgRow,
         }
 
@@ -199,11 +245,24 @@ impl SqlxStorage {
             turn_rows.push(TurnRow {
                 turn_id,
                 attempt_id: row.get("attempt_id"),
-                system_instructions: row.get("attempt_system_instructions"),
+                turn_ordinal: row.get("ordinal"),
+                attempt_ordinal: row.get("attempt_ordinal"),
+                legacy_agent_instruction_text: row.get("attempt_agent_instruction_text"),
                 row,
             });
         }
 
+        let prompt_boundaries = turn_rows
+            .iter()
+            .map(|turn| PromptStateBoundary {
+                turn_id: turn.turn_id,
+                turn_ordinal: turn.turn_ordinal,
+                attempt_ordinal: turn.attempt_ordinal,
+            })
+            .collect::<Vec<_>>();
+        let mut agent_instruction_state_by_turn = self
+            .load_stored_agent_instruction_state(conversation_id, &prompt_boundaries)
+            .await?;
         let turn_ids = turn_rows
             .iter()
             .map(|turn| turn.turn_id.0)
@@ -237,9 +296,17 @@ impl SqlxStorage {
                 .unwrap_or_default();
             let replay_assets = assets_by_turn.remove(&turn_row.turn_id).unwrap_or_default();
             let usage = usage_by_turn.remove(&turn_row.turn_id).unwrap_or_default();
+            let agent_instructions = agent_instruction_state_by_turn
+                .remove(&turn_row.turn_id)
+                .flatten()
+                .or_else(|| {
+                    turn_row
+                        .legacy_agent_instruction_text
+                        .map(|text| AgentInstructionSnapshot::LegacyText { text })
+                });
             turns.push(TurnSnapshot {
                 turn: turn_from_row(&turn_row.row)?,
-                system_instructions: turn_row.system_instructions,
+                agent_instructions,
                 context,
                 tool_trace,
                 model_steps,
@@ -248,6 +315,77 @@ impl SqlxStorage {
             });
         }
         Ok(turns)
+    }
+
+    async fn load_stored_agent_instruction_state(
+        &self,
+        conversation_id: ConversationId,
+        prompt_boundaries: &[PromptStateBoundary],
+    ) -> Result<BTreeMap<TurnId, Option<AgentInstructionSnapshot>>, SqlxStorageError> {
+        if prompt_boundaries.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        // Agent instruction rows are prompt change markers. A legacy marker
+        // replaces the whole prompt; a labeled marker replaces only that part.
+        // The reducer below replays those markers in database order to expose
+        // the effective prompt state at each requested turn boundary.
+        let rows = sqlx::query(
+            "SELECT t.ordinal AS turn_ordinal, ta.attempt_ordinal, m.ordinal AS message_ordinal, \
+                    m.metadata, prompt.text_content \
+               FROM turns t \
+               JOIN turn_attempts ta ON ta.turn_id = t.id \
+               JOIN turn_attempt_input_messages m ON m.attempt_id = ta.id \
+               JOIN LATERAL ( \
+                    SELECT b.text_content \
+                      FROM turn_attempt_input_blocks b \
+                     WHERE b.input_message_id = m.id \
+                       AND b.block_kind = 'text' \
+                       AND b.text_content IS NOT NULL \
+                     ORDER BY b.ordinal \
+                     LIMIT 1 \
+               ) prompt ON true \
+              WHERE t.conversation_id = $1 \
+                AND m.role = 'system' \
+                AND m.metadata->>'agent_instructions' = 'true' \
+              ORDER BY t.ordinal, ta.attempt_ordinal, m.ordinal",
+        )
+        .bind(conversation_id.0)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut markers = Vec::with_capacity(rows.len());
+        for row in rows {
+            let metadata: Value = row.get("metadata");
+            let part_key = metadata
+                .get(AGENT_INSTRUCTIONS_PART_KEY_METADATA_KEY)
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let part_ordinal = metadata
+                .get(AGENT_INSTRUCTIONS_PART_ORDINAL_METADATA_KEY)
+                .and_then(Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .unwrap_or_else(|| row.get("message_ordinal"));
+            let is_part = metadata
+                .get(AGENT_INSTRUCTIONS_PART_METADATA_KEY)
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            markers.push(StoredPromptMarker {
+                turn_ordinal: row.get("turn_ordinal"),
+                attempt_ordinal: row.get("attempt_ordinal"),
+                part_key: is_part.then_some(part_key).flatten(),
+                part_ordinal,
+                text: row.get("text_content"),
+            });
+        }
+
+        let mut states = BTreeMap::new();
+        for boundary in prompt_boundaries {
+            states.insert(
+                boundary.turn_id,
+                stored_agent_instruction_state_at_boundary(&markers, *boundary),
+            );
+        }
+        Ok(states)
     }
 
     async fn latest_attempt_id(&self, turn_id: TurnId) -> Result<Option<Uuid>, SqlxStorageError> {
@@ -453,8 +591,8 @@ impl BotStorage for SqlxStorage {
             "INSERT INTO conversations \
                (id, message_provider, channel, created_by_user_key, root_message_provider, \
                 root_message_channel, root_message, agent_name, llm_provider, llm_model, \
-                system_instructions, title, created_app_version_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
+                title, created_app_version_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
         )
         .bind(id.0)
         .bind(input.channel.platform.as_str())
@@ -466,7 +604,6 @@ impl BotStorage for SqlxStorage {
         .bind(&input.agent_name)
         .bind(input.provider.as_str())
         .bind(input.initial_model.as_str())
-        .bind(&input.system_instructions)
         .bind(&input.title)
         .bind(self.app_version_id)
         .execute(&mut *tx)
@@ -572,8 +709,8 @@ impl BotStorage for SqlxStorage {
         sqlx::query(
             "INSERT INTO turn_attempts \
                (id, turn_id, attempt_ordinal, agent_name, llm_provider, llm_model, \
-                system_instructions, app_version_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                app_version_id) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
         )
         .bind(attempt_id)
         .bind(input.turn_id.0)
@@ -581,16 +718,13 @@ impl BotStorage for SqlxStorage {
         .bind(&input.agent_name)
         .bind(input.provider.as_str())
         .bind(input.model.as_str())
-        .bind(&input.system_instructions)
         .bind(self.app_version_id)
         .execute(&mut *tx)
         .await?;
         for item in input.context {
             insert_context_item(&mut tx, input.turn_id, attempt_id, item).await?;
         }
-        if let Some(transcript) = input.transcript {
-            insert_transcript(&mut tx, attempt_id, transcript).await?;
-        }
+        insert_transcript(&mut tx, attempt_id, input.transcript).await?;
         tx.commit().await?;
         tracing::debug!(
             conversation = %conversation_id,
@@ -2742,6 +2876,7 @@ async fn insert_transcript(
         let role = match turn.role {
             TurnRole::User => "user",
             TurnRole::Assistant => "assistant",
+            TurnRole::System => "system",
         };
         let message_id: i64 = sqlx::query_scalar(
             "INSERT INTO turn_attempt_input_messages (attempt_id, ordinal, role, metadata) \
@@ -2830,6 +2965,57 @@ async fn upsert_media_asset(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+fn stored_agent_instruction_state_at_boundary(
+    markers: &[StoredPromptMarker],
+    boundary: PromptStateBoundary,
+) -> Option<AgentInstructionSnapshot> {
+    let mut legacy_text = None;
+    let mut modern_parts = BTreeMap::<String, AgentInstructionPartSnapshot>::new();
+    let mut using_modern_parts = false;
+    // Replay markers in stored transcript order. Re-inserting a labeled part
+    // by key leaves the latest value for that prompt category at this boundary.
+    for marker in markers
+        .iter()
+        .filter(|marker| prompt_marker_is_visible_at_boundary(marker, boundary))
+    {
+        if let Some(key) = &marker.part_key {
+            using_modern_parts = true;
+            legacy_text = None;
+            modern_parts.insert(
+                key.clone(),
+                AgentInstructionPartSnapshot {
+                    key: key.clone(),
+                    ordinal: marker.part_ordinal,
+                    text: marker.text.clone(),
+                },
+            );
+        } else {
+            using_modern_parts = false;
+            modern_parts.clear();
+            legacy_text = Some(marker.text.clone());
+        }
+    }
+
+    if using_modern_parts {
+        let mut parts = modern_parts.into_values().collect::<Vec<_>>();
+        parts.sort_by_key(|part| part.ordinal);
+        Some(AgentInstructionSnapshot::Parts { parts })
+    } else {
+        legacy_text.map(|text| AgentInstructionSnapshot::LegacyText { text })
+    }
+}
+
+fn prompt_marker_is_visible_at_boundary(
+    marker: &StoredPromptMarker,
+    boundary: PromptStateBoundary,
+) -> bool {
+    marker.turn_ordinal < boundary.turn_ordinal
+        || (marker.turn_ordinal == boundary.turn_ordinal
+            && boundary
+                .attempt_ordinal
+                .is_some_and(|attempt_ordinal| marker.attempt_ordinal <= attempt_ordinal))
 }
 
 async fn conversation_for_turn(
@@ -3110,7 +3296,6 @@ fn conversation_from_row(row: sqlx::postgres::PgRow) -> Result<Conversation, Sql
         initial_model: ModelId::new(row.get::<String, _>("llm_model")),
         agent_name: row.get("agent_name"),
         provider: ProviderName::new(row.get::<String, _>("llm_provider")),
-        system_instructions: row.get("system_instructions"),
         title: row.get("title"),
         stopped_at: row.get("stopped_at"),
         stopped_by: stopped_by_provider

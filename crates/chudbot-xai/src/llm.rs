@@ -903,22 +903,16 @@ async fn to_responses_input(
     provider: &ProviderName,
     image_encoding: ImageEncoding,
 ) -> Result<Vec<Value>, XaiError> {
+    // Agent instructions arrive as the leading system turn; the generic loop
+    // below renders it as an ordinary system message whose stable metadata id
+    // keeps request correlation intact.
     let mut input = Vec::new();
-    if let Some(instructions) = &transcript.instructions
-        && !instructions.is_empty()
-    {
-        let id = transcript.id.as_deref().map(system_message_id);
-        input.push(json_strip_nulls(json!({
-            "id": id,
-            "role": "system",
-            "content": instructions,
-        })));
-    }
-
     for message in &transcript.turns {
         let role = match message.role {
             TurnRole::Assistant => "assistant",
             TurnRole::User => "user",
+            // xAI accepts system messages at any position in the input list.
+            TurnRole::System => "system",
         };
 
         let mut echo = Vec::new();
@@ -1083,10 +1077,6 @@ fn is_replayable_encrypted_content(text: &str) -> bool {
             b.is_ascii_alphanumeric()
                 || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
         })
-}
-
-fn system_message_id(transcript_id: &str) -> String {
-    format!("chudbot_conversation_{transcript_id}_system")
 }
 
 fn transcript_turn_message_id(message: &chudbot_api::TranscriptTurn) -> Option<&str> {
@@ -1455,7 +1445,16 @@ mod tests {
         let provider = ProviderName::new("xai");
         let mut transcript = Transcript::new();
         transcript.id = Some("conv-123".to_string());
-        transcript.instructions = Some("be helpful".to_string());
+        transcript.push(TranscriptTurn {
+            role: TurnRole::System,
+            blocks: vec![ContentBlock::Text {
+                text: "be helpful".to_string(),
+            }],
+            metadata: json!({
+                "id": "chudbot_conversation_conv-123_system",
+                "agent_instructions": true,
+            }),
+        });
         transcript.push(TranscriptTurn {
             role: TurnRole::User,
             blocks: vec![ContentBlock::Text {

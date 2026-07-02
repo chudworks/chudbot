@@ -42,7 +42,8 @@ where
                     ToolInputValueSchema::integer()
                         .minimum(1)
                         .maximum(100)
-                        .default(20),
+                        .default(20)
+                        .description("Number of messages to return, newest first."),
                 ),
                 ToolInputField::optional(
                     "before_message_id",

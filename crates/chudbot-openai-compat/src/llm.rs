@@ -304,17 +304,30 @@ async fn to_chat_messages(
     // message sequence. Tool results are separate `role=tool` messages, so any
     // buffered user text/media must be flushed before emitting one.
     let mut messages = Vec::new();
-    if let Some(instructions) = &transcript.instructions
-        && !instructions.is_empty()
-    {
-        messages.push(json!({ "role": "system", "content": instructions }));
-    }
-
     for turn in &transcript.turns {
         let role = match turn.role {
             TurnRole::Assistant => "assistant",
             TurnRole::User => "user",
+            // Chat Completions hosts accept mid-array system messages (the
+            // leading one is the agent's system prompt); how a local model
+            // treats later ones depends on its chat template.
+            TurnRole::System => "system",
         };
+
+        if turn.role == TurnRole::System {
+            // System turns are text-only runtime notes or instructions; media
+            // and tool blocks are not expected and are not representable here.
+            let mut text = String::new();
+            for block in &turn.blocks {
+                if let ContentBlock::Text { text: t } = block {
+                    text.push_str(t);
+                }
+            }
+            if !text.is_empty() {
+                messages.push(json!({ "role": role, "content": text }));
+            }
+            continue;
+        }
 
         if turn.role == TurnRole::Assistant {
             let mut text = String::new();
@@ -802,8 +815,9 @@ mod tests {
     #[test]
     fn system_and_user_map_to_chat_messages() {
         let mut transcript = Transcript::new();
-        transcript.instructions = Some("be helpful".to_string());
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
         transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
 
         let messages = futures::executor::block_on(to_chat_messages(
             &transcript,
@@ -812,12 +826,17 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(messages.len(), 2);
+        assert_eq!(messages.len(), 3);
         assert_eq!(
             messages[0],
             json!({"role": "system", "content": "be helpful"})
         );
         assert_eq!(messages[1], json!({"role": "user", "content": "hi"}));
+        // Mid-conversation system turns stay system messages for chat hosts.
+        assert_eq!(
+            messages[2],
+            json!({"role": "system", "content": "memory note"})
+        );
     }
 
     #[test]

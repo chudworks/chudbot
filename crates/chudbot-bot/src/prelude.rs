@@ -20,7 +20,8 @@ pub(crate) use std::time::Duration;
 /// Grouping these `chudbot-api` imports keeps the split modules readable while
 /// making new cross-module contract dependencies visible in one place.
 pub(crate) use chudbot_api::{
-    Agent, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentSelection, AttachmentRef,
+    Agent, AgentInstructionPart, AgentInstructionPartSnapshot, AgentInstructionSnapshot,
+    AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentSelection, AgentSpec, AttachmentRef,
     AudioTranscriber, AudioTranscriberRegistry, AudioTranscription, AudioTranscriptionRequest,
     BeginTurn, BotStorage, ChannelLink, ChannelRef, ClientToolCall, ClientToolDefinition,
     ClientToolExecutor, ClientToolExecutorError, ClientToolOutput, ClientToolResult,
@@ -41,7 +42,8 @@ pub(crate) use chudbot_api::{
     TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageCostGrouping,
     UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UserProfile, UserRef,
     VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
-    canonical_stored_media_uri, collect_agent_run, is_stored_media_uri, stored_media_uri,
+    agent_instruction_part_turn, agent_instructions_turn, canonical_stored_media_uri,
+    collect_agent_run, is_stored_media_uri, stored_media_uri,
 };
 
 /// Error derive used by crate-local error types.

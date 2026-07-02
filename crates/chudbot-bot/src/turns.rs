@@ -23,8 +23,8 @@ pub(crate) struct TurnExecution {
     pub(crate) agent_name: String,
     /// Agent configuration used to build providers, tools, and model request shape.
     pub(crate) agent_config: AgentConfig,
-    /// Rendered system instructions persisted for this turn.
-    pub(crate) system_prompt: String,
+    /// Labeled agent-instruction parts for this top-level turn.
+    pub(crate) agent_instruction_parts: Vec<RenderedAgentInstructionPart>,
     /// Model transcript prepared from stored conversation state and current context.
     pub(crate) transcript: Transcript,
     /// Platform message that assistant output should reply to.
@@ -323,7 +323,6 @@ where
         let (snapshot, is_new) = match existing {
             Some(snapshot) => (snapshot, false),
             None => {
-                let system_instructions = self.compose_system_prompt(&agent_config, None);
                 let snapshot = self
                     .storage
                     .open_conversation(OpenConversation {
@@ -333,7 +332,6 @@ where
                         initial_model: agent_config.model.id.clone(),
                         agent_name: agent_name.clone(),
                         provider: agent_config.provider.clone(),
-                        system_instructions: system_instructions.clone(),
                         title: None,
                     })
                     .await
@@ -351,8 +349,8 @@ where
             tracing::field::display(snapshot.conversation.id),
         );
         tracing::Span::current().record("is_new", is_new);
-        let system_instructions =
-            self.compose_system_prompt(&agent_config, Some(snapshot.conversation.id));
+        let agent_instruction_parts =
+            self.compose_top_level_agent_instruction_parts(&agent_config, snapshot.conversation.id);
 
         // Begin the durable turn before assembling context so every saved
         // context item, transcript, trace, and platform reply has one owner.
@@ -394,9 +392,9 @@ where
         // any audio work already performed during wake-up preflight.
         let preflight_tool_traces = incoming_audio.tool_traces();
         let preflight_usage = incoming_audio.usage_records();
-        let turn_context = self
-            .prepare_turn_context(&message, &snapshot.conversation, incoming_audio)
-            .await?;
+        // The fresh snapshot is loaded before context preparation so memory
+        // notes deduplicate against everything already stored, including
+        // context saved by concurrent turns.
         let prompt_snapshot = self
             .storage
             .load_conversation(ConversationLookup::Id {
@@ -407,12 +405,24 @@ where
             .ok_or(BotError::MissingConversation {
                 conversation_id: snapshot.conversation.id,
             })?;
-        let transcript = self
+        let turn_context = self
+            .prepare_turn_context(&message, &prompt_snapshot, &agent_config, incoming_audio)
+            .await?;
+        let mut transcript = self
             .transcript_for_turn(&prompt_snapshot, &turn, &turn_context.items)
             .await?;
+        let previous_prompt_state =
+            stored_agent_instruction_state_before_turn(&prompt_snapshot, turn.id);
+        let recorded_agent_instruction_parts =
+            insert_agent_instruction_part_changes_before_current_turn(
+                &mut transcript,
+                &agent_instruction_parts,
+                previous_prompt_state,
+                turn.id,
+            );
         tracing::debug!(
             transcript_turns = transcript.turns.len(),
-            system_instructions_chars = system_instructions.chars().count(),
+            recorded_agent_instruction_parts,
             "assembled model transcript"
         );
         // Persist the exact prompt input before model execution so the trace
@@ -423,9 +433,8 @@ where
                 agent_name: agent_name.clone(),
                 provider: agent_config.provider.clone(),
                 model: agent_config.model.id.clone(),
-                system_instructions: system_instructions.clone(),
                 context: turn_context.items,
-                transcript: Some(transcript.clone()),
+                transcript: transcript.clone(),
             })
             .await
             .map_err(storage_error)?;
@@ -440,7 +449,7 @@ where
             turn,
             agent_name,
             agent_config,
-            system_prompt: system_instructions,
+            agent_instruction_parts,
             transcript,
             reply_to: message.id,
             is_new,
@@ -601,15 +610,23 @@ where
             model = %agent_config.model.id,
             "prepared turn retry"
         );
-        let system_instructions = turn_snapshot
-            .system_instructions
-            .clone()
-            .unwrap_or_else(|| {
-                self.compose_system_prompt(&agent_config, Some(retry.conversation.conversation.id))
+        let retry_has_modern_parts = matches!(
+            turn_snapshot.agent_instructions,
+            Some(AgentInstructionSnapshot::Parts { .. })
+        );
+        let agent_instruction_parts =
+            effective_agent_instruction_parts_from_snapshot(turn_snapshot, || {
+                self.compose_top_level_agent_instruction_parts(
+                    &agent_config,
+                    retry.conversation.conversation.id,
+                )
             });
-        let stored_context = replayable_context_items(&turn_snapshot.context);
+        let agent_instruction_text = join_agent_instruction_parts(&agent_instruction_parts);
+        // Retries replay the context captured with the original attempt,
+        // including any persistent memory notes it recorded.
+        let stored_context = turn_snapshot.context.clone();
         let has_stored_context = !stored_context.is_empty();
-        let transcript = self
+        let mut transcript = self
             .transcript_for_retry(
                 &retry.conversation,
                 turn_snapshot,
@@ -617,6 +634,41 @@ where
                 has_stored_context,
             )
             .await?;
+        let previous_prompt_state =
+            stored_agent_instruction_state_before_turn(&retry.conversation, turn.id);
+        let recorded_agent_instruction_parts = if retry_has_modern_parts {
+            insert_agent_instruction_part_changes_before_current_turn(
+                &mut transcript,
+                &agent_instruction_parts,
+                previous_prompt_state,
+                turn.id,
+            )
+        } else if turn_snapshot
+            .agent_instructions
+            .as_ref()
+            .and_then(AgentInstructionSnapshot::legacy_text)
+            .is_some()
+        {
+            insert_legacy_agent_instruction_change_before_current_turn(
+                &mut transcript,
+                &agent_instruction_text,
+                previous_prompt_state.legacy_text(),
+                turn.id,
+            ) as usize
+        } else {
+            insert_agent_instruction_part_changes_before_current_turn(
+                &mut transcript,
+                &agent_instruction_parts,
+                previous_prompt_state,
+                turn.id,
+            )
+        };
+        tracing::debug!(
+            transcript_turns = transcript.turns.len(),
+            agent_instruction_chars = agent_instruction_text.chars().count(),
+            recorded_agent_instruction_parts,
+            "assembled retry transcript"
+        );
         // Save the replayed prompt input before deleting visible failure
         // messages; even a retry that later fails should have inspectable input.
         self.storage
@@ -625,9 +677,8 @@ where
                 agent_name: agent_name.clone(),
                 provider: agent_config.provider.clone(),
                 model: agent_config.model.id.clone(),
-                system_instructions: system_instructions.clone(),
                 context: stored_context,
-                transcript: Some(transcript.clone()),
+                transcript: transcript.clone(),
             })
             .await
             .map_err(storage_error)?;
@@ -662,7 +713,7 @@ where
                 turn,
                 agent_name,
                 agent_config,
-                system_prompt: system_instructions,
+                agent_instruction_parts,
                 transcript,
                 reply_to: retry_user_message.clone(),
                 is_new: false,
@@ -839,7 +890,9 @@ where
             ConversationAgentAssembly {
                 agent_name: &execution.agent_name,
                 agent_config: &execution.agent_config,
-                rendered_system_instructions: execution.system_prompt.clone(),
+                instructions: RenderedAgentInstructions::Parts(
+                    execution.agent_instruction_parts.clone(),
+                ),
                 top_level: true,
             },
             &ConversationAgentContext {
@@ -1456,19 +1509,95 @@ where
         }))
     }
 
+    /// Build memory-note context items for newly relevant conversation users.
+    ///
+    /// Memory-enabled agents get one persistent system note per participant,
+    /// injected the first time that user appears in the conversation as the
+    /// message author, a mentioned user, or a quoted-message author. The notes
+    /// replay with conversation history, so `snapshot` is scanned for users
+    /// already covered by an earlier turn. Payload-load failures are logged
+    /// and skipped; memory problems must never block answering the message.
+    pub(crate) async fn participant_memory_context_items(
+        &self,
+        agent_config: &AgentConfig,
+        snapshot: &ConversationSnapshot,
+        message: &PlatformMessage,
+        position: &mut i32,
+    ) -> Vec<chudbot_api::ContextItem> {
+        if !self.agent_memory_enabled(agent_config) {
+            return Vec::new();
+        }
+        let mut noted =
+            noted_memory_user_keys(snapshot.turns.iter().flat_map(|turn| turn.context.iter()));
+        let mut items = Vec::new();
+        for candidate in memory_note_candidates(message) {
+            let key = memory::key_from_user_ref(&candidate.user);
+            if !noted.insert(key.user_key.clone()) {
+                continue;
+            }
+            let payload = match user_memory_payload(&self.storage, &key).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        user = %key.user_key,
+                        scope = %key.scope_key,
+                        "failed to load participant memory note"
+                    );
+                    continue;
+                }
+            };
+            let payload_text =
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| payload.to_string());
+            tracing::debug!(
+                user = %key.user_key,
+                reason = candidate.reason,
+                "injecting participant memory note"
+            );
+            items.push(chudbot_api::ContextItem {
+                position: *position,
+                source: format!("memory:user:{}", key.user_key),
+                role: "system".to_string(),
+                content: format!(
+                    "User memory note for {name} (user id {id}), loaded automatically because \
+                     {reason}. This note remains part of the conversation. Call \
+                     lookup_user_memory with target_user_id \"{id}\" only if asked to reload \
+                     this user's memory or if you need their latest state.\n{payload_text}",
+                    name = candidate.display_name,
+                    id = key.user_key,
+                    reason = candidate.reason,
+                ),
+                message: None,
+            });
+            *position += 1;
+        }
+        items
+    }
+
     /// Build persisted context items for the quoted message and current message.
     ///
-    /// Quoted messages are included when the platform supplies them. Quoted
-    /// assistant replies from the same conversation are skipped because the
-    /// transcript already replays those assistant turns.
+    /// Memory-enabled agents get system memory notes for newly appearing
+    /// participants first, then quoted messages when the platform supplies
+    /// them. Quoted assistant replies from the same conversation are skipped
+    /// because the transcript already replays those assistant turns.
     pub(crate) async fn prepare_turn_context(
         &self,
         message: &PlatformMessage,
-        conversation: &Conversation,
+        snapshot: &ConversationSnapshot,
+        agent_config: &AgentConfig,
         incoming_audio: IncomingAudioContext,
     ) -> Result<PreparedTurnContext, BotError> {
+        let conversation = &snapshot.conversation;
         let mut items = Vec::new();
         let mut position = 0;
+
+        // Memory notes lead so the model reads participant background before
+        // the message. They persist in replay, so each user is noted only on
+        // their first appearance in the conversation.
+        items.extend(
+            self.participant_memory_context_items(agent_config, snapshot, message, &mut position)
+                .await,
+        );
 
         // Quoted context is useful for reply semantics, but must not duplicate
         // an assistant answer already present in the conversation transcript.
@@ -1646,4 +1775,302 @@ where
         }
         Ok(already_replays)
     }
+}
+
+/// Add a durable legacy agent-instructions turn before the current turn when
+/// the effective prompt changed.
+///
+/// Provider input preserves these marked turns as transcript history. Storage
+/// keeps only change points so later turns can inherit the last marked prompt
+/// without repeating a large static policy on every turn.
+pub(crate) fn insert_legacy_agent_instruction_change_before_current_turn(
+    transcript: &mut Transcript,
+    current_text: &str,
+    previous_text: Option<&str>,
+    current_turn_id: TurnId,
+) -> bool {
+    let changed = match previous_text {
+        Some(previous) => previous != current_text,
+        None => !current_text.is_empty(),
+    };
+    if !changed {
+        return false;
+    }
+    let mut prompt_turn =
+        agent_instructions_turn(transcript.id.as_deref(), current_text.to_string());
+    if previous_text.is_some() {
+        set_transcript_message_id(
+            &mut prompt_turn,
+            turn_agent_instruction_message_id(current_turn_id, None),
+        );
+    }
+    insert_prompt_turns_before_current_turn(transcript, current_turn_id, vec![prompt_turn]);
+    true
+}
+
+fn stored_agent_instruction_state_before_turn(
+    snapshot: &ConversationSnapshot,
+    turn_id: TurnId,
+) -> StoredAgentInstructionState<'_> {
+    let turn_ordinal = snapshot
+        .turns
+        .iter()
+        .find(|turn| turn.turn.id == turn_id)
+        .map(|turn| turn.turn.ordinal);
+    let Some(turn_ordinal) = turn_ordinal else {
+        return StoredAgentInstructionState::None;
+    };
+    snapshot
+        .turns
+        .iter()
+        .rev()
+        .filter(|turn| turn.turn.ordinal < turn_ordinal)
+        .find_map(stored_agent_instruction_state_from_turn)
+        .unwrap_or(StoredAgentInstructionState::None)
+}
+
+fn stored_agent_instruction_state_from_turn(
+    turn: &TurnSnapshot,
+) -> Option<StoredAgentInstructionState<'_>> {
+    match turn.agent_instructions.as_ref()? {
+        AgentInstructionSnapshot::Parts { parts } => {
+            Some(StoredAgentInstructionState::LabeledParts(parts))
+        }
+        AgentInstructionSnapshot::LegacyText { text } => {
+            Some(StoredAgentInstructionState::LegacyText(text.as_str()))
+        }
+    }
+}
+
+/// Effective prompt state already reconstructed from stored transcript rows.
+///
+/// `chudbot-storage-sqlx` walks the raw `agent_instructions` messages in
+/// database order and gives each `TurnSnapshot` the prompt state visible at
+/// that turn. Bot orchestration only compares the previous state to the current
+/// config and writes new change markers when needed.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) enum StoredAgentInstructionState<'a> {
+    #[default]
+    None,
+    LegacyText(&'a str),
+    LabeledParts(&'a [AgentInstructionPartSnapshot]),
+}
+
+impl<'a> StoredAgentInstructionState<'a> {
+    fn legacy_text(self) -> Option<&'a str> {
+        match self {
+            Self::LegacyText(text) => Some(text),
+            Self::None | Self::LabeledParts(_) => None,
+        }
+    }
+}
+
+/// Persist changed labeled agent-instructions parts before the current turn.
+///
+/// Modern conversations compare by part key. Legacy conversations compare the
+/// joined prompt text first; when it changes, all non-empty current parts are
+/// written so the conversation is upgraded to part-keyed prompt history.
+pub(crate) fn insert_agent_instruction_part_changes_before_current_turn(
+    transcript: &mut Transcript,
+    current_parts: &[RenderedAgentInstructionPart],
+    previous_state: StoredAgentInstructionState<'_>,
+    current_turn_id: TurnId,
+) -> usize {
+    let use_turn_scoped_ids = !matches!(previous_state, StoredAgentInstructionState::None);
+    let mut parts_to_write = changed_agent_instruction_parts(current_parts, previous_state);
+    let inserted = parts_to_write.len();
+    if inserted == 0 {
+        return 0;
+    }
+    parts_to_write.sort_by_key(|part| part.ordinal);
+    let prompt_turns = parts_to_write
+        .into_iter()
+        .map(|part| {
+            let mut prompt_turn = agent_instruction_part_turn(
+                transcript.id.as_deref(),
+                part.key.clone(),
+                part.ordinal,
+                part.text.clone(),
+            );
+            if use_turn_scoped_ids {
+                set_transcript_message_id(
+                    &mut prompt_turn,
+                    turn_agent_instruction_message_id(current_turn_id, Some(&part.key)),
+                );
+            }
+            prompt_turn
+        })
+        .collect::<Vec<_>>();
+    insert_prompt_turns_before_current_turn(transcript, current_turn_id, prompt_turns);
+    inserted
+}
+
+fn insert_prompt_turns_before_current_turn(
+    transcript: &mut Transcript,
+    current_turn_id: TurnId,
+    prompt_turns: Vec<TranscriptTurn>,
+) {
+    if prompt_turns.is_empty() {
+        return;
+    }
+    let index = current_turn_context_start_index(transcript, current_turn_id);
+    transcript.turns.splice(index..index, prompt_turns);
+}
+
+fn current_turn_context_start_index(transcript: &Transcript, current_turn_id: TurnId) -> usize {
+    let current_system_id = turn_transcript_message_id(current_turn_id, "system");
+    let current_user_id = turn_transcript_message_id(current_turn_id, "user");
+    transcript
+        .turns
+        .iter()
+        .position(|turn| {
+            turn.metadata
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| id == current_system_id || id == current_user_id)
+        })
+        .or_else(|| current_context_start_index_without_metadata(transcript))
+        .unwrap_or(transcript.turns.len())
+}
+
+fn current_context_start_index_without_metadata(transcript: &Transcript) -> Option<usize> {
+    let mut index = transcript
+        .turns
+        .iter()
+        .rposition(|turn| turn.role == TurnRole::User)?;
+    while index > 0
+        && transcript
+            .turns
+            .get(index - 1)
+            .is_some_and(|turn| turn.role == TurnRole::System)
+    {
+        index -= 1;
+    }
+    Some(index)
+}
+
+fn changed_agent_instruction_parts<'a>(
+    current_parts: &'a [RenderedAgentInstructionPart],
+    previous_state: StoredAgentInstructionState<'_>,
+) -> Vec<&'a RenderedAgentInstructionPart> {
+    match previous_state {
+        StoredAgentInstructionState::LabeledParts(previous_parts) => {
+            let previous_text_by_key = previous_parts
+                .iter()
+                .map(|part| (part.key.as_str(), part.text.as_str()))
+                .collect::<BTreeMap<_, _>>();
+            current_parts
+                .iter()
+                .filter(|part| {
+                    previous_text_by_key.get(part.key.as_str()).copied() != Some(part.text.as_str())
+                })
+                .collect()
+        }
+        StoredAgentInstructionState::LegacyText(previous_text)
+            if previous_text == join_agent_instruction_parts(current_parts) =>
+        {
+            Vec::new()
+        }
+        StoredAgentInstructionState::LegacyText(_) | StoredAgentInstructionState::None => {
+            current_parts
+                .iter()
+                .filter(|part| !part.text.is_empty())
+                .collect()
+        }
+    }
+}
+
+fn agent_instruction_part_from_snapshot(
+    part: &AgentInstructionPartSnapshot,
+) -> RenderedAgentInstructionPart {
+    RenderedAgentInstructionPart::new(part.ordinal, part.key.clone(), part.text.clone())
+}
+
+fn effective_agent_instruction_parts_from_snapshot(
+    turn_snapshot: &TurnSnapshot,
+    fallback: impl FnOnce() -> Vec<RenderedAgentInstructionPart>,
+) -> Vec<RenderedAgentInstructionPart> {
+    match &turn_snapshot.agent_instructions {
+        Some(AgentInstructionSnapshot::Parts { parts }) => {
+            return parts
+                .iter()
+                .map(agent_instruction_part_from_snapshot)
+                .collect();
+        }
+        Some(AgentInstructionSnapshot::LegacyText { text }) => {
+            return vec![RenderedAgentInstructionPart::new(0, "legacy", text.clone())];
+        }
+        None => {}
+    }
+    fallback()
+}
+
+/// One user who should receive an automatic memory note this turn.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryNoteCandidate {
+    /// Platform identity used to build the memory key.
+    pub(crate) user: UserRef,
+    /// Display name rendered into the note header.
+    pub(crate) display_name: String,
+    /// Why this user became relevant, rendered into the note header.
+    pub(crate) reason: &'static str,
+}
+
+/// Collect the users made relevant by one platform message, author first.
+///
+/// Bots never get memory notes: the bot itself is mentioned on every wake-up
+/// message, and other bots have no useful user memory. Mentions without a
+/// hydrated profile are skipped because their bot status is unknown; the model
+/// can still reach those users through `lookup_user_memory`.
+pub(crate) fn memory_note_candidates(message: &PlatformMessage) -> Vec<MemoryNoteCandidate> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut candidates = Vec::new();
+    // Bot-authored messages are dropped before turn preparation, but guard
+    // anyway so a future caller cannot create bot memory namespaces.
+    if !message.author.is_bot && seen.insert(message.author.id.user_id.as_str().to_string()) {
+        candidates.push(MemoryNoteCandidate {
+            user: message.author.id.clone(),
+            display_name: display_name(message),
+            reason: "they sent a message in this conversation",
+        });
+    }
+    if let Some(referenced) = message.referenced_message()
+        && !referenced.author.is_bot
+        && seen.insert(referenced.author.id.user_id.as_str().to_string())
+    {
+        candidates.push(MemoryNoteCandidate {
+            user: referenced.author.id.clone(),
+            display_name: display_name_for_profile(&referenced.author),
+            reason: "their message was quoted",
+        });
+    }
+    for mention in &message.mentions {
+        let Some(profile) = message.mention_profiles.iter().find(|profile| {
+            profile.id.platform == mention.platform
+                && profile.id.guild_id == mention.guild_id
+                && profile.id.user_id == mention.user_id
+        }) else {
+            continue;
+        };
+        if profile.is_bot || !seen.insert(mention.user_id.as_str().to_string()) {
+            continue;
+        }
+        candidates.push(MemoryNoteCandidate {
+            user: mention.clone(),
+            display_name: display_name_for_profile(profile),
+            reason: "they were mentioned",
+        });
+    }
+    candidates
+}
+
+/// Collect user keys already covered by a memory note in the given context.
+pub(crate) fn noted_memory_user_keys<'a>(
+    items: impl IntoIterator<Item = &'a chudbot_api::ContextItem>,
+) -> std::collections::BTreeSet<String> {
+    items
+        .into_iter()
+        .filter_map(|item| item.source.strip_prefix("memory:user:"))
+        .map(str::to_string)
+        .collect()
 }

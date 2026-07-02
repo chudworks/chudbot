@@ -599,16 +599,15 @@ async fn to_responses_input(
     image_encoding: ImageEncoding,
 ) -> Result<Vec<Value>, OpenAiError> {
     let mut input = Vec::new();
-    if let Some(instructions) = &transcript.instructions
-        && !instructions.is_empty()
-    {
-        input.push(json!({ "role": "developer", "content": instructions }));
-    }
-
+    // Agent instructions arrive as the leading system turn; the generic loop
+    // below renders it as a developer message.
     for message in &transcript.turns {
         let role = match message.role {
             TurnRole::Assistant => "assistant",
             TurnRole::User => "user",
+            // The Responses API models system-authored content as `developer`
+            // messages, which may appear at any input position.
+            TurnRole::System => "developer",
         };
 
         let mut echo = Vec::new();
@@ -1518,10 +1517,13 @@ mod tests {
     }
 
     #[test]
-    fn sends_transcript_instructions_as_developer_message() {
+    fn sends_system_turns_as_developer_messages() {
         let client = OpenAiClient::new(ProviderName::new("openai"), "key");
         let mut transcript = Transcript::new();
-        transcript.instructions = Some("Follow the application rules.".to_string());
+        transcript.push(TranscriptTurn::text(
+            TurnRole::System,
+            "Follow the application rules.",
+        ));
         transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
 
         let input = futures::executor::block_on(to_responses_input(

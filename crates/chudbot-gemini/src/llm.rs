@@ -442,7 +442,10 @@ async fn to_gemini_contents(
     let mut contents = Vec::new();
     let mut call_names = BTreeMap::new();
 
-    for turn in &transcript.turns {
+    // The leading system turn is hoisted into `systemInstruction` by
+    // `system_instruction`; only later turns render as contents.
+    let hoisted_turns = transcript.leading_system_turn_count();
+    for turn in transcript.turns.iter().skip(hoisted_turns) {
         if let Some(continuation) = provider_continuation_content(turn, provider) {
             index_function_calls(&continuation, &mut call_names);
             contents.push(continuation);
@@ -452,6 +455,10 @@ async fn to_gemini_contents(
         let role = match turn.role {
             TurnRole::Assistant => "model",
             TurnRole::User => "user",
+            // Gemini contents only accept user/model roles; systemInstruction
+            // is a separate top-level field. System turns carry
+            // self-describing runtime notes, so lower them to user content.
+            TurnRole::System => "user",
         };
         let mut parts = Vec::new();
         for block in &turn.blocks {
@@ -577,12 +584,13 @@ fn index_function_calls(content: &Value, call_names: &mut BTreeMap<String, Strin
     }
 }
 
-/// Converts system instructions into Gemini's separate `systemInstruction`.
+/// Converts the leading system turn into Gemini's separate `systemInstruction`.
+///
+/// Gemini contents have no system role, so the agent's instructions turn is
+/// hoisted here and skipped by `to_gemini_contents`.
 fn system_instruction(transcript: &Transcript) -> Option<Value> {
     transcript
-        .instructions
-        .as_ref()
-        .filter(|instructions| !instructions.is_empty())
+        .leading_system_text()
         .map(|instructions| json!({ "parts": [{ "text": instructions }] }))
 }
 
@@ -970,7 +978,7 @@ mod tests {
         {
             let public_url = self.public_url.clone();
             let uri = self.uri().clone();
-            Box::pin(async move { public_url.ok_or_else(|| MediaError::NoPublicUrl { uri }) })
+            Box::pin(async move { public_url.ok_or(MediaError::NoPublicUrl { uri }) })
         }
 
         fn load<'life0, 'async_trait>(
@@ -1075,6 +1083,32 @@ mod tests {
         assert_eq!(info.context_window_tokens, Some(1_048_576));
         assert_eq!(info.max_output_tokens, Some(65_536));
         assert!(info.raw.is_some());
+    }
+
+    #[test]
+    fn hoists_leading_system_turn_and_lowers_later_system_turns() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+
+        // The leading system turn feeds `systemInstruction` and is skipped in
+        // contents; later system turns lower to user content.
+        assert_eq!(
+            system_instruction(&transcript),
+            Some(json!({ "parts": [{ "text": "be helpful" }] }))
+        );
+        let contents = futures::executor::block_on(to_gemini_contents(
+            &transcript,
+            &ProviderName::new("gemini"),
+            ImageEncoding::default(),
+        ))
+        .unwrap();
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "hi");
+        assert_eq!(contents[1]["role"], "user");
+        assert_eq!(contents[1]["parts"][0]["text"], "memory note");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { useParams } from 'react-router-dom';
+import { agentInstructionText } from '../types';
 import { useConversation } from '../store';
 import { usePageTitle } from '../title';
 import Turn from './Turn';
@@ -120,9 +121,21 @@ export default function ConversationView() {
         <UsageSummary turns={turns} modelInfo={modelInfo} />
       </header>
       <main className="conv">
-        {turns.map((tv) => (
-          <Turn key={tv.turn.id} turnView={tv} users={users} />
-        ))}
+        {turns.map((tv, index) => {
+          const current = agentInstructionText(tv.agent_instructions);
+          const previous =
+            index > 0 ? agentInstructionText(turns[index - 1].agent_instructions) : null;
+          const showAgentInstructions =
+            current != null && current !== previous;
+          return (
+            <Turn
+              key={tv.turn.id}
+              turnView={tv}
+              users={users}
+              showAgentInstructions={showAgentInstructions}
+            />
+          );
+        })}
         {turns.length === 0 && <p className="empty">No turns yet.</p>}
       </main>
     </>

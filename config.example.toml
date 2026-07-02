@@ -124,8 +124,8 @@ default_agent = "default"
 admins = [
   { platform = "discord", user_id = "123456789012345678" }
 ]
-# Optional deployment-wide policy prepended before each agent's own prompt.
-extra_system_prompt = """
+# Optional deployment-wide policy prepended before each agent's own instructions.
+extra_agent_instructions = """
 This bot runs in a private Discord server. Follow Discord platform policy and
 do not reveal internal ids, media:// URIs, or implementation details unless the
 operator explicitly asks for them.
@@ -258,14 +258,14 @@ kind = "xai"
 api_key = "xai-..."
 # base_url = "https://api.x.ai/v1"
 
-# Agents are prompt + provider + model + tool exposure. User-facing agents can
+# Agents are instructions + provider + model + tool exposure. User-facing agents can
 # be selected with /chudbot-agent. The reserved system agent names
 # memory_diary, memory_compact, tos_preflight, and conversation_title are picked
 # up by internal jobs and are hidden from /chudbot-agent selection.
 
 [bot.agents.default]
 provider = "grok"
-system_prompt = """
+instructions = """
 You are Chudbot, a direct and useful assistant in a private Discord server.
 Answer naturally for Discord. Use available search and fetch tools when they
 would materially improve the answer.
@@ -292,13 +292,24 @@ value = { reasoning_effort = "high" }
 
 [bot.agents.default.image_generation]
 provider = "grok_images"
-# Provider-specific image model id or tier.
+# Provider-specific image model id or tier. Model selection is operator-owned:
+# the agent cannot pass a model id through the generate_image tool.
 model = "quality"
+# Aspect ratios accepted by this provider/model. When set, the generate_image
+# tool schema advertises them as an enum and other values are rejected before
+# the provider is called; omit to leave the field free-form. Check the
+# provider's docs when changing models.
+aspect_ratios = ["1:1", "4:3", "3:4", "16:9", "9:16"]
 
 [bot.agents.default.video_generation]
 provider = "grok_video"
-# Provider-specific video model id.
+# Provider-specific video model id. Model selection is operator-owned: the
+# agent cannot pass a model id through the generate_video tool.
 model = "grok-imagine-video"
+# Aspect ratios and resolutions accepted by this provider/model. Same
+# enum/free-form behavior as image aspect_ratios; resolutions is video-only.
+aspect_ratios = ["16:9", "9:16", "1:1"]
+resolutions = ["480p", "720p"]
 
 # Optional active-generation rate limit for non-bypassed platform scopes.
 # Counts pending video_jobs and saved done video_jobs inside the rolling interval.
@@ -316,7 +327,7 @@ wake_word = "Chudbot"
 
 [bot.agents.memory_diary]
 provider = "grok"
-system_prompt = """
+instructions = """
 You write concise user-memory diary entries for Chudbot. Read the bounded transcript slice and optional current memory profile. Extract only stable, useful observations about the subject user. Include uncertainty when evidence is weak. Prefer factual bullets over prose. Consider relationships, preferences and dislikes, projects, work, hobbies, recurring topics, server lore, running jokes, good-natured roast material, corrections, stale facts, and visually meaningful image evidence. Do not invent facts.
 """
 limits = { max_iterations = 8 }
@@ -334,7 +345,7 @@ value = { reasoning_effort = "high" }
 
 [bot.agents.memory_compact]
 provider = "grok"
-system_prompt = """
+instructions = """
 You maintain a compact Markdown memory profile for one Chudbot user in one server/workspace. Produce a complete replacement profile, not a diff. Use explicit memory events, diary entries, corrections, and forget requests. Keep the profile short, normally 1-3 KB. Remove or rewrite forgotten and stale facts. Preserve useful uncertainty. Output Markdown only.
 """
 limits = { max_iterations = 8 }
@@ -352,7 +363,7 @@ value = { reasoning_effort = "high" }
 
 [bot.agents.tos_preflight]
 provider = "grok"
-system_prompt = """
+instructions = """
 You are a TOS compliance classifier for a private friends-only Discord server. Each message you classify is prefixed with the sender's display name as `[name]: `. The DEFAULT IS ALLOW. Only REFUSE the narrowly listed categories below.
 
 REFUSE these:
@@ -380,7 +391,7 @@ temperature = 0.0
 
 [bot.agents.conversation_title]
 provider = "grok"
-system_prompt = """
+instructions = """
 You write very short conversation titles. Output ONLY a title for the conversation below: five words or fewer, no quotes, no period, no leading 'Re:' or 'Conversation about'. Just the title text.
 """
 limits = { max_iterations = 8 }
@@ -397,7 +408,7 @@ value = { reasoning_effort = "high" }
 
 [bot.agents.research]
 provider = "openai"
-system_prompt = """
+instructions = """
 You are a careful research assistant. Ground claims with current search when
 available, separate facts from judgment, and keep the final answer concise.
 """
@@ -420,7 +431,7 @@ model = "gpt-image-1"
 
 [bot.agents.claude]
 provider = "anthropic"
-system_prompt = """
+instructions = """
 You are a concise assistant. Prefer clear, factual answers and ask for missing
 context only when it is necessary.
 """
@@ -449,7 +460,7 @@ description = "Ask a focused research subagent to gather facts and return a conc
 # Example local agent for an OpenAI-compatible Chat Completions provider.
 # [bot.agents.local]
 # provider = "local_compat"
-# system_prompt = "You are a helpful local model running behind an OpenAI-compatible API."
+# instructions = "You are a helpful local model running behind an OpenAI-compatible API."
 # client_tools = ["fetch_messages", "post_status_message", "add_reaction", "usage_report"]
 # [bot.agents.local.model]
 # id = "qwen3"
@@ -464,7 +475,7 @@ description = "Ask a focused research subagent to gather facts and return a conc
 # generation.
 # [bot.agents.gemini]
 # provider = "gemini"
-# system_prompt = "You are a helpful assistant using Google's Gemini API."
+# instructions = "You are a helpful assistant using Google's Gemini API."
 # server_tools = ["web_search"]
 # client_tools = ["fetch_messages", "generate_image", "generate_video", "post_status_message", "add_reaction", "usage_report"]
 # [bot.agents.gemini.model]

@@ -86,15 +86,15 @@ pub use platform::{
 // Persistence contracts are intentionally workflow-shaped rather than
 // table-shaped: storage backends answer bot/runtime questions, not SQL row APIs.
 pub use storage::{
-    AgentSelection, BeginTurn, BotStorage, ChannelLink, ContextItem, Conversation,
-    ConversationLookup, ConversationSnapshot, ConversationStop, CountActiveVideoGenerations,
-    CreateVideoJob, FinishTurn, MemoryJobCompletion, MemoryJobKind, MemoryJobSchedule,
-    MemoryTurnWindow, MessageLink, ModelStepKind, ModelStepTrace, NewUserMemoryDiaryEntry,
-    NewUserMemoryDocumentRevision, NewUserMemoryEvent, OpenConversation, ResolveAgent, RetryTurn,
-    SaveTurnInput, StoredGuildProfile, StoredUserProfile, StoredVideoJob, Turn, TurnAsset,
-    TurnSnapshot, TurnStatus, UpdateVideoJob, UserMemoryAudioTranscription, UserMemoryDiaryEntry,
-    UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind, UserMemoryImageContext,
-    UserMemoryJob, UserMemoryKey, UserMemoryTurn,
+    AgentInstructionPartSnapshot, AgentInstructionSnapshot, AgentSelection, BeginTurn, BotStorage,
+    ChannelLink, ContextItem, Conversation, ConversationLookup, ConversationSnapshot,
+    ConversationStop, CountActiveVideoGenerations, CreateVideoJob, FinishTurn, MemoryJobCompletion,
+    MemoryJobKind, MemoryJobSchedule, MemoryTurnWindow, MessageLink, ModelStepKind, ModelStepTrace,
+    NewUserMemoryDiaryEntry, NewUserMemoryDocumentRevision, NewUserMemoryEvent, OpenConversation,
+    ResolveAgent, RetryTurn, SaveTurnInput, StoredGuildProfile, StoredUserProfile, StoredVideoJob,
+    Turn, TurnAsset, TurnSnapshot, TurnStatus, UpdateVideoJob, UserMemoryAudioTranscription,
+    UserMemoryDiaryEntry, UserMemoryDocument, UserMemoryEvent, UserMemoryEventKind,
+    UserMemoryImageContext, UserMemoryJob, UserMemoryKey, UserMemoryTurn,
 };
 
 // Model contracts cover both static model configuration and one provider
@@ -110,8 +110,11 @@ pub use llm::{
 // Agent loop contracts: static agent config, runtime agent execution, outcomes,
 // and final assistant answers.
 pub use agent::{
-    Agent, AgentError, AgentLimits, AgentOutcome, AgentRun, AgentRunError, AgentRunEvent,
-    AgentSpec, AssistantAnswer, collect_agent_run,
+    AGENT_INSTRUCTIONS_METADATA_KEY, AGENT_INSTRUCTIONS_PART_KEY_METADATA_KEY,
+    AGENT_INSTRUCTIONS_PART_METADATA_KEY, AGENT_INSTRUCTIONS_PART_ORDINAL_METADATA_KEY, Agent,
+    AgentError, AgentInstructionPart, AgentLimits, AgentOutcome, AgentRun, AgentRunError,
+    AgentRunEvent, AgentSpec, AssistantAnswer, agent_instruction_part_turn,
+    agent_instructions_turn, collect_agent_run, is_agent_instructions_turn,
 };
 
 // Tool protocol shapes cover model-visible client tools, provider-run server

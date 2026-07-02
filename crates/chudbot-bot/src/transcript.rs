@@ -21,6 +21,22 @@ pub(crate) fn turn_transcript_message_id(turn_id: TurnId, role: &str) -> String 
     format!("chudbot_turn_{turn_id}_{role}")
 }
 
+/// Return the stable synthetic message id for a system prompt change attached
+/// to a specific turn.
+pub(crate) fn turn_agent_instruction_message_id(turn_id: TurnId, part_key: Option<&str>) -> String {
+    match part_key {
+        Some(key) => format!("chudbot_turn_{turn_id}_system_{key}"),
+        None => format!("chudbot_turn_{turn_id}_system"),
+    }
+}
+
+/// Override the provider-visible synthetic message id on a transcript turn.
+pub(crate) fn set_transcript_message_id(turn: &mut TranscriptTurn, id: String) {
+    if let Some(metadata) = turn.metadata.as_object_mut() {
+        metadata.insert("id".to_string(), serde_json::Value::String(id));
+    }
+}
+
 /// Transcript assembly methods that need runtime services such as the media
 /// store.
 impl<R> BotRuntime<R>
@@ -41,7 +57,9 @@ where
         let mut transcript = self
             .transcript_from_snapshot(snapshot, turn.history_cutoff)
             .await?;
-        transcript.push(self.transcript_turn_from_context(turn.id, context).await);
+        for context_turn in self.transcript_turns_from_context(turn.id, context).await {
+            transcript.push(context_turn);
+        }
         tracing::debug!(
             turns = transcript.turns.len(),
             "assembled transcript for live turn"
@@ -78,10 +96,12 @@ where
         // Prefer the context captured with the original attempt; older turns
         // may only have the stored display text plus newly supplied context.
         if has_stored_context {
-            transcript.push(
-                self.transcript_turn_from_context(retry_turn.turn.id, context)
-                    .await,
-            );
+            for context_turn in self
+                .transcript_turns_from_context(retry_turn.turn.id, context)
+                .await
+            {
+                transcript.push(context_turn);
+            }
         } else {
             let mut turn = TranscriptTurn::text(
                 TurnRole::User,
@@ -103,26 +123,45 @@ where
         Ok(transcript)
     }
 
-    /// Convert context items for one user turn into a transcript turn.
+    /// Convert context items for one turn into transcript turns.
     ///
-    /// Empty context still becomes an explicit text block so providers receive a
-    /// well-formed user message instead of an empty block list.
-    pub(crate) async fn transcript_turn_from_context(
+    /// Items with the `system` role — runtime-injected notes such as user
+    /// memory — become a leading [`TurnRole::System`] turn; everything else
+    /// forms the user turn, which is always last in the returned list. Empty
+    /// user context still becomes an explicit text block so providers receive
+    /// a well-formed user message instead of an empty block list.
+    pub(crate) async fn transcript_turns_from_context(
         &self,
         turn_id: TurnId,
         context: &[chudbot_api::ContextItem],
-    ) -> TranscriptTurn {
-        let mut blocks = self.context_blocks_from_items(context).await;
+    ) -> Vec<TranscriptTurn> {
+        let (system_items, user_items): (Vec<_>, Vec<_>) = context
+            .iter()
+            .cloned()
+            .partition(|item| item.role == "system");
+        let mut turns = Vec::new();
+        let system_blocks = self.context_blocks_from_items(&system_items).await;
+        if !system_blocks.is_empty() {
+            turns.push(TranscriptTurn {
+                role: TurnRole::System,
+                blocks: system_blocks,
+                metadata: transcript_message_metadata(turn_transcript_message_id(
+                    turn_id, "system",
+                )),
+            });
+        }
+        let mut blocks = self.context_blocks_from_items(&user_items).await;
         if blocks.is_empty() {
             blocks.push(ContentBlock::Text {
                 text: "(no message content)".to_string(),
             });
         }
-        TranscriptTurn {
+        turns.push(TranscriptTurn {
             role: TurnRole::User,
             blocks,
             metadata: transcript_message_metadata(turn_transcript_message_id(turn_id, "user")),
-        }
+        });
+        turns
     }
 
     /// Convert context items into provider-ready content blocks.
@@ -182,6 +221,7 @@ where
     ) -> Result<Transcript, BotError> {
         let mut transcript = Transcript::new();
         transcript.id = Some(snapshot.conversation.id.to_string());
+        let mut replayed_instruction_state = ReplayedAgentInstructionState::default();
 
         // Step 1: select only completed responses the next model call is
         // allowed to see, then sort by response order with turn order as a
@@ -207,10 +247,16 @@ where
         });
 
         for turn in replay_turns {
-            // Step 2: rebuild the prior user message. Memory context is
-            // prompt scaffolding for the original call, not durable chat
-            // history, so it is dropped when replaying completed turns.
-            let replay_context = replayable_context_items(&turn.context);
+            append_stored_agent_instruction_changes(
+                &mut transcript,
+                turn,
+                &mut replayed_instruction_state,
+            );
+            // Step 2: rebuild the prior turn's context. Memory notes replay as
+            // durable system turns so later turns keep seeing every
+            // participant's memory; the user message is always the final
+            // context turn and receives replayed media below.
+            let replay_context = &turn.context;
             let mut user_turn = if replay_context.is_empty() {
                 TranscriptTurn {
                     role: TurnRole::User,
@@ -226,8 +272,16 @@ where
                     )),
                 }
             } else {
-                self.transcript_turn_from_context(turn.turn.id, &replay_context)
-                    .await
+                let mut context_turns = self
+                    .transcript_turns_from_context(turn.turn.id, replay_context)
+                    .await;
+                let user_turn = context_turns
+                    .pop()
+                    .expect("context turns always end with the user turn");
+                for system_turn in context_turns {
+                    transcript.push(system_turn);
+                }
+                user_turn
             };
             // Track media already present in context so replay assets do not
             // duplicate the same model-visible attachment.
@@ -338,24 +392,108 @@ where
     }
 }
 
-/// Return context items that should be carried forward when replaying history.
-///
-/// Memory items are omitted because they are prompt-time context, not durable
-/// chat messages or attachments that should appear again in completed-history
-/// replay.
-pub(crate) fn replayable_context_items(
-    context: &[chudbot_api::ContextItem],
-) -> Vec<chudbot_api::ContextItem> {
-    context
-        .iter()
-        .filter(|item| !is_memory_context_item(item))
-        .cloned()
-        .collect()
+#[derive(Debug, Clone, Default)]
+enum ReplayedAgentInstructionState {
+    #[default]
+    None,
+    LegacyText(String),
+    LabeledParts(BTreeMap<String, AgentInstructionPartSnapshot>),
 }
 
-/// Identify context supplied by the memory system.
-pub(crate) fn is_memory_context_item(item: &chudbot_api::ContextItem) -> bool {
-    item.source.starts_with("memory:")
+/// Replay durable prompt change markers before the turn where they became
+/// effective.
+///
+/// Storage gives each `TurnSnapshot` the prompt state visible at that turn.
+/// This function walks those effective states in conversation order and emits
+/// only the markers needed to transition from the last emitted prompt state to
+/// the current turn's state. That keeps the provider request prefix stable
+/// across turns while still applying mid-conversation prompt updates.
+fn append_stored_agent_instruction_changes(
+    transcript: &mut Transcript,
+    turn: &TurnSnapshot,
+    replayed_state: &mut ReplayedAgentInstructionState,
+) {
+    match &turn.agent_instructions {
+        Some(AgentInstructionSnapshot::Parts { parts }) => {
+            append_stored_agent_instruction_part_changes(
+                transcript,
+                turn.turn.id,
+                parts,
+                replayed_state,
+            );
+            *replayed_state = ReplayedAgentInstructionState::LabeledParts(
+                parts
+                    .iter()
+                    .map(|part| (part.key.clone(), part.clone()))
+                    .collect(),
+            );
+        }
+        Some(AgentInstructionSnapshot::LegacyText { text }) => {
+            if !matches!(replayed_state, ReplayedAgentInstructionState::LegacyText(previous) if previous == text)
+            {
+                let mut prompt_turn =
+                    agent_instructions_turn(transcript.id.as_deref(), text.clone());
+                if !matches!(replayed_state, ReplayedAgentInstructionState::None) {
+                    set_transcript_message_id(
+                        &mut prompt_turn,
+                        turn_agent_instruction_message_id(turn.turn.id, None),
+                    );
+                }
+                transcript.push(prompt_turn);
+            }
+            *replayed_state = ReplayedAgentInstructionState::LegacyText(text.clone());
+        }
+        None => {}
+    }
+}
+
+fn append_stored_agent_instruction_part_changes(
+    transcript: &mut Transcript,
+    turn_id: TurnId,
+    current_parts: &[AgentInstructionPartSnapshot],
+    replayed_state: &ReplayedAgentInstructionState,
+) {
+    let use_turn_scoped_ids = !matches!(replayed_state, ReplayedAgentInstructionState::None);
+    let mut changed_parts = current_parts
+        .iter()
+        .filter(|part| match replayed_state {
+            ReplayedAgentInstructionState::LabeledParts(previous_parts) => {
+                previous_parts
+                    .get(&part.key)
+                    .map(|previous| previous.text.as_str())
+                    != Some(part.text.as_str())
+            }
+            ReplayedAgentInstructionState::LegacyText(previous_text) => {
+                previous_text != &join_agent_instruction_part_snapshots(current_parts)
+                    && !part.text.is_empty()
+            }
+            ReplayedAgentInstructionState::None => !part.text.is_empty(),
+        })
+        .collect::<Vec<_>>();
+    changed_parts.sort_by_key(|part| part.ordinal);
+    for part in changed_parts {
+        let mut prompt_turn = agent_instruction_part_turn(
+            transcript.id.as_deref(),
+            part.key.clone(),
+            part.ordinal,
+            part.text.clone(),
+        );
+        if use_turn_scoped_ids {
+            set_transcript_message_id(
+                &mut prompt_turn,
+                turn_agent_instruction_message_id(turn_id, Some(&part.key)),
+            );
+        }
+        transcript.push(prompt_turn);
+    }
+}
+
+fn join_agent_instruction_part_snapshots(parts: &[AgentInstructionPartSnapshot]) -> String {
+    parts
+        .iter()
+        .filter(|part| !part.text.is_empty())
+        .map(|part| part.text.as_str())
+        .collect::<String>()
 }
 
 /// Replay stored provider model steps into transcript turns.

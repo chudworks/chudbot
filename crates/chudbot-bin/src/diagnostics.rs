@@ -741,6 +741,7 @@ const BOT_KEYS: &[&str] = &[
     "agents",
     "admins",
     "platforms",
+    "extra_agent_instructions",
     "extra_system_prompt",
     "version",
     "limits",
@@ -751,6 +752,7 @@ const LIMIT_KEYS: &[&str] = &["max_iterations"];
 const PLATFORM_BINDING_KEYS: &[&str] = &["agent"];
 const AGENT_KEYS: &[&str] = &[
     "provider",
+    "instructions",
     "system_prompt",
     "model",
     "server_tools",
@@ -771,7 +773,13 @@ const MODEL_KEYS: &[&str] = &[
 ];
 const SAMPLING_KEYS: &[&str] = &["max_output_tokens", "temperature", "top_p"];
 const PROVIDER_OPTIONS_KEYS: &[&str] = &["value"];
-const GENERATION_BINDING_KEYS: &[&str] = &["provider", "model", "rate_limit"];
+const GENERATION_BINDING_KEYS: &[&str] = &[
+    "provider",
+    "model",
+    "aspect_ratios",
+    "resolutions",
+    "rate_limit",
+];
 const TRANSCRIPTION_BINDING_KEYS: &[&str] = &["provider", "model", "wake_word"];
 const RATE_LIMIT_KEYS: &[&str] = &["limit", "interval", "bypass_scopes"];
 const PLATFORM_SCOPE_BYPASS_KEYS: &[&str] = &["platform", "scope_id"];
@@ -2506,7 +2514,7 @@ agent = "missing-platform-agent"
 
 [bot.agents.default]
 provider = "missing-llm"
-system_prompt = "hi"
+instructions = "hi"
 model = { id = "gpt-test", server_tools = [], sampling = {} }
 
 [bot.agents.default.image_generation]
@@ -2581,7 +2589,7 @@ default_agent = "default"
 
 [bot.agents.default]
 provider = "grok"
-system_prompt = "hi"
+instructions = "hi"
 
 [bot.agents.default.model]
 id = "grok-test"
@@ -2626,7 +2634,7 @@ default_agent = "default"
 
 [bot.agents.default]
 provider = "grok"
-system_prompt = "hi"
+instructions = "hi"
 
 [bot.agents.default.model]
 id = "grok-test"
@@ -2658,7 +2666,7 @@ default_agent = "default"
 
 [bot.agents.default]
 provider = "grok"
-system_prompt = "hi"
+instructions = "hi"
 
 [bot.agents.default.model]
 id = "grok-test"
@@ -2712,7 +2720,7 @@ admins = [{ platform = "discord", user_id = "123", nickname = "Chud" }]
 
 [bot.agents.default]
 provider = "openai"
-system_prompt = "hi"
+instructions = "hi"
 persona = "old"
 
 [bot.agents.default.model]
@@ -2798,7 +2806,7 @@ default_agent = "agent.with.dot"
 
 [bot.agents."agent.with.dot"]
 provider = "missing"
-system_prompt = "hi"
+instructions = "hi"
 model = { id = "gpt-test" }
 "#;
         let config = toml::from_str::<RuntimeConfig>(input).unwrap();
@@ -2832,7 +2840,7 @@ default_agent = "default"
 
 [bot.agents.default]
 provider = "openai"
-system_prompt = "hi"
+instructions = "hi"
 model = { id = "gpt-test" }
 
 [llm.openai]
@@ -2870,7 +2878,7 @@ default_agent = "default"
 
 [bot.agents.default]
 provider = "openai"
-system_prompt = "hi"
+instructions = "hi"
 model = { id = "gpt-test" }
 
 [llm.openai]
@@ -2903,7 +2911,7 @@ default_agent = "default"
 
 [bot.agents.default]
 provider = "openai"
-system_prompt = "hi"
+instructions = "hi"
 model = { id = "gpt-test" }
 
 [llm.openai]
@@ -2936,7 +2944,7 @@ default_agent = "default"
 
 [bot.agents.default]
 provider = "openai"
-system_prompt = "hi"
+instructions = "hi"
 model = { id = "gpt-test" }
 
 [llm.openai]

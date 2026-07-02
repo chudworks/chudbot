@@ -57,21 +57,21 @@ const EMPTY_MEMORY: &str = "(no stored memory)";
 
 /// Prompt guidance inserted into top-level memory-enabled agents.
 ///
-/// The guidance tells agents to lookup each visible user before answering, write
-/// explicit remember/forget events through the tools, and treat lookup output as
-/// a combination of compact profile, pending raw events, and recent diaries.
-pub const PROMPT_GUIDANCE: &str = "CRITICAL: Memory System\n\
-- CRITICAL: If a user is the `author` of a message, you MUST load memory about that user. Do not respond to a user if you do not load their memory document first. Use the `lookup_user_memory` any time you see a user for the first time.\n\
-- CRITICAL: If a user's memory has not been loaded, then any **mention** of a user should trigger a `lookup_user_memory` call, even if they are not the author.\n\
-- The `lookup_user_memory` tool gives you a memory document about a user, recent events, and recent diary entries. These recent events can be `remember` or `forget`.\n\
-- Use the `remember_user_memory` tool to store facts about a user. If there's something you think would be useful in the future, you should use this tool to remember it.\n\
-- There is a `forget_user_memory` which works like `remember_user_memory`, but instead stores a fact to forget about a user.\n\
-- If a user asks you explicitly to remember or forget something about themselves, then you should absolutely use the tools to store the user's preference and respect their humanity!\n\
-- If a user tells you a fact about another user, you are allowed to remember / forget it. Take memories from 3rd parties with a \"grain of salt\".\n\
-- If the current message conflicts with stored memory, trust the current message and remember the correction when appropriate.\n\
-- Avoid repeating or storing any memory which reveals sensitive personal information (credit card, physical address, legal name, SSN, etc)\n\n\n\
-IT IS CRITICAL TO USE THE MEMORY SYSTEM PROACTIVELY! The tool calls are cheap, use the tools!\n\
-VERY IMPORTANT: If a user is the `author` of a message, you MUST load memory about that user. Do not respond to a user if you do not load their memory document first. Use the `lookup_user_memory` any time you see a user for the first time.\n";
+/// The runtime injects persistent memory notes for conversation participants
+/// as system messages, so this guidance covers the parts the model still owns:
+/// refreshing memory on request, writing remember/forget events with correct
+/// targets, and keeping sensitive data out of memory. Concrete example calls
+/// are included because they anchor weaker models better than abstract rules.
+pub const PROMPT_GUIDANCE: &str = "Memory System:\n\
+Memory notes for conversation participants are injected automatically as system messages: the first time a user sends a message, is mentioned, or has a message quoted in this conversation, a note labeled \"User memory note\" with their memory document appears. Read the notes before answering. You normally do not need `lookup_user_memory`.\n\
+- Call `lookup_user_memory` only to fetch fresh or missing memory: when a user asks you to re-load their memory, when a note seems out of date, or for a user discussed by name who has no note (you need their numeric id from the message JSON). The result contains the remembered profile, pending remember/forget events, and recent diary entries.\n\
+- Use `remember_user_memory` proactively whenever you learn a stable fact worth keeping: preferences, relationships, projects, corrections, recurring facts, running jokes. Store one concise third-person fact per call, e.g. {\"memory\": \"Prefers Rust over Python\"}.\n\
+- When the fact is about someone other than the author, pass that user's numeric id as `target_user_id`, e.g. {\"target_user_id\": \"123456789012345678\", \"memory\": \"Runs the weekly movie night\"}. Copy ids from `author.id` or `mentioned_users[].id` in the message JSON; never pass usernames.\n\
+- Use `forget_user_memory` to retract a stored fact. Its `memory` field describes what to stop using, e.g. {\"memory\": \"The claim that they live in Ohio\", \"reason\": \"User corrected this\"}.\n\
+- If a user explicitly asks you to remember or forget something, always honor it with the matching tool call.\n\
+- Facts told by one user about another may be remembered for the subject user; attribute second-hand facts in the text, e.g. {\"memory\": \"According to Alice, is afraid of geese\"}.\n\
+- If the current message conflicts with stored memory, trust the current message and remember the correction.\n\
+- Never store or repeat sensitive personal information (credit cards, physical addresses, legal names, government IDs).\n\n";
 
 impl<R> BotRuntime<R>
 where
@@ -237,16 +237,14 @@ mod tests {
         assert!(guidance.contains(LOOKUP_USER_MEMORY_TOOL));
         assert!(guidance.contains(REMEMBER_USER_MEMORY_TOOL));
         assert!(guidance.contains(FORGET_USER_MEMORY_TOOL));
-        assert!(guidance.contains("CRITICAL: Memory System"));
-        assert!(guidance.contains("`author` of a message"));
-        assert!(guidance.contains("MUST load memory about that user"));
-        assert!(guidance.contains("Do not respond to a user"));
-        assert!(guidance.contains("any time you see a user for the first time"));
-        assert!(guidance.contains("any **mention** of a user"));
-        assert!(guidance.contains("IT IS CRITICAL TO USE THE MEMORY SYSTEM PROACTIVELY"));
-        assert!(guidance.contains("The tool calls are cheap"));
-        assert!(guidance.contains("respect their humanity"));
-        assert!(guidance.contains("grain of salt"));
+        assert!(guidance.contains("Memory System"));
+        assert!(guidance.contains("injected automatically as system messages"));
+        assert!(guidance.contains("You normally do not need `lookup_user_memory`"));
+        assert!(guidance.contains("re-load their memory"));
+        assert!(guidance.contains("target_user_id"));
+        assert!(guidance.contains("mentioned_users[].id"));
+        assert!(guidance.contains("never pass usernames"));
+        assert!(guidance.contains("proactively"));
         assert!(guidance.contains("trust the current message"));
         assert!(guidance.contains("sensitive personal information"));
     }

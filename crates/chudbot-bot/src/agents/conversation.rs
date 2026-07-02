@@ -3,7 +3,7 @@
 //! This module bridges configured agents and per-turn runtime state into the
 //! executable agent used by a conversation turn. It owns the last-mile choices
 //! about runtime-only tool exposure, nested subagent wiring, and the operational
-//! guidance embedded in system prompts.
+//! guidance embedded in agent instructions.
 
 use crate::prelude::*;
 use crate::*;
@@ -18,10 +18,48 @@ pub(crate) struct ConversationAgentAssembly<'a> {
     pub(crate) agent_name: &'a str,
     /// Static deployment config for the resolved agent.
     pub(crate) agent_config: &'a AgentConfig,
-    /// Fully rendered system instructions for this top-level turn or subagent.
-    pub(crate) rendered_system_instructions: String,
+    /// Rendered instructions for this top-level turn or subagent.
+    pub(crate) instructions: RenderedAgentInstructions,
     /// Whether this assembled agent can deliver final reply artifacts and write memory.
     pub(crate) top_level: bool,
+}
+
+/// Rendered agent instructions for one executable agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RenderedAgentInstructions {
+    /// Labeled top-level prompt parts persisted independently.
+    Parts(Vec<RenderedAgentInstructionPart>),
+    /// Legacy monolithic text used by subagents and compatibility paths.
+    LegacyText(String),
+}
+
+/// One independently persisted section of the effective agent instructions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RenderedAgentInstructionPart {
+    /// Stable key used to inherit and update this prompt section.
+    pub(crate) key: String,
+    /// Stable order used when reconstructing the full prompt.
+    pub(crate) ordinal: i32,
+    /// Prompt text for this section. Empty text clears an inherited section.
+    pub(crate) text: String,
+}
+
+impl RenderedAgentInstructionPart {
+    pub(crate) fn new(ordinal: i32, key: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            ordinal,
+            text: text.into(),
+        }
+    }
+}
+
+/// Join independently persisted prompt parts into provider-visible instructions.
+pub(crate) fn join_agent_instruction_parts(parts: &[RenderedAgentInstructionPart]) -> String {
+    parts
+        .iter()
+        .map(|part| part.text.as_str())
+        .collect::<String>()
 }
 
 /// Runtime turn context shared by the top-level agent and configured subagents.
@@ -89,7 +127,7 @@ where
         let ConversationAgentAssembly {
             agent_name,
             agent_config,
-            rendered_system_instructions,
+            instructions,
             top_level,
         } = assembly;
         let policy =
@@ -106,11 +144,25 @@ where
         }
         stack.push(agent_name.to_string());
 
-        // Start from the static agent config, replace its base prompt with the
-        // rendered instructions for this run, then layer in runtime-only tool
-        // exposure.
-        let mut spec = agent_config.agent_spec(self.config.limits);
-        spec.system_prompt = rendered_system_instructions;
+        // Build the runtime agent spec from the already rendered prompt, then
+        // layer in runtime-only tool exposure.
+        let mut spec = match instructions {
+            RenderedAgentInstructions::Parts(parts) => AgentSpec::new(
+                parts
+                    .into_iter()
+                    .filter(|part| !part.text.is_empty())
+                    .map(|part| AgentInstructionPart {
+                        key: part.key,
+                        ordinal: part.ordinal,
+                        text: part.text,
+                    })
+                    .collect(),
+            ),
+            RenderedAgentInstructions::LegacyText(text) => AgentSpec::from_legacy_prompt_text(text),
+        }
+        .with_limits(agent_config.limits.unwrap_or(self.config.limits));
+        spec.server_tools = agent_config.server_tools.clone();
+        spec.client_tools = agent_config.client_tools.clone();
         if policy.memory_lookup() {
             ensure_client_tool_enabled(&mut spec.client_tools, memory::LOOKUP_USER_MEMORY_TOOL);
         }
@@ -225,12 +277,12 @@ where
                 model = %subagent_config.model.id,
                 "attaching subagent tool"
             );
-            let prompt = self.compose_subagent_system_prompt(subagent_config);
+            let instructions = self.compose_subagent_agent_instruction_text(subagent_config);
             let nested = self.build_conversation_agent(
                 ConversationAgentAssembly {
                     agent_name: &subagent_name,
                     agent_config: subagent_config,
-                    rendered_system_instructions: prompt,
+                    instructions: RenderedAgentInstructions::LegacyText(instructions),
                     top_level: false,
                 },
                 context,
@@ -251,63 +303,66 @@ where
         Ok(Agent::new(model, spec, tool_executor))
     }
 
-    /// Compose the system prompt for the top-level agent answering a turn.
+    /// Compose the labeled instruction parts for the top-level agent.
     ///
-    /// Top-level prompts may include user-memory guidance and a concrete trace
-    /// URL for the current conversation.
-    pub(crate) fn compose_system_prompt(
+    /// Storage persists these parts independently so a small runtime-only change
+    /// such as the build version does not rewrite the entire durable prompt.
+    pub(crate) fn compose_top_level_agent_instruction_parts(
         &self,
         agent: &AgentConfig,
-        conversation_id: Option<ConversationId>,
-    ) -> String {
-        self.compose_system_prompt_inner(
+        conversation_id: ConversationId,
+    ) -> Vec<RenderedAgentInstructionPart> {
+        self.compose_agent_instruction_parts(
             agent,
             ConversationToolPolicy::new(true, self.agent_memory_enabled(agent)),
-            conversation_id,
+            Some(conversation_id),
         )
     }
 
-    /// Compose the narrower system prompt used by subagent tools.
+    /// Compose the narrower instruction text used by subagent tools.
     ///
     /// Subagents receive read-only memory lookup guidance, but not final media
     /// delivery guidance, memory-write instructions, or a conversation trace
     /// URL.
-    pub(crate) fn compose_subagent_system_prompt(&self, agent: &AgentConfig) -> String {
-        self.compose_system_prompt_inner(
+    pub(crate) fn compose_subagent_agent_instruction_text(&self, agent: &AgentConfig) -> String {
+        join_agent_instruction_parts(&self.compose_agent_instruction_parts(
             agent,
             ConversationToolPolicy::new(false, self.agent_memory_enabled(agent)),
             None,
-        )
+        ))
     }
 
-    /// Shared system-prompt builder for top-level agents and subagents.
+    /// Shared instruction builder for top-level agents and subagents.
     ///
     /// The tool policy and `conversation_id` are explicit knobs because prompt
     /// text is advisory; the runtime tool executor remains the enforcement
     /// boundary for which calls are actually accepted.
-    fn compose_system_prompt_inner(
+    fn compose_agent_instruction_parts(
         &self,
         agent: &AgentConfig,
         policy: ConversationToolPolicy,
         conversation_id: Option<ConversationId>,
-    ) -> String {
-        let mut out = String::new();
+    ) -> Vec<RenderedAgentInstructionPart> {
+        let mut parts = Vec::new();
         // Deployment-wide policy leads so it frames all later operational and
         // persona instructions.
-        if let Some(extra) = self
+        let operator_policy = self
             .config
-            .extra_system_prompt
+            .extra_agent_instructions
             .as_deref()
             .map(str::trim)
-            .filter(|extra| !extra.is_empty())
-        {
+            .filter(|extra| !extra.is_empty());
+        let mut out = String::new();
+        if let Some(extra) = operator_policy {
             out.push_str("Operator policy:\n");
             out.push_str(extra);
             out.push_str("\n\n");
         }
+        parts.push(RenderedAgentInstructionPart::new(0, "operator_policy", out));
 
         // Runtime identity helps trace readers and model operators understand
         // which configured provider/model produced the turn.
+        let mut out = String::new();
         out.push_str("Operational context:\n");
         out.push_str(&format!(
             "Bot build: {}. You are answering as model `{}` via `{}`.\n",
@@ -319,9 +374,15 @@ where
                 conversation_id,
             ));
         }
+        parts.push(RenderedAgentInstructionPart::new(
+            1,
+            "operational_context",
+            out,
+        ));
 
         // Capability guidance is assembled from config. The executor built
         // above still decides whether a tool call is permitted.
+        let mut out = String::new();
         out.push_str("Capabilities this turn:\n");
         if !agent.model.server_tools.is_empty() {
             out.push_str("- Provider-side tools configured on this model.\n");
@@ -372,7 +433,7 @@ where
             out.push_str("- Specialist subagents are available as tools.\n");
         }
         if policy.memory_writes() {
-            out.push_str("- User memory is available through lookup_user_memory, remember_user_memory, and forget_user_memory.\n");
+            out.push_str("- User memory: memory notes for conversation participants (message authors, mentioned users, quoted users) are injected automatically as system messages. lookup_user_memory re-reads a user's memory on demand; remember_user_memory and forget_user_memory store or retract durable facts.\n");
         } else if policy.memory_lookup() {
             out.push_str("- User memory lookup is available through lookup_user_memory. Subagents can read memory but cannot remember or forget facts.\n");
         }
@@ -386,11 +447,18 @@ where
         }
         out.push_str("- A subtle Unicode emoji reaction can be added to the user's current message with add_reaction when a compact nonverbal acknowledgement, mood, or topic cue is helpful; use it sparingly and never instead of answering.\n");
         if policy.memory_writes() {
+            // A blank line keeps the guidance from visually merging into the
+            // capability bullet list above it.
+            out.push('\n');
             out.push_str(memory::PROMPT_GUIDANCE);
         }
+        parts.push(RenderedAgentInstructionPart::new(2, "capabilities", out));
+
+        let mut out = String::new();
         out.push_str("Agent Persona Prompt:\n");
-        out.push_str(agent.system_prompt.trim());
-        out
+        out.push_str(agent.instructions.trim());
+        parts.push(RenderedAgentInstructionPart::new(3, "persona", out));
+        parts
     }
 
     /// Return whether user-memory behavior should be exposed for this agent.

@@ -52,8 +52,9 @@ use crate::usage::UsageRecord;
 /// with a [`Model`] and a [`ClientToolExecutor`] when building an [`Agent`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
-    /// Agent instructions applied to each run's transcript.
-    pub system_prompt: String,
+    /// Labeled agent-instruction parts applied to each run's transcript.
+    #[serde(default, alias = "system_prompt_parts")]
+    pub agent_instruction_parts: Vec<AgentInstructionPart>,
     /// Provider-side/server-side tools this agent allows.
     ///
     /// `None` means every server tool allowed by the model config is available
@@ -74,13 +75,27 @@ pub struct AgentSpec {
 
 impl AgentSpec {
     /// Create an agent spec with default loop limits and no tool restrictions.
-    pub fn new(system_prompt: impl Into<String>) -> Self {
+    pub fn new(agent_instruction_parts: Vec<AgentInstructionPart>) -> Self {
         Self {
-            system_prompt: system_prompt.into(),
+            agent_instruction_parts,
             server_tools: None,
             client_tools: None,
             limits: AgentLimits::default(),
         }
+    }
+
+    /// Build an agent spec from one legacy monolithic prompt string.
+    pub fn from_legacy_prompt_text(prompt_text: impl Into<String>) -> Self {
+        let prompt_text = prompt_text.into();
+        let parts = (!prompt_text.is_empty())
+            .then(|| AgentInstructionPart {
+                key: "legacy".to_string(),
+                ordinal: 0,
+                text: prompt_text,
+            })
+            .into_iter()
+            .collect();
+        Self::new(parts)
     }
 
     /// Restrict the runtime client-tool surface to these tool names.
@@ -98,6 +113,17 @@ impl AgentSpec {
         self.limits = limits;
         self
     }
+}
+
+/// One labeled section of an agent's system prompt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentInstructionPart {
+    /// Stable key for this prompt section.
+    pub key: String,
+    /// Stable assembly order for this prompt section.
+    pub ordinal: i32,
+    /// Text for this prompt section.
+    pub text: String,
 }
 
 /// Concrete provider-neutral agent runtime.
@@ -429,15 +455,32 @@ where
             let event = AgentRunEvent::RunStarted;
             trace_agent_run_event(&event);
             yield event;
-            // Prepare model input. Agent instructions are owned by the spec, so a
-            // caller-provided transcript cannot accidentally carry stale system text.
-            let Transcript { id, turns, .. } = transcript;
+            // Prepare model input. Top-level bot transcripts persist prompt
+            // instruction turns as part of conversation history, including
+            // mid-conversation part updates. When those markers are already
+            // present, preserve the transcript exactly so provider prompt caches
+            // can keep the stable prefix. Standalone agents and subagents pass
+            // no persisted markers, so they still receive the spec prompt here.
+            let Transcript { id, mut turns } = transcript;
+            if !turns.iter().any(is_agent_instructions_turn) {
+                let mut prompt_parts = self.spec.agent_instruction_parts.clone();
+                prompt_parts.sort_by_key(|part| part.ordinal);
+                let prompt_turns = prompt_parts
+                    .into_iter()
+                    .filter(|part| !part.text.is_empty())
+                    .map(|part| {
+                        agent_instruction_part_turn(
+                            id.as_deref(),
+                            part.key,
+                            part.ordinal,
+                            part.text,
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                turns.splice(0..0, prompt_turns);
+            }
             let initial_turns = turns.len();
-            let mut transcript = Transcript {
-                id,
-                instructions: Some(self.spec.system_prompt.clone()),
-                turns,
-            };
+            let mut transcript = Transcript { id, turns };
 
             // Resolve the model-visible tool surfaces once for this run. Provider
             // crates receive normalized server-tool names; local client tools remain
@@ -943,6 +986,112 @@ fn append_step_trace(trace: &mut Vec<ToolTrace>, output: &ModelStepOutput) {
             .cloned()
             .map(|metadata| ToolTrace::Grounding { metadata }),
     );
+}
+
+/// Metadata key marking an agent-instructions system turn.
+///
+/// Bot storage persists these marked turns so an attempt's saved input
+/// transcript is the source of truth for the prompt that ran. `Agent::run`
+/// preserves caller-provided marked turns; it inserts the current
+/// [`AgentSpec`] prompt only when the transcript has no persisted instruction
+/// markers, as with standalone agents and subagents.
+pub const AGENT_INSTRUCTIONS_METADATA_KEY: &str = "agent_instructions";
+
+/// Metadata key marking one persisted part of the agent instructions.
+///
+/// Part turns are durable change markers. The bot may store only the part that
+/// changed, while storage reconstructs the effective full prompt by inheriting
+/// the latest value for every part key.
+pub const AGENT_INSTRUCTIONS_PART_METADATA_KEY: &str = "agent_instruction_part";
+
+/// Metadata key containing the stable identity for one agent-instructions part.
+pub const AGENT_INSTRUCTIONS_PART_KEY_METADATA_KEY: &str = "agent_instruction_part_key";
+
+/// Metadata key containing the display/assembly order for one prompt part.
+pub const AGENT_INSTRUCTIONS_PART_ORDINAL_METADATA_KEY: &str = "agent_instruction_part_ordinal";
+
+/// Build the leading system turn carrying the agent's instructions.
+///
+/// The metadata `id` mirrors the stable per-conversation system-message id that
+/// providers with id-addressable inputs (xAI Responses) previously received
+/// through the removed `Transcript::instructions` path.
+pub fn agent_instructions_turn(
+    transcript_id: Option<&str>,
+    instructions: String,
+) -> TranscriptTurn {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        AGENT_INSTRUCTIONS_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    if let Some(id) = transcript_id {
+        metadata.insert(
+            "id".to_string(),
+            serde_json::Value::String(format!("chudbot_conversation_{id}_system")),
+        );
+    }
+    TranscriptTurn {
+        role: TurnRole::System,
+        blocks: vec![ContentBlock::Text { text: instructions }],
+        metadata: serde_json::Value::Object(metadata),
+    }
+}
+
+/// Build one labeled part of the agent's instructions.
+///
+/// These turns are both durable change markers and provider-visible transcript
+/// turns. Provider adapters decide whether their native API can preserve the
+/// separate leading system turns or must combine them into one top-level
+/// instructions field.
+pub fn agent_instruction_part_turn(
+    transcript_id: Option<&str>,
+    key: impl Into<String>,
+    ordinal: i32,
+    text: String,
+) -> TranscriptTurn {
+    let key = key.into();
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        AGENT_INSTRUCTIONS_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    metadata.insert(
+        AGENT_INSTRUCTIONS_PART_METADATA_KEY.to_string(),
+        serde_json::Value::Bool(true),
+    );
+    metadata.insert(
+        AGENT_INSTRUCTIONS_PART_KEY_METADATA_KEY.to_string(),
+        serde_json::Value::String(key.clone()),
+    );
+    metadata.insert(
+        AGENT_INSTRUCTIONS_PART_ORDINAL_METADATA_KEY.to_string(),
+        serde_json::Value::Number(serde_json::Number::from(ordinal)),
+    );
+    if let Some(id) = transcript_id {
+        metadata.insert(
+            "id".to_string(),
+            serde_json::Value::String(format!("chudbot_conversation_{id}_system_{key}")),
+        );
+    }
+    TranscriptTurn {
+        role: TurnRole::System,
+        blocks: vec![ContentBlock::Text { text }],
+        metadata: serde_json::Value::Object(metadata),
+    }
+}
+
+/// Return whether a turn is an agent-inserted instructions turn.
+///
+/// This deliberately checks the metadata marker, not ordinal, so persisted
+/// transcripts can be loaded and inspected without relying on storage-specific
+/// row positions.
+pub fn is_agent_instructions_turn(turn: &TranscriptTurn) -> bool {
+    turn.role == TurnRole::System
+        && turn
+            .metadata
+            .get(AGENT_INSTRUCTIONS_METADATA_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// Resolve the client tools visible to the model for this agent run.
@@ -1473,7 +1622,7 @@ mod tests {
             name: ProviderName::new("test"),
             seen_tools: seen_tools.clone(),
         };
-        let spec = AgentSpec::new("system");
+        let spec = AgentSpec::from_legacy_prompt_text("system");
         let tools = NamedToolsExecutor {
             names: vec!["alpha", "beta"],
         };
@@ -1491,7 +1640,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_replaces_transcript_instructions_without_adding_system_turn() {
+    async fn agent_inserts_spec_instructions_when_transcript_has_no_prompt_markers() {
         #[derive(Debug, Clone)]
         struct InstructionBackend {
             name: ProviderName,
@@ -1519,13 +1668,14 @@ mod tests {
             name: ProviderName::new("test"),
             seen: seen.clone(),
         };
-        let mut input = Transcript::from_user_text("hello");
+        let mut input = Transcript::new();
         input.id = Some("conversation-1".to_string());
-        input.instructions = Some("old saved system prompt".to_string());
+        input.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+        input.push(TranscriptTurn::text(TurnRole::User, "hello"));
 
         let agent = Agent::new(
             test_model(backend),
-            AgentSpec::new("new system prompt"),
+            AgentSpec::from_legacy_prompt_text("system prompt"),
             NoClientTools,
         );
         let run = collect_agent_run(agent.run(input)).await.unwrap();
@@ -1533,9 +1683,149 @@ mod tests {
         assert!(matches!(run.outcome, AgentOutcome::Completed { .. }));
         let seen = seen.lock().unwrap().clone().unwrap();
         assert_eq!(seen.id.as_deref(), Some("conversation-1"));
-        assert_eq!(seen.instructions.as_deref(), Some("new system prompt"));
-        assert_eq!(seen.turns.len(), 1);
-        assert_text_block(&seen.turns[0], TurnRole::User, "hello");
+        assert_eq!(seen.turns.len(), 3);
+        assert_eq!(seen.leading_system_text().as_deref(), Some("system prompt"));
+        assert!(is_agent_instructions_turn(&seen.turns[0]));
+        assert_eq!(
+            seen.turns[0].metadata.get("id").and_then(|id| id.as_str()),
+            Some("chudbot_conversation_conversation-1_system_legacy")
+        );
+        assert_text_block(&seen.turns[1], TurnRole::System, "memory note");
+        assert_text_block(&seen.turns[2], TurnRole::User, "hello");
+    }
+
+    #[tokio::test]
+    async fn agent_preserves_persisted_instruction_turns() {
+        #[derive(Debug, Clone)]
+        struct InstructionBackend {
+            name: ProviderName,
+            seen: Arc<Mutex<Option<Transcript>>>,
+        }
+
+        impl LlmBackend for InstructionBackend {
+            type Error = TestError;
+
+            fn backend_name(&self) -> &ProviderName {
+                &self.name
+            }
+
+            fn step(
+                &self,
+                request: crate::llm::ModelStepRequest,
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+                *self.seen.lock().unwrap() = Some(request.transcript);
+                test_step_events(final_text_step("done"))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let backend = InstructionBackend {
+            name: ProviderName::new("test"),
+            seen: seen.clone(),
+        };
+        let mut input = Transcript::new();
+        input.id = Some("conversation-1".to_string());
+        input.push(agent_instructions_turn(
+            Some("conversation-1"),
+            "old saved system prompt".to_string(),
+        ));
+        input.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+        input.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+        let agent = Agent::new(
+            test_model(backend),
+            AgentSpec::from_legacy_prompt_text("new system prompt"),
+            NoClientTools,
+        );
+        let run = collect_agent_run(agent.run(input)).await.unwrap();
+
+        assert!(matches!(run.outcome, AgentOutcome::Completed { .. }));
+        let seen = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(seen.id.as_deref(), Some("conversation-1"));
+        assert_eq!(seen.turns.len(), 3);
+        assert_eq!(
+            seen.leading_system_text().as_deref(),
+            Some("old saved system prompt")
+        );
+        assert!(is_agent_instructions_turn(&seen.turns[0]));
+        assert_eq!(
+            seen.turns[0].metadata.get("id").and_then(|id| id.as_str()),
+            Some("chudbot_conversation_conversation-1_system")
+        );
+        assert_text_block(&seen.turns[1], TurnRole::System, "memory note");
+        assert_text_block(&seen.turns[2], TurnRole::User, "hello");
+    }
+
+    #[tokio::test]
+    async fn agent_inserts_labeled_instruction_parts_without_persisted_markers() {
+        #[derive(Debug, Clone)]
+        struct InstructionPartsBackend {
+            name: ProviderName,
+            seen: Arc<Mutex<Option<Transcript>>>,
+        }
+
+        impl LlmBackend for InstructionPartsBackend {
+            type Error = TestError;
+
+            fn backend_name(&self) -> &ProviderName {
+                &self.name
+            }
+
+            fn step(
+                &self,
+                request: crate::llm::ModelStepRequest,
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+                *self.seen.lock().unwrap() = Some(request.transcript);
+                test_step_events(final_text_step("done"))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let backend = InstructionPartsBackend {
+            name: ProviderName::new("test"),
+            seen: seen.clone(),
+        };
+        let mut input = Transcript::new();
+        input.id = Some("conversation-1".to_string());
+        input.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+        input.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+        let agent = Agent::new(
+            test_model(backend),
+            AgentSpec::new(vec![
+                AgentInstructionPart {
+                    key: "persona".to_string(),
+                    ordinal: 2,
+                    text: "Persona".to_string(),
+                },
+                AgentInstructionPart {
+                    key: "policy".to_string(),
+                    ordinal: 1,
+                    text: "Policy".to_string(),
+                },
+            ]),
+            NoClientTools,
+        );
+        let run = collect_agent_run(agent.run(input)).await.unwrap();
+
+        assert!(matches!(run.outcome, AgentOutcome::Completed { .. }));
+        let seen = seen.lock().unwrap().clone().unwrap();
+        assert_eq!(seen.turns.len(), 4);
+        assert_eq!(seen.leading_system_turn_count(), 2);
+        assert_eq!(
+            seen.leading_system_text().as_deref(),
+            Some("Policy\n\nPersona")
+        );
+        assert_eq!(
+            seen.turns[0].metadata.get("id").and_then(|id| id.as_str()),
+            Some("chudbot_conversation_conversation-1_system_policy")
+        );
+        assert_eq!(
+            seen.turns[1].metadata.get("id").and_then(|id| id.as_str()),
+            Some("chudbot_conversation_conversation-1_system_persona")
+        );
+        assert_text_block(&seen.turns[2], TurnRole::System, "memory note");
+        assert_text_block(&seen.turns[3], TurnRole::User, "hello");
     }
 
     #[tokio::test]
@@ -1573,7 +1863,7 @@ mod tests {
             "x_search".to_string(),
             "model_only".to_string(),
         ]);
-        let mut spec = AgentSpec::new("system");
+        let mut spec = AgentSpec::from_legacy_prompt_text("system");
         spec.server_tools = Some(ServerToolSet::from([
             " web_search ".to_string(),
             "agent_only".to_string(),
@@ -1625,7 +1915,11 @@ mod tests {
         model.spec.server_tools =
             ServerToolSet::from(["WEB_SEARCH".to_string(), "x_search".to_string()]);
 
-        let agent = Agent::new(model, AgentSpec::new("system"), NoClientTools);
+        let agent = Agent::new(
+            model,
+            AgentSpec::from_legacy_prompt_text("system"),
+            NoClientTools,
+        );
         let run = collect_agent_run(agent.run(Transcript::from_user_text("use server tools")))
             .await
             .unwrap();
@@ -1747,7 +2041,8 @@ mod tests {
             calls: Arc::new(Mutex::new(0)),
             result_order: result_order.clone(),
         };
-        let spec = AgentSpec::new("system").with_limits(AgentLimits { max_iterations: 4 });
+        let spec = AgentSpec::from_legacy_prompt_text("system")
+            .with_limits(AgentLimits { max_iterations: 4 });
         let tools = WaitingExecutor {
             barrier: Arc::new(Barrier::new(2)),
         };

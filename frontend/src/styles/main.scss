@@ -21,6 +21,7 @@
     --accent: #7e8aff;
     --err: #f04438;
     --ok: #2dc56e;
+    --system: #c98add;
 }
 
 @media (prefers-color-scheme: light) {
@@ -34,6 +35,7 @@
         --accent: #5b6cff;
         --err: #c0392b;
         --ok: #27ae60;
+        --system: #9b40bd;
     }
 }
 
@@ -408,6 +410,20 @@ details {
 .tool-call__name {
     font-weight: 600;
     color: var(--accent);
+}
+
+// System turns: agent instructions and runtime-injected notes (user memory).
+// A distinct hue separates system-authored content from user context.
+.context--system summary {
+    color: var(--system);
+}
+
+.context-item--system {
+    border-left-color: var(--system);
+
+    .context-item__role {
+        color: var(--system);
+    }
 }
 
 .reasoning {
