@@ -18,8 +18,7 @@ pub async fn run_runtime_services<R>(
     bot: BotRuntime<R>,
     platform_events: impl MessagePlatformEvents<
         Error = <R::Platforms as MessagePlatformRegistry>::Error,
-    > + Send
-    + 'static,
+    > + 'static,
     web: WebState<R>,
     listen: Vec<SocketAddr>,
 ) -> Result<(), BinError>

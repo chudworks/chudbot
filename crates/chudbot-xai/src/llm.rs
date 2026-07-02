@@ -209,9 +209,7 @@ fn build_step_body_from_input(request: &ModelStepRequest, input: Vec<Value>) -> 
 
 impl XaiClient {
     async fn start_step_dump(&self, body: &Value) -> Option<XaiStepDump> {
-        let Some(root) = self.dump_dir() else {
-            return None;
-        };
+        let root = self.dump_dir()?;
         match XaiStepDump::create(root, body).await {
             Ok(dump) => dump,
             Err(error) => {

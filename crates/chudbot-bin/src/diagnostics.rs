@@ -74,10 +74,7 @@ impl ConfigSource {
     }
 
     pub(crate) fn source_for_keys(&self, keys: &[&str]) -> Option<&str> {
-        let path = keys
-            .iter()
-            .map(|part| PathPart::Key(*part))
-            .collect::<Vec<_>>();
+        let path = keys.iter().copied().map(PathPart::Key).collect::<Vec<_>>();
         let span = self.span_for(&path)?;
         self.input.get(span)
     }
@@ -1534,16 +1531,23 @@ fn validate_provider_feature(
     ));
 }
 
+const ENABLED_FEATURES: &[&str] = &[
+    #[cfg(feature = "anthropic")]
+    "anthropic",
+    #[cfg(feature = "gemini")]
+    "gemini",
+    #[cfg(feature = "openai")]
+    "openai",
+    #[cfg(feature = "openai-compat")]
+    "openai-compat",
+    #[cfg(feature = "s3")]
+    "s3",
+    #[cfg(feature = "xai")]
+    "xai",
+];
+
 fn feature_is_enabled(feature: &str) -> bool {
-    match feature {
-        "anthropic" => cfg!(feature = "anthropic"),
-        "gemini" => cfg!(feature = "gemini"),
-        "openai" => cfg!(feature = "openai"),
-        "openai-compat" => cfg!(feature = "openai-compat"),
-        "s3" => cfg!(feature = "s3"),
-        "xai" => cfg!(feature = "xai"),
-        _ => false,
-    }
+    ENABLED_FEATURES.contains(&feature)
 }
 
 fn disabled_feature_diagnostic(
