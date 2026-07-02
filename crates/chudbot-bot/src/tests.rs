@@ -2819,6 +2819,21 @@ fn formats_new_conversation_reply_with_legacy_trace_link() {
 }
 
 #[test]
+fn formats_new_conversation_reply_without_duplicate_trace_link() {
+    let conversation_id = ConversationId::new();
+    let url = format!("https://chud.example/c/{conversation_id}");
+
+    for text in [
+        format!("answer\n\n-# 🔎 [full trace]({url})"),
+        format!("answer\n\nfull trace: {url}"),
+    ] {
+        let reply = format_reply_content(&text, true, conversation_id, "https://chud.example/");
+
+        assert_eq!(reply, text);
+    }
+}
+
+#[test]
 fn full_trace_link_markdown_uses_discord_reply_style() {
     let conversation_id = ConversationId::new();
 

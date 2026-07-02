@@ -243,10 +243,11 @@ pub(crate) fn format_reply_content(
     if !is_new {
         return text;
     }
-    format!(
-        "{text}\n\n{}",
-        full_trace_link_markdown(web_base_url, conversation_id)
-    )
+    let trace_url = full_trace_url(web_base_url, conversation_id);
+    if text.contains(&trace_url) {
+        return text;
+    }
+    format!("{text}\n\n{}", full_trace_link_markdown_for_url(&trace_url))
 }
 
 /// Build the unauthenticated trace-viewer URL for a conversation.
@@ -264,10 +265,11 @@ pub(crate) fn full_trace_link_markdown(
     web_base_url: &str,
     conversation_id: ConversationId,
 ) -> String {
-    format!(
-        "-# 🔎 [full trace]({})",
-        full_trace_url(web_base_url, conversation_id)
-    )
+    full_trace_link_markdown_for_url(&full_trace_url(web_base_url, conversation_id))
+}
+
+fn full_trace_link_markdown_for_url(url: &str) -> String {
+    format!("-# 🔎 [full trace]({url})")
 }
 
 /// Build prompt guidance for trace-link requests in this conversation.
