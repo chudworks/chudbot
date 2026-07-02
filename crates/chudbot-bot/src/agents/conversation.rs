@@ -42,6 +42,8 @@ pub(crate) struct RenderedAgentInstructionPart {
     pub(crate) ordinal: i32,
     /// Prompt text for this section. Empty text clears an inherited section.
     pub(crate) text: String,
+    /// Alternate text to write when updating an existing section.
+    pub(crate) update_text: Option<String>,
 }
 
 impl RenderedAgentInstructionPart {
@@ -50,7 +52,17 @@ impl RenderedAgentInstructionPart {
             key: key.into(),
             ordinal,
             text: text.into(),
+            update_text: None,
         }
+    }
+
+    pub(crate) fn with_update_text(mut self, text: impl Into<String>) -> Self {
+        self.update_text = Some(text.into());
+        self
+    }
+
+    pub(crate) fn matches_persisted_text(&self, text: &str) -> bool {
+        self.text == text || self.update_text.as_deref() == Some(text)
     }
 }
 
@@ -60,6 +72,14 @@ pub(crate) fn join_agent_instruction_parts(parts: &[RenderedAgentInstructionPart
         .iter()
         .map(|part| part.text.as_str())
         .collect::<String>()
+}
+
+fn bot_version_instruction_text(version: &str) -> String {
+    format!("The version of Chudbot is {version}.\n")
+}
+
+fn bot_version_update_instruction_text(version: &str) -> String {
+    format!("The version of Chudbot was updated to {version}.\n")
 }
 
 /// Runtime turn context shared by the top-level agent and configured subagents.
@@ -360,13 +380,22 @@ where
         }
         parts.push(RenderedAgentInstructionPart::new(0, "operator_policy", out));
 
+        parts.push(
+            RenderedAgentInstructionPart::new(
+                1,
+                "bot_version",
+                bot_version_instruction_text(&self.config.version),
+            )
+            .with_update_text(bot_version_update_instruction_text(&self.config.version)),
+        );
+
         // Runtime identity helps trace readers and model operators understand
         // which configured provider/model produced the turn.
         let mut out = String::new();
         out.push_str("Operational context:\n");
         out.push_str(&format!(
-            "Bot build: {}. You are answering as model `{}` via `{}`.\n",
-            self.config.version, agent.model.id, agent.provider
+            "You are answering as model `{}` via `{}`.\n",
+            agent.model.id, agent.provider
         ));
         if let Some(conversation_id) = conversation_id {
             out.push_str(&trace_link_prompt_guidance(
@@ -375,7 +404,7 @@ where
             ));
         }
         parts.push(RenderedAgentInstructionPart::new(
-            1,
+            2,
             "operational_context",
             out,
         ));
@@ -452,12 +481,12 @@ where
             out.push('\n');
             out.push_str(memory::PROMPT_GUIDANCE);
         }
-        parts.push(RenderedAgentInstructionPart::new(2, "capabilities", out));
+        parts.push(RenderedAgentInstructionPart::new(3, "capabilities", out));
 
         let mut out = String::new();
         out.push_str("Agent Persona Prompt:\n");
         out.push_str(agent.instructions.trim());
-        parts.push(RenderedAgentInstructionPart::new(3, "persona", out));
+        parts.push(RenderedAgentInstructionPart::new(4, "persona", out));
         parts
     }
 

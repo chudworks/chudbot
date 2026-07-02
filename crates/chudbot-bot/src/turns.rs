@@ -1863,6 +1863,13 @@ impl<'a> StoredAgentInstructionState<'a> {
             Self::None | Self::LabeledParts(_) => None,
         }
     }
+
+    fn labeled_part(self, key: &str) -> Option<&'a AgentInstructionPartSnapshot> {
+        match self {
+            Self::LabeledParts(parts) => parts.iter().find(|part| part.key == key),
+            Self::None | Self::LegacyText(_) => None,
+        }
+    }
 }
 
 /// Persist changed labeled agent-instructions parts before the current turn.
@@ -1886,11 +1893,12 @@ pub(crate) fn insert_agent_instruction_part_changes_before_current_turn(
     let prompt_turns = parts_to_write
         .into_iter()
         .map(|part| {
+            let text = agent_instruction_part_marker_text(part, previous_state).to_string();
             let mut prompt_turn = agent_instruction_part_turn(
                 transcript.id.as_deref(),
                 part.key.clone(),
                 part.ordinal,
-                part.text.clone(),
+                text,
             );
             if use_turn_scoped_ids {
                 set_transcript_message_id(
@@ -1955,14 +1963,18 @@ fn changed_agent_instruction_parts<'a>(
 ) -> Vec<&'a RenderedAgentInstructionPart> {
     match previous_state {
         StoredAgentInstructionState::LabeledParts(previous_parts) => {
-            let previous_text_by_key = previous_parts
+            let previous_by_key = previous_parts
                 .iter()
-                .map(|part| (part.key.as_str(), part.text.as_str()))
+                .map(|part| (part.key.as_str(), part))
                 .collect::<BTreeMap<_, _>>();
             current_parts
                 .iter()
                 .filter(|part| {
-                    previous_text_by_key.get(part.key.as_str()).copied() != Some(part.text.as_str())
+                    let Some(previous) = previous_by_key.get(part.key.as_str()) else {
+                        return true;
+                    };
+                    previous.ordinal != part.ordinal
+                        || !part.matches_persisted_text(previous.text.as_str())
                 })
                 .collect()
         }
@@ -1977,6 +1989,21 @@ fn changed_agent_instruction_parts<'a>(
                 .filter(|part| !part.text.is_empty())
                 .collect()
         }
+    }
+}
+
+fn agent_instruction_part_marker_text<'a>(
+    part: &'a RenderedAgentInstructionPart,
+    previous_state: StoredAgentInstructionState<'_>,
+) -> &'a str {
+    if previous_state
+        .labeled_part(part.key.as_str())
+        .is_some_and(|previous| !part.matches_persisted_text(previous.text.as_str()))
+        && let Some(update_text) = part.update_text.as_deref()
+    {
+        update_text
+    } else {
+        part.text.as_str()
     }
 }
 

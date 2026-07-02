@@ -1607,6 +1607,80 @@ fn agent_instruction_part_changes_are_recorded_by_key() {
 }
 
 #[test]
+fn agent_instruction_part_update_text_is_used_for_existing_part_updates() {
+    let version_v1 =
+        RenderedAgentInstructionPart::new(1, "bot_version", "The version of Chudbot is v1.\n")
+            .with_update_text("The version of Chudbot was updated to v1.\n");
+    let version_v2 =
+        RenderedAgentInstructionPart::new(1, "bot_version", "The version of Chudbot is v2.\n")
+            .with_update_text("The version of Chudbot was updated to v2.\n");
+
+    let previous_without_version = vec![AgentInstructionPartSnapshot {
+        key: "operator_policy".to_string(),
+        ordinal: 0,
+        text: "policy".to_string(),
+    }];
+    let mut first_version_marker = Transcript::new();
+    first_version_marker.id = Some("conversation-1".to_string());
+    first_version_marker.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    let inserted = insert_agent_instruction_part_changes_before_current_turn(
+        &mut first_version_marker,
+        &[version_v1.clone()],
+        StoredAgentInstructionState::LabeledParts(&previous_without_version),
+        TurnId::new(),
+    );
+
+    assert_eq!(inserted, 1);
+    assert_text_block(
+        &first_version_marker.turns[0],
+        TurnRole::System,
+        "The version of Chudbot is v1.\n",
+    );
+
+    let previous_with_version = vec![AgentInstructionPartSnapshot {
+        key: "bot_version".to_string(),
+        ordinal: 1,
+        text: "The version of Chudbot is v1.\n".to_string(),
+    }];
+    let mut updated_version_marker = Transcript::new();
+    updated_version_marker.id = Some("conversation-1".to_string());
+    updated_version_marker.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    let inserted = insert_agent_instruction_part_changes_before_current_turn(
+        &mut updated_version_marker,
+        &[version_v2.clone()],
+        StoredAgentInstructionState::LabeledParts(&previous_with_version),
+        TurnId::new(),
+    );
+
+    assert_eq!(inserted, 1);
+    assert_text_block(
+        &updated_version_marker.turns[0],
+        TurnRole::System,
+        "The version of Chudbot was updated to v2.\n",
+    );
+
+    let previous_with_update_text = vec![AgentInstructionPartSnapshot {
+        key: "bot_version".to_string(),
+        ordinal: 1,
+        text: "The version of Chudbot was updated to v2.\n".to_string(),
+    }];
+    let mut unchanged_version_marker = Transcript::new();
+    unchanged_version_marker.push(TranscriptTurn::text(TurnRole::User, "hello"));
+
+    let inserted = insert_agent_instruction_part_changes_before_current_turn(
+        &mut unchanged_version_marker,
+        &[version_v2],
+        StoredAgentInstructionState::LabeledParts(&previous_with_update_text),
+        TurnId::new(),
+    );
+
+    assert_eq!(inserted, 0);
+    assert_eq!(unchanged_version_marker.turns.len(), 1);
+}
+
+#[test]
 fn agent_instruction_part_changes_preserve_prior_prompt_prefix() {
     let current_turn_id = TurnId::new();
     let mut transcript = Transcript::new();
