@@ -168,10 +168,12 @@ impl SqlxStorage {
                     t.user_message_channel, t.user_message, t.user_key, t.user_display_name, \
                     t.user_content, t.assistant_message_provider, t.assistant_message_channel, \
                     t.assistant_message, t.assistant_content, t.status, t.error, \
-                    t.app_version_id, ta.agent_name, ta.llm_provider, ta.llm_model \
+                    t.app_version_id, ta.id AS attempt_id, \
+                    ta.system_instructions AS attempt_system_instructions, \
+                    ta.agent_name, ta.llm_provider, ta.llm_model \
                FROM turns t \
                LEFT JOIN LATERAL ( \
-                    SELECT agent_name, llm_provider, llm_model \
+                    SELECT id, system_instructions, agent_name, llm_provider, llm_model \
                       FROM turn_attempts \
                      WHERE turn_id = t.id \
                      ORDER BY attempt_ordinal DESC \
@@ -184,31 +186,60 @@ impl SqlxStorage {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut turns = Vec::with_capacity(rows.len());
+        struct TurnRow {
+            turn_id: TurnId,
+            attempt_id: Option<Uuid>,
+            system_instructions: Option<String>,
+            row: sqlx::postgres::PgRow,
+        }
+
+        let mut turn_rows = Vec::with_capacity(rows.len());
         for row in rows {
             let turn_id = TurnId(row.get("id"));
-            let attempt_id = self.latest_attempt_id(turn_id).await?;
-            let system_instructions = match attempt_id {
-                Some(id) => Some(self.attempt_system_instructions(id).await?),
-                None => None,
-            };
-            let context = match attempt_id {
-                Some(id) => self.load_context(id).await?,
-                None => Vec::new(),
-            };
-            let tool_trace = match attempt_id {
-                Some(id) => self.load_tool_trace(id).await?,
-                None => Vec::new(),
-            };
-            let model_steps = match attempt_id {
-                Some(id) => self.load_model_steps(id).await?,
-                None => Vec::new(),
-            };
-            let replay_assets = self.load_turn_assets(turn_id).await?;
-            let usage = self.load_usage_for_turn(turn_id).await?;
+            turn_rows.push(TurnRow {
+                turn_id,
+                attempt_id: row.get("attempt_id"),
+                system_instructions: row.get("attempt_system_instructions"),
+                row,
+            });
+        }
+
+        let turn_ids = turn_rows
+            .iter()
+            .map(|turn| turn.turn_id.0)
+            .collect::<Vec<_>>();
+        let attempt_ids = turn_rows
+            .iter()
+            .filter_map(|turn| turn.attempt_id)
+            .collect::<Vec<_>>();
+
+        let mut context_by_attempt = self.load_context_for_attempts(&attempt_ids).await?;
+        let mut tool_trace_by_attempt = self.load_tool_trace_for_attempts(&attempt_ids).await?;
+        let mut model_steps_by_attempt = self.load_model_steps_for_attempts(&attempt_ids).await?;
+        let mut assets_by_turn = self.load_assets_for_turns(&turn_ids).await?;
+        let mut usage_by_turn = self
+            .load_usage_for_turns(conversation_id, &turn_ids)
+            .await?;
+
+        let mut turns = Vec::with_capacity(turn_rows.len());
+        for turn_row in turn_rows {
+            let context = turn_row
+                .attempt_id
+                .and_then(|id| context_by_attempt.remove(&id))
+                .unwrap_or_default();
+            let tool_trace = turn_row
+                .attempt_id
+                .and_then(|id| tool_trace_by_attempt.remove(&id))
+                .unwrap_or_default();
+            let model_steps = turn_row
+                .attempt_id
+                .and_then(|id| model_steps_by_attempt.remove(&id))
+                .unwrap_or_default();
+            let replay_assets = assets_by_turn.remove(&turn_row.turn_id).unwrap_or_default();
+            let usage = usage_by_turn.remove(&turn_row.turn_id).unwrap_or_default();
             turns.push(TurnSnapshot {
-                turn: turn_from_row(&row)?,
-                system_instructions,
+                turn: turn_from_row(&turn_row.row)?,
+                system_instructions: turn_row.system_instructions,
                 context,
                 tool_trace,
                 model_steps,
@@ -235,107 +266,149 @@ impl SqlxStorage {
             .ok_or(SqlxStorageError::MissingAttempt { turn_id })
     }
 
-    async fn attempt_system_instructions(
+    async fn load_context_for_attempts(
         &self,
-        attempt_id: Uuid,
-    ) -> Result<String, SqlxStorageError> {
-        Ok(
-            sqlx::query_scalar("SELECT system_instructions FROM turn_attempts WHERE id = $1")
-                .bind(attempt_id)
-                .fetch_one(&self.pool)
-                .await?,
-        )
-    }
-
-    async fn load_context(&self, attempt_id: Uuid) -> Result<Vec<ContextItem>, SqlxStorageError> {
+        attempt_ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<ContextItem>>, SqlxStorageError> {
+        if attempt_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let rows = sqlx::query(
-            "SELECT ordinal, source, role, content, message_provider, channel, message \
+            "SELECT attempt_id, ordinal, source, role, content, message_provider, channel, message \
                FROM turn_attempt_context_items \
-              WHERE attempt_id = $1 \
-              ORDER BY ordinal",
+              WHERE attempt_id = ANY($1) \
+              ORDER BY attempt_id, ordinal",
         )
-        .bind(attempt_id)
+        .bind(attempt_ids)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter()
-            .map(|row| {
-                Ok(ContextItem {
-                    position: row.get("ordinal"),
-                    source: row.get("source"),
-                    role: row.get("role"),
-                    content: row.get("content"),
-                    message: optional_message_ref(
-                        row.get::<Option<String>, _>("message_provider"),
-                        row.get::<Option<String>, _>("channel"),
-                        row.get::<Option<String>, _>("message"),
-                    )?,
-                })
-            })
-            .collect()
+        let mut out = BTreeMap::<Uuid, Vec<ContextItem>>::new();
+        for row in rows {
+            let attempt_id = row.get("attempt_id");
+            out.entry(attempt_id).or_default().push(ContextItem {
+                position: row.get("ordinal"),
+                source: row.get("source"),
+                role: row.get("role"),
+                content: row.get("content"),
+                message: optional_message_ref(
+                    row.get::<Option<String>, _>("message_provider"),
+                    row.get::<Option<String>, _>("channel"),
+                    row.get::<Option<String>, _>("message"),
+                )?,
+            });
+        }
+        Ok(out)
     }
 
-    async fn load_tool_trace(&self, attempt_id: Uuid) -> Result<Vec<ToolTrace>, SqlxStorageError> {
-        let rows = sqlx::query(
-            "SELECT trace FROM turn_attempt_tool_traces WHERE attempt_id = $1 ORDER BY ordinal",
-        )
-        .bind(attempt_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| serde_json::from_value(row.get("trace")).map_err(SqlxStorageError::Json))
-            .collect()
-    }
-
-    async fn load_model_steps(
+    async fn load_tool_trace_for_attempts(
         &self,
-        attempt_id: Uuid,
-    ) -> Result<Vec<ModelStepTrace>, SqlxStorageError> {
+        attempt_ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<ToolTrace>>, SqlxStorageError> {
+        if attempt_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let rows = sqlx::query(
-            "SELECT ordinal, step_kind, llm_provider, llm_model, continuation \
-               FROM turn_attempt_model_steps \
-              WHERE attempt_id = $1 \
-              ORDER BY ordinal",
+            "SELECT attempt_id, trace \
+               FROM turn_attempt_tool_traces \
+              WHERE attempt_id = ANY($1) \
+              ORDER BY attempt_id, ordinal",
         )
-        .bind(attempt_id)
+        .bind(attempt_ids)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(model_step_from_row).collect()
+        let mut out = BTreeMap::<Uuid, Vec<ToolTrace>>::new();
+        for row in rows {
+            let attempt_id = row.get("attempt_id");
+            let trace = serde_json::from_value(row.get("trace")).map_err(SqlxStorageError::Json)?;
+            out.entry(attempt_id).or_default().push(trace);
+        }
+        Ok(out)
     }
 
-    async fn load_turn_assets(&self, turn_id: TurnId) -> Result<Vec<TurnAsset>, SqlxStorageError> {
+    async fn load_model_steps_for_attempts(
+        &self,
+        attempt_ids: &[Uuid],
+    ) -> Result<BTreeMap<Uuid, Vec<ModelStepTrace>>, SqlxStorageError> {
+        if attempt_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
         let rows = sqlx::query(
-            "SELECT a.media_uri, a.source, m.mime_type \
+            "SELECT attempt_id, ordinal, step_kind, llm_provider, llm_model, continuation \
+               FROM turn_attempt_model_steps \
+              WHERE attempt_id = ANY($1) \
+              ORDER BY attempt_id, ordinal",
+        )
+        .bind(attempt_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = BTreeMap::<Uuid, Vec<ModelStepTrace>>::new();
+        for row in rows {
+            let attempt_id = row.get("attempt_id");
+            let step = model_step_from_row(row)?;
+            out.entry(attempt_id).or_default().push(step);
+        }
+        Ok(out)
+    }
+
+    async fn load_assets_for_turns(
+        &self,
+        turn_ids: &[Uuid],
+    ) -> Result<BTreeMap<TurnId, Vec<TurnAsset>>, SqlxStorageError> {
+        if turn_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT a.turn_id, a.media_uri, a.source, m.mime_type \
                FROM turn_assets a \
                LEFT JOIN media_assets m ON m.uri = a.media_uri \
-              WHERE a.turn_id = $1 AND a.replayable \
-              ORDER BY a.ordinal",
+              WHERE a.turn_id = ANY($1) AND a.replayable \
+              ORDER BY a.turn_id, a.ordinal, a.id",
         )
-        .bind(turn_id.0)
+        .bind(turn_ids)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| TurnAsset {
+        let mut out = BTreeMap::<TurnId, Vec<TurnAsset>>::new();
+        for row in rows {
+            let turn_id = TurnId(row.get("turn_id"));
+            out.entry(turn_id).or_default().push(TurnAsset {
                 uri: MediaUri::new(row.get::<String, _>("media_uri")),
                 turn_id,
                 source: row.get("source"),
                 mime_type: row.get("mime_type"),
-            })
-            .collect())
+            });
+        }
+        Ok(out)
     }
 
-    async fn load_usage_for_turn(
+    async fn load_usage_for_turns(
         &self,
-        turn_id: TurnId,
-    ) -> Result<Vec<UsageRecord>, SqlxStorageError> {
-        let rows = sqlx::query("SELECT raw FROM usage_records WHERE turn_id = $1 ORDER BY id")
-            .bind(turn_id.0)
-            .fetch_all(&self.pool)
-            .await?;
-        rows.into_iter()
-            .filter_map(|row| row.get::<Option<Value>, _>("raw"))
-            .map(|value| serde_json::from_value(value).map_err(SqlxStorageError::Json))
-            .collect()
+        conversation_id: ConversationId,
+        turn_ids: &[Uuid],
+    ) -> Result<BTreeMap<TurnId, Vec<UsageRecord>>, SqlxStorageError> {
+        if turn_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let rows = sqlx::query(
+            "SELECT turn_id, raw \
+               FROM usage_records \
+              WHERE conversation_id = $1 \
+                AND turn_id = ANY($2) \
+              ORDER BY turn_id, id",
+        )
+        .bind(conversation_id.0)
+        .bind(turn_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = BTreeMap::<TurnId, Vec<UsageRecord>>::new();
+        for row in rows {
+            let Some(raw) = row.get::<Option<Value>, _>("raw") else {
+                continue;
+            };
+            let turn_id = TurnId(row.get("turn_id"));
+            let usage = serde_json::from_value(raw).map_err(SqlxStorageError::Json)?;
+            out.entry(turn_id).or_default().push(usage);
+        }
+        Ok(out)
     }
 }
 
