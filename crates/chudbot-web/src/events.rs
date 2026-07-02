@@ -6,7 +6,7 @@ use axum::http::HeaderValue;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use chudbot_api::{BotStorage, ConversationId, ConversationLookup, EventSink, LiveEvent};
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
 
@@ -103,9 +103,9 @@ where
                     skipped = n,
                     "conversation event stream lagged"
                 );
-                return futures::future::ready(Some(Ok(Event::default()
-                    .event("lag")
-                    .data(n.to_string()))));
+                return futures::future::ready(Some(Ok::<Event, Infallible>(
+                    Event::default().event("lag").data(n.to_string()),
+                )));
             }
         };
         tracing::trace!(
@@ -114,23 +114,16 @@ where
             "forwarding live event to SSE client"
         );
         let data = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-        futures::future::ready(Some(Ok(Event::default()
-            .event(event.event_name())
-            .data(data))))
+        futures::future::ready(Some(Ok::<Event, Infallible>(
+            Event::default().event(event.event_name()).data(data),
+        )))
     });
     let stream = stream.take_until(state.shutdown_token().cancelled_owned());
-    let mut response = Sse::new(typed_stream(stream))
+    let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE))
         .into_response();
     response
         .headers_mut()
         .insert("x-accel-buffering", HeaderValue::from_static("no"));
     Ok(response)
-}
-
-fn typed_stream<S>(stream: S) -> impl Stream<Item = Result<Event, Infallible>>
-where
-    S: Stream<Item = Result<Event, Infallible>>,
-{
-    stream
 }

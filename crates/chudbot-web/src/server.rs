@@ -1,8 +1,8 @@
-use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::middleware as axum_middleware;
@@ -17,29 +17,72 @@ use crate::middleware::default_trust_forwarded_for;
 use crate::static_files::StaticFileCache;
 use crate::{api, events, media, middleware, spa, static_files};
 
-/// Run the web server until the supplied shutdown future resolves.
+/// Compile-time service types that keep web handlers statically dispatched over
+/// storage, media, and LLM provider services.
+pub trait WebRuntimeTypes: 'static {
+    type Storage: BotStorage + Clone + Send + Sync + 'static;
+    type Media: MediaStore + Clone + Send + Sync + 'static;
+    type Llms: LlmProviderRegistry + Clone + Send + Sync + 'static;
+}
+
+/// Concrete dependencies used to run the web service.
+pub struct WebRuntimeParts<R: WebRuntimeTypes> {
+    pub storage: R::Storage,
+    pub media_store: R::Media,
+    pub llms: R::Llms,
+    pub events: EventBus,
+    pub config: WebConfig,
+}
+
+/// Runtime controls for the web service.
+#[derive(Debug, Clone, Copy)]
+pub struct WebRunOptions {
+    /// How long graceful shutdown waits for active web connections to drain.
+    pub drain_timeout: Duration,
+}
+
+/// Runtime dependencies shared by web handlers.
+pub(crate) struct WebState<R: WebRuntimeTypes> {
+    inner: Arc<WebStateInner<R>>,
+    shutdown: CancellationToken,
+}
+
+/// Runtime dependencies behind [`WebState`].
+#[derive(Debug)]
+pub(crate) struct WebStateInner<R: WebRuntimeTypes> {
+    pub(crate) storage: R::Storage,
+    pub(crate) media_store: R::Media,
+    pub(crate) llms: R::Llms,
+    pub(crate) events: EventBus,
+    pub(crate) config: WebConfig,
+    pub(crate) static_files: StaticFileCache,
+}
+
+/// Run the web server until the supplied shutdown token is cancelled.
 #[tracing::instrument(
     name = "web.run_until_shutdown",
     skip_all,
     fields(
         listen = ?listen,
         listener_count = listen.len(),
-        frontend_dir = %state.config.frontend_dir.display(),
+        frontend_dir = %parts.config.frontend_dir.display(),
     )
 )]
-pub async fn run_until_shutdown<R, F>(
-    state: WebState<R>,
+pub async fn run_until_shutdown<R>(
+    parts: WebRuntimeParts<R>,
     listen: Vec<SocketAddr>,
-    shutdown: F,
+    shutdown: CancellationToken,
+    options: WebRunOptions,
 ) -> Result<(), WebServerError>
 where
     R: WebRuntimeTypes,
-    F: Future<Output = ()> + Send + 'static,
 {
     if listen.is_empty() {
         return Err(WebServerError::NoListeners);
     }
 
+    // Bind every configured address before building the router so startup
+    // fails cleanly if any listener cannot be opened.
     let mut listeners = Vec::with_capacity(listen.len());
     for address in listen {
         let listener = tokio::net::TcpListener::bind(address)
@@ -51,12 +94,38 @@ where
         listeners.push((address, listener));
     }
 
-    let shutdown_token = CancellationToken::new();
-    let state = state.with_shutdown_token(shutdown_token.clone());
+    let WebRuntimeParts {
+        storage,
+        media_store,
+        llms,
+        events,
+        config,
+    } = parts;
+    tracing::debug!(
+        frontend_dir = %config.frontend_dir.display(),
+        title_prefix = %config.title_prefix,
+        version = %config.version,
+        "constructing web server dependencies"
+    );
+    let state = WebState {
+        inner: Arc::new(WebStateInner::<R> {
+            storage,
+            media_store,
+            llms,
+            events,
+            config,
+            static_files: StaticFileCache::new(),
+        }),
+        // Share the caller's service token with long-lived handlers such as SSE
+        // streams so they stop when the web service is shutting down.
+        shutdown: shutdown.clone(),
+    };
 
+    // Serve each listener over the same state; the select below turns an early
+    // listener exit into a web-service shutdown for the whole listener group.
     let servers = listeners.into_iter().map(|(listen, listener)| {
         let state = state.clone();
-        let shutdown_token = shutdown_token.clone();
+        let shutdown = shutdown.clone();
         async move {
             tracing::info!(listen = %listen, "web server listening");
             axum::serve(
@@ -64,7 +133,7 @@ where
                 router(state).into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(async move {
-                shutdown_token.cancelled().await;
+                shutdown.cancelled().await;
             })
             .await
             .map_err(|source| WebServerError::Serve { listen, source })?;
@@ -76,13 +145,29 @@ where
     tokio::pin!(all_servers);
 
     tokio::select! {
-        _ = shutdown => {
-            shutdown_token.cancel();
-            tracing::info!("web server shutdown requested");
-            all_servers.await?;
+        // Normal process shutdown: ask Axum to drain every listener, but do not
+        // let stuck connections block process shutdown forever.
+        _ = shutdown.cancelled() => {
+            tracing::info!(
+                timeout_ms = options.drain_timeout.as_millis(),
+                "web server shutdown requested"
+            );
+            match tokio::time::timeout(options.drain_timeout, &mut all_servers).await {
+                Ok(result) => {
+                    result?;
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        timeout_ms = options.drain_timeout.as_millis(),
+                        "web server graceful shutdown timed out"
+                    );
+                }
+            }
         }
+        // Early listener exit or failure: cancel the shared token so sibling
+        // listeners and SSE streams see the same web-service shutdown signal.
         result = &mut all_servers => {
-            shutdown_token.cancel();
+            shutdown.cancel();
             result?;
         }
     }
@@ -93,7 +178,7 @@ where
 
 /// Build the Axum router that wires API routes, media/static routes, the SPA
 /// fallback, and shared middleware for the viewer.
-pub fn router<R>(state: WebState<R>) -> Router
+fn router<R>(state: WebState<R>) -> Router
 where
     R: WebRuntimeTypes,
 {
@@ -187,73 +272,10 @@ pub struct WebConfig {
     pub trust_forwarded_for: bool,
 }
 
-/// Compile-time service types that keep web handlers statically dispatched over
-/// storage, media, and LLM provider services.
-pub trait WebRuntimeTypes: 'static {
-    type Storage: BotStorage + Clone + Send + Sync + 'static;
-    type Media: MediaStore + Clone + Send + Sync + 'static;
-    type Llms: LlmProviderRegistry + Clone + Send + Sync + 'static;
-}
-
-/// Runtime dependencies shared by web handlers.
-pub struct WebState<R: WebRuntimeTypes> {
-    inner: Arc<WebStateInner<R>>,
-    shutdown: CancellationToken,
-}
-
-/// Runtime dependencies behind [`WebState`].
-#[doc(hidden)]
-#[derive(Debug)]
-pub struct WebStateInner<R: WebRuntimeTypes> {
-    pub(crate) storage: R::Storage,
-    pub(crate) media_store: R::Media,
-    pub(crate) llms: R::Llms,
-    pub(crate) events: EventBus,
-    pub(crate) config: WebConfig,
-    pub(crate) static_files: StaticFileCache,
-}
-
 impl<R> WebState<R>
 where
     R: WebRuntimeTypes,
 {
-    /// Build web server dependencies from concrete services.
-    pub fn new(
-        storage: R::Storage,
-        media_store: R::Media,
-        llms: R::Llms,
-        events: EventBus,
-        config: WebConfig,
-    ) -> Self {
-        tracing::debug!(
-            frontend_dir = %config.frontend_dir.display(),
-            title_prefix = %config.title_prefix,
-            version = %config.version,
-            "constructing web server dependencies"
-        );
-        Self {
-            inner: Arc::new(WebStateInner {
-                storage,
-                media_store,
-                llms,
-                events,
-                config,
-                static_files: StaticFileCache::new(),
-            }),
-            shutdown: CancellationToken::new(),
-        }
-    }
-
-    /// Expose the live event bus for publishers outside the web router.
-    pub fn events(&self) -> &EventBus {
-        &self.events
-    }
-
-    pub(crate) fn with_shutdown_token(mut self, shutdown: CancellationToken) -> Self {
-        self.shutdown = shutdown;
-        self
-    }
-
     pub(crate) fn shutdown_token(&self) -> CancellationToken {
         self.shutdown.clone()
     }

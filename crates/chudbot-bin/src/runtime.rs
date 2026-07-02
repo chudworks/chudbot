@@ -2,14 +2,14 @@ use std::net::SocketAddr;
 
 use chudbot_api::{MessagePlatformEvents, MessagePlatformRegistry};
 use chudbot_bot::{BotRunOptions, BotRuntime, BotRuntimeTypes};
-use chudbot_web::{WebRuntimeTypes, WebState};
+use chudbot_web::{WebRunOptions, WebRuntimeParts, WebRuntimeTypes};
 use tokio::task::JoinError;
 use tokio_util::sync::CancellationToken;
 
 use crate::SHUTDOWN_GRACE_PERIOD;
 use crate::errors::BinError;
 
-/// Run fully constructed bot and web services under one process supervisor.
+/// Run the bot and web service dependencies under one process supervisor.
 ///
 /// The binary owns the process-level lifecycle: start the bot and web server as
 /// sibling tasks, let either an OS signal or an early service exit begin
@@ -19,7 +19,7 @@ pub async fn run_runtime_services<R>(
     platform_events: impl MessagePlatformEvents<
         Error = <R::Platforms as MessagePlatformRegistry>::Error,
     > + 'static,
-    web: WebState<R>,
+    web: WebRuntimeParts<R>,
     listen: Vec<SocketAddr>,
 ) -> Result<(), BinError>
 where
@@ -47,10 +47,14 @@ where
         .map_err(BinError::Bot)
     });
     let mut web_task = tokio::spawn(async move {
-        // Axum wants a shutdown future; the token is the shared process signal.
-        chudbot_web::run_until_shutdown(web, listen, async move {
-            web_shutdown.cancelled().await;
-        })
+        chudbot_web::run_until_shutdown::<R>(
+            web,
+            listen,
+            web_shutdown,
+            WebRunOptions {
+                drain_timeout: SHUTDOWN_GRACE_PERIOD,
+            },
+        )
         .await
         .map_err(BinError::Web)
     });

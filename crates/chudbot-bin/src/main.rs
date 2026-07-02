@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use chudbot_bot::{BotRuntime, BotRuntimeParts};
 use chudbot_storage_sqlx::SqlxStorage;
-use chudbot_web::WebState;
+use chudbot_web::WebRuntimeParts;
 use clap::{Parser, Subcommand};
 use config::{LoadedRuntimeConfig, LogFormat, LoggingConfig, LoggingFilterError, RuntimeConfig};
 use diagnostics::render_toml_error_for_stderr;
@@ -217,17 +217,16 @@ async fn serve(
         },
         config.bot,
     );
-    let web = WebState::<ConfiguredBotRuntime>::new(
-        storage,
-        services.media_store,
-        llms,
-        services.events,
-        services.web,
-    );
-
     // `runtime.rs` owns the select loop that runs bot and web tasks, fans out
     // cancellation, drains in-flight bot work, and joins both services before
     // returning.
+    let web = WebRuntimeParts::<ConfiguredBotRuntime> {
+        storage,
+        media_store: services.media_store,
+        llms,
+        events: services.events,
+        config: services.web,
+    };
     run_runtime_services(bot, platform_events, web, listen).await
 }
 
