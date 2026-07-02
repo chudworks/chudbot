@@ -37,6 +37,7 @@ impl AnthropicClient {
         let (system, mut messages) = to_anthropic_messages(
             &request.transcript,
             self.provider_name(),
+            &request.model,
             request.image_encoding,
         )
         .await?;
@@ -647,20 +648,25 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 /// Render the provider-neutral transcript into Anthropic Messages inputs.
 ///
 /// The leading system turn is hoisted into a cached top-level `system` block
-/// for the stable conversation instructions. Later system turns become native
-/// Anthropic mid-conversation system messages. Chudbot can insert those turns
-/// before the user turn they should affect, so this renderer moves such runs to
-/// immediately after the following user message, matching Anthropic's placement
-/// rules while preserving their effect on the next assistant response. Prior
-/// Anthropic continuations are replayed verbatim, and fresh Chudbot content
-/// blocks are converted into the closest Anthropic block type.
+/// for the stable conversation instructions. Opus 4.8 receives later system
+/// turns as native Anthropic mid-conversation system messages. Chudbot can
+/// insert those turns before the user turn they should affect, so this renderer
+/// moves such runs to immediately after the following user message, matching
+/// Anthropic's placement rules while preserving their effect on the next
+/// assistant response. Other Anthropic models do not support native
+/// mid-conversation system messages, so later system turns are lowered to user
+/// messages in transcript order. Prior Anthropic continuations are replayed
+/// verbatim, and fresh Chudbot content blocks are converted into the closest
+/// Anthropic block type.
 async fn to_anthropic_messages(
     transcript: &Transcript,
     provider: &ProviderName,
+    model: &ModelId,
     image_encoding: ImageEncoding,
 ) -> Result<(Option<Value>, Vec<Value>), AnthropicError> {
     let system_text = transcript.leading_system_text();
     let hoisted_turns = transcript.leading_system_turn_count();
+    let native_system_messages = supports_native_mid_conversation_system(model);
     let system = system_text.map(|instructions| {
         json!([{
             "type": "text",
@@ -678,21 +684,46 @@ async fn to_anthropic_messages(
         }
 
         match turn.role {
-            TurnRole::System => {
+            TurnRole::System if native_system_messages => {
                 pending_system_content.extend(content);
+            }
+            TurnRole::System => {
+                messages.push(json!({ "role": "user", "content": content }));
             }
             TurnRole::User => {
                 messages.push(json!({ "role": "user", "content": content }));
             }
             TurnRole::Assistant => {
-                flush_anthropic_system_content(&mut messages, &mut pending_system_content);
+                if native_system_messages {
+                    flush_anthropic_system_content(&mut messages, &mut pending_system_content);
+                }
                 messages.push(json!({ "role": "assistant", "content": content }));
             }
         }
     }
-    flush_anthropic_system_content(&mut messages, &mut pending_system_content);
+    if native_system_messages {
+        flush_anthropic_system_content(&mut messages, &mut pending_system_content);
+    }
 
     Ok((system, messages))
+}
+
+fn supports_native_mid_conversation_system(model: &ModelId) -> bool {
+    matches!(
+        strip_compact_date_suffix(model.as_str()).unwrap_or(model.as_str()),
+        "claude-opus-4-8" | "claude-opus-4.8" | "opus-4-8" | "opus-4.8"
+    )
+}
+
+fn strip_compact_date_suffix(model: &str) -> Option<&str> {
+    const SUFFIX_LEN: usize = "-YYYYMMDD".len();
+    let suffix_start = model.len().checked_sub(SUFFIX_LEN)?;
+    if !model.is_char_boundary(suffix_start) {
+        return None;
+    }
+    let suffix = model.as_bytes().get(suffix_start..)?;
+    let dated = suffix[0] == b'-' && suffix[1..].iter().all(u8::is_ascii_digit);
+    dated.then_some(&model[..suffix_start])
 }
 
 async fn anthropic_content_for_turn(
@@ -1252,7 +1283,7 @@ mod tests {
         ClientToolResult, ClientToolResultContent, LoadedMedia, MediaCategory, MediaMetadata,
         MediaRef, MediaUri, ModelOutputBlock, ModelStepItem, ModelStepOutput, ProviderName,
         PublicMediaUrl, ToolInputField, ToolInputSchema, ToolInputValueSchema, ToolUseId,
-        TranscriptTurn, TurnRole, UrlMediaRef, collect_model_step,
+        TranscriptTurn, TurnRole, UrlMediaRef, agent_instruction_part_turn, collect_model_step,
     };
     use serde_json::json;
 
@@ -1301,6 +1332,21 @@ mod tests {
                 bytes: self.bytes.clone(),
             })
         }
+    }
+
+    fn render_anthropic_messages(
+        transcript: &Transcript,
+        model: &str,
+    ) -> (Option<Value>, Vec<Value>) {
+        let provider = ProviderName::new("anthropic");
+        let model = ModelId::new(model);
+        futures::executor::block_on(to_anthropic_messages(
+            transcript,
+            &provider,
+            &model,
+            ImageEncoding::default(),
+        ))
+        .unwrap()
     }
 
     #[test]
@@ -1352,19 +1398,13 @@ mod tests {
     }
 
     #[test]
-    fn hoists_leading_system_turn_and_keeps_later_system_turns_native() {
-        let provider = ProviderName::new("anthropic");
+    fn opus_4_8_keeps_later_system_turns_native() {
         let mut transcript = Transcript::new();
         transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
         transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
         transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
 
-        let (system, messages) = futures::executor::block_on(to_anthropic_messages(
-            &transcript,
-            &provider,
-            ImageEncoding::default(),
-        ))
-        .unwrap();
+        let (system, messages) = render_anthropic_messages(&transcript, "claude-opus-4-8");
 
         // The leading system turn becomes the cached top-level system block.
         let system = system.expect("system block");
@@ -1379,8 +1419,71 @@ mod tests {
     }
 
     #[test]
-    fn moves_system_turns_before_user_to_anthropic_valid_position() {
-        let provider = ProviderName::new("anthropic");
+    fn non_opus_4_8_lowers_later_system_turns_to_user_messages() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+
+        let (system, messages) = render_anthropic_messages(&transcript, "claude-sonnet-4-6");
+
+        assert!(system.is_some());
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "hi");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["text"], "memory note");
+    }
+
+    #[test]
+    fn haiku_new_conversation_runtime_system_note_is_lowered_to_user_message() {
+        let mut transcript = Transcript::new();
+        transcript.push(agent_instruction_part_turn(
+            None,
+            "policy",
+            0,
+            "be helpful".to_string(),
+        ));
+        transcript.push(agent_instruction_part_turn(
+            None,
+            "style",
+            1,
+            "be concise".to_string(),
+        ));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+        transcript.push(TranscriptTurn::text(
+            TurnRole::User,
+            "what version are you on?",
+        ));
+
+        let (system, messages) = render_anthropic_messages(&transcript, "claude-haiku-4-5");
+
+        let system = system.expect("system block");
+        assert_eq!(system[0]["text"], "be helpful\n\nbe concise");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "memory note");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(
+            messages[1]["content"][0]["text"],
+            "what version are you on?"
+        );
+    }
+
+    #[test]
+    fn dated_opus_4_8_snapshot_keeps_later_system_turns_native() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+
+        let (_, messages) = render_anthropic_messages(&transcript, "claude-opus-4-8-20260702");
+
+        assert_eq!(messages[1]["role"], "system");
+    }
+
+    #[test]
+    fn opus_4_8_moves_system_turns_before_user_to_anthropic_valid_position() {
         let mut transcript = Transcript::new();
         transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
         transcript.push(TranscriptTurn::text(TurnRole::User, "first"));
@@ -1389,12 +1492,7 @@ mod tests {
         transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
         transcript.push(TranscriptTurn::text(TurnRole::User, "current"));
 
-        let (system, messages) = futures::executor::block_on(to_anthropic_messages(
-            &transcript,
-            &provider,
-            ImageEncoding::default(),
-        ))
-        .unwrap();
+        let (system, messages) = render_anthropic_messages(&transcript, "claude-opus-4-8");
 
         assert!(system.is_some());
         assert_eq!(messages.len(), 4);
@@ -1410,8 +1508,32 @@ mod tests {
     }
 
     #[test]
-    fn defers_system_flush_until_before_assistant_or_end() {
-        let provider = ProviderName::new("anthropic");
+    fn non_opus_4_8_lowers_system_turns_before_user_in_transcript_order() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "first"));
+        transcript.push(TranscriptTurn::text(TurnRole::Assistant, "answer"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "new policy"));
+        transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
+        transcript.push(TranscriptTurn::text(TurnRole::User, "current"));
+
+        let (_, messages) = render_anthropic_messages(&transcript, "claude-sonnet-4-6");
+
+        assert_eq!(messages.len(), 5);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "first");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["content"][0]["text"], "answer");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["text"], "new policy");
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"][0]["text"], "memory note");
+        assert_eq!(messages[4]["role"], "user");
+        assert_eq!(messages[4]["content"][0]["text"], "current");
+    }
+
+    #[test]
+    fn opus_4_8_defers_system_flush_until_before_assistant_or_end() {
         let mut transcript = Transcript::new();
         transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
         transcript.push(TranscriptTurn::text(TurnRole::User, "first"));
@@ -1419,12 +1541,7 @@ mod tests {
         transcript.push(TranscriptTurn::text(TurnRole::User, "current"));
         transcript.push(TranscriptTurn::text(TurnRole::Assistant, "answer"));
 
-        let (_, messages) = futures::executor::block_on(to_anthropic_messages(
-            &transcript,
-            &provider,
-            ImageEncoding::default(),
-        ))
-        .unwrap();
+        let (_, messages) = render_anthropic_messages(&transcript, "claude-opus-4-8");
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "user");
@@ -1435,19 +1552,13 @@ mod tests {
     }
 
     #[test]
-    fn lowers_unplaceable_system_turn_to_user_message() {
-        let provider = ProviderName::new("anthropic");
+    fn opus_4_8_lowers_unplaceable_system_turn_to_user_message() {
         let mut transcript = Transcript::new();
         transcript.push(TranscriptTurn::text(TurnRole::System, "be helpful"));
         transcript.push(TranscriptTurn::text(TurnRole::Assistant, "answer"));
         transcript.push(TranscriptTurn::text(TurnRole::System, "memory note"));
 
-        let (system, messages) = futures::executor::block_on(to_anthropic_messages(
-            &transcript,
-            &provider,
-            ImageEncoding::default(),
-        ))
-        .unwrap();
+        let (system, messages) = render_anthropic_messages(&transcript, "claude-opus-4-8");
 
         assert!(system.is_some());
         assert_eq!(messages.len(), 2);
@@ -1458,15 +1569,9 @@ mod tests {
 
     #[test]
     fn transcript_without_leading_system_turn_has_no_system_block() {
-        let provider = ProviderName::new("anthropic");
         let transcript = Transcript::from_user_text("hi");
 
-        let (system, messages) = futures::executor::block_on(to_anthropic_messages(
-            &transcript,
-            &provider,
-            ImageEncoding::default(),
-        ))
-        .unwrap();
+        let (system, messages) = render_anthropic_messages(&transcript, "claude-sonnet-4-6");
 
         assert!(system.is_none());
         assert_eq!(messages.len(), 1);
