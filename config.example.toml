@@ -453,7 +453,11 @@ description = "Ask a focused research subagent to gather facts and return a conc
 # client_tools = ["fetch_messages", "post_status_message", "add_reaction", "usage_report"]
 # [bot.agents.local.model]
 # id = "qwen3"
+# image_encoding = "embedded_base64"
 # [bot.agents.local.model.provider_options]
+# `image_encoding` defaults to "embedded_base64", which works well for local
+# vision backends such as LM Studio. Use "public_url" for gateways that can
+# fetch Chudbot media URLs, or "disabled" for text-only models.
 # value = { parallel_tool_calls = false, extra_body = { top_k = 40, min_p = 0.05 } }
 
 # Example Gemini agent with Nano Banana image generation and Veo video

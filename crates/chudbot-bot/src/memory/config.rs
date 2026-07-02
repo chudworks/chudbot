@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use chudbot_api::{
-    AgentLimits, ModelId, ModelSpec, ProviderName, ProviderOptions, SamplingNumber, SamplingOptions,
+    AgentLimits, ImageEncoding, ModelId, ModelSpec, ProviderName, ProviderOptions, SamplingNumber,
+    SamplingOptions,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -263,6 +264,7 @@ pub(crate) fn resolve_memory_agent(
                 temperature: Some(SamplingNumber::from_static("0.2")),
                 top_p: Some(SamplingNumber::from_static("0.9")),
             },
+            image_encoding: ImageEncoding::default(),
             provider_options: Some(ProviderOptions {
                 value: json!({ "reasoning_effort": MEMORY_REASONING_EFFORT }),
             }),
@@ -389,6 +391,7 @@ mod tests {
                 id: ModelId::new(model),
                 server_tools: BTreeSet::new(),
                 sampling: SamplingOptions::default(),
+                image_encoding: ImageEncoding::default(),
                 provider_options: None,
             },
             server_tools: None,

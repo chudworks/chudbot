@@ -403,7 +403,7 @@ fn stringify_redacted_json(value: &Value) -> String {
         .unwrap_or_else(|_| "[unserializable JSON payload]".to_string())
 }
 
-fn redact_json(value: &Value, key: Option<&str>) -> Value {
+pub(crate) fn redact_json(value: &Value, key: Option<&str>) -> Value {
     // Redaction is shape-preserving so debug logs still show which provider
     // fields were sent without leaking inline media or encrypted content.
     match value {

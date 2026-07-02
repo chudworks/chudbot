@@ -492,6 +492,7 @@ where
                     client_tools: client_tools.clone(),
                     server_tools: server_tools.clone(),
                     sampling: self.model.spec.sampling.clone(),
+                    image_encoding: self.model.spec.image_encoding,
                     provider_options: self.model.spec.provider_options.clone(),
                 });
                 futures::pin_mut!(events);
@@ -1192,7 +1193,7 @@ mod tests {
 
     use crate::ids::{ProviderName, ToolUseId};
     use crate::llm::{
-        ModelOutputBlock, ModelSpec, ModelStepEvent, ModelStepItem, ModelStepOutput,
+        ImageEncoding, ModelOutputBlock, ModelSpec, ModelStepEvent, ModelStepItem, ModelStepOutput,
         SamplingOptions,
     };
     use crate::tool::ToolInputSchema;
@@ -1217,6 +1218,7 @@ mod tests {
                 id: ModelId::new("test-model"),
                 server_tools: ServerToolSet::default(),
                 sampling: SamplingOptions::default(),
+                image_encoding: ImageEncoding::default(),
                 provider_options: None,
             },
         }

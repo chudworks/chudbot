@@ -100,10 +100,11 @@ pub use storage::{
 // Model contracts cover both static model configuration and one provider
 // round-trip; provider crates translate these shapes to their native APIs.
 pub use llm::{
-    LlmBackend, Model, ModelInfo, ModelInfoRequest, ModelOutputBlock, ModelSpec, ModelStep,
-    ModelStepCollectionError, ModelStepDelta, ModelStepEvent, ModelStepItem, ModelStepOutput,
-    ModelStepReducerError, ModelStepRequest, ProviderOptions, SamplingNumber, SamplingOptions,
-    ServerToolSet, collect_model_step, reasoning_items_to_delta_events,
+    ImageEncoding, ImageReferenceError, LlmBackend, Model, ModelImageReference, ModelInfo,
+    ModelInfoRequest, ModelOutputBlock, ModelSpec, ModelStep, ModelStepCollectionError,
+    ModelStepDelta, ModelStepEvent, ModelStepItem, ModelStepOutput, ModelStepReducerError,
+    ModelStepRequest, ProviderOptions, SamplingNumber, SamplingOptions, ServerToolSet,
+    collect_model_step, reasoning_items_to_delta_events, resolve_image_reference,
 };
 
 // Agent loop contracts: static agent config, runtime agent execution, outcomes,
@@ -126,11 +127,11 @@ pub use tool::{
 // IO, and provider-side image/video/audio generation.
 pub use media::{
     AudioTranscriber, AudioTranscriptChannel, AudioTranscriptWord, AudioTranscription,
-    AudioTranscriptionRequest, BoxedMediaRef, CreateMedia, GeneratedImage, GeneratedVideo,
-    ImageGenerator, ImageRequest, LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef,
-    MediaStore, MediaUri, PublicMediaUrl, StoredMediaUri, UrlMediaRef, VideoGenerator,
-    VideoJobStatus, VideoMeta, VideoRequest, canonical_stored_media_uri, is_stored_media_uri,
-    parse_stored_media_uri, stored_media_served_path, stored_media_uri,
+    AudioTranscriptionRequest, BoxedMediaRef, CreateMedia, EmbeddedMediaBase64, GeneratedImage,
+    GeneratedVideo, ImageGenerator, ImageRequest, LoadedMedia, MediaCategory, MediaError,
+    MediaMetadata, MediaRef, MediaStore, MediaUri, PublicMediaUrl, StoredMediaUri, UrlMediaRef,
+    VideoGenerator, VideoJobStatus, VideoMeta, VideoRequest, canonical_stored_media_uri,
+    is_stored_media_uri, parse_stored_media_uri, stored_media_served_path, stored_media_uri,
 };
 
 // Usage records and aggregate query shapes let model, tool, media, and nested

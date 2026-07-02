@@ -15,11 +15,11 @@ use chudbot_api::reasoning::TurnReasoning;
 use chudbot_api::retry::{RetryPolicy, retry_after_error};
 use chudbot_api::sse::{ServerSentEvent, SseDecoder};
 use chudbot_api::{
-    ClientToolCall, ClientToolSpec, ContentBlock, CostAmount, GroundingMetadata, LlmBackend,
-    ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta, ModelStepEvent, ModelStepKind,
-    ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet, ServerToolUse,
-    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
-    reasoning_items_to_delta_events,
+    ClientToolCall, ClientToolSpec, ContentBlock, CostAmount, GroundingMetadata, ImageEncoding,
+    LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta, ModelStepEvent,
+    ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet,
+    ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord,
+    UsageSubject, reasoning_items_to_delta_events, resolve_image_reference,
 };
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -27,15 +27,19 @@ use serde_json::{Value, json};
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
-use crate::imagine::media_provider_url;
-use crate::{XaiClient, XaiError, json_strip_nulls};
+use crate::{XaiClient, XaiError, json_strip_nulls, redact_json};
 
 /// Request encrypted reasoning blobs so later turns can replay provider state.
 const REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
 
 impl XaiClient {
     async fn build_step_body(&self, request: &ModelStepRequest) -> Result<Value, XaiError> {
-        let input = to_responses_input(&request.transcript, self.provider_name()).await?;
+        let input = to_responses_input(
+            &request.transcript,
+            self.provider_name(),
+            request.image_encoding,
+        )
+        .await?;
         Ok(build_step_body_from_input(request, input))
     }
 }
@@ -236,6 +240,7 @@ impl XaiStepDump {
         let Some(conversation) = dump_conversation_id(body) else {
             return Ok(None);
         };
+        let redacted_body = redact_json(body, None);
         let dir = root.join(sanitize_dump_path_segment(conversation));
         fs::create_dir_all(&dir).await?;
         let start = next_dump_ordinal(&dir).await?;
@@ -244,7 +249,7 @@ impl XaiStepDump {
                 dir: dir.clone(),
                 prefix: format!("{ordinal:04}"),
             };
-            match dump.write_json_new("request", body).await {
+            match dump.write_json_new("request", &redacted_body).await {
                 Ok(()) => {
                     tracing::debug!(
                         dump_dir = %dump.dir.display(),
@@ -896,6 +901,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 async fn to_responses_input(
     transcript: &Transcript,
     provider: &ProviderName,
+    image_encoding: ImageEncoding,
 ) -> Result<Vec<Value>, XaiError> {
     let mut input = Vec::new();
     if let Some(instructions) = &transcript.instructions
@@ -953,7 +959,10 @@ async fn to_responses_input(
             match block {
                 ContentBlock::Text { text: t } => text.push_str(t),
                 ContentBlock::Media { media } => {
-                    media_urls.push(media_provider_url(media.as_ref()).await?)
+                    let reference = resolve_image_reference(media.as_ref(), image_encoding)
+                        .await
+                        .map_err(|error| XaiError::Reference(error.to_string()))?;
+                    media_urls.push(reference.as_url_or_data_url());
                 }
                 ContentBlock::Continuation(_) => {}
                 ContentBlock::ClientToolCall(call) => {
@@ -1322,9 +1331,12 @@ struct TokenDetails {
 mod tests {
     use super::*;
     use chudbot_api::{
-        ProviderOptions, SamplingNumber, SamplingOptions, ToolInputField, ToolInputSchema,
+        LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef, MediaUri, ProviderOptions,
+        PublicMediaUrl, SamplingNumber, SamplingOptions, ToolInputField, ToolInputSchema,
         ToolInputValueSchema, TranscriptTurn, collect_model_step,
     };
+    use std::future::Future;
+    use std::pin::Pin;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dump_root(name: &str) -> PathBuf {
@@ -1333,6 +1345,109 @@ mod tests {
             .expect("system clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("chudbot-xai-{name}-{}-{nanos}", std::process::id()))
+    }
+
+    #[derive(Debug, Clone)]
+    struct LoadableTestMediaRef {
+        metadata: MediaMetadata,
+        bytes: Vec<u8>,
+        public_url: Option<PublicMediaUrl>,
+    }
+
+    impl LoadableTestMediaRef {
+        fn new(uri: &str, mime_type: &str, bytes: &[u8]) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "test-image".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: mime_type.to_string(),
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes: bytes.to_vec(),
+                public_url: None,
+            }
+        }
+
+        fn with_public_url(mut self, url: &str) -> Self {
+            self.public_url = Some(PublicMediaUrl::new(url));
+            self
+        }
+
+        fn boxed(self) -> Box<dyn MediaRef> {
+            Box::new(self)
+        }
+    }
+
+    impl MediaRef for LoadableTestMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> Box<dyn MediaRef> {
+            Box::new(self.clone())
+        }
+
+        fn public_url<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> Pin<Box<dyn Future<Output = Result<PublicMediaUrl, MediaError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let uri = self.uri().clone();
+            let public_url = self.public_url.clone();
+            Box::pin(async move { public_url.ok_or(MediaError::NoPublicUrl { uri }) })
+        }
+
+        fn load<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> Pin<Box<dyn Future<Output = Result<LoadedMedia, MediaError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let media = self.clone();
+            let bytes = self.bytes.clone();
+            Box::pin(async move {
+                Ok(LoadedMedia {
+                    media: Box::new(media),
+                    bytes,
+                })
+            })
+        }
+    }
+
+    fn request_with_image(
+        media: Box<dyn MediaRef>,
+        image_encoding: ImageEncoding,
+    ) -> ModelStepRequest {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "describe this".to_string(),
+                },
+                ContentBlock::Media { media },
+            ],
+            metadata: Value::Null,
+        });
+        ModelStepRequest {
+            model: ModelId::new("grok-4.3"),
+            transcript,
+            client_tools: BTreeMap::new(),
+            server_tools: ServerToolSet::new(),
+            sampling: SamplingOptions::default(),
+            image_encoding,
+            provider_options: None,
+        }
+    }
+
+    fn body_image_url(body: &Value) -> &str {
+        body["input"][0]["content"][1]["image_url"]
+            .as_str()
+            .expect("image_url string")
     }
 
     #[test]
@@ -1349,14 +1464,63 @@ mod tests {
             metadata: json!({ "id": "chudbot_turn_user_1" }),
         });
 
-        let input =
-            futures::executor::block_on(to_responses_input(&transcript, &provider)).unwrap();
+        let input = futures::executor::block_on(to_responses_input(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
 
         assert_eq!(input.len(), 2);
         assert_eq!(input[0]["id"], "chudbot_conversation_conv-123_system");
         assert_eq!(input[0]["role"], "system");
         assert_eq!(input[1]["id"], "chudbot_turn_user_1");
         assert_eq!(input[1]["role"], "user");
+    }
+
+    #[test]
+    fn responses_input_embeds_base64_image_when_configured() {
+        let client = XaiClient::new(ProviderName::new("xai"), "key");
+        let media = LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+            .with_public_url("https://example.com/test.png")
+            .boxed();
+        let request = request_with_image(media, ImageEncoding::EmbeddedBase64);
+
+        let body = futures::executor::block_on(client.build_step_body(&request)).unwrap();
+
+        assert_eq!(body_image_url(&body), "data:image/png;base64,YWJj");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn responses_input_uses_public_image_url_when_configured() {
+        let client = XaiClient::new(ProviderName::new("xai"), "key");
+        let media = LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+            .with_public_url("https://example.com/test.png")
+            .boxed();
+        let request = request_with_image(media, ImageEncoding::PublicUrl);
+
+        let body = futures::executor::block_on(client.build_step_body(&request)).unwrap();
+
+        assert_eq!(body_image_url(&body), "https://example.com/test.png");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn responses_input_errors_when_image_encoding_disabled() {
+        let client = XaiClient::new(ProviderName::new("xai"), "key");
+        let media =
+            LoadableTestMediaRef::new("media://images/disabled.png", "image/png", b"abc").boxed();
+        let request = request_with_image(media, ImageEncoding::Disabled);
+
+        let error = futures::executor::block_on(client.build_step_body(&request))
+            .expect_err("disabled image encoding should reject media");
+
+        assert!(matches!(
+            error,
+            XaiError::Reference(message)
+                if message == "image inputs are disabled for media `media://images/disabled.png`"
+        ));
     }
 
     #[tokio::test]
@@ -1406,6 +1570,31 @@ mod tests {
         assert!(response_file.contains("\"id\": \"resp_1\""));
         assert!(continuation_file.contains("\"encrypted_content\": \"BLOB\""));
         assert!(!dir.join("0001_event_0001_response.completed.json").exists());
+
+        fs::remove_dir_all(root).await.ok();
+    }
+
+    #[tokio::test]
+    async fn step_dump_redacts_embedded_image_data_urls_from_request_json() {
+        let root = temp_dump_root("stream-dump-redacted-image");
+        let request = json!({
+            "prompt_cache_key": "conv-redact",
+            "input": [{
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,YWJj"
+                }]
+            }],
+        });
+
+        XaiStepDump::create(&root, &request).await.unwrap().unwrap();
+
+        let request_file = fs::read_to_string(root.join("conv-redact").join("0001_request.json"))
+            .await
+            .unwrap();
+        assert!(request_file.contains("data:image/png;base64,[redacted base64 data; chars=4]"));
+        assert!(!request_file.contains("YWJj"));
 
         fs::remove_dir_all(root).await.ok();
     }
@@ -1470,8 +1659,12 @@ mod tests {
             metadata: json!({ "id": "synthetic_assistant_id" }),
         });
 
-        let input =
-            futures::executor::block_on(to_responses_input(&transcript, &provider)).unwrap();
+        let input = futures::executor::block_on(to_responses_input(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
 
         assert_eq!(input.len(), 4);
         assert_eq!(input[0]["type"], "reasoning");
@@ -1513,8 +1706,12 @@ mod tests {
             metadata: Value::Null,
         });
 
-        let input =
-            futures::executor::block_on(to_responses_input(&transcript, &provider)).unwrap();
+        let input = futures::executor::block_on(to_responses_input(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
 
         assert_eq!(input.len(), 3);
         assert_eq!(input[0]["id"], "rs_good");
@@ -1547,8 +1744,12 @@ mod tests {
             metadata: json!({ "id": "synthetic_assistant_id" }),
         });
 
-        let input =
-            futures::executor::block_on(to_responses_input(&transcript, &provider)).unwrap();
+        let input = futures::executor::block_on(to_responses_input(
+            &transcript,
+            &provider,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["id"], "synthetic_assistant_id");
@@ -1584,6 +1785,7 @@ mod tests {
             client_tools: BTreeMap::new(),
             server_tools: ServerToolSet::new(),
             sampling: chudbot_api::SamplingOptions::default(),
+            image_encoding: chudbot_api::ImageEncoding::default(),
             provider_options: Some(ProviderOptions {
                 value: json!({ "reasoning_effort": "high" }),
             }),
@@ -1609,6 +1811,7 @@ mod tests {
                 temperature: Some(SamplingNumber::from_json_number_literal("1.30").unwrap()),
                 top_p: Some(SamplingNumber::from_json_number_literal("0.950").unwrap()),
             },
+            image_encoding: chudbot_api::ImageEncoding::default(),
             provider_options: None,
         };
 

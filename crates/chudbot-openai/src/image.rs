@@ -161,49 +161,6 @@ impl OpenAiClient {
     }
 }
 
-/// Resolve media into a URL string accepted by the Responses API.
-///
-/// Text-generation messages can reference media by public URL. If the store
-/// cannot expose the media publicly, this falls back to an inline data URI so
-/// local attachments still work with OpenAI's multimodal input blocks.
-pub(crate) async fn media_bytes_or_url(media: &dyn MediaRef) -> Result<String, OpenAiError> {
-    match media.public_url().await {
-        Ok(url) => {
-            tracing::debug!(
-                uri = %media.uri(),
-                category = ?media.category(),
-                "resolved media public URL for OpenAI"
-            );
-            Ok(url.to_string())
-        }
-        Err(public_error) => match media.load().await {
-            Ok(loaded) => {
-                tracing::debug!(
-                    uri = %media.uri(),
-                    category = ?media.category(),
-                    bytes = loaded.bytes.len(),
-                    mime_type = loaded.media.mime_type(),
-                    "inlined media bytes for OpenAI"
-                );
-                Ok(data_uri(loaded.media.mime_type(), &loaded.bytes))
-            }
-            Err(load_error) => {
-                tracing::warn!(
-                    uri = %media.uri(),
-                    category = ?media.category(),
-                    public_error = %public_error,
-                    load_error = %load_error,
-                    "failed to resolve media for OpenAI"
-                );
-                Err(OpenAiError::Reference(format!(
-                    "media `{}` has no public URL ({public_error}) and could not be loaded ({load_error})",
-                    media.uri()
-                )))
-            }
-        },
-    }
-}
-
 /// Resolve an edit reference into bytes and a provider-safe MIME type.
 ///
 /// The edit endpoint needs multipart bytes, so local media loads are preferred.
@@ -460,11 +417,6 @@ fn map_aspect_to_size(aspect: Option<&str>) -> Option<&'static str> {
         "auto" => Some("auto"),
         _ => Some("auto"),
     }
-}
-
-/// Encode media bytes as a data URI for APIs that accept inline image URLs.
-fn data_uri(mime_type: &str, bytes: &[u8]) -> String {
-    format!("data:{mime_type};base64,{}", B64.encode(bytes))
 }
 
 /// Decode a data URI into bytes and a normalized static image MIME type.

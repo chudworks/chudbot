@@ -44,6 +44,7 @@ use serde_json::value::RawValue;
 use thiserror::Error;
 
 use crate::ids::{ModelId, ProviderName, ToolName};
+use crate::media::{EmbeddedMediaBase64, MediaRef, MediaUri, PublicMediaUrl};
 use crate::reasoning::ReasoningItem;
 use crate::storage::ModelStepKind;
 use crate::tool::{ClientToolCall, ClientToolSpec, GroundingMetadata, ServerToolUse};
@@ -112,10 +113,10 @@ pub struct Model<B> {
 
 /// Static model configuration.
 ///
-/// This is the TOML-shaped part: model id, sampling, provider-specific static
-/// options, and provider-side/server-side tools. It does not know how to call
-/// any API, and it does not carry the provider route; routing is represented by
-/// the backend half of [`Model`].
+/// This is the TOML-shaped part: model id, sampling, image encoding,
+/// provider-specific static options, and provider-side/server-side tools. It
+/// does not know how to call any API, and it does not carry the provider route;
+/// routing is represented by the backend half of [`Model`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelSpec {
     /// Provider model id, e.g. the string sent in a vendor request's `model`.
@@ -129,6 +130,13 @@ pub struct ModelSpec {
     /// Provider-neutral sampling options applied to every step.
     #[serde(default)]
     pub sampling: SamplingOptions,
+    /// Preferred encoding for image media blocks sent to model providers.
+    ///
+    /// Providers that have not implemented this option may ignore it and keep
+    /// their existing media behavior. Providers that do implement it should
+    /// treat [`ImageEncoding::Disabled`] as a request to reject or omit images.
+    #[serde(default)]
+    pub image_encoding: ImageEncoding,
     /// Opaque provider-specific options applied to every step.
     #[serde(default)]
     pub provider_options: Option<ProviderOptions>,
@@ -159,6 +167,8 @@ pub struct ModelStepRequest {
     pub server_tools: ServerToolSet,
     /// Provider-neutral sampling options for this step.
     pub sampling: SamplingOptions,
+    /// Preferred image media encoding for this step.
+    pub image_encoding: ImageEncoding,
     /// Opaque provider-specific options for this already-routed backend.
     pub provider_options: Option<ProviderOptions>,
 }
@@ -629,6 +639,128 @@ pub struct SamplingOptions {
     pub top_p: Option<SamplingNumber>,
 }
 
+/// Provider-neutral image media encoding preference.
+///
+/// This describes how a model request should carry image inputs when the
+/// selected provider supports multiple forms. The default favors embedded bytes
+/// because local gateways often cannot fetch Chudbot's public media URLs.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageEncoding {
+    /// Send a provider-fetchable public URL.
+    PublicUrl,
+    /// Send bytes embedded as base64, usually in a data URL wrapper when the
+    /// provider protocol expects a URL-shaped image field.
+    #[default]
+    EmbeddedBase64,
+    /// Do not send image inputs to the model.
+    Disabled,
+}
+
+/// Image media resolved into a provider-request-ready reference.
+///
+/// This type is intentionally not serializable: embedded variants may contain
+/// base64 image bytes and should stay inside the provider request boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelImageReference {
+    /// Provider-fetchable public URL.
+    PublicUrl {
+        /// Public URL for the provider request.
+        url: PublicMediaUrl,
+    },
+    /// Embedded base64 bytes.
+    EmbeddedBase64 {
+        /// Encoded media bytes and MIME type.
+        data: EmbeddedMediaBase64,
+    },
+}
+
+impl ModelImageReference {
+    /// Return a string accepted by OpenAI-compatible `image_url.url` fields:
+    /// either a public URL or a data URL for embedded bytes.
+    pub fn as_url_or_data_url(&self) -> String {
+        match self {
+            Self::PublicUrl { url } => url.to_string(),
+            Self::EmbeddedBase64 { data } => data.data_url(),
+        }
+    }
+}
+
+/// Failure while resolving an image input according to [`ImageEncoding`].
+#[derive(Debug, Error)]
+pub enum ImageReferenceError {
+    /// The configured model does not accept image media.
+    #[error("image inputs are disabled for media `{uri}`")]
+    Disabled {
+        /// Stable media URI.
+        uri: MediaUri,
+    },
+    /// Embedded-base64 mode could not encode bytes and had no URL fallback.
+    #[error(
+        "media `{uri}` could not be base64-encoded ({encode_error}) and has no public URL ({public_error})"
+    )]
+    EmbeddedBase64Unavailable {
+        /// Stable media URI.
+        uri: MediaUri,
+        /// Error from byte loading/base64 preparation.
+        encode_error: String,
+        /// Error from public URL fallback.
+        public_error: String,
+    },
+    /// Public-URL mode could not mint a URL and had no base64 fallback.
+    #[error(
+        "media `{uri}` has no public URL ({public_error}) and could not be base64-encoded ({encode_error})"
+    )]
+    PublicUrlUnavailable {
+        /// Stable media URI.
+        uri: MediaUri,
+        /// Error from public URL lookup.
+        public_error: String,
+        /// Error from byte loading/base64 fallback.
+        encode_error: String,
+    },
+}
+
+/// Resolve one image media handle according to the configured model image
+/// encoding.
+///
+/// `EmbeddedBase64` tries bytes first and falls back to a public URL when the
+/// media handle is URL-only. `PublicUrl` does the inverse. `Disabled` returns an
+/// error immediately so providers automatically reject image content for
+/// text-only model configs.
+pub async fn resolve_image_reference(
+    media: &dyn MediaRef,
+    image_encoding: ImageEncoding,
+) -> Result<ModelImageReference, ImageReferenceError> {
+    match image_encoding {
+        ImageEncoding::EmbeddedBase64 => match media.embedded_base64().await {
+            Ok(data) => Ok(ModelImageReference::EmbeddedBase64 { data }),
+            Err(encode_error) => match media.public_url().await {
+                Ok(url) => Ok(ModelImageReference::PublicUrl { url }),
+                Err(public_error) => Err(ImageReferenceError::EmbeddedBase64Unavailable {
+                    uri: media.uri().clone(),
+                    encode_error: encode_error.to_string(),
+                    public_error: public_error.to_string(),
+                }),
+            },
+        },
+        ImageEncoding::PublicUrl => match media.public_url().await {
+            Ok(url) => Ok(ModelImageReference::PublicUrl { url }),
+            Err(public_error) => match media.embedded_base64().await {
+                Ok(data) => Ok(ModelImageReference::EmbeddedBase64 { data }),
+                Err(encode_error) => Err(ImageReferenceError::PublicUrlUnavailable {
+                    uri: media.uri().clone(),
+                    public_error: public_error.to_string(),
+                    encode_error: encode_error.to_string(),
+                }),
+            },
+        },
+        ImageEncoding::Disabled => Err(ImageReferenceError::Disabled {
+            uri: media.uri().clone(),
+        }),
+    }
+}
+
 /// Provider-specific options for the already-routed backend.
 ///
 /// The API crate intentionally keeps this as raw JSON so provider crates can
@@ -644,6 +776,9 @@ pub struct ProviderOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::{
+        LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef, MediaUri, PublicMediaUrl,
+    };
 
     #[test]
     fn sampling_number_serializes_exact_raw_literal() {
@@ -671,5 +806,121 @@ mod tests {
                 "{raw} should not be accepted"
             );
         }
+    }
+
+    #[test]
+    fn model_spec_defaults_to_embedded_base64_image_encoding() {
+        let spec: ModelSpec = serde_json::from_value(serde_json::json!({
+            "id": "test-model"
+        }))
+        .unwrap();
+
+        assert_eq!(spec.image_encoding, ImageEncoding::EmbeddedBase64);
+    }
+
+    #[test]
+    fn model_spec_deserializes_typed_image_encoding() {
+        let spec: ModelSpec = serde_json::from_value(serde_json::json!({
+            "id": "test-model",
+            "image_encoding": "public_url"
+        }))
+        .unwrap();
+
+        assert_eq!(spec.image_encoding, ImageEncoding::PublicUrl);
+    }
+
+    #[derive(Debug, Clone)]
+    struct LoadableTestMediaRef {
+        metadata: MediaMetadata,
+        bytes: Vec<u8>,
+        public_url: Option<PublicMediaUrl>,
+    }
+
+    impl LoadableTestMediaRef {
+        fn new(uri: &str, mime_type: &str, bytes: &[u8]) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "test-image".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: mime_type.to_string(),
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes: bytes.to_vec(),
+                public_url: None,
+            }
+        }
+
+        fn with_public_url(mut self, url: &str) -> Self {
+            self.public_url = Some(PublicMediaUrl::new(url));
+            self
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MediaRef for LoadableTestMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> crate::media::BoxedMediaRef {
+            Box::new(self.clone())
+        }
+
+        async fn public_url(&self) -> Result<PublicMediaUrl, MediaError> {
+            self.public_url
+                .clone()
+                .ok_or_else(|| MediaError::NoPublicUrl {
+                    uri: self.uri().clone(),
+                })
+        }
+
+        async fn load(&self) -> Result<LoadedMedia, MediaError> {
+            Ok(LoadedMedia {
+                media: self.clone_box(),
+                bytes: self.bytes.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn resolve_image_reference_defaults_to_embedded_base64_when_loadable() {
+        let media = LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+            .with_public_url("https://example.com/image.png");
+
+        let reference =
+            futures::executor::block_on(resolve_image_reference(&media, ImageEncoding::default()))
+                .unwrap();
+
+        assert_eq!(reference.as_url_or_data_url(), "data:image/png;base64,YWJj");
+    }
+
+    #[test]
+    fn resolve_image_reference_public_url_mode_prefers_public_url() {
+        let media = LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+            .with_public_url("https://example.com/image.png");
+
+        let reference =
+            futures::executor::block_on(resolve_image_reference(&media, ImageEncoding::PublicUrl))
+                .unwrap();
+
+        assert_eq!(
+            reference.as_url_or_data_url(),
+            "https://example.com/image.png"
+        );
+    }
+
+    #[test]
+    fn resolve_image_reference_disabled_errors_for_any_image() {
+        let media = LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc");
+
+        let error =
+            futures::executor::block_on(resolve_image_reference(&media, ImageEncoding::Disabled))
+                .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "image inputs are disabled for media `media://images/test.png`"
+        );
     }
 }

@@ -207,6 +207,7 @@ pub(crate) fn default_tos_preflight_agent(
                 temperature: Some(SamplingNumber::from_static("0.0")),
                 top_p: None,
             },
+            image_encoding: source.model.image_encoding,
             provider_options: None,
         },
         source.limits.unwrap_or(default_limits),

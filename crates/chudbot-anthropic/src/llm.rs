@@ -10,17 +10,16 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
 use chudbot_api::reasoning::TurnReasoning;
 use chudbot_api::retry::{RetryPolicy, retry_after_error};
 use chudbot_api::sse::{ServerSentEvent, SseDecoder};
 use chudbot_api::{
     ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
-    GroundingMetadata, LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta,
-    ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
-    SamplingNumber, ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript,
-    TurnRole, UsageRecord, UsageSubject, reasoning_items_to_delta_events,
+    GroundingMetadata, ImageEncoding, LlmBackend, MediaRef, ModelId, ModelImageReference,
+    ModelInfo, ModelInfoRequest, ModelStepDelta, ModelStepEvent, ModelStepKind, ModelStepRequest,
+    ProviderContinuation, ProviderName, SamplingNumber, ServerToolSet, ServerToolUse,
+    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    reasoning_items_to_delta_events, resolve_image_reference,
 };
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -35,8 +34,12 @@ const WEB_SEARCH_TOOL_NAME: &str = "web_search";
 
 impl AnthropicClient {
     async fn build_step_body(&self, request: &ModelStepRequest) -> Result<Value, AnthropicError> {
-        let (system, mut messages) =
-            to_anthropic_messages(&request.transcript, self.provider_name()).await?;
+        let (system, mut messages) = to_anthropic_messages(
+            &request.transcript,
+            self.provider_name(),
+            request.image_encoding,
+        )
+        .await?;
         mark_last_block_ephemeral(&mut messages);
 
         let tools = build_messages_tools(&request.client_tools, &request.server_tools);
@@ -649,6 +652,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 async fn to_anthropic_messages(
     transcript: &Transcript,
     provider: &ProviderName,
+    image_encoding: ImageEncoding,
 ) -> Result<(Option<Value>, Vec<Value>), AnthropicError> {
     let system = transcript
         .instructions
@@ -688,7 +692,7 @@ async fn to_anthropic_messages(
                 ContentBlock::Media { media } => {
                     content.push(json!({
                         "type": "image",
-                        "source": media_source(media.as_ref()).await?,
+                        "source": media_source(media.as_ref(), image_encoding).await?,
                     }));
                 }
                 ContentBlock::ClientToolCall(call) => {
@@ -741,7 +745,10 @@ fn provider_continuation_content(
 }
 
 /// Convert a Chudbot media reference into one of Anthropic's accepted image sources.
-async fn media_source(media: &dyn MediaRef) -> Result<Value, AnthropicError> {
+async fn media_source(
+    media: &dyn MediaRef,
+    image_encoding: ImageEncoding,
+) -> Result<Value, AnthropicError> {
     let mime_type = media.mime_type();
     if !mime_type.starts_with("image/") {
         return Err(AnthropicError::Reference(format!(
@@ -750,25 +757,19 @@ async fn media_source(media: &dyn MediaRef) -> Result<Value, AnthropicError> {
         )));
     }
 
-    match media.load().await {
-        // Prefer inline bytes when the media store can provide them; this keeps
-        // private local assets usable without requiring an externally reachable
-        // media URL.
-        Ok(loaded) => Ok(json!({
+    match resolve_image_reference(media, image_encoding)
+        .await
+        .map_err(|error| AnthropicError::Reference(error.to_string()))?
+    {
+        ModelImageReference::EmbeddedBase64 { data } => Ok(json!({
             "type": "base64",
-            "media_type": loaded.media.mime_type(),
-            "data": B64.encode(&loaded.bytes),
+            "media_type": data.mime_type(),
+            "data": data.as_base64(),
         })),
-        Err(load_error) => match media.public_url().await {
-            Ok(url) => Ok(json!({
-                "type": "url",
-                "url": url.as_str(),
-            })),
-            Err(public_error) => Err(AnthropicError::Reference(format!(
-                "media `{}` could not be loaded ({load_error}) and has no public URL ({public_error})",
-                media.uri()
-            ))),
-        },
+        ModelImageReference::PublicUrl { url } => Ok(json!({
+            "type": "url",
+            "url": url.as_str(),
+        })),
     }
 }
 
@@ -1597,7 +1598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn loadable_media_is_inlined_instead_of_sent_as_url() {
+    async fn embedded_base64_image_encoding_uses_base64_source() {
         let media = LoadablePublicMediaRef::new(
             "media://images/stored.png",
             "https://chud.example/media/images/stored.png",
@@ -1605,7 +1606,9 @@ mod tests {
             b"image bytes".to_vec(),
         );
 
-        let source = media_source(&media).await.expect("media source");
+        let source = media_source(&media, ImageEncoding::EmbeddedBase64)
+            .await
+            .expect("media source");
 
         assert_eq!(source["type"], "base64");
         assert_eq!(source["media_type"], "image/png");
@@ -1614,17 +1617,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn url_only_media_still_uses_url_source() {
+    async fn public_url_image_encoding_uses_url_source() {
+        let media = LoadablePublicMediaRef::new(
+            "media://images/stored.png",
+            "https://chud.example/media/images/stored.png",
+            "image/png",
+            b"image bytes".to_vec(),
+        );
+
+        let source = media_source(&media, ImageEncoding::PublicUrl)
+            .await
+            .expect("media source");
+
+        assert_eq!(source["type"], "url");
+        assert_eq!(
+            source["url"],
+            "https://chud.example/media/images/stored.png"
+        );
+        assert!(source.get("media_type").is_none());
+        assert!(source.get("data").is_none());
+    }
+
+    #[tokio::test]
+    async fn embedded_base64_image_encoding_falls_back_to_url_for_url_only_media() {
         let media = UrlMediaRef::new(
             MediaCategory::Image,
             "https://example.com/image.png",
             "image/png",
         );
 
-        let source = media_source(&media).await.expect("media source");
+        let source = media_source(&media, ImageEncoding::EmbeddedBase64)
+            .await
+            .expect("media source");
 
         assert_eq!(source["type"], "url");
         assert_eq!(source["url"], "https://example.com/image.png");
+    }
+
+    #[tokio::test]
+    async fn disabled_image_encoding_rejects_image_media() {
+        let media = LoadablePublicMediaRef::new(
+            "media://images/stored.png",
+            "https://chud.example/media/images/stored.png",
+            "image/png",
+            b"image bytes".to_vec(),
+        );
+
+        let error = media_source(&media, ImageEncoding::Disabled)
+            .await
+            .expect_err("disabled image input should fail");
+
+        assert!(matches!(error, AnthropicError::Reference(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("image inputs are disabled for media `media://images/stored.png`")
+        );
     }
 
     #[test]

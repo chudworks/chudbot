@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 
 use chudbot_api::{
     ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
-    GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta,
-    ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
-    ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole,
-    UsageRecord, UsageSubject,
+    GroundingMetadata, ImageEncoding, ImageReferenceError, LlmBackend, MediaRef, ModelId,
+    ModelImageReference, ModelInfo, ModelInfoRequest, ModelStepDelta, ModelStepEvent,
+    ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName, ServerToolSet,
+    ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord,
+    UsageSubject, resolve_image_reference,
     retry::{RetryPolicy, retry_after_error},
     sse::{ServerSentEvent, SseDecoder},
 };
@@ -22,13 +23,18 @@ use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::{GeminiClient, GeminiError, get_field, inline_media, json_strip_nulls};
+use crate::{GeminiClient, GeminiError, get_field, json_strip_nulls};
 
 impl GeminiClient {
     async fn build_step_body(&self, request: &ModelStepRequest) -> Result<Value, GeminiError> {
         // Convert the durable transcript first so Gemini continuations can
         // short-circuit re-encoding for provider-native content.
-        let contents = to_gemini_contents(&request.transcript, self.provider_name()).await?;
+        let contents = to_gemini_contents(
+            &request.transcript,
+            self.provider_name(),
+            request.image_encoding,
+        )
+        .await?;
         let tools = build_tools(&request.client_tools, &request.server_tools);
         let tool_config = build_tool_config(&request.server_tools);
         let options = GeminiOptions::from_request(request);
@@ -431,6 +437,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 async fn to_gemini_contents(
     transcript: &Transcript,
     provider: &ProviderName,
+    image_encoding: ImageEncoding,
 ) -> Result<Vec<Value>, GeminiError> {
     let mut contents = Vec::new();
     let mut call_names = BTreeMap::new();
@@ -454,7 +461,7 @@ async fn to_gemini_contents(
                 }
                 ContentBlock::Text { .. } => {}
                 ContentBlock::Media { media } => {
-                    parts.push(inline_media(media.as_ref()).await?);
+                    parts.push(gemini_media_part(media.as_ref(), image_encoding).await?);
                 }
                 ContentBlock::ClientToolCall(call) => {
                     call_names.insert(call.id.as_str().to_string(), call.name.as_str().to_string());
@@ -477,6 +484,58 @@ async fn to_gemini_contents(
     }
 
     Ok(contents)
+}
+
+/// Converts one image reference into Gemini's documented generateContent media
+/// part. Arbitrary public URLs are not a generateContent input form; Google
+/// documents URL images by fetching them client-side and sending inline bytes.
+async fn gemini_media_part(
+    media: &dyn MediaRef,
+    image_encoding: ImageEncoding,
+) -> Result<Value, GeminiError> {
+    let reference = match image_encoding {
+        ImageEncoding::PublicUrl => {
+            let preferred = resolve_image_reference(media, ImageEncoding::PublicUrl)
+                .await
+                .map_err(gemini_image_reference_error)?;
+            match preferred {
+                ModelImageReference::PublicUrl { .. } => {
+                    resolve_image_reference(media, ImageEncoding::EmbeddedBase64)
+                        .await
+                        .map_err(gemini_image_reference_error)?
+                }
+                embedded => embedded,
+            }
+        }
+        ImageEncoding::EmbeddedBase64 | ImageEncoding::Disabled => {
+            resolve_image_reference(media, image_encoding)
+                .await
+                .map_err(gemini_image_reference_error)?
+        }
+    };
+    gemini_part_from_image_reference(media, reference)
+}
+
+fn gemini_part_from_image_reference(
+    media: &dyn MediaRef,
+    reference: ModelImageReference,
+) -> Result<Value, GeminiError> {
+    match reference {
+        ModelImageReference::EmbeddedBase64 { data } => Ok(json!({
+            "inlineData": {
+                "mimeType": data.mime_type(),
+                "data": data.as_base64(),
+            }
+        })),
+        ModelImageReference::PublicUrl { url } => Err(GeminiError::Reference(format!(
+            "Gemini generateContent does not support direct public URL image input for media `{}` (`{url}`); use loadable media for embedded base64 or upload through the Gemini Files API",
+            media.uri()
+        ))),
+    }
+}
+
+fn gemini_image_reference_error(error: ImageReferenceError) -> GeminiError {
+    GeminiError::Reference(error.to_string())
 }
 
 /// Returns the Gemini-native content saved from a previous model response.
@@ -849,14 +908,86 @@ struct UsageMetadata {
 
 #[cfg(test)]
 mod tests {
+    use std::{future::Future, pin::Pin};
+
     use chudbot_api::{
-        ProviderName, ServerToolSet, ToolInputField, ToolInputSchema, ToolInputValueSchema,
-        collect_model_step,
+        LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef, MediaUri, ProviderName,
+        PublicMediaUrl, ServerToolSet, ToolInputField, ToolInputSchema, ToolInputValueSchema,
+        TranscriptTurn, UrlMediaRef, collect_model_step,
     };
     use futures::stream;
     use serde_json::json;
 
     use super::*;
+
+    #[derive(Debug, Clone)]
+    struct LoadableTestMediaRef {
+        metadata: MediaMetadata,
+        bytes: Vec<u8>,
+        public_url: Option<PublicMediaUrl>,
+    }
+
+    impl LoadableTestMediaRef {
+        fn new(uri: &str, mime_type: &str, bytes: &[u8]) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "test-image".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: mime_type.to_string(),
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes: bytes.to_vec(),
+                public_url: None,
+            }
+        }
+
+        fn with_public_url(mut self, url: &str) -> Self {
+            self.public_url = Some(PublicMediaUrl::new(url));
+            self
+        }
+
+        fn boxed(self) -> Box<dyn MediaRef> {
+            Box::new(self)
+        }
+    }
+
+    impl MediaRef for LoadableTestMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> Box<dyn MediaRef> {
+            Box::new(self.clone())
+        }
+
+        fn public_url<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> Pin<Box<dyn Future<Output = Result<PublicMediaUrl, MediaError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let public_url = self.public_url.clone();
+            let uri = self.uri().clone();
+            Box::pin(async move { public_url.ok_or_else(|| MediaError::NoPublicUrl { uri }) })
+        }
+
+        fn load<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> Pin<Box<dyn Future<Output = Result<LoadedMedia, MediaError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(LoadedMedia {
+                    media: self.clone_box(),
+                    bytes: self.bytes.clone(),
+                })
+            })
+        }
+    }
 
     #[test]
     fn builds_gemini_tools_for_functions_and_search() {
@@ -944,6 +1075,138 @@ mod tests {
         assert_eq!(info.context_window_tokens, Some(1_048_576));
         assert_eq!(info.max_output_tokens, Some(65_536));
         assert!(info.raw.is_some());
+    }
+
+    #[test]
+    fn user_image_defaults_to_inline_data_when_media_bytes_are_loadable() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "look".to_string(),
+                },
+                ContentBlock::Media {
+                    media: LoadableTestMediaRef::new(
+                        "media://images/test.png",
+                        "image/png",
+                        b"abc",
+                    )
+                    .boxed(),
+                },
+            ],
+            metadata: Value::Null,
+        });
+
+        let contents = futures::executor::block_on(to_gemini_contents(
+            &transcript,
+            &ProviderName::new("gemini"),
+            ImageEncoding::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            contents[0],
+            json!({
+                "role": "user",
+                "parts": [
+                    { "text": "look" },
+                    {
+                        "inlineData": {
+                            "mimeType": "image/png",
+                            "data": "YWJj"
+                        }
+                    }
+                ]
+            })
+        );
+    }
+
+    #[test]
+    fn public_url_image_encoding_falls_back_to_inline_data_when_loadable() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Media {
+                media: LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+                    .with_public_url("https://example.com/image.png")
+                    .boxed(),
+            }],
+            metadata: Value::Null,
+        });
+
+        let contents = futures::executor::block_on(to_gemini_contents(
+            &transcript,
+            &ProviderName::new("gemini"),
+            ImageEncoding::PublicUrl,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            contents[0]["parts"][0],
+            json!({
+                "inlineData": {
+                    "mimeType": "image/png",
+                    "data": "YWJj"
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn public_url_only_image_is_rejected_for_generate_content() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Media {
+                media: UrlMediaRef::new(
+                    MediaCategory::Image,
+                    "https://example.com/image.png",
+                    "image/png",
+                )
+                .boxed(),
+            }],
+            metadata: Value::Null,
+        });
+
+        let error = futures::executor::block_on(to_gemini_contents(
+            &transcript,
+            &ProviderName::new("gemini"),
+            ImageEncoding::PublicUrl,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not support direct public URL image input")
+        );
+    }
+
+    #[test]
+    fn disabled_image_encoding_rejects_user_media() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Media {
+                media: LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+                    .boxed(),
+            }],
+            metadata: Value::Null,
+        });
+
+        let error = futures::executor::block_on(to_gemini_contents(
+            &transcript,
+            &ProviderName::new("gemini"),
+            ImageEncoding::Disabled,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("image inputs are disabled for media `media://images/test.png`")
+        );
     }
 
     #[test]

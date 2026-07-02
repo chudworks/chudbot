@@ -16,14 +16,13 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as B64;
 use chudbot_api::reasoning::TurnReasoning;
 use chudbot_api::{
     ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
-    LlmBackend, MediaRef, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta, ModelStepEvent,
-    ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName, ToolInputSchema, ToolName,
-    ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject, reasoning_items_to_delta_events,
+    ImageEncoding, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta,
+    ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
+    ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole, UsageRecord, UsageSubject,
+    reasoning_items_to_delta_events, resolve_image_reference,
 };
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -39,7 +38,13 @@ impl OpenAiCompatClient {
         // Build the provider request in Chat Completions terms while preserving
         // the shared agent-loop semantics: transcript, client tools, sampling,
         // and opaque provider options all come from the already-shaped request.
-        let messages = to_chat_messages(&request.transcript, self.provider_name()).await?;
+        let options = OpenAiCompatOptions::from_request(&request);
+        let messages = to_chat_messages(
+            &request.transcript,
+            self.provider_name(),
+            request.image_encoding,
+        )
+        .await?;
         let tools = build_chat_tools(&request.client_tools);
         if !request.server_tools.is_empty() {
             tracing::debug!(
@@ -49,7 +54,6 @@ impl OpenAiCompatClient {
             );
         }
 
-        let options = OpenAiCompatOptions::from_request(&request);
         let tool_choice = if tools.is_empty() {
             None
         } else {
@@ -294,6 +298,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 async fn to_chat_messages(
     transcript: &Transcript,
     provider: &ProviderName,
+    image_encoding: ImageEncoding,
 ) -> Result<Vec<Value>, OpenAiCompatError> {
     // Translate Chudbot's mixed transcript blocks into the Chat Completions
     // message sequence. Tool results are separate `role=tool` messages, so any
@@ -364,7 +369,10 @@ async fn to_chat_messages(
                 match block {
                     ContentBlock::Text { text: t } => text.push_str(t),
                     ContentBlock::Media { media } => {
-                        media_urls.push(media_url_or_data(media.as_ref()).await?);
+                        let reference = resolve_image_reference(media.as_ref(), image_encoding)
+                            .await
+                            .map_err(|error| OpenAiCompatError::Reference(error.to_string()))?;
+                        media_urls.push(reference.as_url_or_data_url());
                     }
                     ContentBlock::ClientToolCall(_) => {}
                     ContentBlock::ClientToolResult(result) => {
@@ -420,50 +428,6 @@ fn push_chat_user_message(
     messages.push(json!({ "role": "user", "content": parts }));
     text.clear();
     media_urls.clear();
-}
-
-async fn media_url_or_data(media: &dyn MediaRef) -> Result<String, OpenAiCompatError> {
-    match media.public_url().await {
-        Ok(url) => {
-            tracing::debug!(
-                uri = %media.uri(),
-                category = ?media.category(),
-                "resolved media public URL for OpenAI-compatible chat"
-            );
-            Ok(url.to_string())
-        }
-        Err(public_error) => match media.load().await {
-            Ok(loaded) => {
-                // Prefer fetchable URLs, but data URIs make local media stores
-                // usable with gateways that support OpenAI's image_url field.
-                tracing::debug!(
-                    uri = %media.uri(),
-                    category = ?media.category(),
-                    bytes = loaded.bytes.len(),
-                    mime_type = loaded.media.mime_type(),
-                    "inlined media bytes for OpenAI-compatible chat"
-                );
-                Ok(data_uri(loaded.media.mime_type(), &loaded.bytes))
-            }
-            Err(load_error) => {
-                tracing::warn!(
-                    uri = %media.uri(),
-                    category = ?media.category(),
-                    public_error = %public_error,
-                    load_error = %load_error,
-                    "failed to resolve media for OpenAI-compatible chat"
-                );
-                Err(OpenAiCompatError::Reference(format!(
-                    "media `{}` has no public URL ({public_error}) and could not be loaded ({load_error})",
-                    media.uri()
-                )))
-            }
-        },
-    }
-}
-
-fn data_uri(mime_type: &str, bytes: &[u8]) -> String {
-    format!("data:{mime_type};base64,{}", B64.encode(bytes))
 }
 
 fn chat_tool_call(call: &ClientToolCall) -> Value {
@@ -772,9 +736,68 @@ struct TokenDetails {
 mod tests {
     use super::*;
     use chudbot_api::{
-        MediaCategory, ProviderOptions, ServerToolSet, ToolInputField, ToolInputSchema,
-        ToolInputValueSchema, TranscriptTurn, UrlMediaRef,
+        LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef, MediaUri, ProviderOptions,
+        PublicMediaUrl, ServerToolSet, ToolInputField, ToolInputSchema, ToolInputValueSchema,
+        TranscriptTurn, UrlMediaRef,
     };
+
+    #[derive(Debug, Clone)]
+    struct LoadableTestMediaRef {
+        metadata: MediaMetadata,
+        bytes: Vec<u8>,
+        public_url: Option<PublicMediaUrl>,
+    }
+
+    impl LoadableTestMediaRef {
+        fn new(uri: &str, mime_type: &str, bytes: &[u8]) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "test-image".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: mime_type.to_string(),
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes: bytes.to_vec(),
+                public_url: None,
+            }
+        }
+
+        fn with_public_url(mut self, url: &str) -> Self {
+            self.public_url = Some(PublicMediaUrl::new(url));
+            self
+        }
+
+        fn boxed(self) -> Box<dyn MediaRef> {
+            Box::new(self)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MediaRef for LoadableTestMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> Box<dyn MediaRef> {
+            Box::new(self.clone())
+        }
+
+        async fn public_url(&self) -> Result<PublicMediaUrl, MediaError> {
+            self.public_url
+                .clone()
+                .ok_or_else(|| MediaError::NoPublicUrl {
+                    uri: self.uri().clone(),
+                })
+        }
+
+        async fn load(&self) -> Result<LoadedMedia, MediaError> {
+            Ok(LoadedMedia {
+                media: self.clone_box(),
+                bytes: self.bytes.clone(),
+            })
+        }
+    }
 
     #[test]
     fn system_and_user_map_to_chat_messages() {
@@ -782,9 +805,12 @@ mod tests {
         transcript.instructions = Some("be helpful".to_string());
         transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
 
-        let messages =
-            futures::executor::block_on(to_chat_messages(&transcript, &ProviderName::new("x")))
-                .unwrap();
+        let messages = futures::executor::block_on(to_chat_messages(
+            &transcript,
+            &ProviderName::new("x"),
+            ImageEncoding::default(),
+        ))
+        .unwrap();
 
         assert_eq!(messages.len(), 2);
         assert_eq!(
@@ -821,9 +847,12 @@ mod tests {
             metadata: Value::Null,
         });
 
-        let messages =
-            futures::executor::block_on(to_chat_messages(&transcript, &ProviderName::new("x")))
-                .unwrap();
+        let messages = futures::executor::block_on(to_chat_messages(
+            &transcript,
+            &ProviderName::new("x"),
+            ImageEncoding::default(),
+        ))
+        .unwrap();
 
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["role"], "assistant");
@@ -856,9 +885,12 @@ mod tests {
             metadata: Value::Null,
         });
 
-        let messages =
-            futures::executor::block_on(to_chat_messages(&transcript, &ProviderName::new("x")))
-                .unwrap();
+        let messages = futures::executor::block_on(to_chat_messages(
+            &transcript,
+            &ProviderName::new("x"),
+            ImageEncoding::default(),
+        ))
+        .unwrap();
 
         assert_eq!(messages[0]["role"], "assistant");
         assert_eq!(messages[0]["content"], Value::Null);
@@ -886,9 +918,12 @@ mod tests {
             metadata: Value::Null,
         });
 
-        let messages =
-            futures::executor::block_on(to_chat_messages(&transcript, &ProviderName::new("x")))
-                .unwrap();
+        let messages = futures::executor::block_on(to_chat_messages(
+            &transcript,
+            &ProviderName::new("x"),
+            ImageEncoding::default(),
+        ))
+        .unwrap();
 
         assert_eq!(messages.len(), 1);
         assert_eq!(
@@ -901,6 +936,99 @@ mod tests {
                 "type": "image_url",
                 "image_url": { "url": "https://example.com/image.png" },
             })
+        );
+    }
+
+    #[test]
+    fn user_image_defaults_to_data_url_when_media_bytes_are_loadable() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "look".to_string(),
+                },
+                ContentBlock::Media {
+                    media: LoadableTestMediaRef::new(
+                        "media://images/test.png",
+                        "image/png",
+                        b"abc",
+                    )
+                    .with_public_url("https://example.com/image.png")
+                    .boxed(),
+                },
+            ],
+            metadata: Value::Null,
+        });
+
+        let messages = futures::executor::block_on(to_chat_messages(
+            &transcript,
+            &ProviderName::new("x"),
+            ImageEncoding::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            messages[0]["content"][1],
+            json!({
+                "type": "image_url",
+                "image_url": { "url": "data:image/png;base64,YWJj" },
+            })
+        );
+    }
+
+    #[test]
+    fn public_url_image_transport_preserves_url_first_behavior() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Media {
+                media: LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+                    .with_public_url("https://example.com/image.png")
+                    .boxed(),
+            }],
+            metadata: Value::Null,
+        });
+
+        let messages = futures::executor::block_on(to_chat_messages(
+            &transcript,
+            &ProviderName::new("x"),
+            ImageEncoding::PublicUrl,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            messages[0]["content"][0],
+            json!({
+                "type": "image_url",
+                "image_url": { "url": "https://example.com/image.png" },
+            })
+        );
+    }
+
+    #[test]
+    fn disabled_image_encoding_rejects_user_media() {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![ContentBlock::Media {
+                media: LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+                    .boxed(),
+            }],
+            metadata: Value::Null,
+        });
+
+        let error = futures::executor::block_on(to_chat_messages(
+            &transcript,
+            &ProviderName::new("x"),
+            ImageEncoding::Disabled,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("image inputs are disabled for media `media://images/test.png`")
         );
     }
 
@@ -1102,6 +1230,7 @@ mod tests {
             client_tools: BTreeMap::new(),
             server_tools: ServerToolSet::new(),
             sampling: chudbot_api::SamplingOptions::default(),
+            image_encoding: ImageEncoding::default(),
             provider_options: Some(ProviderOptions {
                 value: json!({
                     "tool_choice": "required",

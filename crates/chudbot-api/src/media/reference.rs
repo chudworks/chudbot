@@ -12,6 +12,8 @@
 //! [`super::MediaStore`] owns persistence and URI resolution, while provider
 //! crates consume only [`BoxedMediaRef`] values.
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -223,6 +225,44 @@ pub struct MediaMetadata {
     pub size_bytes: u64,
 }
 
+/// Media bytes encoded for embedding directly in provider requests.
+///
+/// Providers commonly accept inline images as `data:<mime>;base64,<payload>`
+/// strings even when the request field is named `image_url`. This type keeps
+/// the MIME type and encoded payload together so provider adapters can choose
+/// either the raw base64 payload or a data URL without re-implementing the
+/// formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedMediaBase64 {
+    mime_type: String,
+    base64: String,
+}
+
+impl EmbeddedMediaBase64 {
+    /// Encode raw bytes with their MIME type.
+    pub fn new(mime_type: impl Into<String>, bytes: &[u8]) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            base64: B64.encode(bytes),
+        }
+    }
+
+    /// MIME type associated with the encoded bytes.
+    pub fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    /// Raw base64 payload without a data URL prefix.
+    pub fn as_base64(&self) -> &str {
+        &self.base64
+    }
+
+    /// Format as `data:<mime>;base64,<payload>`.
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime_type, self.base64)
+    }
+}
+
 /// Media storage/access error.
 ///
 /// These variants describe failures at the media contract boundary. Concrete
@@ -301,6 +341,15 @@ pub trait MediaRef: std::fmt::Debug + Send + Sync {
     /// Returning [`MediaError::BytesUnavailable`] is valid for handles that are
     /// already public URLs or otherwise cannot load bytes inside this process.
     async fn load(&self) -> Result<LoadedMedia, MediaError>;
+
+    /// Load and encode bytes for inline provider requests.
+    async fn embedded_base64(&self) -> Result<EmbeddedMediaBase64, MediaError> {
+        let loaded = self.load().await?;
+        Ok(EmbeddedMediaBase64::new(
+            loaded.media.mime_type(),
+            &loaded.bytes,
+        ))
+    }
 
     /// Media category.
     fn category(&self) -> &MediaCategory {
@@ -400,5 +449,65 @@ impl MediaRef for UrlMediaRef {
         Err(MediaError::BytesUnavailable {
             uri: self.uri().clone(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone)]
+    struct LoadableTestMediaRef {
+        metadata: MediaMetadata,
+        bytes: Vec<u8>,
+    }
+
+    impl LoadableTestMediaRef {
+        fn new(mime_type: &str, bytes: &[u8]) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "test.png".to_string(),
+                    uri: MediaUri::new("media://images/test.png"),
+                    mime_type: mime_type.to_string(),
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes: bytes.to_vec(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl MediaRef for LoadableTestMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> BoxedMediaRef {
+            Box::new(self.clone())
+        }
+
+        async fn public_url(&self) -> Result<PublicMediaUrl, MediaError> {
+            Err(MediaError::NoPublicUrl {
+                uri: self.uri().clone(),
+            })
+        }
+
+        async fn load(&self) -> Result<LoadedMedia, MediaError> {
+            Ok(LoadedMedia {
+                media: self.clone_box(),
+                bytes: self.bytes.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn media_ref_embedded_base64_formats_data_url() {
+        let media = LoadableTestMediaRef::new("image/png", b"abc");
+        let encoded = futures::executor::block_on(media.embedded_base64()).unwrap();
+
+        assert_eq!(encoded.mime_type(), "image/png");
+        assert_eq!(encoded.as_base64(), "YWJj");
+        assert_eq!(encoded.data_url(), "data:image/png;base64,YWJj");
     }
 }

@@ -762,7 +762,13 @@ const AGENT_KEYS: &[&str] = &[
     "memory",
     "subagents",
 ];
-const MODEL_KEYS: &[&str] = &["id", "server_tools", "sampling", "provider_options"];
+const MODEL_KEYS: &[&str] = &[
+    "id",
+    "server_tools",
+    "sampling",
+    "image_encoding",
+    "provider_options",
+];
 const SAMPLING_KEYS: &[&str] = &["max_output_tokens", "temperature", "top_p"];
 const PROVIDER_OPTIONS_KEYS: &[&str] = &["value"];
 const GENERATION_BINDING_KEYS: &[&str] = &["provider", "model", "rate_limit"];
@@ -2602,6 +2608,82 @@ api_key = "key"
         ));
         assert!(rendered.contains("top_p = 1_000"));
         assert!(rendered.contains("avoid TOML-only forms"));
+    }
+
+    #[test]
+    fn model_image_encoding_is_a_known_typed_model_key() {
+        let input = r#"
+[database]
+url = "postgres://localhost/chudbot"
+
+[web]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+
+[bot.agents.default]
+provider = "grok"
+system_prompt = "hi"
+
+[bot.agents.default.model]
+id = "grok-test"
+image_encoding = "embedded_base64"
+
+[llm.grok]
+kind = "xai"
+api_key = "key"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
+
+        validate_runtime_config(&config, &source).unwrap();
+    }
+
+    #[test]
+    fn model_image_encoding_invalid_value_reports_expected_variants() {
+        let input = r#"
+[database]
+url = "postgres://localhost/chudbot"
+
+[web]
+title_prefix = "Chudbot"
+frontend_dir = "frontend-build"
+
+[bot]
+web_base_url = "http://localhost:1860"
+default_agent = "default"
+
+[bot.agents.default]
+provider = "grok"
+system_prompt = "hi"
+
+[bot.agents.default.model]
+id = "grok-test"
+image_encoding = "base64"
+
+[llm.grok]
+kind = "xai"
+api_key = "key"
+"#;
+        let error = toml::from_str::<RuntimeConfig>(input)
+            .expect_err("invalid image_encoding should fail typed config parsing");
+        let rendered = render_toml_error_with_style(
+            Path::new("config.test.toml"),
+            input,
+            &error,
+            DiagnosticStyle::plain(),
+        );
+
+        assert!(rendered.contains("could not parse config file `config.test.toml`"));
+        assert!(rendered.contains("image_encoding = \"base64\""));
+        assert!(rendered.contains("TOML could not be decoded here"));
+        assert!(rendered.contains("unknown variant `base64`"));
+        assert!(rendered.contains("public_url"));
+        assert!(rendered.contains("embedded_base64"));
+        assert!(rendered.contains("disabled"));
     }
 
     #[test]

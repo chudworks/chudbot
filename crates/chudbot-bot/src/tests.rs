@@ -931,6 +931,7 @@ fn test_model_spec(model: &str) -> ModelSpec {
         id: ModelId::new(model),
         server_tools: Default::default(),
         sampling: SamplingOptions::default(),
+        image_encoding: chudbot_api::ImageEncoding::default(),
         provider_options: None,
     }
 }
@@ -989,6 +990,7 @@ fn test_llm_model<B>(backend: B) -> Model<B> {
             id: ModelId::new("test-model"),
             server_tools: ServerToolSet::default(),
             sampling: SamplingOptions::default(),
+            image_encoding: chudbot_api::ImageEncoding::default(),
             provider_options: None,
         },
     }

@@ -833,6 +833,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "base64",
  "futures",
  "serde",
  "serde_json",
@@ -972,7 +973,7 @@ name = "chudbot-openai-compat"
 version = "0.1.0"
 dependencies = [
  "async-stream",
- "base64",
+ "async-trait",
  "chudbot-api",
  "futures",
  "reqwest",

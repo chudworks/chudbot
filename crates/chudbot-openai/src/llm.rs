@@ -14,16 +14,15 @@ use chudbot_api::retry::{RetryPolicy, retry_after_error};
 use chudbot_api::sse::{ServerSentEvent, SseDecoder};
 use chudbot_api::{
     ClientToolCall, ClientToolResult, ClientToolResultContent, ClientToolSpec, ContentBlock,
-    GroundingMetadata, LlmBackend, ModelId, ModelInfo, ModelInfoRequest, ModelStepDelta,
-    ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation, ProviderName,
-    ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript, TurnRole,
-    UsageRecord, UsageSubject, reasoning_items_to_delta_events,
+    GroundingMetadata, ImageEncoding, LlmBackend, ModelId, ModelInfo, ModelInfoRequest,
+    ModelStepDelta, ModelStepEvent, ModelStepKind, ModelStepRequest, ProviderContinuation,
+    ProviderName, ServerToolSet, ServerToolUse, ToolInputSchema, ToolName, ToolUseId, Transcript,
+    TurnRole, UsageRecord, UsageSubject, reasoning_items_to_delta_events, resolve_image_reference,
 };
 use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::image::media_bytes_or_url;
 use crate::pricing::OpenAiPricing;
 use crate::{OpenAiClient, OpenAiError, json_strip_nulls};
 
@@ -32,7 +31,7 @@ const REASONING_INCLUDE: &[&str] = &["reasoning.encrypted_content"];
 
 impl OpenAiClient {
     async fn build_step_body(&self, request: &ModelStepRequest) -> Result<Value, OpenAiError> {
-        let input = to_responses_input(&request.transcript, self).await?;
+        let input = to_responses_input(&request.transcript, self, request.image_encoding).await?;
         Ok(build_step_body_from_input(request, input))
     }
 }
@@ -597,6 +596,7 @@ fn value_as_u64(value: &Value) -> Option<u64> {
 async fn to_responses_input(
     transcript: &Transcript,
     client: &OpenAiClient,
+    image_encoding: ImageEncoding,
 ) -> Result<Vec<Value>, OpenAiError> {
     let mut input = Vec::new();
     if let Some(instructions) = &transcript.instructions
@@ -640,7 +640,10 @@ async fn to_responses_input(
             match block {
                 ContentBlock::Text { text: t } => text.push_str(t),
                 ContentBlock::Media { media } => {
-                    media_urls.push(media_bytes_or_url(media.as_ref()).await?)
+                    let reference = resolve_image_reference(media.as_ref(), image_encoding)
+                        .await
+                        .map_err(|error| OpenAiError::Reference(error.to_string()))?;
+                    media_urls.push(reference.as_url_or_data_url());
                 }
                 ContentBlock::Continuation(_) => {}
                 ContentBlock::ClientToolCall(call) => {
@@ -996,10 +999,117 @@ struct TokenDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+
     use chudbot_api::{
-        ProviderOptions, ToolInputField, ToolInputSchema, ToolInputValueSchema, TranscriptTurn,
+        LoadedMedia, MediaCategory, MediaError, MediaMetadata, MediaRef, MediaUri, ProviderOptions,
+        PublicMediaUrl, ToolInputField, ToolInputSchema, ToolInputValueSchema, TranscriptTurn,
         collect_model_step,
     };
+
+    #[derive(Debug, Clone)]
+    struct LoadableTestMediaRef {
+        metadata: MediaMetadata,
+        bytes: Vec<u8>,
+        public_url: Option<PublicMediaUrl>,
+    }
+
+    impl LoadableTestMediaRef {
+        fn new(uri: &str, mime_type: &str, bytes: &[u8]) -> Self {
+            Self {
+                metadata: MediaMetadata {
+                    category: MediaCategory::Image,
+                    name: "test-image".to_string(),
+                    uri: MediaUri::new(uri),
+                    mime_type: mime_type.to_string(),
+                    size_bytes: bytes.len() as u64,
+                },
+                bytes: bytes.to_vec(),
+                public_url: None,
+            }
+        }
+
+        fn with_public_url(mut self, url: &str) -> Self {
+            self.public_url = Some(PublicMediaUrl::new(url));
+            self
+        }
+
+        fn boxed(self) -> Box<dyn MediaRef> {
+            Box::new(self)
+        }
+    }
+
+    impl MediaRef for LoadableTestMediaRef {
+        fn metadata(&self) -> &MediaMetadata {
+            &self.metadata
+        }
+
+        fn clone_box(&self) -> Box<dyn MediaRef> {
+            Box::new(self.clone())
+        }
+
+        fn public_url<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> Pin<Box<dyn Future<Output = Result<PublicMediaUrl, MediaError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let uri = self.uri().clone();
+            let public_url = self.public_url.clone();
+            Box::pin(async move { public_url.ok_or(MediaError::NoPublicUrl { uri }) })
+        }
+
+        fn load<'life0, 'async_trait>(
+            &'life0 self,
+        ) -> Pin<Box<dyn Future<Output = Result<LoadedMedia, MediaError>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            let media = self.clone();
+            let bytes = self.bytes.clone();
+            Box::pin(async move {
+                Ok(LoadedMedia {
+                    media: Box::new(media),
+                    bytes,
+                })
+            })
+        }
+    }
+
+    fn request_with_image(
+        media: Box<dyn MediaRef>,
+        image_encoding: ImageEncoding,
+    ) -> ModelStepRequest {
+        let mut transcript = Transcript::new();
+        transcript.push(TranscriptTurn {
+            role: TurnRole::User,
+            blocks: vec![
+                ContentBlock::Text {
+                    text: "describe this".to_string(),
+                },
+                ContentBlock::Media { media },
+            ],
+            metadata: Value::Null,
+        });
+        ModelStepRequest {
+            model: ModelId::new("gpt-5"),
+            transcript,
+            client_tools: BTreeMap::new(),
+            server_tools: ServerToolSet::new(),
+            sampling: chudbot_api::SamplingOptions::default(),
+            image_encoding,
+            provider_options: None,
+        }
+    }
+
+    fn body_image_url(body: &Value) -> &str {
+        body["input"][0]["content"][1]["image_url"]
+            .as_str()
+            .expect("image_url string")
+    }
 
     #[test]
     fn reasoning_models_reject_sampling_knobs() {
@@ -1053,6 +1163,51 @@ mod tests {
                 "additionalProperties": false
             })
         );
+    }
+
+    #[test]
+    fn responses_input_embeds_base64_image_when_configured() {
+        let client = OpenAiClient::new(ProviderName::new("openai"), "key");
+        let media = LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+            .with_public_url("https://example.com/test.png")
+            .boxed();
+        let request = request_with_image(media, ImageEncoding::EmbeddedBase64);
+
+        let body = futures::executor::block_on(client.build_step_body(&request)).unwrap();
+
+        assert_eq!(body_image_url(&body), "data:image/png;base64,YWJj");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn responses_input_uses_public_image_url_when_configured() {
+        let client = OpenAiClient::new(ProviderName::new("openai"), "key");
+        let media = LoadableTestMediaRef::new("media://images/test.png", "image/png", b"abc")
+            .with_public_url("https://example.com/test.png")
+            .boxed();
+        let request = request_with_image(media, ImageEncoding::PublicUrl);
+
+        let body = futures::executor::block_on(client.build_step_body(&request)).unwrap();
+
+        assert_eq!(body_image_url(&body), "https://example.com/test.png");
+        assert_eq!(body["input"][0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn responses_input_errors_when_image_encoding_disabled() {
+        let client = OpenAiClient::new(ProviderName::new("openai"), "key");
+        let media =
+            LoadableTestMediaRef::new("media://images/disabled.png", "image/png", b"abc").boxed();
+        let request = request_with_image(media, ImageEncoding::Disabled);
+
+        let error = futures::executor::block_on(client.build_step_body(&request))
+            .expect_err("disabled image encoding should reject media");
+
+        assert!(matches!(
+            error,
+            OpenAiError::Reference(message)
+                if message == "image inputs are disabled for media `media://images/disabled.png`"
+        ));
     }
 
     #[test]
@@ -1275,6 +1430,7 @@ mod tests {
             client_tools: BTreeMap::new(),
             server_tools: ServerToolSet::new(),
             sampling: chudbot_api::SamplingOptions::default(),
+            image_encoding: chudbot_api::ImageEncoding::default(),
             provider_options: Some(ProviderOptions {
                 value: json!({
                     "reasoning_effort": "high",
@@ -1348,7 +1504,12 @@ mod tests {
             ],
             metadata: Value::Null,
         });
-        let input = futures::executor::block_on(to_responses_input(&transcript, &client)).unwrap();
+        let input = futures::executor::block_on(to_responses_input(
+            &transcript,
+            &client,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
         assert_eq!(input.len(), 3);
         assert_eq!(input[1]["type"], "reasoning");
         assert_eq!(input[1]["encrypted_content"], "BLOB");
@@ -1363,7 +1524,12 @@ mod tests {
         transcript.instructions = Some("Follow the application rules.".to_string());
         transcript.push(TranscriptTurn::text(TurnRole::User, "hi"));
 
-        let input = futures::executor::block_on(to_responses_input(&transcript, &client)).unwrap();
+        let input = futures::executor::block_on(to_responses_input(
+            &transcript,
+            &client,
+            ImageEncoding::default(),
+        ))
+        .unwrap();
         assert_eq!(input[0]["role"], "developer");
         assert_eq!(input[0]["content"], "Follow the application rules.");
         assert_eq!(input[1]["role"], "user");

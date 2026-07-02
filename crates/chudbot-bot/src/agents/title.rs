@@ -129,6 +129,7 @@ pub(crate) fn default_conversation_title_agent(
                 temperature: Some(SamplingNumber::from_static("0.3")),
                 top_p: None,
             },
+            image_encoding: source.model.image_encoding,
             provider_options: source.model.provider_options.clone(),
         },
         source.limits.unwrap_or(default_limits),
