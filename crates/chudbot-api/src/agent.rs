@@ -22,11 +22,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::time::Duration;
 
 use futures::Stream;
 use futures::stream::{FuturesOrdered, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tokio::time::{Instant, timeout_at};
 use tracing::Instrument;
 
 use crate::ids::{ModelId, ProviderName, ToolName};
@@ -203,11 +205,40 @@ pub struct AgentLimits {
     /// Maximum model steps before the run returns
     /// [`AgentOutcome::IterationLimit`].
     pub max_iterations: u32,
+    /// Hard ceiling applied to one provider model step's requested output
+    /// tokens. If model sampling config asks for more, the agent clamps it.
+    #[serde(default = "default_max_model_step_output_tokens")]
+    pub max_model_step_output_tokens: u32,
+    /// Maximum wall-clock seconds a model may spend streaming generated text,
+    /// reasoning, or tool-call arguments after the first generated delta.
+    ///
+    /// A value of zero disables this runtime guard.
+    #[serde(default = "default_text_generation_timeout_seconds")]
+    pub text_generation_timeout_seconds: u64,
 }
 
 impl Default for AgentLimits {
     fn default() -> Self {
-        Self { max_iterations: 8 }
+        Self {
+            max_iterations: 8,
+            max_model_step_output_tokens: default_max_model_step_output_tokens(),
+            text_generation_timeout_seconds: default_text_generation_timeout_seconds(),
+        }
+    }
+}
+
+fn default_max_model_step_output_tokens() -> u32 {
+    4096
+}
+
+fn default_text_generation_timeout_seconds() -> u64 {
+    120
+}
+
+impl AgentLimits {
+    fn text_generation_timeout(self) -> Option<Duration> {
+        (self.text_generation_timeout_seconds > 0)
+            .then(|| Duration::from_secs(self.text_generation_timeout_seconds))
     }
 }
 
@@ -443,6 +474,8 @@ where
             model = tracing::field::Empty,
             initial_turns = tracing::field::Empty,
             max_iterations = tracing::field::Empty,
+            max_model_step_output_tokens = tracing::field::Empty,
+            text_generation_timeout_seconds = tracing::field::Empty,
             client_tools = tracing::field::Empty,
             server_tools = tracing::field::Empty,
         )
@@ -504,9 +537,21 @@ where
             span.record("model", tracing::field::display(&self.model.spec.id));
             span.record("initial_turns", initial_turns);
             span.record("max_iterations", self.spec.limits.max_iterations);
+            span.record(
+                "max_model_step_output_tokens",
+                self.spec.limits.max_model_step_output_tokens,
+            );
+            span.record(
+                "text_generation_timeout_seconds",
+                self.spec.limits.text_generation_timeout_seconds,
+            );
             span.record("client_tools", client_tools.len());
             span.record("server_tools", server_tools.len());
-            tracing::info!("starting agent run");
+            tracing::info!(
+                max_model_step_output_tokens = self.spec.limits.max_model_step_output_tokens,
+                text_generation_timeout_seconds = self.spec.limits.text_generation_timeout_seconds,
+                "starting agent run"
+            );
 
             // Accumulators returned in `AgentRun`. The transcript is the model's
             // replayable view; trace/model_steps/usage are the audit view.
@@ -534,13 +579,55 @@ where
                     transcript: transcript.clone(),
                     client_tools: client_tools.clone(),
                     server_tools: server_tools.clone(),
-                    sampling: self.model.spec.sampling.clone(),
+                    sampling: sampling_with_agent_limits(
+                        self.model.spec.sampling.clone(),
+                        self.spec.limits,
+                    ),
                     image_encoding: self.model.spec.image_encoding,
                     provider_options: self.model.spec.provider_options.clone(),
                 });
                 futures::pin_mut!(events);
                 let mut collector = ModelStepCollector::default();
-                while let Some(event) = events.next().await {
+                let text_generation_timeout = self.spec.limits.text_generation_timeout();
+                let mut text_generation_deadline = None;
+                loop {
+                    let next = if let Some(deadline) = text_generation_deadline {
+                        match timeout_at(deadline, events.next()).await {
+                            Ok(next) => next,
+                            Err(_) => {
+                                let seconds = self.spec.limits.text_generation_timeout_seconds;
+                                let message = format!(
+                                    "model text generation exceeded timeout ({seconds}s)"
+                                );
+                                tracing::warn!(
+                                    iteration = iteration + 1,
+                                    timeout_seconds = seconds,
+                                    "model text generation timed out"
+                                );
+                                let run = AgentRun {
+                                    outcome: AgentOutcome::Failed {
+                                        error: AgentError::Model { message },
+                                        partial: None,
+                                    },
+                                    transcript,
+                                    trace,
+                                    model_steps,
+                                    last_model_id,
+                                    final_continuation,
+                                    usage,
+                                };
+                                let event = AgentRunEvent::RunFinished { run };
+                                trace_agent_run_event(&event);
+                                yield event;
+                                return;
+                            }
+                        }
+                    } else {
+                        events.next().await
+                    };
+                    let Some(event) = next else {
+                        break;
+                    };
                     let event = match event {
                         Ok(event) => event,
                         Err(error) => {
@@ -552,6 +639,12 @@ where
                             Err(AgentRunError::Model(error))?
                         }
                     };
+                    if text_generation_deadline.is_none()
+                        && text_generation_started(&event)
+                        && let Some(timeout) = text_generation_timeout
+                    {
+                        text_generation_deadline = Some(text_generation_deadline_from(timeout));
+                    }
                     collector.push(event.clone())?;
                     let event = AgentRunEvent::ModelEvent {
                         ordinal: iteration,
@@ -744,6 +837,36 @@ where
             yield event;
         }
     }
+}
+
+fn sampling_with_agent_limits(
+    mut sampling: crate::llm::SamplingOptions,
+    limits: AgentLimits,
+) -> crate::llm::SamplingOptions {
+    let limit = limits.max_model_step_output_tokens;
+    sampling.max_output_tokens = Some(
+        sampling
+            .max_output_tokens
+            .map_or(limit, |configured| configured.min(limit)),
+    );
+    sampling
+}
+
+fn text_generation_started(event: &ModelStepEvent) -> bool {
+    matches!(
+        event,
+        ModelStepEvent::Delta(
+            ModelStepDelta::Text { .. }
+                | ModelStepDelta::ReasoningSummary { .. }
+                | ModelStepDelta::ClientToolCall { .. }
+        )
+    )
+}
+
+fn text_generation_deadline_from(timeout: Duration) -> Instant {
+    Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now)
 }
 
 fn trace_agent_run_event(event: &AgentRunEvent) {
@@ -1932,6 +2055,112 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_clamps_model_step_output_tokens() {
+        #[derive(Debug, Clone)]
+        struct SamplingBackend {
+            name: ProviderName,
+            seen_max_output_tokens: Arc<Mutex<Option<Option<u32>>>>,
+        }
+
+        impl LlmBackend for SamplingBackend {
+            type Error = TestError;
+
+            fn backend_name(&self) -> &ProviderName {
+                &self.name
+            }
+
+            fn step(
+                &self,
+                request: crate::llm::ModelStepRequest,
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+                *self.seen_max_output_tokens.lock().unwrap() =
+                    Some(request.sampling.max_output_tokens);
+                test_step_events(final_text_step("done"))
+            }
+        }
+
+        let seen_max_output_tokens = Arc::new(Mutex::new(None));
+        let backend = SamplingBackend {
+            name: ProviderName::new("test"),
+            seen_max_output_tokens: seen_max_output_tokens.clone(),
+        };
+        let mut model = test_model(backend);
+        model.spec.sampling.max_output_tokens = Some(99_999);
+        let spec = AgentSpec::from_legacy_prompt_text("system").with_limits(AgentLimits {
+            max_iterations: 1,
+            max_model_step_output_tokens: 1234,
+            text_generation_timeout_seconds: 0,
+        });
+        let agent = Agent::new(model, spec, NoClientTools);
+
+        let run = collect_agent_run(agent.run(Transcript::from_user_text("hello")))
+            .await
+            .unwrap();
+
+        assert!(matches!(run.outcome, AgentOutcome::Completed { .. }));
+        assert_eq!(*seen_max_output_tokens.lock().unwrap(), Some(Some(1234)));
+    }
+
+    #[tokio::test]
+    async fn agent_times_out_long_text_generation() {
+        #[derive(Debug, Clone)]
+        struct HangingTextBackend {
+            name: ProviderName,
+        }
+
+        impl LlmBackend for HangingTextBackend {
+            type Error = TestError;
+
+            fn backend_name(&self) -> &ProviderName {
+                &self.name
+            }
+
+            fn step(
+                &self,
+                _request: crate::llm::ModelStepRequest,
+            ) -> impl Stream<Item = Result<ModelStepEvent, Self::Error>> + Send + '_ {
+                async_stream::try_stream! {
+                    yield ModelStepEvent::Delta(ModelStepDelta::Text {
+                        item_id: "text".to_string(),
+                        delta: "still going".to_string(),
+                    });
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    yield ModelStepEvent::Finished {
+                        kind: ModelStepKind::Final,
+                        model_id: ModelId::new("test-model"),
+                    };
+                }
+            }
+        }
+
+        let backend = HangingTextBackend {
+            name: ProviderName::new("test"),
+        };
+        let spec = AgentSpec::from_legacy_prompt_text("system").with_limits(AgentLimits {
+            max_iterations: 1,
+            max_model_step_output_tokens: 4096,
+            text_generation_timeout_seconds: 1,
+        });
+        let agent = Agent::new(test_model(backend), spec, NoClientTools);
+
+        let run = timeout(
+            Duration::from_secs(2),
+            collect_agent_run(agent.run(Transcript::from_user_text("loop forever"))),
+        )
+        .await
+        .expect("generation timeout should finish the run")
+        .unwrap();
+
+        match run.outcome {
+            AgentOutcome::Failed {
+                error: AgentError::Model { message },
+                partial: None,
+            } => assert!(message.contains("text generation exceeded timeout")),
+            outcome => panic!("expected timeout failure, got {outcome:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn agent_runs_client_tool_calls_concurrently() {
         #[derive(Debug, Clone)]
         struct TwoToolCallBackend {
@@ -2041,8 +2270,10 @@ mod tests {
             calls: Arc::new(Mutex::new(0)),
             result_order: result_order.clone(),
         };
-        let spec = AgentSpec::from_legacy_prompt_text("system")
-            .with_limits(AgentLimits { max_iterations: 4 });
+        let spec = AgentSpec::from_legacy_prompt_text("system").with_limits(AgentLimits {
+            max_iterations: 4,
+            ..AgentLimits::default()
+        });
         let tools = WaitingExecutor {
             barrier: Arc::new(Barrier::new(2)),
         };

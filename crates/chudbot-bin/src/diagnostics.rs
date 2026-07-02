@@ -18,7 +18,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use chudbot_api::{ProviderName, SamplingNumber};
+use chudbot_api::{AgentLimits, ProviderName, SamplingNumber};
 use chudbot_bot::{GenerationBinding, TranscriptionBinding, VideoGenerationRateLimit};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -748,7 +748,11 @@ const BOT_KEYS: &[&str] = &[
     "thread_threshold_chars",
     "thread_threshold_lines",
 ];
-const LIMIT_KEYS: &[&str] = &["max_iterations"];
+const LIMIT_KEYS: &[&str] = &[
+    "max_iterations",
+    "max_model_step_output_tokens",
+    "text_generation_timeout_seconds",
+];
 const PLATFORM_BINDING_KEYS: &[&str] = &["agent"];
 const AGENT_KEYS: &[&str] = &[
     "provider",
@@ -1628,6 +1632,13 @@ fn validate_bot_config(
     source: &ConfigSource,
     diagnostics: &mut Vec<ConfigDiagnostic>,
 ) {
+    validate_agent_limits(
+        source,
+        diagnostics,
+        &[key("bot"), key("limits")],
+        &config.bot.limits,
+    );
+
     // Agent names form a local registry. Validate the registry itself first,
     // then every place that refers back into it.
     let agents = config.bot.agents.keys().cloned().collect::<BTreeSet<_>>();
@@ -1688,6 +1699,19 @@ fn validate_bot_config(
     }
 
     for (agent_name, agent) in &config.bot.agents {
+        if let Some(limits) = &agent.limits {
+            validate_agent_limits(
+                source,
+                diagnostics,
+                &[
+                    key("bot"),
+                    key("agents"),
+                    key(agent_name.as_str()),
+                    key("limits"),
+                ],
+                limits,
+            );
+        }
         if let Some(binding) = &agent.image_generation {
             validate_generation_binding(
                 source,
@@ -1752,6 +1776,21 @@ fn validate_bot_config(
                 );
             }
         }
+    }
+}
+
+fn validate_agent_limits(
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+    limit_path: &[PathPart<'_>],
+    limits: &AgentLimits,
+) {
+    if limits.max_model_step_output_tokens == 0 {
+        let field_path = child_path(limit_path, "max_model_step_output_tokens");
+        diagnostics.push(
+            ConfigDiagnostic::new("max_model_step_output_tokens must be greater than zero")
+                .with_label(source.primary_label(&field_path, limit_path, "invalid output limit")),
+        );
     }
 }
 

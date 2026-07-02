@@ -132,8 +132,11 @@ operator explicitly asks for them.
 """
 # Usually left empty; chudbot-bin fills this from its package version.
 version = ""
-# Default agent loop limit. Individual agents can override it.
-limits = { max_iterations = 8 }
+# Default agent loop and generation limits. Individual agents can override them.
+# max_model_step_output_tokens clamps each model request even if
+# model.sampling.max_output_tokens is higher or omitted. A zero
+# text_generation_timeout_seconds disables the streamed-output timeout.
+limits = { max_iterations = 8, max_model_step_output_tokens = 4096, text_generation_timeout_seconds = 120 }
 # New conversations ask the platform to open a thread once the answer exceeds
 # either threshold. Visible lines count literal newlines plus approximate
 # Discord soft-wrap rows.

@@ -371,8 +371,13 @@ mod tests {
             test_agent_config("openai", "gpt-5.5"),
         );
 
-        let providers = MemoryConfig::default()
-            .resolved_agent_providers(&agents, AgentLimits { max_iterations: 4 });
+        let providers = MemoryConfig::default().resolved_agent_providers(
+            &agents,
+            AgentLimits {
+                max_iterations: 4,
+                ..AgentLimits::default()
+            },
+        );
 
         assert_eq!(
             providers,
