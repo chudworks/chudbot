@@ -1741,7 +1741,7 @@ where
                 ),
                 role: "user".to_string(),
                 content: format!(
-                    "Image attachment reference IDs available for tool calls: {}",
+                    "Image attachment reference URIs available for tool calls: {}",
                     image_refs.join(", ")
                 ),
                 message: Some(message.id.clone()),

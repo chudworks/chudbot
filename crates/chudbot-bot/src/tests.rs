@@ -71,10 +71,25 @@ fn generated_tool_schemas_advertise_canonical_input_fields() {
     assert!(audio["properties"].get("keyterms").is_some());
     assert!(audio["properties"].get("audio").is_none());
     assert!(audio["properties"].get("keyterm").is_none());
+    let audio_description = audio["properties"]["audio_uri"]["description"]
+        .as_str()
+        .expect("audio_uri should have a description");
+    assert!(audio_description.contains("media://audio/..."));
+    assert!(audio_description.contains("file://audio/..."));
+    assert!(audio_description.contains("public http(s) audio URLs"));
 
     let image = image_tool_schema(&[]).json_schema();
     assert!(image["properties"].get("reference_images").is_some());
     assert!(image["properties"].get("references").is_none());
+    let reference_description = image["properties"]["reference_images"]["description"]
+        .as_str()
+        .expect("reference_images should have a description");
+    assert!(reference_description.contains("media://images/..."));
+    assert!(reference_description.contains("media://avatars/..."));
+    assert!(reference_description.contains("media://guild-icons/..."));
+    assert!(reference_description.contains("user_avatar://<user_id>"));
+    assert!(reference_description.contains("guild_icon://current"));
+    assert!(reference_description.contains("Do not use avatar://"));
     // Model selection is operator-owned; the schema must not offer it.
     assert!(image["properties"].get("model").is_none());
     assert!(image["properties"]["aspect_ratio"].get("enum").is_none());
@@ -90,6 +105,15 @@ fn generated_tool_schemas_advertise_canonical_input_fields() {
     assert!(video["properties"].get("image").is_some());
     assert!(video["properties"].get("image_url").is_none());
     assert!(video["properties"].get("model").is_none());
+    let video_image_description = video["properties"]["image"]["description"]
+        .as_str()
+        .expect("video image should have a description");
+    assert!(video_image_description.contains("media://images/..."));
+    assert!(video_image_description.contains("media://avatars/..."));
+    assert!(video_image_description.contains("media://guild-icons/..."));
+    assert!(video_image_description.contains("user_avatar://<user_id>"));
+    assert!(video_image_description.contains("file://guild-icons/..."));
+    assert!(video_image_description.contains("Do not use avatar://"));
     assert_eq!(
         video["properties"]["aspect_ratio"]["enum"],
         json!(["16:9", "9:16"])
@@ -98,6 +122,16 @@ fn generated_tool_schemas_advertise_canonical_input_fields() {
         video["properties"]["resolution"]["enum"],
         json!(["480p", "720p"])
     );
+
+    let asset = asset_uri_tool_schema().json_schema();
+    let asset_description = asset["properties"]["uri"]["description"]
+        .as_str()
+        .expect("asset uri should have a description");
+    assert!(asset_description.contains("media://avatars/<name>"));
+    assert!(asset_description.contains("media://guild-icons/<name>"));
+    assert!(asset_description.contains("file://<category>/<name>"));
+    assert!(asset_description.contains("user_avatar://<user_id>"));
+    assert!(asset_description.contains("not a user-id lookup"));
 }
 
 // Shared binding fixture for schema and parser tests that need configured
@@ -352,6 +386,55 @@ impl MediaStore for RecordingMediaStore {
 }
 
 #[derive(Debug, Clone)]
+struct AliasStorage {
+    guild_icon: Option<MediaUri>,
+    avatars: BTreeMap<String, MediaUri>,
+}
+
+impl AliasStorage {
+    fn with_media() -> Self {
+        Self {
+            guild_icon: Some(MediaUri::new("file://guild-icons/current.png")),
+            avatars: BTreeMap::from([
+                (
+                    "user-1".to_string(),
+                    MediaUri::new("file://avatars/current.png"),
+                ),
+                (
+                    "user-2".to_string(),
+                    MediaUri::new("file://avatars/other.png"),
+                ),
+            ]),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("test alias storage error")]
+struct TestAliasStorageError;
+
+impl MediaAliasStorage for AliasStorage {
+    type Error = TestAliasStorageError;
+
+    async fn lookup_guild_icon_alias(
+        &self,
+        _platform: PlatformName,
+        guild_id: ExternalId,
+    ) -> Result<Option<MediaUri>, Self::Error> {
+        Ok((guild_id.as_str() == "guild-1")
+            .then(|| self.guild_icon.clone())
+            .flatten())
+    }
+
+    async fn lookup_user_avatar_alias(
+        &self,
+        user: UserRef,
+    ) -> Result<Option<MediaUri>, Self::Error> {
+        Ok(self.avatars.get(user.user_id.as_str()).cloned())
+    }
+}
+
+#[derive(Debug, Clone)]
 struct RecordingMediaRef {
     metadata: MediaMetadata,
     bytes: Vec<u8>,
@@ -437,6 +520,151 @@ async fn image_generation_rejects_more_than_three_reference_images() {
     .unwrap_err();
 
     assert!(matches!(error, BotToolError::InvalidInput(message) if message.contains("at most 3")));
+}
+
+#[tokio::test]
+async fn image_generation_reference_aliases_are_canonicalized() {
+    let context = RuntimeToolContext::new(
+        message_ref("message-1"),
+        ConversationId::new(),
+        TurnId::new(),
+        user("discord", Some("guild-1"), "user-1"),
+    );
+    let call = resolve_image_generation_tool_call(
+        &AliasStorage::with_media(),
+        &context,
+        ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new(GENERATE_IMAGE_TOOL),
+            input: json!({
+                "prompt": "combine these",
+                "reference_images": [
+                    "guild_icon://current",
+                    "user_avatar://current",
+                    "user_avatar://user-2",
+                    "file://images/upload.png",
+                    "https://example.com/ref.png"
+                ],
+            }),
+        },
+    )
+    .await
+    .expect("image reference aliases should resolve");
+
+    assert_eq!(
+        call.input["reference_images"],
+        json!([
+            "media://guild-icons/current.png",
+            "media://avatars/current.png",
+            "media://avatars/other.png",
+            "media://images/upload.png",
+            "https://example.com/ref.png",
+        ])
+    );
+}
+
+#[tokio::test]
+async fn image_generation_rejects_unsupported_avatar_shorthand() {
+    let context = RuntimeToolContext::new(
+        message_ref("message-1"),
+        ConversationId::new(),
+        TurnId::new(),
+        user("discord", Some("guild-1"), "user-1"),
+    );
+    let error = resolve_image_generation_tool_call(
+        &AliasStorage::with_media(),
+        &context,
+        ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new(GENERATE_IMAGE_TOOL),
+            input: json!({
+                "prompt": "use the avatar",
+                "reference_images": ["avatar://1335037364980023356"],
+            }),
+        },
+    )
+    .await
+    .expect_err("avatar:// is not the documented avatar URI scheme");
+
+    assert!(
+        matches!(error, BotToolError::InvalidInput(message) if message.contains("user_avatar://<user_id>"))
+    );
+}
+
+#[tokio::test]
+async fn video_generation_image_aliases_are_canonicalized() {
+    let context = RuntimeToolContext::new(
+        message_ref("message-1"),
+        ConversationId::new(),
+        TurnId::new(),
+        user("discord", Some("guild-1"), "user-1"),
+    );
+    let call = resolve_video_generation_tool_call(
+        &AliasStorage::with_media(),
+        &context,
+        ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new(GENERATE_VIDEO_TOOL),
+            input: json!({
+                "prompt": "animate this",
+                "image": "user_avatar://user-2",
+            }),
+        },
+    )
+    .await
+    .expect("video image alias should resolve");
+
+    assert_eq!(call.input["image"], "media://avatars/other.png");
+}
+
+#[tokio::test]
+async fn media_access_aliases_are_canonicalized() {
+    let context = RuntimeToolContext::new(
+        message_ref("message-1"),
+        ConversationId::new(),
+        TurnId::new(),
+        user("discord", Some("guild-1"), "user-1"),
+    );
+    let storage = AliasStorage::with_media();
+
+    let avatar = resolve_media_access_tool_call(
+        &storage,
+        &context,
+        ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new(READ_ASSET_TOOL),
+            input: json!({ "uri": "user_avatar://current" }),
+        },
+    )
+    .await
+    .expect("current avatar alias should resolve");
+    assert_eq!(avatar.input["uri"], "media://avatars/current.png");
+
+    let guild_icon = resolve_media_access_tool_call(
+        &storage,
+        &context,
+        ClientToolCall {
+            id: ToolUseId::new("call-2"),
+            name: ToolName::new(STAT_ASSET_TOOL),
+            input: json!({ "uri": "guild_icon://current" }),
+        },
+    )
+    .await
+    .expect("current guild icon alias should resolve");
+    assert_eq!(guild_icon.input["uri"], "media://guild-icons/current.png");
+
+    let legacy = resolve_media_access_tool_call(
+        &storage,
+        &context,
+        ClientToolCall {
+            id: ToolUseId::new("call-3"),
+            name: ToolName::new(PUBLIC_URL_ASSET_TOOL),
+            input: json!({ "uri": "file://images/upload.png" }),
+        },
+    )
+    .await
+    .expect("legacy stored image URI should canonicalize");
+    assert_eq!(legacy.input["uri"], "media://images/upload.png");
 }
 
 #[tokio::test]

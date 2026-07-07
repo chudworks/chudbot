@@ -29,8 +29,12 @@ impl<T, M> AudioTranscriptionTool<T, M> {
             transcriber,
             media_store,
             default_keyterms: Vec::new(),
-            description: "Transcribe a stored audio attachment and return its speech as text."
-                .to_string(),
+            description: concat!(
+                "Transcribe an audio input and return its speech as text. Prefer exact ",
+                "media://audio/... URIs from message context; legacy file://audio/... stored ",
+                "URIs and public http(s) audio URLs are accepted when already present."
+            )
+            .to_string(),
         }
     }
 
@@ -131,12 +135,11 @@ where
 
 /// Converts raw tool input into a provider transcription request.
 ///
-/// `audio_uri` is the primary input field and `audio` is an alias. The selected
-/// value is resolved as stored audio through `MediaStore`; this is the trust
-/// boundary that rejects unsupported categories and invalid stored-media
-/// references before any provider request is built. Optional language and
-/// keyterms fields are validated with the shared tool helpers; the transcription
-/// model always comes from the operator-configured binding.
+/// `audio_uri` is the primary input field and `audio` is an alias. Stored
+/// references are resolved through `MediaStore`; direct HTTP(S) URLs are
+/// preserved for providers that can fetch audio themselves. Optional language
+/// and keyterms fields are validated with the shared tool helpers; the
+/// transcription model always comes from the operator-configured binding.
 pub(crate) async fn audio_transcription_request_from_tool_input<M>(
     media_store: &M,
     input: serde_json::Value,
@@ -199,7 +202,7 @@ pub(crate) fn audio_transcription_tool_schema() -> ToolInputSchema {
         ToolInputField::required(
             "audio_uri",
             ToolInputValueSchema::string().description(
-                "A media://audio/... URI from the message JSON audio_attachments or attachment audio_uri field.",
+                "An exact audio URI. Prefer media://audio/... values from message JSON audio_attachments or attachment audio_uri fields. Legacy stored file://audio/... URIs are accepted when already present in context; public http(s) audio URLs are also accepted. Do not use image/avatar/guild icon URIs, local filesystem paths, or guessed filenames.",
             ),
         ),
         ToolInputField::optional(

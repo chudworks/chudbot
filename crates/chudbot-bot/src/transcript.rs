@@ -676,7 +676,7 @@ pub(crate) fn append_client_tool_replay(transcript: &mut Transcript, traces: &[T
 /// Append a synthetic user turn containing media produced by the previous
 /// assistant response.
 ///
-/// The text block exposes the exact stored media ids that image tools should
+/// The text block exposes the exact stored media URIs that image tools should
 /// use as `reference_images`. Keeping this as a user turn makes prior generated
 /// images available to providers that only accept media in user messages.
 pub(crate) fn append_generated_media_replay(
@@ -691,10 +691,10 @@ pub(crate) fn append_generated_media_replay(
 
     let mut text = "Generated media attached to the previous assistant reply.".to_string();
     if !media_refs.is_empty() {
-        text.push_str(" Image reference IDs available for tool calls: ");
+        text.push_str(" Image reference URIs available for tool calls: ");
         text.push_str(&media_refs.join(", "));
         text.push_str(concat!(
-            ". Use these exact IDs in generate_image.reference_images when the user asks to ",
+            ". Use these exact URIs in generate_image.reference_images when the user asks to ",
             "edit, restyle, transform, or make a variation of the images."
         ));
     }

@@ -426,7 +426,8 @@ where
                         "- Image generation and image editing are available through generate_image ",
                         "using provider `{}` and model `{}`. When the user asks to edit, restyle, ",
                         "transform, or make a variation of an existing image, pass the exact ",
-                        "available URI in reference_images.\n"
+                        "available image URI in reference_images; avatar_uri values use ",
+                        "user_avatar://..., not avatar:// or guessed media://avatars filenames.\n"
                     ),
                     binding.provider, binding.model
                 ));
@@ -456,7 +457,7 @@ where
                     .map(|model| format!(" and model `{model}`"))
                     .unwrap_or_default()
             ));
-            out.push_str("- Platform message JSON may include `audio_attachments` or attachment `audio_uri` fields. Use transcribe_audio with those media://audio/... URIs when the user's audio is relevant.\n");
+            out.push_str("- Platform message JSON may include `audio_attachments` or attachment `audio_uri` fields. Use transcribe_audio with those exact media://audio/... URIs when the user's audio is relevant; legacy file://audio/... stored URIs and public http(s) audio URLs are accepted only when already present in context.\n");
         }
         if !agent.subagents.is_empty() {
             out.push_str("- Specialist subagents are available as tools.\n");
@@ -467,11 +468,11 @@ where
             out.push_str("- User memory lookup is available through lookup_user_memory. Subagents can read memory but cannot remember or forget facts.\n");
         }
         if policy.final_reply_attach() {
-            out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, visually inspected with read, and explicitly attached to the final platform reply with attach. read and attach only accept verified stored image assets, never return file bytes, and reject videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths. attach deduplicates with generated media already queued for the final reply.\n");
+            out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, visually inspected with read, and explicitly attached to the final platform reply with attach. Use exact media://... stored URIs, legacy file://... stored URIs only when already present in context, user_avatar://... for cached user avatars, and guild_icon://... for the current guild icon; do not invent media://avatars/<user_id>.jpg paths. read and attach only accept verified stored image assets, never return file bytes, and reject videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths. attach deduplicates with generated media already queued for the final reply.\n");
             out.push_str("- Generated image and video media are attached to the final platform reply automatically; do not paste media URLs, media:// URIs, filenames, or markdown media links in user-facing text.\n");
             out.push_str("- Slow work (video generation, subagent calls, research) SHOULD be narrated with calls to the post_status_message tool.\n");
         } else {
-            out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, and visually inspected with read. read only accepts verified stored image assets, never returns file bytes, and rejects videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths.\n");
+            out.push_str("- Stored media assets can be checked with stat, resolved to a configured public URL with public_url, and visually inspected with read. Use exact media://... stored URIs, legacy file://... stored URIs only when already present in context, user_avatar://... for cached user avatars, and guild_icon://... for the current guild icon; do not invent media://avatars/<user_id>.jpg paths. read only accepts verified stored image assets, never returns file bytes, and rejects videos, audio, PDFs, unknown MIME types, public URLs, and local filesystem paths.\n");
             out.push_str("- Slow work (subagent calls or research) SHOULD be narrated with calls to the post_status_message tool.\n");
         }
         out.push_str("- A subtle Unicode emoji reaction can be added to the user's current message with add_reaction when a compact nonverbal acknowledgement, mood, or topic cue is helpful; use it sparingly and never instead of answering.\n");

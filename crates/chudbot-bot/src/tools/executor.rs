@@ -34,6 +34,47 @@ type RuntimeVideoGenerationTool<R> = PersistentVideoGeneratorTool<
 const GUILD_ICON_URI_PREFIX: &str = "guild_icon://";
 const USER_AVATAR_URI_PREFIX: &str = "user_avatar://";
 
+/// Storage lookups needed to resolve platform-scoped image handles.
+///
+/// The executor owns this alias resolution because it has the current turn
+/// context. Media stores should only need to resolve concrete stored URIs.
+pub(crate) trait MediaAliasStorage: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn lookup_guild_icon_alias(
+        &self,
+        platform: PlatformName,
+        guild_id: ExternalId,
+    ) -> impl Future<Output = Result<Option<MediaUri>, Self::Error>> + Send;
+
+    fn lookup_user_avatar_alias(
+        &self,
+        user: UserRef,
+    ) -> impl Future<Output = Result<Option<MediaUri>, Self::Error>> + Send;
+}
+
+impl<T> MediaAliasStorage for T
+where
+    T: BotStorage,
+{
+    type Error = T::Error;
+
+    async fn lookup_guild_icon_alias(
+        &self,
+        platform: PlatformName,
+        guild_id: ExternalId,
+    ) -> Result<Option<MediaUri>, Self::Error> {
+        BotStorage::load_guild_icon(self, platform, guild_id).await
+    }
+
+    async fn lookup_user_avatar_alias(
+        &self,
+        user: UserRef,
+    ) -> Result<Option<MediaUri>, Self::Error> {
+        BotStorage::load_user_avatar(self, user).await
+    }
+}
+
 /// One configured agent exposed as a named client tool by its parent executor.
 pub(crate) struct Subagent<B, T = NoClientTools> {
     /// Model-facing tool description.
@@ -577,7 +618,7 @@ where
             )
             .with_default_keyterms(audio_transcription_default_keyterms(binding))
             .with_description(format!(
-                "Transcribe a stored audio attachment with the configured `{}` audio provider{} and return the speech as text.",
+                "Transcribe an audio input with the configured `{}` audio provider{} and return the speech as text. Prefer exact media://audio/... URIs from message context; legacy file://audio/... stored URIs and public http(s) audio URLs are accepted when already present.",
                 binding.provider,
                 binding
                     .model
@@ -653,6 +694,9 @@ where
         let Some(tool) = self.image_generation_tool() else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
+        let call = resolve_image_generation_tool_call(&self.deps.storage, &self.context, call)
+            .await
+            .map_err(runtime_tool_execution_error)?;
         tool.call(call).await.map_err(runtime_tool_execution_error)
     }
 
@@ -665,6 +709,9 @@ where
         let Some(tool) = self.video_generation_tool() else {
             return Err(ClientToolExecutorError::unknown(call.name));
         };
+        let call = resolve_video_generation_tool_call(&self.deps.storage, &self.context, call)
+            .await
+            .map_err(runtime_tool_execution_error)?;
         tool.call(call).await.map_err(runtime_tool_execution_error)
     }
 
@@ -882,13 +929,13 @@ fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
     }
 }
 
-async fn resolve_media_access_tool_call<S>(
+pub(crate) async fn resolve_media_access_tool_call<S>(
     storage: &S,
     context: &RuntimeToolContext,
     mut call: ClientToolCall,
 ) -> Result<ClientToolCall, BotToolError>
 where
-    S: BotStorage,
+    S: MediaAliasStorage,
 {
     let uri = media_access_uri_from_context(storage, context, &call.input).await?;
     if let Some(input) = call.input.as_object_mut() {
@@ -902,13 +949,67 @@ where
     Ok(call)
 }
 
+pub(crate) async fn resolve_image_generation_tool_call<S>(
+    storage: &S,
+    context: &RuntimeToolContext,
+    mut call: ClientToolCall,
+) -> Result<ClientToolCall, BotToolError>
+where
+    S: MediaAliasStorage,
+{
+    for field in ["reference_images", "references"] {
+        let Some(value) = call.input.get(field) else {
+            continue;
+        };
+        let values = value.as_array().ok_or_else(|| {
+            BotToolError::InvalidInput("`reference_images` must be an array".to_string())
+        })?;
+        let mut resolved = Vec::with_capacity(values.len());
+        for value in values {
+            let reference = value.as_str().ok_or_else(|| {
+                BotToolError::InvalidInput("media references must be strings".to_string())
+            })?;
+            resolved.push(serde_json::Value::String(
+                image_reference_uri_from_context(storage, context, reference).await?,
+            ));
+        }
+        if let Some(input) = call.input.as_object_mut() {
+            input.insert(field.to_string(), serde_json::Value::Array(resolved));
+        }
+    }
+    Ok(call)
+}
+
+pub(crate) async fn resolve_video_generation_tool_call<S>(
+    storage: &S,
+    context: &RuntimeToolContext,
+    mut call: ClientToolCall,
+) -> Result<ClientToolCall, BotToolError>
+where
+    S: MediaAliasStorage,
+{
+    for field in ["image", "image_url"] {
+        let Some(value) = call.input.get(field) else {
+            continue;
+        };
+        let reference = value
+            .as_str()
+            .ok_or_else(|| BotToolError::InvalidInput(format!("`{field}` must be a string")))?;
+        let resolved = image_reference_uri_from_context(storage, context, reference).await?;
+        if let Some(input) = call.input.as_object_mut() {
+            input.insert(field.to_string(), serde_json::Value::String(resolved));
+        }
+    }
+    Ok(call)
+}
+
 async fn media_access_uri_from_context<S>(
     storage: &S,
     context: &RuntimeToolContext,
     input: &serde_json::Value,
 ) -> Result<MediaUri, BotToolError>
 where
-    S: BotStorage,
+    S: MediaAliasStorage,
 {
     let uri = tool_required_string(input, "uri")?;
     if let Some(target) = uri.strip_prefix(GUILD_ICON_URI_PREFIX) {
@@ -920,6 +1021,40 @@ where
         );
     }
     media_uri_from_tool_input(input)
+}
+
+async fn image_reference_uri_from_context<S>(
+    storage: &S,
+    context: &RuntimeToolContext,
+    uri: &str,
+) -> Result<String, BotToolError>
+where
+    S: MediaAliasStorage,
+{
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        return Ok(uri.to_string());
+    }
+    if let Some(target) = uri.strip_prefix(GUILD_ICON_URI_PREFIX) {
+        let uri =
+            canonical_media_access_uri(current_guild_icon_uri(storage, context, target).await?)?;
+        return Ok(uri.to_string());
+    }
+    if let Some(target) = uri.strip_prefix(USER_AVATAR_URI_PREFIX) {
+        let uri =
+            canonical_media_access_uri(current_user_avatar_uri(storage, context, target).await?)?;
+        return Ok(uri.to_string());
+    }
+    if is_stored_media_uri(uri) {
+        let uri = canonical_stored_media_uri(&MediaUri::new(uri)).map_err(|_| {
+            BotToolError::InvalidInput(format!(
+                "reference image `{uri}` is not a supported stored media URI"
+            ))
+        })?;
+        return Ok(uri.to_string());
+    }
+    Err(BotToolError::InvalidInput(format!(
+        "reference image `{uri}` must be an http(s) URL, a stored media:// image/avatar/guild-icon URI, a legacy stored file:// image/avatar/guild-icon URI, guild_icon://current, guild_icon://<current_guild_id>, user_avatar://current, or user_avatar://<user_id>"
+    )))
 }
 
 fn canonical_media_access_uri(uri: MediaUri) -> Result<MediaUri, BotToolError> {
@@ -934,7 +1069,7 @@ async fn current_guild_icon_uri<S>(
     target: &str,
 ) -> Result<MediaUri, BotToolError>
 where
-    S: BotStorage,
+    S: MediaAliasStorage,
 {
     let Some(current_guild) = context.default_channel.guild_id.as_ref() else {
         return Err(BotToolError::InvalidInput(
@@ -955,7 +1090,7 @@ where
     }
 
     storage
-        .load_guild_icon(
+        .lookup_guild_icon_alias(
             context.default_channel.platform.clone(),
             current_guild.clone(),
         )
@@ -974,7 +1109,7 @@ async fn current_user_avatar_uri<S>(
     target: &str,
 ) -> Result<MediaUri, BotToolError>
 where
-    S: BotStorage,
+    S: MediaAliasStorage,
 {
     let user_id = if target == "current" {
         context.turn_user.user_id.clone()
@@ -987,7 +1122,7 @@ where
     };
 
     storage
-        .load_user_avatar(UserRef {
+        .lookup_user_avatar_alias(UserRef {
             platform: context.default_channel.platform.clone(),
             guild_id: context.default_channel.guild_id.clone(),
             user_id,

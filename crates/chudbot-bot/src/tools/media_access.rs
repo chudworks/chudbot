@@ -20,10 +20,12 @@ pub(crate) fn read_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: concat!(
             "Read a stored image asset so it becomes visible to your next step.\n",
-            "Accepts: media://images/... URIs of stored images; guild_icon://current (or ",
-            "guild.icon_uri) for the current Discord guild icon; user_avatar://current, ",
-            "user_avatar://<user_id>, or an avatar_uri value from message context for cached ",
-            "avatars.\n",
+            "Accepts: media://images/..., media://avatars/..., and media://guild-icons/... ",
+            "stored image URIs; legacy file://images/..., file://avatars/..., and ",
+            "file://guild-icons/... stored URIs when already present in context; ",
+            "guild_icon://current or the guild.icon_uri value from message context for the ",
+            "current Discord guild icon; user_avatar://current, user_avatar://<user_id>, or ",
+            "an avatar_uri value from message context for cached avatars.\n",
             "Rejects: videos, audio, PDFs, unknown MIME types, public URLs, and local ",
             "filesystem paths.\n",
             "Returns metadata and attaches the image to the next model step; never returns ",
@@ -43,10 +45,12 @@ pub(crate) fn stat_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: concat!(
             "Check whether a stored media asset exists and report its MIME type and size.\n",
-            "Accepts: media://... URIs of any stored media category (images, videos, audio, ",
-            "avatars, guild icons); guild_icon://current (or guild.icon_uri); ",
-            "user_avatar://current, user_avatar://<user_id>, or an avatar_uri value from ",
-            "message context.\n",
+            "Accepts: media://images/..., media://videos/..., media://audio/..., ",
+            "media://avatars/..., and media://guild-icons/... stored URIs; matching legacy ",
+            "file://... stored URIs when already present in context; guild_icon://current or ",
+            "the guild.icon_uri value from message context for the current Discord guild icon; ",
+            "user_avatar://current, user_avatar://<user_id>, or an avatar_uri value from message ",
+            "context for cached avatars.\n",
             "Rejects: public URLs and local filesystem paths.\n",
             "Returns metadata only; never reads or returns file bytes."
         )
@@ -66,9 +70,12 @@ pub(crate) fn public_url_asset_spec() -> ClientToolSpec {
         description: concat!(
             "Resolve a stored media asset to its configured public URL when one is ",
             "available.\n",
-            "Accepts: media://... URIs of stored images, videos, audio, avatars, and guild ",
-            "icons; guild_icon://current (or guild.icon_uri); user_avatar://current, ",
-            "user_avatar://<user_id>, or an avatar_uri value from message context.\n",
+            "Accepts: media://images/..., media://videos/..., media://audio/..., ",
+            "media://avatars/..., and media://guild-icons/... stored URIs; matching legacy ",
+            "file://... stored URIs when already present in context; guild_icon://current or ",
+            "the guild.icon_uri value from message context for the current Discord guild icon; ",
+            "user_avatar://current, user_avatar://<user_id>, or an avatar_uri value from message ",
+            "context for cached avatars.\n",
             "Rejects: unknown/non-media MIME types, public URLs as input, and local ",
             "filesystem paths.\n",
             "Returns metadata and a URL only; never reads or returns file bytes."
@@ -88,10 +95,12 @@ pub(crate) fn attach_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: concat!(
             "Attach an existing stored image asset to the final platform reply.\n",
-            "Accepts: media://images/... URIs of stored images; guild_icon://current (or ",
-            "guild.icon_uri) for the current Discord guild icon; user_avatar://current, ",
-            "user_avatar://<user_id>, or an avatar_uri value from message context for cached ",
-            "avatars.\n",
+            "Accepts: media://images/..., media://avatars/..., and media://guild-icons/... ",
+            "stored image URIs; legacy file://images/..., file://avatars/..., and ",
+            "file://guild-icons/... stored URIs when already present in context; ",
+            "guild_icon://current or the guild.icon_uri value from message context for the ",
+            "current Discord guild icon; user_avatar://current, user_avatar://<user_id>, or ",
+            "an avatar_uri value from message context for cached avatars.\n",
             "Rejects: videos, audio, PDFs, unknown MIME types, public URLs, and local ",
             "filesystem paths.\n",
             "Queues the image for final delivery, deduplicated against generated media and ",
@@ -110,7 +119,7 @@ pub(crate) fn asset_uri_tool_schema() -> ToolInputSchema {
     ToolInputSchema::object([ToolInputField::required(
         "uri",
         ToolInputValueSchema::string().description(
-            "A stored Chudbot media:// URI such as media://images/abc.jpg, media://videos/abc.mp4, media://audio/abc.ogg, media://avatars/abc.png, or media://guild-icons/abc.png. In Discord guild channels, guild_icon://current and guild.icon_uri resolve to the current guild icon. user_avatar://current, user_avatar://<user_id>, and avatar_uri values from message context resolve to cached avatars on the current platform. Do not pass local filesystem paths or public URLs.",
+            "A stored Chudbot URI: media://images/<name>, media://videos/<name>, media://audio/<name>, media://avatars/<name>, or media://guild-icons/<name>. Matching legacy file://<category>/<name> stored URIs are accepted only when already present in context; they are not local filesystem paths. In Discord guild channels, guild_icon://current and the guild.icon_uri value from message context resolve to the current guild icon. user_avatar://current, user_avatar://<user_id>, and avatar_uri values from message context resolve to cached avatars on the current platform. media://avatars/<name> is a stored filename, not a user-id lookup; use user_avatar://<user_id> for user ids. Do not pass public URLs or local filesystem paths.",
         ),
     )])
 }
@@ -359,7 +368,9 @@ pub(crate) fn media_uri_from_tool_input(
 ) -> Result<MediaUri, BotToolError> {
     let uri = tool_required_string(input, "uri")?;
     canonical_stored_media_uri(&MediaUri::new(uri)).map_err(|_| {
-        BotToolError::InvalidInput("`uri` must be a stored media:// media URI".to_string())
+        BotToolError::InvalidInput(
+            "`uri` must be a stored media://... URI or legacy stored file://... URI".to_string(),
+        )
     })
 }
 

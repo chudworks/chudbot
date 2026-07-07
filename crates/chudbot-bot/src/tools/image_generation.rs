@@ -163,8 +163,10 @@ where
 /// The parser requires a prompt, accepts `reference_images` or `references`,
 /// enforces the reference count limit, resolves each reference through the
 /// media store as an image, and checks `aspect_ratio` against the configured
-/// allowlist. The model cannot choose a model id: the operator-configured
-/// binding always owns model selection, so the routed generator fills it in.
+/// allowlist. The runtime executor pre-resolves context-local handles such as
+/// `guild_icon://current` and `user_avatar://...` before this parser runs. The
+/// model cannot choose a model id: the operator-configured binding always owns
+/// model selection, so the routed generator fills it in.
 pub(crate) async fn image_request_from_tool_input<M>(
     media_store: &M,
     input: serde_json::Value,
@@ -260,11 +262,17 @@ pub(crate) fn image_tool_schema(aspect_ratios: &[String]) -> ToolInputSchema {
     let reference_images_description = concat!(
         "Optional list of 1-3 existing images to edit, restyle, transform, vary, or combine. ",
         "Prefer this when the user refers to an image already visible in the conversation, ",
-        "such as \"this image\", \"the image above\", or \"make it...\". Use exact ",
-        "media://images/... URIs from prior tool results, generated-media notes, or image ",
-        "attachment reference notes; public https URLs also work. Never invent paths. For ",
-        "2-3 references, refer to them in the prompt as <IMAGE_0>, <IMAGE_1>, etc. in this ",
-        "array's order."
+        "such as \"this image\", \"the image above\", or \"make it...\". Use exact image ",
+        "URI strings from context: media://images/... for uploaded/generated images, ",
+        "media://avatars/... for cached avatar files, media://guild-icons/... for cached guild ",
+        "icons, user_avatar://current or user_avatar://<user_id> for cached user avatars, and ",
+        "guild_icon://current or guild_icon://<current_guild_id> for the current guild icon. ",
+        "Legacy file://images/..., file://avatars/..., and file://guild-icons/... stored URIs ",
+        "are also accepted when already present in context; public http(s) image URLs also work. Do not ",
+        "invent paths or derive media://avatars/<user_id>.jpg from a user id. Do not use ",
+        "avatar://, avatars://, or media://user_avatars/...; use the avatar_uri value from ",
+        "message context instead. For 2-3 references, refer to them in the prompt as <IMAGE_0>, ",
+        "<IMAGE_1>, etc. in this array's order."
     );
     ToolInputSchema::object([
         ToolInputField::required(

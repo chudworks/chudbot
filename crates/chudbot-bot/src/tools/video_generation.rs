@@ -396,9 +396,10 @@ impl<G, M, S> PersistentVideoGeneratorTool<G, M, S> {
 /// The parser requires a non-empty `prompt`, accepts `image` or `image_url` as
 /// a single optional image reference, bounds `duration_seconds` to the schema's
 /// maximum, and checks `aspect_ratio`/`resolution` against the binding's
-/// configured allowlists. The model cannot choose a model id: the
-/// operator-configured binding always owns model selection, so the routed
-/// generator fills it in.
+/// configured allowlists. The runtime executor pre-resolves context-local image
+/// handles such as `guild_icon://current` and `user_avatar://...` before this
+/// parser runs. The model cannot choose a model id: the operator-configured
+/// binding always owns model selection, so the routed generator fills it in.
 pub(crate) async fn video_request_from_tool_input<M>(
     media_store: &M,
     input: serde_json::Value,
@@ -496,9 +497,16 @@ pub(crate) fn video_tool_schema(binding: &GenerationBinding) -> ToolInputSchema 
         ToolInputField::optional(
             "image",
             ToolInputValueSchema::string().description(concat!(
-                "Optional image to animate. Use an exact media://images/... URI from prior ",
-                "tool results, generated-media notes, or image attachment reference notes; ",
-                "public https URLs also work. Never invent paths."
+                "Optional image to animate. Use an exact image URI string from context: ",
+                "media://images/... for uploaded/generated images, media://avatars/... for cached ",
+                "avatar files, media://guild-icons/... for cached guild icon files, ",
+                "user_avatar://current or user_avatar://<user_id> for cached user avatars, and ",
+                "guild_icon://current or guild_icon://<current_guild_id> for the current guild ",
+                "icon. Legacy file://images/..., file://avatars/..., and file://guild-icons/... ",
+                "stored URIs are also accepted when already present in context; public http(s) ",
+                "image URLs also work. Do not invent paths or derive media://avatars/<user_id>.jpg ",
+                "from a user id. Do not use avatar://, avatars://, or media://user_avatars/...; ",
+                "use the avatar_uri value from message context instead."
             )),
         ),
         ToolInputField::optional(
