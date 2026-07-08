@@ -1032,6 +1032,10 @@ where
                     text
                 };
                 let text = append_generated_media_public_urls(text, &generated_media.public_urls);
+                let text = append_generated_media_delivery_failures(
+                    text,
+                    &generated_media.delivery_failures,
+                );
                 let content = self.format_reply(&text, execution.is_new, execution.conversation.id);
                 let rendered_lines = rendered_line_count(&content);
                 let mut attempted_title_generation = false;

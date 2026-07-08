@@ -145,6 +145,9 @@ pub(crate) struct GeneratedReplyMedia {
     pub(crate) attachments: Vec<OutgoingAttachment>,
     /// Public URLs for media that could not be attached directly.
     pub(crate) public_urls: Vec<String>,
+    /// User-visible delivery failures for media that could not be uploaded or
+    /// linked.
+    pub(crate) delivery_failures: Vec<String>,
 }
 
 impl<R> BotRuntime<R>
@@ -364,6 +367,7 @@ where
     let mut media = GeneratedReplyMedia {
         attachments: Vec::with_capacity(uris.len()),
         public_urls: Vec::new(),
+        delivery_failures: Vec::new(),
     };
 
     // Step 1: walk only URIs that came from successful delivery-producing tool
@@ -376,18 +380,29 @@ where
             Ok(media) => media,
             Err(error) => {
                 tracing::warn!(error = %error, uri = %uri, "generated media was not found");
+                push_unique_string(
+                    &mut media.delivery_failures,
+                    &format!("Stored media `{}` could not be found.", uri),
+                );
                 continue;
             }
         };
 
         // Step 2: if the store knows the file is too large, avoid loading bytes.
         if media_ref.size_bytes() > MAX_OUTGOING_ATTACHMENT_BYTES as u64 {
-            push_oversized_generated_media_url(
+            if !push_oversized_generated_media_url(
                 media_ref.as_ref(),
                 media_ref.size_bytes(),
                 &mut media.public_urls,
             )
-            .await;
+            .await
+            {
+                push_oversized_delivery_failure(
+                    media_ref.as_ref(),
+                    media_ref.size_bytes(),
+                    &mut media.delivery_failures,
+                );
+            }
             continue;
         }
 
@@ -396,6 +411,13 @@ where
             Ok(loaded) => loaded,
             Err(error) => {
                 tracing::warn!(error = %error, uri = %uri, "failed to load generated media");
+                push_unique_string(
+                    &mut media.delivery_failures,
+                    &format!(
+                        "`{}` could not be loaded for attachment delivery.",
+                        media_ref.name()
+                    ),
+                );
                 continue;
             }
         };
@@ -403,12 +425,19 @@ where
         // Step 4: re-check the concrete byte length because store metadata can
         // be unavailable, stale, or rounded differently than the loaded body.
         if loaded.bytes.len() > MAX_OUTGOING_ATTACHMENT_BYTES {
-            push_oversized_generated_media_url(
+            if !push_oversized_generated_media_url(
                 loaded.media.as_ref(),
                 loaded.bytes.len() as u64,
                 &mut media.public_urls,
             )
-            .await;
+            .await
+            {
+                push_oversized_delivery_failure(
+                    loaded.media.as_ref(),
+                    loaded.bytes.len() as u64,
+                    &mut media.delivery_failures,
+                );
+            }
             continue;
         }
         tracing::debug!(
@@ -435,7 +464,7 @@ pub(crate) async fn push_oversized_generated_media_url(
     media: &dyn MediaRef,
     bytes: u64,
     public_urls: &mut Vec<String>,
-) {
+) -> bool {
     match media.public_url().await {
         Ok(public_url) => {
             tracing::warn!(
@@ -446,6 +475,7 @@ pub(crate) async fn push_oversized_generated_media_url(
                 "generated media exceeds outgoing attachment size limit; using public URL"
             );
             push_unique_string(public_urls, public_url.as_str());
+            true
         }
         Err(error) => {
             tracing::warn!(
@@ -455,7 +485,33 @@ pub(crate) async fn push_oversized_generated_media_url(
                 limit = MAX_OUTGOING_ATTACHMENT_BYTES,
                 "generated media exceeds outgoing attachment size limit but no public URL is available"
             );
+            false
         }
+    }
+}
+
+fn push_oversized_delivery_failure(
+    media: &dyn MediaRef,
+    bytes: u64,
+    delivery_failures: &mut Vec<String>,
+) {
+    push_unique_string(
+        delivery_failures,
+        &format!(
+            "`{}` could not be attached because it is {} and exceeds the {} direct-upload limit; no public media URL is configured.",
+            media.name(),
+            format_bytes(bytes),
+            format_bytes(MAX_OUTGOING_ATTACHMENT_BYTES as u64)
+        ),
+    );
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let mib = bytes as f64 / 1024.0 / 1024.0;
+    if mib >= 1.0 {
+        format!("{mib:.1} MiB")
+    } else {
+        format!("{bytes} bytes")
     }
 }
 
@@ -495,6 +551,37 @@ pub(crate) fn append_generated_media_public_urls(
     for public_url in public_urls {
         text.push_str("- ");
         text.push_str(public_url);
+        text.push('\n');
+    }
+    let trimmed_len = text.trim_end().len();
+    text.truncate(trimmed_len);
+    text
+}
+
+/// Append generated media delivery failures to assistant text.
+pub(crate) fn append_generated_media_delivery_failures(
+    mut text: String,
+    delivery_failures: &[String],
+) -> String {
+    if delivery_failures.is_empty() {
+        return text;
+    }
+
+    let trimmed_len = text.trim_end().len();
+    text.truncate(trimmed_len);
+    if !text.is_empty() {
+        text.push_str("\n\n");
+    }
+    if delivery_failures.len() == 1 {
+        text.push_str("Media delivery issue: ");
+        text.push_str(&delivery_failures[0]);
+        return text;
+    }
+
+    text.push_str("Media delivery issues:\n");
+    for failure in delivery_failures {
+        text.push_str("- ");
+        text.push_str(failure);
         text.push('\n');
     }
     let trimmed_len = text.trim_end().len();

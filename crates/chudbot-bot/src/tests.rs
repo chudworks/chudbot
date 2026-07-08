@@ -2277,6 +2277,20 @@ impl ReplyMediaRef {
             public_url: Some(PublicMediaUrl::new(public_url)),
         }
     }
+
+    fn video_without_public_url(uri: &str, size_bytes: u64) -> Self {
+        Self {
+            metadata: MediaMetadata {
+                category: MediaCategory::Video,
+                name: "generated.mp4".to_string(),
+                uri: MediaUri::new(uri),
+                mime_type: "video/mp4".to_string(),
+                size_bytes,
+            },
+            bytes: Vec::new(),
+            public_url: None,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -2393,6 +2407,25 @@ async fn oversized_generated_video_uses_public_url_fallback() {
 
     assert!(media.attachments.is_empty());
     assert_eq!(media.public_urls, vec![public_url.to_string()]);
+    assert!(media.delivery_failures.is_empty());
+}
+
+#[tokio::test]
+async fn oversized_attached_video_without_public_url_reports_delivery_failure() {
+    let uri = "media://videos/generated.mp4";
+    let trace = attach_trace(uri);
+    let store = ReplyMediaStore::new(ReplyMediaRef::video_without_public_url(
+        uri,
+        (MAX_OUTGOING_ATTACHMENT_BYTES + 1) as u64,
+    ));
+
+    let media = generated_reply_media(&store, &[trace]).await;
+
+    assert!(media.attachments.is_empty());
+    assert!(media.public_urls.is_empty());
+    assert_eq!(media.delivery_failures.len(), 1);
+    assert!(media.delivery_failures[0].contains("generated.mp4"));
+    assert!(media.delivery_failures[0].contains("direct-upload limit"));
 }
 
 #[test]
@@ -2405,6 +2438,19 @@ fn appends_generated_media_public_urls_to_reply_text() {
     assert_eq!(
         reply,
         "Done.\n\nAttached media: https://chud.example/videos/generated.mp4"
+    );
+}
+
+#[test]
+fn appends_generated_media_delivery_failures_to_reply_text() {
+    let reply = append_generated_media_delivery_failures(
+        "Done.  \n".to_string(),
+        &["`generated.mp4` could not be attached.".to_string()],
+    );
+
+    assert_eq!(
+        reply,
+        "Done.\n\nMedia delivery issue: `generated.mp4` could not be attached."
     );
 }
 
@@ -2502,6 +2548,7 @@ async fn read_asset_does_not_queue_final_reply_attachment() {
 
     assert!(media.attachments.is_empty());
     assert!(media.public_urls.is_empty());
+    assert!(media.delivery_failures.is_empty());
 }
 
 #[tokio::test]
@@ -2647,6 +2694,7 @@ async fn explicit_attach_deduplicates_with_automatic_generated_attachment() {
     assert_eq!(media.attachments.len(), 1);
     assert_eq!(media.attachments[0].filename, "generated.jpg");
     assert!(media.public_urls.is_empty());
+    assert!(media.delivery_failures.is_empty());
 }
 
 #[tokio::test]
