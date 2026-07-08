@@ -31,9 +31,9 @@ use crate::media::{
     VideoRequest,
 };
 use crate::platform::{
-    FetchMessages, PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent,
-    PlatformMessage, PlatformMessageRelationship, PostedMessage, ReactionKind, SendMessage,
-    UserProfile,
+    AttachmentCandidate, AttachmentPreflight, FetchMessages, PlatformCommandDefinition,
+    PlatformCommandResponse, PlatformEvent, PlatformMessage, PlatformMessageRelationship,
+    PostedMessage, ReactionKind, SendMessage, UserProfile,
 };
 
 // Provider registries route agent-selected provider names to concrete runtime
@@ -214,6 +214,16 @@ pub trait MessagePlatformRegistry: Clone + Send + Sync {
         &self,
         request: SendMessage,
     ) -> impl Future<Output = Result<PostedMessage, Self::Error>> + Send;
+
+    /// Preflight a candidate media attachment through the owning platform.
+    ///
+    /// The platform is selected from [`ChannelRef::platform`].
+    fn preflight_attachment(
+        &self,
+        channel: ChannelRef,
+        reply_to: Option<MessageRef>,
+        candidate: AttachmentCandidate,
+    ) -> impl Future<Output = Result<AttachmentPreflight, Self::Error>> + Send;
 
     /// Delete a platform message.
     ///

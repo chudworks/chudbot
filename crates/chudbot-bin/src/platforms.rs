@@ -13,9 +13,10 @@ use std::sync::Arc;
 
 use chudbot_api::MessagePlatform;
 use chudbot_api::{
-    ChannelRef, FetchMessages, MessagePlatformEvents, MessagePlatformRegistry, MessageRef,
-    PlatformCommandDefinition, PlatformCommandResponse, PlatformEvent, PlatformMessage,
-    PlatformMessageRelationship, PostedMessage, ReactionKind, SendMessage, UserProfile,
+    AttachmentCandidate, AttachmentPreflight, ChannelRef, FetchMessages, MessagePlatformEvents,
+    MessagePlatformRegistry, MessageRef, PlatformCommandDefinition, PlatformCommandResponse,
+    PlatformEvent, PlatformMessage, PlatformMessageRelationship, PostedMessage, ReactionKind,
+    SendMessage, UserProfile,
 };
 use futures::FutureExt;
 use tokio::task::{JoinError, JoinHandle};
@@ -393,6 +394,18 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
     async fn send_message(&self, request: SendMessage) -> Result<PostedMessage, Self::Error> {
         let platform = self.discord(&request.channel.platform)?;
         MessagePlatform::send_message(&platform.platform, request)
+            .await
+            .map_err(ConfiguredPlatformError::Discord)
+    }
+
+    async fn preflight_attachment(
+        &self,
+        channel: ChannelRef,
+        reply_to: Option<MessageRef>,
+        candidate: AttachmentCandidate,
+    ) -> Result<AttachmentPreflight, Self::Error> {
+        let platform = self.discord(&channel.platform)?;
+        MessagePlatform::preflight_attachment(&platform.platform, channel, reply_to, candidate)
             .await
             .map_err(ConfiguredPlatformError::Discord)
     }

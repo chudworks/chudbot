@@ -15,7 +15,8 @@ use crate::config::{
 };
 use crate::constants::*;
 use crate::media::{
-    attach_supports_media, model_transcript_supports_media, public_url_supports_media,
+    attach_supports_media, attachment_candidate_for_media, model_transcript_supports_media,
+    public_url_supports_media,
 };
 use crate::platform::{channel_from_message, requested_channel};
 use crate::prelude::*;

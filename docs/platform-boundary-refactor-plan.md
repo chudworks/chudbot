@@ -54,8 +54,9 @@ Discord assumptions still live above it.
 - System/status/control reactions are bot constants.
   - Working, success, error, retry, stop, and refused are all emoji glyphs.
   - This is a good Discord UI, but it is not the right abstraction for a TUI.
-- Delivery limits are Discord-shaped.
-  - `MAX_OUTGOING_ATTACHMENT_BYTES` uses Discord's default upload cap.
+- Outgoing delivery still has Discord-shaped presentation details.
+  - Attachment direct-upload checks are routed through platform preflight; keep
+    any concrete upload policy in the platform adapter.
   - `suppress_embeds` is sent from bot code on every reply/status message.
 - Tool descriptions and system prompt fragments mention Discord/server/guild
   directly.

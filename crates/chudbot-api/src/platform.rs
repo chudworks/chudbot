@@ -480,6 +480,29 @@ pub struct OutgoingAttachment {
     pub bytes: Vec<u8>,
 }
 
+/// Metadata for a candidate outgoing media attachment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentCandidate {
+    /// Filename that would be uploaded.
+    pub filename: String,
+    /// MIME/content type hint.
+    pub content_type: String,
+    /// Candidate size in bytes.
+    pub size_bytes: u64,
+}
+
+/// Platform decision for a candidate attachment.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachmentPreflight {
+    /// Candidate media that was evaluated.
+    pub candidate: AttachmentCandidate,
+    /// Whether the platform can accept this candidate as a direct upload.
+    pub direct_upload: bool,
+    /// Explanation for a rejected direct upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 /// Request to open a thread while posting a message.
 ///
 /// Thread support is platform-dependent. Adapters that support it decide how
@@ -588,6 +611,14 @@ pub trait MessagePlatform: Send + Sync {
         &self,
         request: SendMessage,
     ) -> impl Future<Output = Result<PostedMessage, Self::Error>> + Send;
+
+    /// Preflight a candidate media attachment for a platform reply.
+    fn preflight_attachment(
+        &self,
+        channel: ChannelRef,
+        reply_to: Option<MessageRef>,
+        candidate: AttachmentCandidate,
+    ) -> impl Future<Output = Result<AttachmentPreflight, Self::Error>> + Send;
 
     /// Delete a platform message previously identified by [`MessageRef`].
     fn delete_message(

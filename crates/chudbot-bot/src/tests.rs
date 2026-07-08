@@ -17,6 +17,8 @@ use futures::Stream;
 use serde_json::json;
 use test_case::test_case;
 
+const TEST_ATTACHMENT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
 // Shared constructors keep platform ids consistent across tests without pulling in
 // Discord-specific types.
 fn user(platform: &str, guild: Option<&str>, id: &str) -> chudbot_api::UserRef {
@@ -782,9 +784,28 @@ async fn image_generation_tool_saves_media_and_returns_uri() {
 
 // Platform double used by reaction-tool tests. Every method except add_reaction
 // fails loudly so validation tests can prove no platform call was attempted.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct ReactionRecordingPlatform {
     reactions: Arc<Mutex<Vec<(MessageRef, ReactionKind)>>>,
+    max_attachment_bytes: u64,
+}
+
+impl Default for ReactionRecordingPlatform {
+    fn default() -> Self {
+        Self {
+            reactions: Arc::default(),
+            max_attachment_bytes: TEST_ATTACHMENT_MAX_BYTES,
+        }
+    }
+}
+
+impl ReactionRecordingPlatform {
+    fn with_max_attachment_bytes(max_attachment_bytes: u64) -> Self {
+        Self {
+            max_attachment_bytes,
+            ..Self::default()
+        }
+    }
 }
 
 impl MessagePlatformRegistry for ReactionRecordingPlatform {
@@ -814,6 +835,30 @@ impl MessagePlatformRegistry for ReactionRecordingPlatform {
 
     async fn send_message(&self, _request: SendMessage) -> Result<PostedMessage, Self::Error> {
         Err(TestPlatformError("unexpected send_message".to_string()))
+    }
+
+    async fn preflight_attachment(
+        &self,
+        _channel: ChannelRef,
+        _reply_to: Option<MessageRef>,
+        candidate: AttachmentCandidate,
+    ) -> Result<AttachmentPreflight, Self::Error> {
+        if candidate.size_bytes > self.max_attachment_bytes {
+            return Ok(AttachmentPreflight {
+                reason: Some(format!(
+                    "`{}` exceeds the test direct-upload limit",
+                    candidate.filename
+                )),
+                candidate,
+                direct_upload: false,
+            });
+        }
+
+        Ok(AttachmentPreflight {
+            candidate,
+            direct_upload: true,
+            reason: None,
+        })
     }
 
     async fn delete_message(&self, _message: MessageRef) -> Result<(), Self::Error> {
@@ -2121,7 +2166,7 @@ fn generated_video_trace(uri: &str, public_url: &str) -> ToolTrace {
                         "category": "video",
                         "name": "generated.mp4",
                         "mime_type": "video/mp4",
-                        "size_bytes": MAX_OUTGOING_ATTACHMENT_BYTES + 1,
+                        "size_bytes": TEST_ATTACHMENT_MAX_BYTES + 1,
                         "delivery": {
                             "platform_reply": "attached automatically"
                         },
@@ -2136,7 +2181,7 @@ fn generated_video_trace(uri: &str, public_url: &str) -> ToolTrace {
                 "category": "video",
                 "name": "generated.mp4",
                 "mime_type": "video/mp4",
-                "size_bytes": MAX_OUTGOING_ATTACHMENT_BYTES + 1,
+                "size_bytes": TEST_ATTACHMENT_MAX_BYTES + 1,
                 "public_url": public_url,
                 "extra": {}
             }),
@@ -2399,11 +2444,19 @@ async fn oversized_generated_video_uses_public_url_fallback() {
     let trace = generated_video_trace(uri, public_url);
     let store = ReplyMediaStore::new(ReplyMediaRef::video(
         uri,
-        (MAX_OUTGOING_ATTACHMENT_BYTES + 1) as u64,
+        TEST_ATTACHMENT_MAX_BYTES + 1,
         public_url,
     ));
 
-    let media = generated_reply_media(&store, &[trace]).await;
+    let platform = ReactionRecordingPlatform::default();
+    let media = generated_reply_media(
+        &store,
+        &platform,
+        &channel_ref(Some("guild-1")),
+        Some(&message_ref("message-1")),
+        &[trace],
+    )
+    .await;
 
     assert!(media.attachments.is_empty());
     assert_eq!(media.public_urls, vec![public_url.to_string()]);
@@ -2416,16 +2469,24 @@ async fn oversized_attached_video_without_public_url_reports_delivery_failure() 
     let trace = attach_trace(uri);
     let store = ReplyMediaStore::new(ReplyMediaRef::video_without_public_url(
         uri,
-        (MAX_OUTGOING_ATTACHMENT_BYTES + 1) as u64,
+        TEST_ATTACHMENT_MAX_BYTES + 1,
     ));
 
-    let media = generated_reply_media(&store, &[trace]).await;
+    let platform = ReactionRecordingPlatform::default();
+    let media = generated_reply_media(
+        &store,
+        &platform,
+        &channel_ref(Some("guild-1")),
+        Some(&message_ref("message-1")),
+        &[trace],
+    )
+    .await;
 
     assert!(media.attachments.is_empty());
     assert!(media.public_urls.is_empty());
     assert_eq!(media.delivery_failures.len(), 1);
     assert!(media.delivery_failures[0].contains("generated.mp4"));
-    assert!(media.delivery_failures[0].contains("direct-upload limit"));
+    assert!(media.delivery_failures[0].contains("test direct-upload limit"));
 }
 
 #[test]
@@ -2544,7 +2605,15 @@ async fn read_asset_does_not_queue_final_reply_attachment() {
         },
     };
 
-    let media = generated_reply_media(&store, &[trace]).await;
+    let platform = ReactionRecordingPlatform::default();
+    let media = generated_reply_media(
+        &store,
+        &platform,
+        &channel_ref(Some("guild-1")),
+        Some(&message_ref("message-1")),
+        &[trace],
+    )
+    .await;
 
     assert!(media.attachments.is_empty());
     assert!(media.public_urls.is_empty());
@@ -2627,6 +2696,9 @@ async fn attach_asset_queues_supported_image_without_returning_bytes() {
 
     let output = attach_asset(
         &store,
+        &ReactionRecordingPlatform::default(),
+        &channel_ref(Some("guild-1")),
+        Some(&message_ref("message-1")),
         ClientToolCall {
             id: ToolUseId::new("call-1"),
             name: ToolName::new(ATTACH_ASSET_TOOL),
@@ -2659,6 +2731,9 @@ async fn attach_asset_queues_supported_video_without_returning_bytes() {
 
     let output = attach_asset(
         &store,
+        &ReactionRecordingPlatform::default(),
+        &channel_ref(Some("guild-1")),
+        Some(&message_ref("message-1")),
         ClientToolCall {
             id: ToolUseId::new("call-1"),
             name: ToolName::new(ATTACH_ASSET_TOOL),
@@ -2683,13 +2758,78 @@ async fn attach_asset_queues_supported_video_without_returning_bytes() {
 }
 
 #[tokio::test]
+async fn attach_asset_uses_public_url_fallback_when_platform_rejects_direct_upload() {
+    let uri = "media://videos/generated.mp4";
+    let public_url = "https://chud.example/videos/generated.mp4";
+    let store = ReplyMediaStore::new(ReplyMediaRef::video(uri, 42, public_url));
+    let platform = ReactionRecordingPlatform::with_max_attachment_bytes(41);
+
+    let output = attach_asset(
+        &store,
+        &platform,
+        &channel_ref(Some("guild-1")),
+        Some(&message_ref("message-1")),
+        ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new(ATTACH_ASSET_TOOL),
+            input: json!({ "uri": uri }),
+        },
+    )
+    .await
+    .expect("stored video with public URL should be link-deliverable");
+
+    let ClientToolResultContent::Json { value } = &output.result else {
+        panic!("expected json result");
+    };
+    assert_eq!(value["uri"], uri);
+    assert_eq!(value["queued"], true);
+    assert_eq!(value["attached"], false);
+    assert_eq!(value["public_url"], public_url);
+    assert_eq!(value["delivery"]["mode"], "public_url_fallback");
+    assert_eq!(value["preflight"]["direct_upload"], false);
+}
+
+#[tokio::test]
+async fn attach_asset_rejects_oversized_video_without_public_url_before_queueing() {
+    let uri = "media://videos/generated.mp4";
+    let store = ReplyMediaStore::new(ReplyMediaRef::video_without_public_url(uri, 42));
+    let platform = ReactionRecordingPlatform::with_max_attachment_bytes(41);
+
+    let error = attach_asset(
+        &store,
+        &platform,
+        &channel_ref(Some("guild-1")),
+        Some(&message_ref("message-1")),
+        ClientToolCall {
+            id: ToolUseId::new("call-1"),
+            name: ToolName::new(ATTACH_ASSET_TOOL),
+            input: json!({ "uri": uri }),
+        },
+    )
+    .await
+    .expect_err("undeliverable stored video should fail preflight");
+
+    assert!(
+        matches!(error, BotToolError::InvalidInput(message) if message.contains("test direct-upload limit") && message.contains("media has no public URL"))
+    );
+}
+
+#[tokio::test]
 async fn explicit_attach_deduplicates_with_automatic_generated_attachment() {
     let uri = "media://images/generated.jpg";
     let public_url = "https://chud.example/images/generated.jpg";
     let store = ReplyMediaStore::new(ReplyMediaRef::image(uri, public_url));
     let traces = vec![generated_image_trace(uri, public_url), attach_trace(uri)];
 
-    let media = generated_reply_media(&store, &traces).await;
+    let platform = ReactionRecordingPlatform::default();
+    let media = generated_reply_media(
+        &store,
+        &platform,
+        &channel_ref(Some("guild-1")),
+        Some(&message_ref("message-1")),
+        &traces,
+    )
+    .await;
 
     assert_eq!(media.attachments.len(), 1);
     assert_eq!(media.attachments[0].filename, "generated.jpg");

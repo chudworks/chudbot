@@ -771,9 +771,15 @@ where
         call: ClientToolCall,
     ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
         let call = self.resolve_media_access_call(call).await?;
-        attach_asset(&self.deps.media_store, call)
-            .await
-            .map_err(runtime_tool_execution_error)
+        attach_asset(
+            &self.deps.media_store,
+            &self.deps.platforms,
+            &self.context.default_channel,
+            Some(&self.context.reply_to),
+            call,
+        )
+        .await
+        .map_err(runtime_tool_execution_error)
     }
 
     async fn lookup_user_memory(

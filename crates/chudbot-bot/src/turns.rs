@@ -886,6 +886,7 @@ where
             });
         }
         tracing::debug!("building agent for turn");
+        let reply_channel = channel_from_message(&execution.reply_to);
         let agent = self.build_conversation_agent(
             ConversationAgentAssembly {
                 agent_name: &execution.agent_name,
@@ -1019,7 +1020,14 @@ where
                 generated_media_refs.push(reference);
             }
         }
-        let generated_media = generated_reply_media(&self.media_store, &run.trace).await;
+        let generated_media = generated_reply_media(
+            &self.media_store,
+            &self.platforms,
+            &reply_channel,
+            Some(&execution.reply_to),
+            &run.trace,
+        )
+        .await;
 
         // Only this match writes terminal turn state. Every branch publishes a
         // viewer update after storage reaches its final status for the turn.

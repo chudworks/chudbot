@@ -75,12 +75,13 @@ pub use transcript::{ContentBlock, ProviderContinuation, Transcript, TranscriptT
 // Platform adapters normalize external messaging systems into bot events,
 // messages, commands, replies, reactions, and history fetches.
 pub use platform::{
-    AttachmentRef, FetchMessages, GuildProfile, MessagePlatform, OutgoingAttachment,
-    PlatformCommand, PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
-    PlatformCommandOptionChoice, PlatformCommandOptionKind, PlatformCommandResponse,
-    PlatformCommandResponseTarget, PlatformCommandValue, PlatformEvent, PlatformMessage,
-    PlatformMessageReference, PlatformMessageRelationship, PlatformReaction, PlatformReady,
-    PostedMessage, ReactionKind, SendMessage, ThreadRequest, UserProfile,
+    AttachmentCandidate, AttachmentPreflight, AttachmentRef, FetchMessages, GuildProfile,
+    MessagePlatform, OutgoingAttachment, PlatformCommand, PlatformCommandDefinition,
+    PlatformCommandInput, PlatformCommandOption, PlatformCommandOptionChoice,
+    PlatformCommandOptionKind, PlatformCommandResponse, PlatformCommandResponseTarget,
+    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
+    PlatformMessageRelationship, PlatformReaction, PlatformReady, PostedMessage, ReactionKind,
+    SendMessage, ThreadRequest, UserProfile,
 };
 
 // Persistence contracts are intentionally workflow-shaped rather than

@@ -355,13 +355,17 @@ where
 ///
 /// This handles both generated media and explicit `attach` tool requests. It
 /// preserves trace order, deduplicates by URI before loading, and falls back to
-/// public URLs for oversized assets when the media store can provide one.
-pub(crate) async fn generated_reply_media<M>(
+/// public URLs for assets the platform will not accept as direct uploads.
+pub(crate) async fn generated_reply_media<M, P>(
     media_store: &M,
+    platforms: &P,
+    channel: &ChannelRef,
+    reply_to: Option<&MessageRef>,
     trace: &[ToolTrace],
 ) -> GeneratedReplyMedia
 where
     M: MediaStore,
+    P: MessagePlatformRegistry,
 {
     let uris = media_uris_from_tool_traces(trace);
     let mut media = GeneratedReplyMedia {
@@ -388,18 +392,26 @@ where
             }
         };
 
-        // Step 2: if the store knows the file is too large, avoid loading bytes.
-        if media_ref.size_bytes() > MAX_OUTGOING_ATTACHMENT_BYTES as u64 {
-            if !push_oversized_generated_media_url(
-                media_ref.as_ref(),
-                media_ref.size_bytes(),
-                &mut media.public_urls,
-            )
-            .await
-            {
-                push_oversized_delivery_failure(
+        // Step 2: if metadata is enough for the platform to reject direct
+        // upload, avoid loading bytes and use the public URL fallback.
+        let preflight = match preflight_reply_media(
+            platforms,
+            channel,
+            reply_to,
+            media_ref.as_ref(),
+            media_ref.size_bytes(),
+            &mut media.delivery_failures,
+        )
+        .await
+        {
+            Some(preflight) => preflight,
+            None => continue,
+        };
+        if !preflight.direct_upload {
+            if !push_generated_media_public_url(media_ref.as_ref(), &mut media.public_urls).await {
+                push_preflight_delivery_failure(
                     media_ref.as_ref(),
-                    media_ref.size_bytes(),
+                    &preflight,
                     &mut media.delivery_failures,
                 );
             }
@@ -424,17 +436,25 @@ where
 
         // Step 4: re-check the concrete byte length because store metadata can
         // be unavailable, stale, or rounded differently than the loaded body.
-        if loaded.bytes.len() > MAX_OUTGOING_ATTACHMENT_BYTES {
-            if !push_oversized_generated_media_url(
-                loaded.media.as_ref(),
-                loaded.bytes.len() as u64,
-                &mut media.public_urls,
-            )
-            .await
+        let preflight = match preflight_reply_media(
+            platforms,
+            channel,
+            reply_to,
+            loaded.media.as_ref(),
+            loaded.bytes.len() as u64,
+            &mut media.delivery_failures,
+        )
+        .await
+        {
+            Some(preflight) => preflight,
+            None => continue,
+        };
+        if !preflight.direct_upload {
+            if !push_generated_media_public_url(loaded.media.as_ref(), &mut media.public_urls).await
             {
-                push_oversized_delivery_failure(
+                push_preflight_delivery_failure(
                     loaded.media.as_ref(),
-                    loaded.bytes.len() as u64,
+                    &preflight,
                     &mut media.delivery_failures,
                 );
             }
@@ -456,23 +476,70 @@ where
     media
 }
 
-/// Append a public URL fallback for an oversized generated/attached asset.
+async fn preflight_reply_media<P>(
+    platforms: &P,
+    channel: &ChannelRef,
+    reply_to: Option<&MessageRef>,
+    media: &dyn MediaRef,
+    size_bytes: u64,
+    delivery_failures: &mut Vec<String>,
+) -> Option<AttachmentPreflight>
+where
+    P: MessagePlatformRegistry,
+{
+    match platforms
+        .preflight_attachment(
+            channel.clone(),
+            reply_to.cloned(),
+            attachment_candidate_for_media(media, size_bytes),
+        )
+        .await
+    {
+        Ok(preflight) => Some(preflight),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                uri = %media.uri(),
+                filename = media.name(),
+                "failed to preflight generated media attachment"
+            );
+            push_unique_string(
+                delivery_failures,
+                &format!(
+                    "`{}` could not be checked for attachment delivery.",
+                    media.name()
+                ),
+            );
+            None
+        }
+    }
+}
+
+pub(crate) fn attachment_candidate_for_media(
+    media: &dyn MediaRef,
+    size_bytes: u64,
+) -> AttachmentCandidate {
+    AttachmentCandidate {
+        filename: media.name().to_string(),
+        content_type: media.mime_type().to_string(),
+        size_bytes,
+    }
+}
+
+/// Append a public URL fallback for generated/attached media.
 ///
 /// Missing public URLs are logged and otherwise ignored so the text reply can
 /// still be sent.
-pub(crate) async fn push_oversized_generated_media_url(
+pub(crate) async fn push_generated_media_public_url(
     media: &dyn MediaRef,
-    bytes: u64,
     public_urls: &mut Vec<String>,
 ) -> bool {
     match media.public_url().await {
         Ok(public_url) => {
             tracing::warn!(
                 uri = %media.uri(),
-                bytes,
-                limit = MAX_OUTGOING_ATTACHMENT_BYTES,
                 public_url = %public_url,
-                "generated media exceeds outgoing attachment size limit; using public URL"
+                "generated media is not direct-uploadable; using public URL"
             );
             push_unique_string(public_urls, public_url.as_str());
             true
@@ -481,38 +548,30 @@ pub(crate) async fn push_oversized_generated_media_url(
             tracing::warn!(
                 error = %error,
                 uri = %media.uri(),
-                bytes,
-                limit = MAX_OUTGOING_ATTACHMENT_BYTES,
-                "generated media exceeds outgoing attachment size limit but no public URL is available"
+                "generated media is not direct-uploadable and no public URL is available"
             );
             false
         }
     }
 }
 
-fn push_oversized_delivery_failure(
+fn push_preflight_delivery_failure(
     media: &dyn MediaRef,
-    bytes: u64,
+    preflight: &AttachmentPreflight,
     delivery_failures: &mut Vec<String>,
 ) {
+    let reason = preflight
+        .reason
+        .as_deref()
+        .unwrap_or("the platform rejected direct upload");
     push_unique_string(
         delivery_failures,
         &format!(
-            "`{}` could not be attached because it is {} and exceeds the {} direct-upload limit; no public media URL is configured.",
+            "`{}` could not be attached: {}; no public media URL is configured.",
             media.name(),
-            format_bytes(bytes),
-            format_bytes(MAX_OUTGOING_ATTACHMENT_BYTES as u64)
+            reason
         ),
     );
-}
-
-fn format_bytes(bytes: u64) -> String {
-    let mib = bytes as f64 / 1024.0 / 1024.0;
-    if mib >= 1.0 {
-        format!("{mib:.1} MiB")
-    } else {
-        format!("{bytes} bytes")
-    }
 }
 
 /// Push a non-empty string if it has not already appeared.

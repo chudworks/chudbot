@@ -8,13 +8,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chudbot_api::{
-    AttachmentRef, ChannelRef, ExternalId, FetchMessages, GuildProfile, MessagePlatform,
-    MessageRef, OutgoingAttachment, PlatformCommand, PlatformCommandDefinition,
-    PlatformCommandInput, PlatformCommandOption, PlatformCommandOptionKind,
-    PlatformCommandResponse, PlatformCommandResponseTarget, PlatformCommandValue, PlatformEvent,
-    PlatformMessage, PlatformMessageReference, PlatformMessageRelationship, PlatformName,
-    PlatformReaction, PlatformReady, PostedMessage, ReactionKind, SendMessage, UserProfile,
-    UserRef,
+    AttachmentCandidate, AttachmentPreflight, AttachmentRef, ChannelRef, ExternalId, FetchMessages,
+    GuildProfile, MessagePlatform, MessageRef, OutgoingAttachment, PlatformCommand,
+    PlatformCommandDefinition, PlatformCommandInput, PlatformCommandOption,
+    PlatformCommandOptionKind, PlatformCommandResponse, PlatformCommandResponseTarget,
+    PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
+    PlatformMessageRelationship, PlatformName, PlatformReaction, PlatformReady, PostedMessage,
+    ReactionKind, SendMessage, UserProfile, UserRef,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -54,6 +54,7 @@ use twilight_util::builder::command::{
 const DEFAULT_PLATFORM_NAME: &str = "discord";
 const DISCORD_MESSAGE_LIMIT: usize = 2000;
 const DISCORD_ATTACHMENT_LIMIT: usize = 10;
+const DISCORD_ATTACHMENT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 const CODE_FENCE_MIN_WIDTH: usize = 3;
 const GATEWAY_RECONNECT_BASE_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 const GATEWAY_RECONNECT_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
@@ -604,6 +605,15 @@ impl MessagePlatform for DiscordPlatform {
             },
             extra_messages,
         })
+    }
+
+    async fn preflight_attachment(
+        &self,
+        _channel: ChannelRef,
+        _reply_to: Option<MessageRef>,
+        candidate: AttachmentCandidate,
+    ) -> Result<AttachmentPreflight, Self::Error> {
+        Ok(discord_attachment_preflight(candidate))
     }
 
     async fn delete_message(&self, message: MessageRef) -> Result<(), Self::Error> {
@@ -1372,6 +1382,36 @@ fn http_attachments(attachments: &[OutgoingAttachment]) -> Vec<HttpAttachment> {
         .collect()
 }
 
+fn discord_attachment_preflight(candidate: AttachmentCandidate) -> AttachmentPreflight {
+    if candidate.size_bytes > DISCORD_ATTACHMENT_MAX_BYTES {
+        return AttachmentPreflight {
+            reason: Some(format!(
+                "`{}` is {} and exceeds Discord's {} direct-upload limit",
+                candidate.filename,
+                format_bytes(candidate.size_bytes),
+                format_bytes(DISCORD_ATTACHMENT_MAX_BYTES)
+            )),
+            candidate,
+            direct_upload: false,
+        };
+    }
+
+    AttachmentPreflight {
+        candidate,
+        direct_upload: true,
+        reason: None,
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    let mib = bytes as f64 / 1024.0 / 1024.0;
+    if mib >= 1.0 {
+        format!("{mib:.1} MiB")
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 fn discord_attachment_batches(attachments: &[OutgoingAttachment]) -> Vec<Vec<HttpAttachment>> {
     attachments
         .chunks(DISCORD_ATTACHMENT_LIMIT)
@@ -1716,9 +1756,9 @@ mod tests {
     use std::time::Duration;
 
     use chudbot_api::{
-        AttachmentRef, ExternalId, MessageRef, OutgoingAttachment, PlatformMessage,
-        PlatformMessageReference, PlatformMessageRelationship, PlatformName, ReactionKind,
-        UserProfile, UserRef,
+        AttachmentCandidate, AttachmentRef, ExternalId, MessageRef, OutgoingAttachment,
+        PlatformMessage, PlatformMessageReference, PlatformMessageRelationship, PlatformName,
+        ReactionKind, UserProfile, UserRef,
     };
     use time::OffsetDateTime;
     use twilight_cache_inmemory::{DefaultInMemoryCache, ResourceType};
@@ -1729,8 +1769,9 @@ mod tests {
     use twilight_model::id::Id;
 
     use super::{
-        DISCORD_ATTACHMENT_LIMIT, DISCORD_MESSAGE_LIMIT, DiscordError, GATEWAY_RECONNECT_MAX_DELAY,
-        discord_attachment_batches, discord_message_context_json, message_ref_from_reference,
+        DISCORD_ATTACHMENT_LIMIT, DISCORD_ATTACHMENT_MAX_BYTES, DISCORD_MESSAGE_LIMIT,
+        DiscordError, GATEWAY_RECONNECT_MAX_DELAY, discord_attachment_batches,
+        discord_attachment_preflight, discord_message_context_json, message_ref_from_reference,
         next_reconnect_delay, parse_channel_id, reaction_kind, split_discord_content,
     };
 
@@ -1841,6 +1882,25 @@ mod tests {
             (0..10).collect::<Vec<_>>()
         );
         assert_eq!(batches[1][0].id, 0);
+    }
+
+    #[test]
+    fn discord_attachment_preflight_rejects_oversized_files() {
+        let candidate = AttachmentCandidate {
+            filename: "generated.mp4".to_string(),
+            content_type: "video/mp4".to_string(),
+            size_bytes: DISCORD_ATTACHMENT_MAX_BYTES + 1,
+        };
+
+        let preflight = discord_attachment_preflight(candidate);
+
+        assert!(!preflight.direct_upload);
+        assert!(
+            preflight
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Discord"))
+        );
     }
 
     #[test]

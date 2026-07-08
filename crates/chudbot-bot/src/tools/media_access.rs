@@ -298,12 +298,16 @@ where
     skip_all,
     fields(tool_call = %call.id)
 )]
-pub(crate) async fn attach_asset<M>(
+pub(crate) async fn attach_asset<M, P>(
     media_store: &M,
+    platforms: &P,
+    channel: &ChannelRef,
+    reply_to: Option<&MessageRef>,
     call: ClientToolCall,
 ) -> Result<ClientToolOutput, BotToolError>
 where
     M: MediaStore,
+    P: MessagePlatformRegistry,
 {
     let uri = media_uri_from_tool_input(&call.input)?;
     // Validate now, but leave byte loading and final attachment sizing to the
@@ -327,15 +331,54 @@ where
         )));
     }
 
+    let preflight = platforms
+        .preflight_attachment(
+            channel.clone(),
+            reply_to.cloned(),
+            attachment_candidate_for_media(media.as_ref(), media.size_bytes()),
+        )
+        .await
+        .map_err(|error| BotToolError::Platform(error.to_string()))?;
+    let public_url = if preflight.direct_upload {
+        None
+    } else {
+        Some(media.public_url().await.map_err(|error| {
+            BotToolError::InvalidInput(format!(
+                "`attach` cannot deliver `{}`: {}; {}",
+                media.name(),
+                preflight
+                    .reason
+                    .as_deref()
+                    .unwrap_or("the platform rejected direct upload"),
+                error
+            ))
+        })?)
+    };
+
+    let delivery_mode = if preflight.direct_upload {
+        "direct_upload"
+    } else {
+        "public_url_fallback"
+    };
+    let platform_reply = if preflight.direct_upload {
+        "The media will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown links in user-facing text."
+    } else {
+        "The media exceeds the direct-upload policy for this platform reply, so its public URL will be appended to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown links in user-facing text."
+    };
+
     // `attach` communicates through trace JSON only. Keeping `media` empty
     // prevents provider adapters from treating this as model-visible input.
     let value = media_access_metadata_json(
         media.as_ref(),
         serde_json::json!({
             "exists": true,
-            "attached": true,
+            "queued": true,
+            "attached": preflight.direct_upload,
+            "public_url": public_url.as_ref().map(|url| url.as_str()),
+            "preflight": &preflight,
             "delivery": {
-                "platform_reply": "The media will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown links in user-facing text.",
+                "mode": delivery_mode,
+                "platform_reply": platform_reply,
                 "deduplication": "If this URI is already queued by generated media or another attach call, it will only be sent once."
             }
         }),

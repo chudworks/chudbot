@@ -77,12 +77,6 @@ pub(crate) const DEFAULT_SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(
 /// Interval used to refresh typing indicators during long model turns.
 pub(crate) const TYPING_REFRESH_INTERVAL: Duration = Duration::from_secs(8);
 
-/// Maximum attachment size uploaded directly to Discord.
-///
-// Discord's default per-file upload limit is 10 MiB; larger generated media is
-// linked by public URL instead of uploaded.
-pub(crate) const MAX_OUTGOING_ATTACHMENT_BYTES: usize = 10 * 1024 * 1024;
-
 /// Maximum stored/displayed conversation title length after title generation.
 pub(crate) const TITLE_MAX_CHARS: usize = 80;
 
