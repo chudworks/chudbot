@@ -3753,6 +3753,58 @@ mod tests {
     }
 
     #[test]
+    fn stored_agent_instruction_state_keeps_latest_marker_per_part_key() {
+        let markers = vec![
+            StoredPromptMarker {
+                turn_ordinal: 1,
+                attempt_ordinal: 0,
+                part_key: Some("operator_policy".to_string()),
+                part_ordinal: 0,
+                text: "policy".to_string(),
+            },
+            StoredPromptMarker {
+                turn_ordinal: 1,
+                attempt_ordinal: 0,
+                part_key: Some("bot_version".to_string()),
+                part_ordinal: 1,
+                text: "The version of Chudbot is v1.\n".to_string(),
+            },
+            StoredPromptMarker {
+                turn_ordinal: 2,
+                attempt_ordinal: 0,
+                part_key: Some("bot_version".to_string()),
+                part_ordinal: 1,
+                text: "The version of Chudbot was updated to v2.\n".to_string(),
+            },
+            StoredPromptMarker {
+                turn_ordinal: 3,
+                attempt_ordinal: 0,
+                part_key: Some("bot_version".to_string()),
+                part_ordinal: 1,
+                text: "The version of Chudbot was updated to v3.\n".to_string(),
+            },
+        ];
+
+        let state = stored_agent_instruction_state_at_boundary(
+            &markers,
+            PromptStateBoundary {
+                turn_id: TurnId::new(),
+                turn_ordinal: 4,
+                attempt_ordinal: None,
+            },
+        );
+
+        let Some(AgentInstructionSnapshot::Parts { parts }) = state else {
+            panic!("expected labeled prompt parts");
+        };
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].key, "operator_policy");
+        assert_eq!(parts[0].text, "policy");
+        assert_eq!(parts[1].key, "bot_version");
+        assert_eq!(parts[1].text, "The version of Chudbot was updated to v3.\n");
+    }
+
+    #[test]
     fn tool_trace_media_asset_canonicalizes_nested_legacy_client_result_uri() {
         let fields = ToolTraceFields {
             trace_kind: "client",
