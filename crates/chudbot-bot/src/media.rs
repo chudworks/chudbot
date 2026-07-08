@@ -646,17 +646,20 @@ pub(crate) fn public_url_supports_media(media: &dyn chudbot_api::MediaRef) -> bo
 
 /// Return whether the `attach` tool may queue a stored asset for reply delivery.
 pub(crate) fn attach_supports_media(media: &dyn chudbot_api::MediaRef) -> bool {
-    matches!(
-        media.category(),
-        MediaCategory::Image | MediaCategory::Avatar | MediaCategory::GuildIcon
-    ) && media
+    let mime_type = media
         .mime_type()
         .split(';')
         .next()
         .unwrap_or("")
         .trim()
-        .to_ascii_lowercase()
-        .starts_with("image/")
+        .to_ascii_lowercase();
+    match media.category() {
+        MediaCategory::Image | MediaCategory::Avatar | MediaCategory::GuildIcon => {
+            mime_type.starts_with("image/")
+        }
+        MediaCategory::Video => mime_type.starts_with("video/"),
+        MediaCategory::Audio | MediaCategory::Other(_) => false,
+    }
 }
 
 /// Inject saved audio attachment refs into platform message context JSON.

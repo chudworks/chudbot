@@ -87,23 +87,24 @@ pub(crate) fn public_url_asset_spec() -> ClientToolSpec {
 
 /// Describe the `attach` tool exposed to model providers.
 ///
-/// `attach` validates an existing stored image and marks its URI for final
-/// platform delivery. It does not expose the image to the next model step; the
-/// send path later resolves the URI, deduplicates it with generated media, and
-/// loads bytes only when preparing the platform reply.
+/// `attach` validates an existing stored image or video and marks its URI for
+/// final platform delivery. It does not expose the media to the next model
+/// step; the send path later resolves the URI, deduplicates it with generated
+/// media, and loads bytes only when preparing the platform reply.
 pub(crate) fn attach_asset_spec() -> ClientToolSpec {
     ClientToolSpec {
         description: concat!(
-            "Attach an existing stored image asset to the final platform reply.\n",
-            "Accepts: media://images/..., media://avatars/..., and media://guild-icons/... ",
-            "stored image URIs; legacy file://images/..., file://avatars/..., and ",
+            "Attach an existing stored image or video asset to the final platform reply.\n",
+            "Accepts: media://images/..., media://videos/..., media://avatars/..., and ",
+            "media://guild-icons/... stored media URIs; legacy file://images/..., ",
+            "file://videos/..., file://avatars/..., and ",
             "file://guild-icons/... stored URIs when already present in context; ",
             "guild_icon://current or the guild.icon_uri value from message context for the ",
             "current Discord guild icon; user_avatar://current, user_avatar://<user_id>, or ",
             "an avatar_uri value from message context for cached avatars.\n",
-            "Rejects: videos, audio, PDFs, unknown MIME types, public URLs, and local ",
+            "Rejects: audio, PDFs, unknown MIME types, public URLs, and local ",
             "filesystem paths.\n",
-            "Queues the image for final delivery, deduplicated against generated media and ",
+            "Queues the media for final delivery, deduplicated against generated media and ",
             "other attach calls; never returns raw bytes."
         )
         .to_string(),
@@ -319,7 +320,7 @@ where
             "attach rejected unsupported media asset"
         );
         return Err(BotToolError::InvalidInput(format!(
-            "`attach` only supports stored image assets; `{}` resolved as category `{:?}` with MIME type `{}`",
+            "`attach` only supports stored image or video assets; `{}` resolved as category `{:?}` with MIME type `{}`",
             media.uri(),
             media.category(),
             media.mime_type()
@@ -334,7 +335,7 @@ where
             "exists": true,
             "attached": true,
             "delivery": {
-                "platform_reply": "The image will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown image links in user-facing text.",
+                "platform_reply": "The media will be attached to the final platform reply automatically. Do not paste media URIs, filenames, public URLs, or markdown links in user-facing text.",
                 "deduplication": "If this URI is already queued by generated media or another attach call, it will only be sent once."
             }
         }),
@@ -343,7 +344,7 @@ where
         uri = %media.uri(),
         mime_type = %media.mime_type(),
         size_bytes = media.size_bytes(),
-        "queued stored image asset for final reply attachment"
+        "queued stored media asset for final reply attachment"
     );
     Ok(ClientToolOutput {
         result: ClientToolResultContent::Json {

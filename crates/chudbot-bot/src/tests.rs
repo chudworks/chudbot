@@ -132,6 +132,11 @@ fn generated_tool_schemas_advertise_canonical_input_fields() {
     assert!(asset_description.contains("file://<category>/<name>"));
     assert!(asset_description.contains("user_avatar://<user_id>"));
     assert!(asset_description.contains("not a user-id lookup"));
+
+    let attach_description = attach_asset_spec().description;
+    assert!(attach_description.contains("media://videos/..."));
+    assert!(attach_description.contains("file://videos/..."));
+    assert!(!attach_description.contains("Rejects: videos"));
 }
 
 // Shared binding fixture for schema and parser tests that need configured
@@ -2597,7 +2602,7 @@ async fn attach_asset_queues_supported_image_without_returning_bytes() {
 }
 
 #[tokio::test]
-async fn attach_asset_rejects_video() {
+async fn attach_asset_queues_supported_video_without_returning_bytes() {
     let uri = "media://videos/generated.mp4";
     let store = ReplyMediaStore::new(ReplyMediaRef::video(
         uri,
@@ -2605,7 +2610,7 @@ async fn attach_asset_rejects_video() {
         "https://chud.example/videos/generated.mp4",
     ));
 
-    let error = attach_asset(
+    let output = attach_asset(
         &store,
         ClientToolCall {
             id: ToolUseId::new("call-1"),
@@ -2614,11 +2619,20 @@ async fn attach_asset_rejects_video() {
         },
     )
     .await
-    .expect_err("videos should not be attachable through attach");
+    .expect("stored video should be attachable");
 
-    assert!(
-        matches!(error, BotToolError::InvalidInput(message) if message.contains("only supports stored image assets"))
-    );
+    assert!(!output.is_error);
+    assert!(output.media.is_empty());
+    let ClientToolResultContent::Json { value } = &output.result else {
+        panic!("expected json result");
+    };
+    assert_eq!(value["uri"], uri);
+    assert_eq!(value["category"], "video");
+    assert_eq!(value["mime_type"], "video/mp4");
+    assert_eq!(value["attached"], true);
+    assert!(value.get("bytes").is_none());
+    assert!(value.get("base64").is_none());
+    assert!(value.get("data_url").is_none());
 }
 
 #[tokio::test]
@@ -2688,6 +2702,34 @@ fn model_transcript_media_support_matches_llm_image_inputs(
     };
 
     assert_eq!(model_transcript_supports_media(&media), expected);
+}
+
+#[test_case(MediaCategory::Image, "image/png", true ; "png image")]
+#[test_case(MediaCategory::Avatar, "image/jpeg", true ; "avatar")]
+#[test_case(MediaCategory::GuildIcon, "image/webp", true ; "guild icon")]
+#[test_case(MediaCategory::Video, "video/mp4", true ; "mp4 video")]
+#[test_case(MediaCategory::Video, "video/mp4; codecs=h264", true ; "mp4 video with params")]
+#[test_case(MediaCategory::Video, "application/octet-stream", false ; "video category with unknown mime")]
+#[test_case(MediaCategory::Image, "video/mp4", false ; "image category with video mime")]
+#[test_case(MediaCategory::Audio, "audio/ogg", false ; "audio category")]
+fn attach_media_support_matches_reply_delivery_policy(
+    category: MediaCategory,
+    mime_type: &str,
+    expected: bool,
+) {
+    let prefix = category.prefix().to_string();
+    let media = PromptMediaRef {
+        metadata: MediaMetadata {
+            category,
+            name: "media.bin".to_string(),
+            uri: MediaUri::new(format!("media://{prefix}/media.bin")),
+            mime_type: mime_type.to_string(),
+            size_bytes: 42,
+        },
+        public_url: PublicMediaUrl::new("https://chud.example/media/media.bin"),
+    };
+
+    assert_eq!(attach_supports_media(&media), expected);
 }
 
 // Audio tests cover attachment detection, injected context refs, wake-word
