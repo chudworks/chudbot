@@ -426,6 +426,236 @@ details {
     }
 }
 
+// Injected user-memory system notes: parse the JSON payload and render the
+// markdown profile instead of a raw pre block.
+.memory-note {
+    margin: 0.5rem 0;
+    padding: 0.75rem 0.9rem;
+    border: 1px solid color-mix(in srgb, var(--system) 35%, var(--border));
+    border-left: 3px solid var(--system);
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--system) 8%, var(--card));
+
+    &__header {
+        margin-bottom: 0.75rem;
+    }
+
+    &__title-row {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: baseline;
+        gap: 0.45rem 0.6rem;
+        margin-bottom: 0.25rem;
+    }
+
+    &__badge {
+        display: inline-block;
+        padding: 0.1rem 0.45rem;
+        border-radius: 999px;
+        background: color-mix(in srgb, var(--system) 22%, transparent);
+        color: var(--system);
+        font-size: 0.72rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+    }
+
+    &__name {
+        font-size: 1rem;
+    }
+
+    &__user-id {
+        font-size: 0.78rem;
+        color: var(--muted);
+    }
+
+    &__reason {
+        margin: 0.15rem 0 0.45rem;
+        color: var(--muted);
+        font-size: 0.85rem;
+    }
+
+    &__meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem;
+    }
+
+    &__chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.2rem;
+        min-width: 0;
+        padding: 0.15rem 0.45rem;
+        border: 1px solid var(--border);
+        border-radius: 999px;
+        background: var(--bg);
+        color: var(--muted);
+        font-size: 0.75rem;
+        overflow-wrap: anywhere;
+
+        code {
+            background: transparent;
+            padding: 0;
+            font-size: inherit;
+        }
+
+        &--ok {
+            border-color: color-mix(in srgb, var(--ok) 45%, var(--border));
+            color: var(--ok);
+        }
+
+        &--muted {
+            opacity: 0.85;
+        }
+    }
+
+    &__section {
+        margin-top: 0.65rem;
+    }
+
+    &__section-title {
+        margin: 0 0 0.4rem;
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        color: var(--system);
+    }
+
+    &__empty {
+        margin: 0;
+        color: var(--muted);
+        font-style: italic;
+    }
+
+    &__markdown {
+        h1,
+        h2,
+        h3 {
+            margin: 0.85rem 0 0.35rem;
+            line-height: 1.3;
+            color: var(--fg);
+        }
+
+        h1 {
+            font-size: 1.05rem;
+            border-bottom: 1px solid color-mix(in srgb, var(--system) 25%, var(--border));
+            padding-bottom: 0.25rem;
+        }
+
+        h2 {
+            font-size: 0.92rem;
+            color: var(--system);
+        }
+
+        h3 {
+            font-size: 0.85rem;
+            color: var(--muted);
+        }
+
+        // Profile documents usually start with "# User Memory" — tighten the
+        // first heading so the card doesn't open with excess top space.
+        > :first-child {
+            margin-top: 0;
+        }
+
+        p {
+            margin: 0.35rem 0;
+        }
+
+        ul {
+            margin: 0.25rem 0 0.55rem;
+            padding-left: 1.2rem;
+        }
+
+        li {
+            margin: 0.2rem 0;
+            overflow-wrap: anywhere;
+        }
+
+        strong {
+            font-weight: 600;
+        }
+
+        &--compact {
+            h1,
+            h2,
+            h3 {
+                font-size: 0.85rem;
+            }
+
+            ul {
+                margin-bottom: 0.25rem;
+            }
+        }
+    }
+
+    &__fold {
+        margin: 0.65rem 0 0;
+        border-color: color-mix(in srgb, var(--system) 20%, var(--border));
+        background: color-mix(in srgb, var(--bg) 70%, transparent);
+
+        summary {
+            color: var(--system);
+            font-weight: 600;
+        }
+
+        &--raw summary {
+            color: var(--muted);
+            font-weight: 500;
+        }
+    }
+
+    &__diary-list,
+    &__event-list {
+        display: flex;
+        flex-direction: column;
+        gap: 0.55rem;
+    }
+
+    &__diary,
+    &__event {
+        padding: 0.5rem 0.65rem;
+        border-left: 2px solid color-mix(in srgb, var(--system) 45%, var(--border));
+        border-radius: 0 6px 6px 0;
+        background: var(--bg);
+
+        header {
+            margin-bottom: 0.3rem;
+            color: var(--muted);
+            font-size: 0.78rem;
+        }
+    }
+
+    &__id {
+        font-size: 0.72rem;
+    }
+
+    &__event-kind {
+        font-weight: 600;
+        color: var(--system);
+        text-transform: lowercase;
+    }
+
+    &__event-body {
+        margin: 0;
+        overflow-wrap: anywhere;
+    }
+
+    &__tags {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.3rem;
+        margin-top: 0.35rem;
+    }
+
+    &__raw {
+        margin-top: 0.4rem;
+        font-size: 0.78rem;
+    }
+}
+
 .reasoning {
     &__usage {
         display: flex;

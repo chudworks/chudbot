@@ -9,6 +9,7 @@ import type {
 } from '../types';
 import { agentInstructionText } from '../types';
 import Avatar from './Avatar';
+import MemoryNote from './MemoryNote';
 import RelativeTime from './RelativeTime';
 import ToolCall from './ToolCall';
 
@@ -234,14 +235,21 @@ function StatusBadge({ status }: { status: string }) {
 function ContextPanels({ context }: { context: ContextItem[] }) {
   const systemItems = context.filter((item) => item.role === 'system');
   const userItems = context.filter((item) => item.role !== 'system');
+  const memoryCount = systemItems.filter((item) =>
+    item.source.startsWith('memory:user:')
+  ).length;
+  const systemSummary =
+    memoryCount > 0 && memoryCount === systemItems.length
+      ? `System turn · memory notes (${systemItems.length})`
+      : memoryCount > 0
+        ? `System turn · injected notes (${systemItems.length}, ${memoryCount} memory)`
+        : `System turn · injected notes (${systemItems.length})`;
 
   return (
     <>
       {systemItems.length > 0 && (
         <details className="context context--system">
-          <summary>
-            System turn · injected notes ({systemItems.length})
-          </summary>
+          <summary>{systemSummary}</summary>
           {systemItems.map((item, i) => (
             <ContextItemView key={i} item={item} />
           ))}
@@ -260,6 +268,22 @@ function ContextPanels({ context }: { context: ContextItem[] }) {
 }
 
 function ContextItemView({ item }: { item: ContextItem }) {
+  // Memory notes are system context with source `memory:user:<id>` and a
+  // prose preamble + pretty-printed JSON payload. Render a dedicated card
+  // when we can parse that shape; otherwise fall through to the generic view.
+  if (item.source.startsWith('memory:user:')) {
+    return (
+      <MemoryNote
+        source={item.source}
+        content={item.content}
+        fallback={<RawContextItem item={item} />}
+      />
+    );
+  }
+  return <RawContextItem item={item} />;
+}
+
+function RawContextItem({ item }: { item: ContextItem }) {
   const isImage = isImageUri(item.content);
   const isVideo = isVideoUri(item.content);
   const isAudio = isAudioUri(item.content);
