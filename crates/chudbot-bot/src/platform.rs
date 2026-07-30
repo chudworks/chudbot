@@ -52,6 +52,33 @@ pub(crate) fn same_platform_user(
     left.platform == right.platform && left.user_id == right.user_id
 }
 
+/// Check whether a user matches a configured platform-wide or guild admin.
+pub(crate) fn is_configured_admin(
+    user: &chudbot_api::UserRef,
+    admins: &[chudbot_api::UserRef],
+) -> bool {
+    admins.iter().any(|admin| {
+        admin.platform == user.platform
+            && admin.user_id == user.user_id
+            && admin
+                .guild_id
+                .as_ref()
+                .is_none_or(|guild| user.guild_id.as_ref() == Some(guild))
+    })
+}
+
+/// Check whether a user may explicitly retry a failed turn.
+///
+/// Turn ownership follows stable platform identity. Configured admins may be
+/// platform-wide or restricted to one guild.
+pub(crate) fn may_explicitly_retry_turn(
+    requester: &chudbot_api::UserRef,
+    turn_user: &chudbot_api::UserRef,
+    admins: &[chudbot_api::UserRef],
+) -> bool {
+    same_platform_user(requester, turn_user) || is_configured_admin(requester, admins)
+}
+
 /// Prepare inbound message text for the transcript and model prompt.
 ///
 /// The wake-up mention for the bot is removed, while mentions of other users

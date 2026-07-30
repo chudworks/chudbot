@@ -709,8 +709,8 @@ impl BotStorage for SqlxStorage {
         sqlx::query(
             "INSERT INTO turn_attempts \
                (id, turn_id, attempt_ordinal, agent_name, llm_provider, llm_model, \
-                app_version_id) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                app_version_id, explicit_retry_user_key) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(attempt_id)
         .bind(input.turn_id.0)
@@ -719,6 +719,12 @@ impl BotStorage for SqlxStorage {
         .bind(input.provider.as_str())
         .bind(input.model.as_str())
         .bind(self.app_version_id)
+        .bind(
+            input
+                .explicit_retry_user
+                .as_ref()
+                .map(|user| user.user_id.as_str()),
+        )
         .execute(&mut *tx)
         .await?;
         for item in input.context {

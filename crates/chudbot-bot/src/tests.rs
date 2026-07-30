@@ -1655,6 +1655,34 @@ fn platform_user_match_ignores_guild_scope() {
     assert!(!same_platform_user(&other_platform, &global_bot));
 }
 
+#[test_case("discord", Some("guild-1"), "owner", false, None, true ; "turn owner")]
+#[test_case("discord", Some("guild-2"), "owner", false, None, true ; "turn owner in another guild")]
+#[test_case("slack", None, "owner", false, None, false ; "same id on another platform")]
+#[test_case("discord", Some("guild-1"), "troll", false, None, false ; "unrelated user")]
+#[test_case("discord", Some("guild-1"), "admin", true, None, true ; "platform admin")]
+#[test_case("discord", Some("guild-1"), "admin", true, Some("guild-1"), true ; "guild admin")]
+#[test_case("discord", Some("guild-2"), "admin", true, Some("guild-1"), false ; "admin in another guild")]
+fn explicit_retry_authorization_allows_only_owner_or_admin(
+    requester_platform: &str,
+    requester_guild: Option<&str>,
+    requester_id: &str,
+    configure_admin: bool,
+    admin_guild: Option<&str>,
+    expected: bool,
+) {
+    let requester = user(requester_platform, requester_guild, requester_id);
+    let turn_user = user("discord", Some("guild-1"), "owner");
+    let admins = configure_admin
+        .then(|| user("discord", admin_guild, requester_id))
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        may_explicitly_retry_turn(&requester, &turn_user, &admins),
+        expected
+    );
+}
+
 #[test]
 fn normalizes_bot_and_member_mentions() {
     let bot = user("discord", None, "111111111111111111");

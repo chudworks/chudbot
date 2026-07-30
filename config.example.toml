@@ -119,8 +119,9 @@ max_job_attempts = 5
 web_base_url = "http://localhost:1860"
 # Fallback agent when no platform/DB scoped selection applies.
 default_agent = "default"
-# Operator users allowed to pause/resume a conversation with 🛑 on any
-# Chudbot-tracked message. Omit guild_id to allow the user across the platform.
+# Operator users allowed to retry failed turns with 🔄 or pause/resume a
+# conversation with 🛑 on any Chudbot-tracked message. Omit guild_id to allow
+# the user across the platform.
 admins = [
   { platform = "discord", user_id = "123456789012345678" }
 ]

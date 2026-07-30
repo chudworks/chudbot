@@ -404,6 +404,12 @@ pub struct BeginTurn {
 pub struct SaveTurnInput {
     /// Turn id.
     pub turn_id: TurnId,
+    /// User who explicitly requested this attempt by retrying a failed turn.
+    ///
+    /// Initial attempts and provider-internal automatic retries leave this
+    /// unset.
+    #[serde(default)]
+    pub explicit_retry_user: Option<UserRef>,
     /// Agent name.
     pub agent_name: String,
     /// Provider.

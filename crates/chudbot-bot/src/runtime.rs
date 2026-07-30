@@ -434,14 +434,7 @@ where
 
     /// Check whether a user matches any configured admin identity.
     pub(crate) fn is_admin(&self, user: &chudbot_api::UserRef) -> bool {
-        self.config.admins.iter().any(|admin| {
-            admin.platform == user.platform
-                && admin.user_id == user.user_id
-                && admin
-                    .guild_id
-                    .as_ref()
-                    .is_none_or(|guild| user.guild_id.as_ref() == Some(guild))
-        })
+        is_configured_admin(user, &self.config.admins)
     }
 
     /// Add a status reaction, logging failures as non-fatal platform issues.

@@ -34,8 +34,9 @@ pub struct BotConfig {
     pub default_agent: String,
     /// Named agents. An agent may be top-level, subagent-only, or both.
     pub agents: BTreeMap<String, AgentConfig>,
-    /// Operator users allowed to stop/resume conversations with the stop
-    /// reaction. A missing `guild_id` applies across the platform.
+    /// Operator users allowed to retry failed turns and stop/resume
+    /// conversations with reactions. A missing `guild_id` applies across the
+    /// platform.
     #[serde(default)]
     pub admins: Vec<chudbot_api::UserRef>,
     /// Platform default bindings, e.g. `discord -> chudbot`.

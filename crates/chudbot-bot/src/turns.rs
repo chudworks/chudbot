@@ -430,6 +430,7 @@ where
         self.storage
             .save_turn_input(SaveTurnInput {
                 turn_id: turn.id,
+                explicit_retry_user: None,
                 agent_name: agent_name.clone(),
                 provider: agent_config.provider.clone(),
                 model: agent_config.model.id.clone(),
@@ -474,9 +475,8 @@ where
     /// Handle one platform reaction that may request retry or conversation stop.
     ///
     /// The reaction glyph is a user-facing control surface, but only retry and
-    /// stop are interpreted here. Stop/resume is admin-only; retry is resolved
-    /// through the stored message link so either a failed reply or its turn can
-    /// locate the correct conversation.
+    /// stop are interpreted here. Stop/resume is admin-only; retry is restricted
+    /// to the user who owns the failed turn and configured admins.
     pub(crate) async fn handle_reaction(
         &self,
         reaction: PlatformReaction,
@@ -498,7 +498,10 @@ where
         tracing::debug!(reaction = %name, "handling unicode reaction");
 
         match (name.as_str(), removed) {
-            (RETRY_REACTION, false) => self.retry_from_message(reaction.message).await,
+            (RETRY_REACTION, false) => {
+                self.retry_from_message(reaction.message, reaction.user)
+                    .await
+            }
             (STOP_REACTION, _) => {
                 if !self.is_admin(&reaction.user) {
                     tracing::debug!("stop reaction ignored because user is not configured admin");
@@ -533,10 +536,11 @@ where
     /// instead of creating a new turn. Stored context is replayed when present,
     /// prior assistant/error messages for that turn are best-effort deleted, and
     /// the turn then follows the same `execute_turn` terminal path as a fresh
-    /// message.
+    /// message. Authorization is checked before storage prepares the retry.
     pub(crate) async fn retry_from_message(
         &self,
         message: MessageRef,
+        explicit_retry_user: chudbot_api::UserRef,
     ) -> Result<BotAction, BotError> {
         let Some(link) = self
             .storage
@@ -552,6 +556,40 @@ where
             tracing::field::display(link.conversation_id),
         );
         tracing::Span::current().record("turn", tracing::field::display(link.turn_id));
+        let Some(current_conversation) = self
+            .storage
+            .load_conversation(ConversationLookup::Id {
+                id: link.conversation_id,
+            })
+            .await
+            .map_err(storage_error)?
+        else {
+            tracing::debug!("retry ignored because linked conversation is missing");
+            return Ok(BotAction::Ignored);
+        };
+        if current_conversation.conversation.stopped_at.is_some() {
+            tracing::info!("retry ignored because conversation is stopped");
+            return Ok(BotAction::Ignored);
+        }
+        let Some(current_turn) = current_conversation
+            .turns
+            .iter()
+            .find(|snapshot| snapshot.turn.id == link.turn_id)
+        else {
+            tracing::debug!("retry ignored because linked turn is missing");
+            return Ok(BotAction::Ignored);
+        };
+        if !may_explicitly_retry_turn(
+            &explicit_retry_user,
+            &current_turn.turn.user,
+            &self.config.admins,
+        ) {
+            tracing::debug!(
+                turn_user = %current_turn.turn.user.user_id,
+                "retry reaction ignored because user is neither turn owner nor configured admin"
+            );
+            return Ok(BotAction::Ignored);
+        }
         // Existing assistant links are captured before prepare_retry mutates
         // turn state so failed platform replies can be removed after the retry
         // is known to be eligible.
@@ -560,19 +598,6 @@ where
             .load_message_links_for_turn(link.turn_id)
             .await
             .map_err(storage_error)?;
-        if self
-            .storage
-            .load_conversation(ConversationLookup::Id {
-                id: link.conversation_id,
-            })
-            .await
-            .map_err(storage_error)?
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.conversation.stopped_at.is_some())
-        {
-            tracing::info!("retry ignored because conversation is stopped");
-            return Ok(BotAction::Ignored);
-        }
         // Storage owns retry eligibility and state reset. If it declines, the
         // reaction was valid but the turn should not be run again.
         let Some(retry) = self
@@ -674,6 +699,7 @@ where
         self.storage
             .save_turn_input(SaveTurnInput {
                 turn_id: turn.id,
+                explicit_retry_user: Some(explicit_retry_user),
                 agent_name: agent_name.clone(),
                 provider: agent_config.provider.clone(),
                 model: agent_config.model.id.clone(),
