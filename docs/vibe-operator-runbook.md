@@ -23,18 +23,18 @@ firewall commands. The deployment uses the system Docker daemon at
    `/var/run/docker.sock`. Add only the Unix account that runs Chudbot to the
    `docker` group, then start a fresh login session. Membership in that group is
    root-equivalent; do not grant it to site authors.
-2. Apply the repository-managed rules to Vibe's dedicated Docker network:
+2. Apply the repository-managed rules to the dedicated sandbox Docker network:
 
    ```sh
    cd "$CHUDBOT_DIR/grok-discord-bot"
    ./serve.sh firewall-install
    ```
 
-   The command idempotently creates the `chudbot-vibe` Docker network with the
-   fixed `chudbot-vibe0` bridge and owns one `CHUDBOT_VIBE` chain. Other Docker
-   networks are unaffected. It rejects loopback, link-local, carrier-grade NAT,
-   RFC 1918, and IPv6 private destinations while allowing public Bun/npm
-   traffic.
+   The command idempotently creates the `chudbot-sandbox` Docker network with
+   the fixed `chudbot-sbx0` bridge and owns one `CHUDBOT_SANDBOX` chain. Other
+   Docker networks are unaffected. It rejects loopback, link-local,
+   carrier-grade NAT, RFC 1918, and IPv6 private destinations while allowing
+   public Bun/npm traffic.
 3. Verify the Docker network and every managed firewall rule:
 
    ```sh

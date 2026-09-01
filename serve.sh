@@ -36,9 +36,9 @@ VIBE_DATA="$CHUDBOT_DIR/vibe"
 VIBE_SANDBOX_SRC="$REPO_DIR/vibe-sandbox"
 VIBE_SKILL_SRC="$REPO_DIR/skills"
 SKILL_DIR="$CHUDBOT_DIR/skills"
-VIBE_DOCKER_NETWORK="chudbot-vibe"
-VIBE_DOCKER_BRIDGE="chudbot-vibe0"
-VIBE_FIREWALL_CHAIN="CHUDBOT_VIBE"
+VIBE_DOCKER_NETWORK="chudbot-sandbox"
+VIBE_DOCKER_BRIDGE="chudbot-sbx0"
+VIBE_FIREWALL_CHAIN="CHUDBOT_SANDBOX"
 BINARY="$CHUDBOT_DIR/chudbot"
 LOG_DIR="$CHUDBOT_DIR/logs"
 SESSION="chudbot"
@@ -58,7 +58,7 @@ commands:
   migrate   run \`chudbot migrate\` with the installed binary
   vibe-purge <name>  permanently purge one Vibe site (operator-only)
   firewall-install   idempotently apply the Vibe Docker firewall rules
-  firewall-check     verify the Vibe Docker network and firewall rules
+  firewall-check     verify the sandbox Docker network and firewall rules
   firewall-remove    stop Chudbot and remove the Vibe firewall rules/network
 
 env vars:
@@ -152,7 +152,7 @@ check_firewall_rule() {
     local tool="$1"
     shift
     if ! sudo "$tool" -C "$VIBE_FIREWALL_CHAIN" "$@" >/dev/null 2>&1; then
-        echo "error: missing Vibe firewall rule: $tool $VIBE_FIREWALL_CHAIN $*" >&2
+        echo "error: missing sandbox firewall rule: $tool $VIBE_FIREWALL_CHAIN $*" >&2
         exit 1
     fi
 }
@@ -201,7 +201,7 @@ remove_firewall_family() {
 cmd_firewall_install() {
     ensure_firewall_tools
     ensure_vibe_docker_network
-    echo "==> apply Vibe firewall to $VIBE_DOCKER_NETWORK ($VIBE_DOCKER_BRIDGE)"
+    echo "==> apply sandbox firewall to $VIBE_DOCKER_NETWORK ($VIBE_DOCKER_BRIDGE)"
     apply_ipv4_firewall
     apply_ipv6_firewall_if_enabled
     cmd_firewall_check
@@ -221,12 +221,12 @@ cmd_firewall_check() {
     fi
     check_ipv4_firewall
     check_ipv6_firewall_if_enabled
-    echo "Vibe firewall is active on $VIBE_DOCKER_NETWORK ($VIBE_DOCKER_BRIDGE)"
+    echo "Sandbox firewall is active on $VIBE_DOCKER_NETWORK ($VIBE_DOCKER_BRIDGE)"
 }
 
 cmd_firewall_remove() {
     ensure_firewall_tools
-    echo "==> stop Chudbot before removing its Vibe firewall"
+    echo "==> stop Chudbot before removing its sandbox firewall"
     stop_session
     if docker network inspect "$VIBE_DOCKER_NETWORK" >/dev/null 2>&1; then
         local attached
@@ -241,7 +241,7 @@ cmd_firewall_remove() {
     if docker network inspect "$VIBE_DOCKER_NETWORK" >/dev/null 2>&1; then
         docker network rm "$VIBE_DOCKER_NETWORK" >/dev/null
     fi
-    echo "==> Vibe firewall removed"
+    echo "==> sandbox firewall removed"
 }
 
 start_session() {
