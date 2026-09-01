@@ -87,7 +87,7 @@ async fn copy_tree(
             if name_text == ".git" && relative.as_os_str().is_empty() {
                 continue;
             }
-            if matches!(name_text, "node_modules" | "dist") {
+            if matches!(name_text, "node_modules" | "dist") || name_text.ends_with(".tsbuildinfo") {
                 continue;
             }
             if name_text == ".git"
@@ -336,6 +336,37 @@ mod tests {
             );
             let _ = tokio::fs::remove_dir_all(root).await;
         }
+    }
+
+    #[tokio::test]
+    async fn export_skips_dependencies_and_build_artifacts() {
+        let root = fixture("{}").await;
+        tokio::fs::create_dir_all(root.join("node_modules/react"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("node_modules/react/index.js"), "dependency")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(root.join("dist/assets"))
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("dist/assets/index.js"), "artifact")
+            .await
+            .unwrap();
+        tokio::fs::write(root.join("tsconfig.app.tsbuildinfo"), "metadata")
+            .await
+            .unwrap();
+
+        let exported = validate_and_export(&root, &std::env::temp_dir(), limits())
+            .await
+            .unwrap();
+        assert!(!exported.root.join("node_modules").exists());
+        assert!(!exported.root.join("dist").exists());
+        assert!(!exported.root.join("tsconfig.app.tsbuildinfo").exists());
+        assert!(exported.root.join("src/App.tsx").exists());
+
+        let _ = tokio::fs::remove_dir_all(root).await;
+        let _ = tokio::fs::remove_dir_all(exported.root).await;
     }
 
     #[tokio::test]

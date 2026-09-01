@@ -6,6 +6,8 @@ use tokio::process::Command;
 
 use crate::VibeError;
 
+const GENERATED_GITIGNORE_RULES: [&str; 3] = ["node_modules/", "dist/", "*.tsbuildinfo"];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitCommit {
     pub oid: String,
@@ -74,6 +76,7 @@ impl VibeDiskStore {
             }
             None => copy_template(&self.template, &workspace).await?,
         }
+        ensure_generated_gitignore(&workspace).await?;
         initialize_workspace_git(&workspace).await?;
         Ok(workspace)
     }
@@ -247,7 +250,11 @@ impl VibeDiskStore {
                 "ls-tree",
             )
             .await?;
-        Ok(output.lines().map(str::to_string).collect())
+        Ok(output
+            .lines()
+            .filter(|path| source_path_is_visible(path))
+            .map(str::to_string)
+            .collect())
     }
 
     /// Read a bounded UTF-8 source file from one trusted stored commit.
@@ -259,6 +266,14 @@ impl VibeDiskStore {
     ) -> Result<String, VibeError> {
         validate_oid(oid)?;
         crate::export::validate_relative_path(path)?;
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| VibeError::InvalidSource("paths must be UTF-8".into()))?;
+        if !source_path_is_visible(path_text) {
+            return Err(VibeError::InvalidSource(
+                "generated source paths are hidden".into(),
+            ));
+        }
         let spec = format!("{oid}:{}", path.display());
         let output = self
             .git(&self.repo_path(site), None, ["show", &spec], "show")
@@ -274,7 +289,18 @@ impl VibeDiskStore {
             .git(
                 &self.repo_path(site),
                 None,
-                ["diff", "--no-ext-diff", "--no-textconv", from, to, "--"],
+                [
+                    "diff",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    from,
+                    to,
+                    "--",
+                    ".",
+                    ":(glob,exclude)**/node_modules/**",
+                    ":(glob,exclude)**/dist/**",
+                    ":(glob,exclude)**/*.tsbuildinfo",
+                ],
                 "diff",
             )
             .await?;
@@ -330,6 +356,16 @@ impl VibeDiskStore {
     }
 }
 
+fn source_path_is_visible(path: &str) -> bool {
+    !path
+        .split('/')
+        .any(|segment| matches!(segment, "node_modules" | "dist"))
+        && !path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.ends_with(".tsbuildinfo"))
+}
+
 fn validate_oid(oid: &str) -> Result<(), VibeError> {
     if (40..=64).contains(&oid.len()) && oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         Ok(())
@@ -374,6 +410,33 @@ async fn copy_template(source: &Path, destination: &Path) -> Result<(), VibeErro
             }
         }
     }
+    Ok(())
+}
+
+async fn ensure_generated_gitignore(workspace: &Path) -> Result<(), VibeError> {
+    let path = workspace.join(".gitignore");
+    let mut contents = if tokio::fs::try_exists(&path).await? {
+        tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|_| VibeError::InvalidSource(".gitignore must be UTF-8".into()))?
+    } else {
+        String::new()
+    };
+    let missing = GENERATED_GITIGNORE_RULES
+        .into_iter()
+        .filter(|rule| !contents.lines().any(|line| line.trim() == *rule))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    for rule in missing {
+        contents.push_str(rule);
+        contents.push('\n');
+    }
+    tokio::fs::write(path, contents).await?;
     Ok(())
 }
 
@@ -479,6 +542,116 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        let _ = tokio::fs::remove_dir_all(root).await;
+    }
+
+    #[tokio::test]
+    async fn source_history_hides_legacy_dependencies_and_build_artifacts() {
+        let root = std::env::temp_dir().join(format!(
+            "vibe-git-hidden-source-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let template = root.join("template");
+        tokio::fs::create_dir_all(&template).await.unwrap();
+        tokio::fs::write(template.join("package.json"), "{}")
+            .await
+            .unwrap();
+        tokio::fs::write(template.join(".gitignore"), "custom-cache/\n")
+            .await
+            .unwrap();
+        let store = VibeDiskStore::new(root.clone(), template);
+        store.initialize().await.unwrap();
+        let site = VibeSiteId::new();
+        let first = store
+            .create_workspace(site, VibeJobId::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(first.join(".gitignore"))
+                .await
+                .unwrap(),
+            "custom-cache/\nnode_modules/\ndist/\n*.tsbuildinfo\n"
+        );
+        tokio::fs::remove_file(first.join(".gitignore"))
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(first.join("src")).await.unwrap();
+        tokio::fs::write(first.join("src/App.tsx"), "export default 1")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(first.join("node_modules/pkg"))
+            .await
+            .unwrap();
+        tokio::fs::write(first.join("node_modules/pkg/index.js"), "dependency")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(first.join("dist/assets"))
+            .await
+            .unwrap();
+        tokio::fs::write(first.join("dist/assets/index.js"), "artifact one")
+            .await
+            .unwrap();
+        tokio::fs::write(first.join("tsconfig.app.tsbuildinfo"), "metadata one")
+            .await
+            .unwrap();
+        let commit1 = store
+            .commit_tree(site, &first, None, &ExternalId::new("1"), "Create site")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.list_files(site, &commit1.oid).await.unwrap(),
+            ["package.json", "src/App.tsx"]
+        );
+        for hidden in [
+            "node_modules/pkg/index.js",
+            "dist/assets/index.js",
+            "tsconfig.app.tsbuildinfo",
+        ] {
+            assert!(
+                store
+                    .read_file(site, &commit1.oid, Path::new(hidden))
+                    .await
+                    .is_err(),
+                "{hidden}"
+            );
+        }
+
+        let second = store
+            .create_workspace(site, VibeJobId::new(), Some(&commit1.oid))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read_to_string(second.join(".gitignore"))
+                .await
+                .unwrap(),
+            "node_modules/\ndist/\n*.tsbuildinfo\n"
+        );
+        tokio::fs::write(second.join("src/App.tsx"), "export default 2")
+            .await
+            .unwrap();
+        tokio::fs::write(second.join("dist/assets/index.js"), "artifact two")
+            .await
+            .unwrap();
+        tokio::fs::write(second.join("tsconfig.app.tsbuildinfo"), "metadata two")
+            .await
+            .unwrap();
+        let commit2 = store
+            .commit_tree(
+                site,
+                &second,
+                Some(&commit1.oid),
+                &ExternalId::new("1"),
+                "Update site",
+            )
+            .await
+            .unwrap();
+        let diff = store.diff(site, &commit1.oid, &commit2.oid).await.unwrap();
+        assert!(diff.contains("src/App.tsx"));
+        assert!(!diff.contains("diff --git a/node_modules/"));
+        assert!(!diff.contains("diff --git a/dist/"));
+        assert!(!diff.contains("diff --git a/tsconfig.app.tsbuildinfo"));
+
         let _ = tokio::fs::remove_dir_all(root).await;
     }
 }
