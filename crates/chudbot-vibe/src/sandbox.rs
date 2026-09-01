@@ -3,12 +3,16 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use chudbot_api::VibeJobId;
+use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::config::VibeSandboxConfig;
 use crate::{VibeError, export};
 
 const MAX_COMMAND_OUTPUT: usize = 64 * 1024;
+const MAX_FILE_TOOL_REQUEST: usize = 4 * 1024 * 1024;
+const FILE_HELPER_SCRIPT: &str = include_str!("file_helper.mjs");
 const VIBE_DOCKER_NETWORK: &str = "chudbot-sandbox";
 
 #[derive(Debug, Clone)]
@@ -300,6 +304,65 @@ impl CodingContainer {
                 })
             }
         }
+    }
+
+    /// Run a fixed file-operation helper inside the container namespace.
+    ///
+    /// Keeping filesystem access in the container prevents workspace symlinks
+    /// from redirecting host-side reads or writes outside the bind mount.
+    pub async fn file_tool(&mut self, request: &Value) -> Result<Value, VibeError> {
+        let request = serde_json::to_vec(request).map_err(|error| VibeError::Sandbox {
+            operation: "encode coding file request",
+            message: error.to_string(),
+        })?;
+        if request.len() > MAX_FILE_TOOL_REQUEST {
+            return Err(VibeError::Sandbox {
+                operation: "coding file request",
+                message: "request exceeds the file tool size limit".into(),
+            });
+        }
+        let mut command = self.sandbox.docker();
+        command.stdin(Stdio::piped()).args([
+            "exec",
+            "--interactive",
+            &self.name,
+            "/usr/local/bin/node",
+            "--input-type=module",
+            "--eval",
+            FILE_HELPER_SCRIPT,
+        ]);
+        let mut child = command.spawn()?;
+        let mut stdin = child.stdin.take().ok_or_else(|| VibeError::Sandbox {
+            operation: "coding file request",
+            message: "Docker did not provide a request pipe".into(),
+        })?;
+        let result = tokio::time::timeout(
+            Duration::from_secs(self.sandbox.config.command_timeout_seconds),
+            async move {
+                stdin.write_all(&request).await?;
+                drop(stdin);
+                child.wait_with_output().await
+            },
+        )
+        .await;
+        let output = match result {
+            Ok(output) => output?,
+            Err(_) => {
+                self.sandbox.force_remove(&self.name).await?;
+                self.removed = true;
+                return Err(VibeError::TimedOut);
+            }
+        };
+        if !output.status.success() {
+            return Err(VibeError::Sandbox {
+                operation: "coding file request",
+                message: "sandbox file helper failed".into(),
+            });
+        }
+        serde_json::from_slice(&output.stdout).map_err(|_| VibeError::Sandbox {
+            operation: "decode coding file response",
+            message: "sandbox file helper returned an invalid response".into(),
+        })
     }
 
     pub async fn remove(mut self) -> Result<(), VibeError> {

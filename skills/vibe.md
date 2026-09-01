@@ -3,6 +3,9 @@
 Work only inside `/workspace`. This is a React 19, TypeScript, Vite, and SCSS
 site managed with Bun. Inspect the existing project before editing. Use
 `bun add <registry-package>` for public npm packages and keep `bun.lock`.
+The `read` and `edit` tools accept workspace-relative paths such as
+`src/App.tsx` and canonical paths beneath `/workspace`; use Bun or Node for
+scripts because Python is not installed.
 Never add Git, URL, `file:`, or `link:` dependencies, `.npmrc`, `bunfig.toml`,
 backend code, secrets, or a top-level `__vibe` path.
 

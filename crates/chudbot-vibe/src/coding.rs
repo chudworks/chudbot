@@ -49,8 +49,34 @@ impl VibeCodingExecutor {
     }
 
     async fn read(&self, call: ClientToolCall) -> Result<ClientToolOutput, CodingToolError> {
-        let relative = input_string(&call, "path")?;
-        let path = workspace_path(&self.workspace, relative)?;
+        let supplied = input_string(&call, "path")?;
+        let relative = workspace_relative(supplied)?;
+        if let Some(container) = &self.container {
+            let response = container
+                .lock()
+                .await
+                .file_tool(&json!({
+                    "operation": "read",
+                    "path": path_text(&relative)?,
+                    "maxBytes": MAX_READ_BYTES,
+                }))
+                .await?;
+            ensure_file_tool_success(&response)?;
+            if response["kind"] == "directory" {
+                return Ok(output(json!({"entries":response["entries"]}), false));
+            }
+            let encoded = response["data"]
+                .as_str()
+                .ok_or_else(|| CodingToolError::Input("read returned no file data".into()))?;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .map_err(|_| CodingToolError::Input("read returned invalid file data".into()))?;
+            return read_file_output(&call, supplied, &relative, bytes);
+        }
+
+        // Container-less executors exist only in unit tests. Production file
+        // access always goes through the container namespace above.
+        let path = self.workspace.join(&relative);
         let metadata = tokio::fs::metadata(&path).await?;
         if metadata.is_dir() {
             let mut entries = tokio::fs::read_dir(&path).await?;
@@ -69,55 +95,48 @@ impl VibeCodingExecutor {
                 "file is too large for read; use shell with a bounded command".into(),
             ));
         }
-        if let Some(mime) = image_mime(&path) {
-            let bytes = tokio::fs::read(&path).await?;
-            let data = format!(
-                "data:{mime};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            );
-            let mut result = output(json!({"path":relative,"kind":"image"}), false);
-            result
-                .media
-                .push(UrlMediaRef::new(MediaCategory::Image, data, mime).boxed());
-            return Ok(result);
-        }
-        let text = tokio::fs::read_to_string(&path)
-            .await
-            .map_err(|_| CodingToolError::Input("file is not UTF-8 text".into()))?;
-        let start = call
-            .input
-            .get("startLine")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(1)
-            .max(1) as usize;
-        let end = call
-            .input
-            .get("endLine")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or_else(|| start.saturating_add(399));
-        if end < start {
-            return Err(CodingToolError::Input(
-                "endLine must be at least startLine".into(),
-            ));
-        }
-        let numbered = text
-            .lines()
-            .enumerate()
-            .filter(|(index, _)| (*index + 1) >= start && (*index + 1) <= end)
-            .map(|(index, line)| format!("{:>6} | {line}", index + 1))
-            .collect::<Vec<_>>()
-            .join("\n");
-        Ok(output(
-            json!({"path":relative,"startLine":start,"endLine":end,"text":numbered}),
-            false,
-        ))
+        let bytes = tokio::fs::read(path).await?;
+        read_file_output(&call, supplied, &relative, bytes)
     }
 
     async fn edit(&self, call: ClientToolCall) -> Result<ClientToolOutput, CodingToolError> {
-        let relative = input_string(&call, "path")?;
-        let path = workspace_path(&self.workspace, relative)?;
-        match input_string(&call, "operation")? {
+        let supplied = input_string(&call, "path")?;
+        let relative = workspace_relative(supplied)?;
+        if relative.as_os_str().is_empty() {
+            return Err(CodingToolError::InvalidPath(supplied.into()));
+        }
+        let operation = input_string(&call, "operation")?;
+        if let Some(container) = &self.container {
+            let request = match operation {
+                "create" => json!({
+                    "operation": operation,
+                    "path": path_text(&relative)?,
+                    "content": input_string(&call, "content")?,
+                }),
+                "delete" => json!({
+                    "operation": operation,
+                    "path": path_text(&relative)?,
+                }),
+                "replace" => json!({
+                    "operation": operation,
+                    "path": path_text(&relative)?,
+                    "old": input_string(&call, "old")?,
+                    "new": input_string(&call, "new")?,
+                }),
+                other => {
+                    return Err(CodingToolError::Input(format!(
+                        "unknown edit operation `{other}`"
+                    )));
+                }
+            };
+            let response = container.lock().await.file_tool(&request).await?;
+            ensure_file_tool_success(&response)?;
+            return Ok(output(json!({"ok":true,"path":supplied}), false));
+        }
+
+        // Container-less executors exist only in unit tests.
+        let path = self.workspace.join(&relative);
+        match operation {
             "create" => {
                 if tokio::fs::try_exists(&path).await? {
                     return Err(CodingToolError::Input(
@@ -159,7 +178,7 @@ impl VibeCodingExecutor {
                 )));
             }
         }
-        Ok(output(json!({"ok":true,"path":relative}), false))
+        Ok(output(json!({"ok":true,"path":supplied}), false))
     }
 
     async fn shell(&self, call: ClientToolCall) -> Result<ClientToolOutput, CodingToolError> {
@@ -205,7 +224,7 @@ impl ClientToolExecutor for VibeCodingExecutor {
 
 fn read_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Read a UTF-8 file with numbered lines, inspect an image, or list a directory inside /workspace.".into(),
+        description: "Read a UTF-8 file with numbered lines, inspect an image, or list a directory. Paths may be relative to /workspace or begin with /workspace/.".into(),
         input_schema: ToolInputSchema::object([
             ToolInputField::required("path", ToolInputValueSchema::string()),
             ToolInputField::optional("startLine", ToolInputValueSchema::integer().minimum(1)),
@@ -215,7 +234,7 @@ fn read_spec() -> ClientToolSpec {
 }
 fn edit_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Create or delete a file, or replace one exact unique string. Reread after a missing or ambiguous match.".into(),
+        description: "Create or delete a file, or replace one exact unique string. Paths may be relative to /workspace or begin with /workspace/. Reread after a missing or ambiguous match.".into(),
         input_schema: ToolInputSchema::object([
             ToolInputField::required("path", ToolInputValueSchema::string()),
             ToolInputField::required(
@@ -254,12 +273,20 @@ fn input_string<'a>(call: &'a ClientToolCall, name: &str) -> Result<&'a str, Cod
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| CodingToolError::Input(format!("`{name}` must be a string")))
 }
-fn workspace_path(root: &Path, value: &str) -> Result<PathBuf, CodingToolError> {
+fn workspace_relative(value: &str) -> Result<PathBuf, CodingToolError> {
     if value.is_empty() || value.contains('\\') || value.contains('\0') {
         return Err(CodingToolError::InvalidPath(value.into()));
     }
-    let mut path = root.to_path_buf();
-    for component in Path::new(value.trim_start_matches('/')).components() {
+    let supplied = Path::new(value);
+    let relative = if supplied.is_absolute() {
+        supplied
+            .strip_prefix("/workspace")
+            .map_err(|_| CodingToolError::InvalidPath(value.into()))?
+    } else {
+        supplied
+    };
+    let mut path = PathBuf::new();
+    for component in relative.components() {
         match component {
             Component::Normal(part)
                 if !matches!(part.to_str(), Some(".git" | "node_modules" | "dist")) =>
@@ -270,6 +297,72 @@ fn workspace_path(root: &Path, value: &str) -> Result<PathBuf, CodingToolError> 
         }
     }
     Ok(path)
+}
+
+fn path_text(path: &Path) -> Result<&str, CodingToolError> {
+    path.to_str()
+        .ok_or_else(|| CodingToolError::InvalidPath(path.display().to_string()))
+}
+
+fn ensure_file_tool_success(response: &serde_json::Value) -> Result<(), CodingToolError> {
+    if response["ok"] == true {
+        return Ok(());
+    }
+    Err(CodingToolError::Input(
+        response["error"]
+            .as_str()
+            .unwrap_or("workspace file operation failed")
+            .to_string(),
+    ))
+}
+
+fn read_file_output(
+    call: &ClientToolCall,
+    supplied: &str,
+    relative: &Path,
+    bytes: Vec<u8>,
+) -> Result<ClientToolOutput, CodingToolError> {
+    if let Some(mime) = image_mime(relative) {
+        let data = format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        let mut result = output(json!({"path":supplied,"kind":"image"}), false);
+        result
+            .media
+            .push(UrlMediaRef::new(MediaCategory::Image, data, mime).boxed());
+        return Ok(result);
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|_| CodingToolError::Input("file is not UTF-8 text".into()))?;
+    let start = call
+        .input
+        .get("startLine")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
+    let end = call
+        .input
+        .get("endLine")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or_else(|| start.saturating_add(399));
+    if end < start {
+        return Err(CodingToolError::Input(
+            "endLine must be at least startLine".into(),
+        ));
+    }
+    let numbered = text
+        .lines()
+        .enumerate()
+        .filter(|(index, _)| (*index + 1) >= start && (*index + 1) <= end)
+        .map(|(index, line)| format!("{:>6} | {line}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(output(
+        json!({"path":supplied,"startLine":start,"endLine":end,"text":numbered}),
+        false,
+    ))
 }
 fn image_mime(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
@@ -308,10 +401,25 @@ mod tests {
 
     #[test]
     fn workspace_paths_reject_escape_and_reserved() {
-        let root = Path::new("/workspace");
-        assert!(workspace_path(root, "src/App.tsx").is_ok());
-        for path in ["../x", "node_modules/x", "dist/x", ".git/config", "a\\b"] {
-            assert!(workspace_path(root, path).is_err(), "{path}");
+        assert_eq!(
+            workspace_relative("src/App.tsx").unwrap(),
+            Path::new("src/App.tsx")
+        );
+        assert_eq!(
+            workspace_relative("/workspace/src/App.tsx").unwrap(),
+            Path::new("src/App.tsx")
+        );
+        assert_eq!(workspace_relative("/workspace").unwrap(), Path::new(""));
+        for path in [
+            "../x",
+            "/etc/passwd",
+            "/workspace-other/x",
+            "node_modules/x",
+            "dist/x",
+            ".git/config",
+            "a\\b",
+        ] {
+            assert!(workspace_relative(path).is_err(), "{path}");
         }
     }
 
@@ -324,7 +432,7 @@ mod tests {
             .unwrap();
         let executor = executor(root.clone());
         let listing = executor
-            .read(call("read", json!({"path":"src"})))
+            .read(call("read", json!({"path":"/workspace"})))
             .await
             .unwrap();
         assert!(
@@ -332,12 +440,12 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|value| value == "App.tsx")
+                .any(|value| value == "src")
         );
         let range = executor
             .read(call(
                 "read",
-                json!({"path":"src/App.tsx","startLine":2,"endLine":3}),
+                json!({"path":"/workspace/src/App.tsx","startLine":2,"endLine":3}),
             ))
             .await
             .unwrap();
@@ -353,7 +461,7 @@ mod tests {
         executor
             .edit(call(
                 "edit",
-                json!({"path":"src/a.txt","operation":"create","content":"old old"}),
+                json!({"path":"/workspace/src/a.txt","operation":"create","content":"old old"}),
             ))
             .await
             .unwrap();
@@ -378,6 +486,7 @@ mod tests {
                 .unwrap(),
             "new"
         );
+        assert!(!root.join("workspace").exists());
         executor
             .edit(call(
                 "edit",
