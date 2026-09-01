@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use chudbot_api::{ModelId, ProviderName, SamplingNumber};
 use chudbot_bot::{BotConfig, MemoryConfig};
+use chudbot_vibe::VibeConfig;
 use chudbot_web::WebConfig;
 use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
@@ -68,6 +69,9 @@ pub struct RuntimeConfig {
     /// Media storage backend config.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Optional Vibe website runtime.
+    #[serde(default)]
+    pub vibe: Option<VibeConfig>,
 }
 
 /// Parsed runtime config paired with the source text used for diagnostics.
@@ -148,6 +152,12 @@ fn default_log_ansi() -> bool {
 }
 
 impl RuntimeConfig {
+    /// Load validated skill Markdown before agent construction.
+    pub(crate) fn load_skills(&mut self, config_path: &Path) -> Result<(), std::io::Error> {
+        let directory = config_path.parent().unwrap_or_else(|| Path::new("."));
+        self.bot.load_skill_contents(directory)
+    }
+
     /// Load config from TOML and retain source text for diagnostics.
     ///
     /// This only performs file I/O, TOML parsing, and default normalization that
@@ -352,6 +362,18 @@ frontend_dir = "frontend-build"
         let config = toml::from_str::<WebRuntimeConfig>(input).unwrap();
 
         assert_eq!(config.listen.addresses(), ["127.0.0.1:1860", "[::1]:1860"]);
+    }
+
+    #[test]
+    fn config_example_deserializes_with_vibe() {
+        let config = toml::from_str::<RuntimeConfig>(include_str!("../../../config.example.toml"))
+            .expect("config.example.toml must remain a valid RuntimeConfig");
+        let vibe = config.vibe.expect("example enables Vibe");
+        assert!(vibe.enabled);
+        assert_eq!(
+            config.bot.agents["vibe_coder"].model.id.as_str(),
+            "grok-4.3"
+        );
     }
 }
 

@@ -35,6 +35,7 @@ mod reaction;
 mod shared;
 mod status;
 mod usage_report;
+mod vibe;
 mod video_generation;
 
 pub(crate) use audio_transcription::*;
@@ -47,4 +48,5 @@ pub(crate) use reaction::*;
 pub(crate) use shared::*;
 pub(crate) use status::*;
 pub(crate) use usage_report::*;
+pub(crate) use vibe::*;
 pub(crate) use video_generation::*;

@@ -45,6 +45,7 @@ chudbot-gemini = { path = "../chudbot-gemini", optional = true }
 chudbot-openai = { path = "../chudbot-openai", optional = true }
 chudbot-openai-compat = { path = "../chudbot-openai-compat", optional = true }
 chudbot-storage-sqlx = { path = "../chudbot-storage-sqlx" }
+chudbot-vibe = { path = "../chudbot-vibe" }
 chudbot-web = { path = "../chudbot-web" }
 chudbot-xai = { path = "../chudbot-xai", optional = true }
 futures.workspace = true

@@ -60,6 +60,7 @@ pub mod storage;
 pub mod tool;
 pub mod transcript;
 pub mod usage;
+pub mod vibe;
 
 // Shared id newtypes keep platform/provider ids explicit without making the API
 // crate depend on any concrete platform SDK.
@@ -143,6 +144,16 @@ pub use media::{
 pub use usage::{
     CostAmount, UsageCostGrouping, UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord,
     UsageSubject,
+};
+
+// Vibe contracts keep website persistence and Discord identity behind neutral,
+// statically-dispatched traits. Concrete SQLx, Twilight, Docker, Git, and Axum
+// code belongs in downstream crates.
+pub use vibe::{
+    CompleteVibeRevision, CreateVibeJob, NewVibeOauthState, NewVibeSession, VibeAction, VibeActor,
+    VibeIdentity, VibeIdentityProvider, VibeJob, VibeJobId, VibeJobState, VibeMembership,
+    VibeOauthLogin, VibeOauthState, VibeRevision, VibeRevisionId, VibeRole, VibeSession, VibeSite,
+    VibeSiteId, VibeSiteStatus, VibeStorage,
 };
 
 // Viewer-safe reasoning summaries extracted from provider continuations and

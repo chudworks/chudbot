@@ -19,9 +19,9 @@ use crate::*;
 /// this crate keeps orchestration static and provider-neutral.
 pub trait BotRuntimeTypes {
     /// Registry that performs cloneable platform I/O such as replies and history fetches.
-    type Platforms: MessagePlatformRegistry + Clone + Send + Sync + 'static;
+    type Platforms: MessagePlatformRegistry + VibeIdentityProvider + Clone + Send + Sync + 'static;
     /// Durable storage implementation for conversations, turns, settings, and jobs.
-    type Storage: BotStorage + Clone + Send + Sync + 'static;
+    type Storage: BotStorage + VibeStorage + Clone + Send + Sync + 'static;
     /// Media store used for incoming attachments and generated assets.
     type Media: MediaStore + Clone + Send + Sync + 'static;
     /// LLM provider registry keyed by runtime provider name.
@@ -106,6 +106,8 @@ pub struct BotRuntimeInner<R: BotRuntimeTypes> {
     pub(crate) memory_config: memory::MemoryConfig,
     /// Reserved agent configs cached at startup to avoid per-turn resolution.
     pub(crate) system_agents: RuntimeSystemAgents,
+    /// Vibe sandbox, disk, and rollout services when enabled.
+    pub(crate) vibe: Option<chudbot_vibe::VibeRuntime>,
 }
 
 /// Runtime service implementations supplied by the binary crate.
@@ -132,6 +134,8 @@ pub struct BotRuntimeParts<R: BotRuntimeTypes> {
     pub events: R::Events,
     /// User-memory runtime configuration supplied by the config loader.
     pub memory: memory::MemoryConfig,
+    /// Vibe sandbox and disk runtime when enabled.
+    pub vibe: Option<chudbot_vibe::VibeRuntime>,
 }
 
 /// In-memory cancellation registry for currently running turns.
@@ -271,6 +275,7 @@ where
                 config,
                 memory_config: parts.memory,
                 system_agents,
+                vibe: parts.vibe,
             }),
         }
     }

@@ -15,7 +15,7 @@ use tracing::Instrument;
 /// erases those failures into one displayable error so the agent loop can apply
 /// uniform error-result and trace serialization behavior.
 #[derive(Debug)]
-pub(crate) struct RuntimeToolError(String);
+pub(crate) struct RuntimeToolError(pub(super) String);
 
 impl std::fmt::Display for RuntimeToolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -158,6 +158,8 @@ pub(crate) struct RuntimeToolDeps<R: BotRuntimeTypes> {
     pub(crate) platforms: R::Platforms,
     /// Storage implementation used for conversation, usage, memory, and jobs.
     pub(crate) storage: R::Storage,
+    /// LLM registry used by Vibe's isolated coding agent.
+    pub(crate) llms: R::Llms,
     /// Media store used by generation, transcription, and stored-asset tools.
     pub(crate) media_store: R::Media,
     /// Image provider registry used by the configured image-generation binding.
@@ -168,6 +170,21 @@ pub(crate) struct RuntimeToolDeps<R: BotRuntimeTypes> {
     pub(crate) audio: R::Audio,
     /// Per-scope locks shared by persistent video generation tools.
     pub(crate) video_rate_limit_locks: VideoRateLimitLocks,
+}
+
+impl<R: BotRuntimeTypes> Clone for RuntimeToolDeps<R> {
+    fn clone(&self) -> Self {
+        Self {
+            platforms: self.platforms.clone(),
+            storage: self.storage.clone(),
+            llms: self.llms.clone(),
+            media_store: self.media_store.clone(),
+            images: self.images.clone(),
+            videos: self.videos.clone(),
+            audio: self.audio.clone(),
+            video_rate_limit_locks: self.video_rate_limit_locks.clone(),
+        }
+    }
 }
 
 /// Per-turn context captured by tools that interact with the current conversation.
@@ -287,9 +304,9 @@ impl RuntimeMemoryTools {
 /// later persisting trace rows.
 pub(crate) struct RuntimeToolExecutor<R: BotRuntimeTypes> {
     /// Shared service handles used to construct concrete tools.
-    deps: RuntimeToolDeps<R>,
+    pub(super) deps: RuntimeToolDeps<R>,
     /// Conversation and user context captured for this turn.
-    context: RuntimeToolContext,
+    pub(super) context: RuntimeToolContext,
     /// Runtime flags controlling which built-in tools are advertised and accepted.
     enabled: RuntimeToolFlags,
     /// Memory tools, present only when memory is enabled for this run.
@@ -302,6 +319,11 @@ pub(crate) struct RuntimeToolExecutor<R: BotRuntimeTypes> {
     audio_transcription: Option<TranscriptionBinding>,
     /// Configured subagents exposed as additional named client tools.
     subagents: BTreeMap<ToolName, Subagent<RoutedLlmBackend<<R as BotRuntimeTypes>::Llms>, Self>>,
+    /// Vibe coding agents use the isolated workspace executor instead.
+    vibe_subagents: BTreeMap<ToolName, VibeSubagent<R>>,
+    /// Companion Vibe conversation tools when an admitted binding exists.
+    pub(super) vibe: Option<chudbot_vibe::VibeRuntime>,
+    pub(super) vibe_actor_is_admin: bool,
 }
 
 impl<R> std::fmt::Debug for RuntimeToolExecutor<R>
@@ -319,6 +341,7 @@ where
             .field("video_generation", &self.video_generation.is_some())
             .field("audio_transcription", &self.audio_transcription.is_some())
             .field("subagents", &self.subagents)
+            .field("vibe_subagents", &self.vibe_subagents.keys())
             .finish()
     }
 }
@@ -379,6 +402,9 @@ where
             FORGET_USER_MEMORY_TOOL if self.memory_writes_enabled() => {
                 self.forget_user_memory(call).await
             }
+            VIBE_CHECK_NAMES_TOOL if self.vibe.is_some() => self.vibe_check_names(call).await,
+            VIBE_LIST_SITES_TOOL if self.vibe.is_some() => self.vibe_list_sites(call).await,
+            VIBE_MANAGE_TOOL if self.vibe.is_some() => self.vibe_manage(call).await,
             _ => self.execute_subagent_or_unknown(call).await,
         }
     }
@@ -473,6 +499,23 @@ where
         for (name, subagent) in &self.subagents {
             definitions.push(ClientToolDefinition::new(name.clone(), subagent.spec()));
         }
+        for (name, subagent) in &self.vibe_subagents {
+            definitions.push(ClientToolDefinition::new(name.clone(), subagent.spec()));
+        }
+        if self.vibe.is_some() {
+            definitions.push(ClientToolDefinition::new(
+                VIBE_CHECK_NAMES_TOOL,
+                vibe_check_names_spec(),
+            ));
+            definitions.push(ClientToolDefinition::new(
+                VIBE_LIST_SITES_TOOL,
+                vibe_list_sites_spec(),
+            ));
+            definitions.push(ClientToolDefinition::new(
+                VIBE_MANAGE_TOOL,
+                vibe_manage_spec(),
+            ));
+        }
         definitions
     }
 }
@@ -492,6 +535,9 @@ where
             video_generation: None,
             audio_transcription: None,
             subagents: BTreeMap::new(),
+            vibe_subagents: BTreeMap::new(),
+            vibe: None,
+            vibe_actor_is_admin: false,
         }
     }
 
@@ -529,6 +575,12 @@ where
     ) {
         self.subagents
             .insert(name, Subagent::new(description, agent));
+    }
+
+    pub(crate) fn add_vibe_subagent(&mut self, name: ToolName, subagent: VibeSubagent<R>) {
+        self.vibe = Some(subagent.runtime().clone());
+        self.vibe_actor_is_admin = subagent.is_admin();
+        self.vibe_subagents.insert(name, subagent);
     }
 
     // Tool wrappers are built lazily so the executor stores services and flags,
@@ -838,6 +890,9 @@ where
                 .await
                 .map_err(runtime_tool_execution_error);
         }
+        if let Some(subagent) = self.vibe_subagents.get(&call.name) {
+            return Ok(subagent.call(call).await);
+        }
         Err(ClientToolExecutorError::unknown(call.name))
     }
 }
@@ -910,7 +965,7 @@ fn subagent_output_from_run(run: &AgentRun) -> ClientToolOutput {
 }
 
 /// Serialize the nested run summary into one trace payload.
-fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
+pub(super) fn subagent_trace_response(run: &AgentRun) -> serde_json::Value {
     match &run.outcome {
         AgentOutcome::Completed { answer } => serde_json::json!({
             "outcome": "completed",

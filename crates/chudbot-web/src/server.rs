@@ -7,7 +7,8 @@ use std::time::Duration;
 use axum::Router;
 use axum::middleware as axum_middleware;
 use axum::routing::get;
-use chudbot_api::{BotStorage, LlmProviderRegistry, MediaStore};
+use chudbot_api::{BotStorage, LlmProviderRegistry, MediaStore, VibeIdentityProvider, VibeStorage};
+use chudbot_vibe::{VibeConfig, VibeDiskStore};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
@@ -15,14 +16,15 @@ use tokio_util::sync::CancellationToken;
 use crate::events::EventBus;
 use crate::middleware::default_trust_forwarded_for;
 use crate::static_files::StaticFileCache;
-use crate::{api, events, media, middleware, spa, static_files};
+use crate::{api, events, media, middleware, spa, static_files, vibe};
 
 /// Compile-time service types that keep web handlers statically dispatched over
 /// storage, media, and LLM provider services.
 pub trait WebRuntimeTypes: 'static {
-    type Storage: BotStorage + Clone + Send + Sync + 'static;
+    type Storage: BotStorage + VibeStorage + Clone + Send + Sync + 'static;
     type Media: MediaStore + Clone + Send + Sync + 'static;
     type Llms: LlmProviderRegistry + Clone + Send + Sync + 'static;
+    type Identity: VibeIdentityProvider + Clone + Send + Sync + 'static;
 }
 
 /// Concrete dependencies used to run the web service.
@@ -32,6 +34,15 @@ pub struct WebRuntimeParts<R: WebRuntimeTypes> {
     pub llms: R::Llms,
     pub events: EventBus,
     pub config: WebConfig,
+    pub identity: R::Identity,
+    pub vibe: Option<VibeWebParts>,
+}
+
+/// Vibe-specific dependencies enabled on the shared loopback listener.
+#[derive(Debug, Clone)]
+pub struct VibeWebParts {
+    pub config: VibeConfig,
+    pub disk: VibeDiskStore,
 }
 
 /// Runtime controls for the web service.
@@ -56,6 +67,8 @@ pub(crate) struct WebStateInner<R: WebRuntimeTypes> {
     pub(crate) events: EventBus,
     pub(crate) config: WebConfig,
     pub(crate) static_files: StaticFileCache,
+    pub(crate) identity: R::Identity,
+    pub(crate) vibe: Option<vibe::VibeWebState>,
 }
 
 /// Run the web server until the supplied shutdown token is cancelled.
@@ -100,6 +113,8 @@ where
         llms,
         events,
         config,
+        identity,
+        vibe,
     } = parts;
     tracing::debug!(
         frontend_dir = %config.frontend_dir.display(),
@@ -115,6 +130,8 @@ where
             events,
             config,
             static_files: StaticFileCache::new(),
+            identity,
+            vibe: vibe.map(vibe::VibeWebState::new),
         }),
         // Share the caller's service token with long-lived handlers such as SSE
         // streams so they stop when the web service is shutting down.
@@ -196,7 +213,7 @@ where
         )
         .layer(static_files::cache_layer(static_files::CACHE_NO_STORE));
 
-    Router::new()
+    let router = Router::new()
         .merge(api)
         .route("/videos/{name}", get(media::get_video::<R>))
         .route("/audio/{name}", get(media::get_audio::<R>))
@@ -218,7 +235,11 @@ where
             trust_forwarded_for,
             middleware::access_log,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+    router.layer(axum_middleware::from_fn_with_state(
+        state,
+        vibe::host_router::<R>,
+    ))
 }
 
 /// Web server startup error.

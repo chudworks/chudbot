@@ -50,7 +50,7 @@ pub use action::BotAction;
 /// Configuration types used to bind agents, platforms, and media generation.
 pub use config::{
     AgentConfig, BotConfig, BotRunOptions, GenerationBinding, PlatformBinding, PlatformScopeBypass,
-    SubagentBinding, TranscriptionBinding, VideoGenerationRateLimit,
+    SubagentBinding, SubagentToolPolicy, TranscriptionBinding, VideoGenerationRateLimit,
 };
 /// Error type returned by bot runtime operations.
 pub use error::BotError;

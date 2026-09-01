@@ -7,6 +7,7 @@
 #     chudbot              # the installed binary, copied from target/distribute/chudbot
 #     config.toml          # the production config (gitignored in the repo)
 #     frontend-build/      # built React bundle, copied from frontend/dist on deploy
+#     vibe/                 # persistent Vibe bare repositories and build artifacts
 #     images/, videos/     # media storage (per [storage] in config.toml)
 #     avatars/             # cached Discord profile pictures
 #     logs/                # tmux pane output, one file per service
@@ -30,6 +31,8 @@ CHUDBOT_DIR="${CHUDBOT_DIR:-$HOME/chudbot}"
 REPO_DIR="$CHUDBOT_DIR/grok-discord-bot"
 FRONTEND_SRC="$REPO_DIR/frontend"
 FRONTEND_BUILD="$CHUDBOT_DIR/frontend-build"
+VIBE_DATA="$CHUDBOT_DIR/vibe"
+VIBE_SANDBOX_SRC="$REPO_DIR/vibe-sandbox"
 BINARY="$CHUDBOT_DIR/chudbot"
 LOG_DIR="$CHUDBOT_DIR/logs"
 SESSION="chudbot"
@@ -47,6 +50,7 @@ commands:
   status    show whether the session is running, with pids per window
   logs      attach to the session (Ctrl-b d to detach)
   migrate   run \`chudbot migrate\` with the installed binary
+  vibe-purge <name>  permanently purge one Vibe site (operator-only)
 
 env vars:
   CHUDBOT_DIR    deployment root (default: \$HOME/chudbot)
@@ -160,6 +164,38 @@ build_frontend() {
     echo "==> frontend installed to $FRONTEND_BUILD"
 }
 
+build_vibe_sandbox() {
+    if ! command -v docker >/dev/null 2>&1; then
+        echo "error: docker is not on PATH -- Vibe requires the system Docker daemon" >&2
+        exit 1
+    fi
+    if [[ ! -S /var/run/docker.sock ]]; then
+        echo "error: Docker socket not found at /var/run/docker.sock" >&2
+        exit 1
+    fi
+    echo "==> build pinned Vibe sandbox image"
+    docker build --pull --tag chudbot-vibe-sandbox:latest "$VIBE_SANDBOX_SRC"
+    local image_id
+    image_id="$(docker image inspect --format '{{.Id}}' chudbot-vibe-sandbox:latest)"
+    if [[ -z "$image_id" ]]; then
+        echo "error: Vibe sandbox image build produced no inspectable image id" >&2
+        exit 1
+    fi
+    echo "==> Vibe sandbox image: $image_id"
+    mkdir -p "$VIBE_DATA/repos" "$VIBE_DATA/workspaces" "$VIBE_DATA/artifacts"
+    local template_stage="$VIBE_DATA/.template.new"
+    rm -rf "$template_stage"
+    cp -R "$VIBE_SANDBOX_SRC/template" "$template_stage"
+    local template_previous="$VIBE_DATA/.template.old"
+    rm -rf "$template_previous"
+    if [[ -d "$VIBE_DATA/template" ]]; then
+        mv "$VIBE_DATA/template" "$template_previous"
+    fi
+    mv "$template_stage" "$VIBE_DATA/template"
+    rm -rf "$template_previous"
+    echo "==> persistent Vibe data remains at $VIBE_DATA"
+}
+
 cmd_deploy() {
     if [[ ! -d "$REPO_DIR/.git" ]]; then
         echo "error: $REPO_DIR is not a git checkout" >&2
@@ -170,6 +206,7 @@ cmd_deploy() {
     git -C "$REPO_DIR" pull --ff-only
 
     build_frontend
+    build_vibe_sandbox
 
     echo "==> cargo build --locked --profile $PROFILE"
     (cd "$REPO_DIR" && cargo build --locked --profile "$PROFILE" -p chudbot-bin)
@@ -196,6 +233,7 @@ cmd_deploy() {
 
     start_session
     echo "==> deploy complete"
+    echo "==> Vibe remains private only if the DGX firewall and Cloudflare no-cache rule from docs/vibe-operator-runbook.md are active"
 }
 
 cmd_restart() {
@@ -226,6 +264,16 @@ cmd_migrate() {
     (cd "$CHUDBOT_DIR" && "$BINARY" --config "$CHUDBOT_DIR/config.toml" migrate)
 }
 
+cmd_vibe_purge() {
+    ensure_binary
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "error: vibe-purge requires an exact site name" >&2
+        exit 1
+    fi
+    (cd "$CHUDBOT_DIR" && "$BINARY" --config "$CHUDBOT_DIR/config.toml" vibe purge "$name")
+}
+
 case "${1:-}" in
     deploy)         cmd_deploy ;;
     restart)        cmd_restart ;;
@@ -234,6 +282,7 @@ case "${1:-}" in
     status)         cmd_status ;;
     logs)           cmd_logs ;;
     migrate)        cmd_migrate ;;
+    vibe-purge)     cmd_vibe_purge "${2:-}" ;;
     -h|--help|help|"") usage ;;
     *)              echo "unknown command: $1" >&2; usage; exit 1 ;;
 esac

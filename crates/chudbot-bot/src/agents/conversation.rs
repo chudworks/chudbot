@@ -194,23 +194,23 @@ where
         // Seed the executor with per-turn handles. Later blocks only enable
         // feature bits or attach configured bindings; they do not change turn
         // identity.
-        let mut tool_executor = RuntimeToolExecutor::new(
-            RuntimeToolDeps {
-                platforms: self.platforms.clone(),
-                storage: self.storage.clone(),
-                media_store: self.media_store.clone(),
-                images: self.images.clone(),
-                videos: self.videos.clone(),
-                audio: self.audio.clone(),
-                video_rate_limit_locks: self.video_rate_limit_locks.clone(),
-            },
-            RuntimeToolContext::new(
-                context.reply_to.clone(),
-                context.conversation_id,
-                context.turn_id,
-                context.turn_user.clone(),
-            ),
+        let tool_deps = RuntimeToolDeps {
+            platforms: self.platforms.clone(),
+            storage: self.storage.clone(),
+            llms: self.llms.clone(),
+            media_store: self.media_store.clone(),
+            images: self.images.clone(),
+            videos: self.videos.clone(),
+            audio: self.audio.clone(),
+            video_rate_limit_locks: self.video_rate_limit_locks.clone(),
+        };
+        let tool_context = RuntimeToolContext::new(
+            context.reply_to.clone(),
+            context.conversation_id,
+            context.turn_id,
+            context.turn_user.clone(),
         );
+        let mut tool_executor = RuntimeToolExecutor::new(tool_deps.clone(), tool_context.clone());
         // Conversation helpers are available to both top-level agents and
         // subagents. They operate on the same turn context and do not create
         // final reply artifacts.
@@ -297,6 +297,32 @@ where
                 model = %subagent_config.model.id,
                 "attaching subagent tool"
             );
+            if binding.tool_policy == SubagentToolPolicy::VibeCoder {
+                let Some(runtime) = self.vibe.clone() else {
+                    return Err(BotError::InvalidVibeCoder {
+                        agent: subagent_name,
+                        message: "Vibe is disabled in runtime config".into(),
+                    });
+                };
+                let coder = VibeCoderConfig {
+                    provider: subagent_config.provider.clone(),
+                    model: subagent_config.model.clone(),
+                    instructions: self.compose_vibe_coder_instruction_text(subagent_config),
+                    limits: subagent_config.limits.unwrap_or(self.config.limits),
+                };
+                tool_executor.add_vibe_subagent(
+                    tool_name.clone(),
+                    VibeSubagent::new(
+                        binding.description.clone(),
+                        coder,
+                        tool_deps.clone(),
+                        tool_context.clone(),
+                        runtime,
+                        self.is_admin(context.turn_user),
+                    ),
+                );
+                continue;
+            }
             let instructions = self.compose_subagent_agent_instruction_text(subagent_config);
             let nested = self.build_conversation_agent(
                 ConversationAgentAssembly {
@@ -350,6 +376,25 @@ where
             ConversationToolPolicy::new(false, self.agent_memory_enabled(agent)),
             None,
         ))
+    }
+
+    fn compose_vibe_coder_instruction_text(&self, agent: &AgentConfig) -> String {
+        let mut text = String::new();
+        if let Some(policy) = self.config.extra_agent_instructions.as_deref() {
+            text.push_str("Operator policy:\n");
+            text.push_str(policy.trim());
+            text.push_str("\n\n");
+        }
+        text.push_str(agent.instructions.trim());
+        for skill_name in &agent.skills {
+            if let Some(skill) = self.config.skills.get(skill_name) {
+                text.push_str("\n\n[Skill: ");
+                text.push_str(skill_name);
+                text.push_str("]\n");
+                text.push_str(skill.contents.trim());
+            }
+        }
+        text
     }
 
     /// Shared instruction builder for top-level agents and subagents.
@@ -488,6 +533,17 @@ where
         out.push_str("Agent Persona Prompt:\n");
         out.push_str(agent.instructions.trim());
         parts.push(RenderedAgentInstructionPart::new(4, "persona", out));
+        let mut out = String::new();
+        for skill_name in &agent.skills {
+            if let Some(skill) = self.config.skills.get(skill_name) {
+                out.push_str("\n\n[Skill: ");
+                out.push_str(skill_name);
+                out.push_str("]\n");
+                out.push_str(skill.contents.trim());
+                out.push('\n');
+            }
+        }
+        parts.push(RenderedAgentInstructionPart::new(5, "skills", out));
         parts
     }
 

@@ -14,7 +14,8 @@ use chudbot_api::{
     PlatformCommandOptionKind, PlatformCommandResponse, PlatformCommandResponseTarget,
     PlatformCommandValue, PlatformEvent, PlatformMessage, PlatformMessageReference,
     PlatformMessageRelationship, PlatformName, PlatformReaction, PlatformReady, PostedMessage,
-    ReactionKind, SendMessage, UserProfile, UserRef,
+    ReactionKind, SendMessage, UserProfile, UserRef, VibeIdentityProvider, VibeMembership,
+    VibeOauthLogin,
 };
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -164,6 +165,21 @@ impl DiscordPlatform {
     /// Discord bot user id.
     pub fn bot_user_id(&self) -> Id<UserMarker> {
         self.inner.bot_user_id
+    }
+
+    /// Build the identify-only OAuth and guild-membership adapter used by Vibe.
+    pub fn vibe_identity_provider(
+        &self,
+        client_id: impl Into<String>,
+        client_secret: impl Into<String>,
+    ) -> DiscordVibeIdentityProvider {
+        DiscordVibeIdentityProvider {
+            platform: self.inner.platform.clone(),
+            bot_token: self.inner.token.clone(),
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            http: reqwest::Client::new(),
+        }
     }
 
     /// Request a clean Discord Gateway shutdown.
@@ -325,6 +341,178 @@ impl DiscordPlatform {
 
     async fn platform_message(&self, message: Message) -> PlatformMessage {
         platform_message_with_guild(&self.inner.platform, message, None)
+    }
+}
+
+/// Discord's identify-only OAuth flow plus bot-token guild membership checks.
+#[derive(Clone)]
+pub struct DiscordVibeIdentityProvider {
+    platform: PlatformName,
+    bot_token: String,
+    client_id: String,
+    client_secret: String,
+    http: reqwest::Client,
+}
+
+impl std::fmt::Debug for DiscordVibeIdentityProvider {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DiscordVibeIdentityProvider")
+            .field("platform", &self.platform)
+            .field("client_id", &self.client_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiscordOauthTokenResponse {
+    access_token: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiscordOauthUser {
+    id: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiscordMemberResponse {
+    user: DiscordMemberUser,
+    nick: Option<String>,
+    avatar: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiscordMemberUser {
+    id: String,
+    username: String,
+    global_name: Option<String>,
+    avatar: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct DiscordGuildResponse {
+    id: String,
+    name: String,
+}
+
+impl VibeIdentityProvider for DiscordVibeIdentityProvider {
+    type Error = DiscordError;
+
+    fn authorization_url(&self, state: &str, callback_url: &str) -> Result<String, Self::Error> {
+        let mut url = url::Url::parse("https://discord.com/oauth2/authorize")
+            .expect("Discord OAuth URL is static and valid");
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.client_id)
+            .append_pair("response_type", "code")
+            .append_pair("scope", "identify")
+            .append_pair("redirect_uri", callback_url)
+            .append_pair("state", state);
+        Ok(url.into())
+    }
+
+    async fn exchange_code(
+        &self,
+        code: &str,
+        callback_url: &str,
+    ) -> Result<VibeOauthLogin, Self::Error> {
+        let token = self
+            .http
+            .post("https://discord.com/api/v10/oauth2/token")
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("grant_type", "authorization_code"),
+                ("code", code),
+                ("redirect_uri", callback_url),
+            ])
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DiscordOauthTokenResponse>()
+            .await?;
+        let user = self
+            .http
+            .get("https://discord.com/api/v10/users/@me")
+            .bearer_auth(&token.access_token)
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DiscordOauthUser>()
+            .await?;
+        parse_user_id(&ExternalId::new(&user.id))?;
+        Ok(VibeOauthLogin {
+            platform: self.platform.clone(),
+            user_id: ExternalId::new(user.id),
+        })
+    }
+
+    async fn guild_membership(
+        &self,
+        platform: &PlatformName,
+        guild_id: &ExternalId,
+        user_id: &ExternalId,
+    ) -> Result<Option<VibeMembership>, Self::Error> {
+        if platform != &self.platform {
+            return Ok(None);
+        }
+        parse_guild_id(guild_id)?;
+        parse_user_id(user_id)?;
+        let member_response = self
+            .http
+            .get(format!(
+                "https://discord.com/api/v10/guilds/{}/members/{}",
+                guild_id.as_str(),
+                user_id.as_str()
+            ))
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?;
+        if member_response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let member = member_response
+            .error_for_status()?
+            .json::<DiscordMemberResponse>()
+            .await?;
+        let guild = self
+            .http
+            .get(format!(
+                "https://discord.com/api/v10/guilds/{}",
+                guild_id.as_str()
+            ))
+            .header("Authorization", format!("Bot {}", self.bot_token))
+            .send()
+            .await?
+            .error_for_status()?
+            .json::<DiscordGuildResponse>()
+            .await?;
+        let avatar_hash = member.avatar.as_ref().or(member.user.avatar.as_ref());
+        let avatar_url = avatar_hash.map(|hash| {
+            if member.avatar.is_some() {
+                format!(
+                    "https://cdn.discordapp.com/guilds/{}/users/{}/avatars/{}.png?size=128",
+                    guild_id.as_str(),
+                    member.user.id,
+                    hash
+                )
+            } else {
+                format!(
+                    "https://cdn.discordapp.com/avatars/{}/{}.png?size=128",
+                    member.user.id, hash
+                )
+            }
+        });
+        Ok(Some(VibeMembership {
+            user_id: ExternalId::new(member.user.id),
+            username: member.user.username.clone(),
+            display_name: member
+                .nick
+                .or(member.user.global_name)
+                .unwrap_or(member.user.username),
+            avatar_url,
+            guild_id: ExternalId::new(guild.id),
+            guild_display_name: guild.name,
+        }))
     }
 }
 
@@ -732,6 +920,9 @@ pub enum DiscordError {
     /// Discord response body could not be decoded.
     #[error("discord deserialize: {0}")]
     Deserialize(#[from] twilight_http::response::DeserializeBodyError),
+    /// Discord OAuth or bot REST request failed.
+    #[error("discord identity http: {0}")]
+    IdentityHttp(#[from] reqwest::Error),
     /// Platform id was not a valid non-zero Discord snowflake.
     #[error("invalid discord {kind} id `{value}`")]
     InvalidId {

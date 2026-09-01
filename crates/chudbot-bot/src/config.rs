@@ -5,7 +5,8 @@
 //! between named agents, turns agent config into `AgentSpec` values, and keeps
 //! tool-facing descriptions close to the config that enables those tools.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use chudbot_api::{
@@ -34,6 +35,9 @@ pub struct BotConfig {
     pub default_agent: String,
     /// Named agents. An agent may be top-level, subagent-only, or both.
     pub agents: BTreeMap<String, AgentConfig>,
+    /// Named Markdown instruction skills available to agents.
+    #[serde(default)]
+    pub skills: BTreeMap<String, SkillConfig>,
     /// Operator users allowed to retry failed turns and stop/resume
     /// conversations with reactions. A missing `guild_id` applies across the
     /// platform.
@@ -102,9 +106,32 @@ pub struct AgentConfig {
     /// Whether top-level runs for this agent receive user-memory tools.
     #[serde(default)]
     pub memory: bool,
+    /// Named instruction skills appended as labeled prompt content.
+    #[serde(default)]
+    pub skills: Vec<String>,
     /// Subagents exposed as named client-side tools.
     #[serde(default)]
     pub subagents: BTreeMap<ToolName, SubagentBinding>,
+}
+
+/// One configured instruction skill.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillConfig {
+    /// UTF-8 Markdown file, resolved relative to the config file.
+    pub path: PathBuf,
+    /// Loaded at process startup after validation.
+    #[serde(skip)]
+    pub contents: String,
+}
+
+impl BotConfig {
+    /// Load all validated skill files relative to the config directory.
+    pub fn load_skill_contents(&mut self, config_dir: &Path) -> std::io::Result<()> {
+        for skill in self.skills.values_mut() {
+            skill.contents = std::fs::read_to_string(config_dir.join(&skill.path))?;
+        }
+        Ok(())
+    }
 }
 
 /// Platform default binding.
@@ -136,6 +163,17 @@ pub struct SubagentBinding {
     pub agent: String,
     /// Tool description shown to the parent model.
     pub description: String,
+    /// Runtime tool executor policy for the target agent.
+    #[serde(default)]
+    pub tool_policy: SubagentToolPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubagentToolPolicy {
+    #[default]
+    Conversation,
+    VibeCoder,
 }
 
 /// Effective configuration for a reserved system agent.
@@ -440,6 +478,15 @@ impl BotConfig {
         // here so missing names or malformed media/audio bindings fail before
         // the bot starts accepting events.
         for (agent_name, agent) in &self.agents {
+            for skill in &agent.skills {
+                if !self.skills.contains_key(skill) {
+                    tracing::warn!(agent = %agent_name, skill, "agent references missing skill");
+                    return Err(BotError::MissingSkill {
+                        agent: agent_name.clone(),
+                        skill: skill.clone(),
+                    });
+                }
+            }
             if let Some(binding) = &agent.image_generation {
                 validate_generation_binding(agent_name, "image_generation", binding)?;
             }
@@ -461,6 +508,46 @@ impl BotConfig {
                         subagent: binding.agent.clone(),
                     });
                 }
+                if binding.tool_policy == SubagentToolPolicy::VibeCoder {
+                    let target = &self.agents[&binding.agent];
+                    let tools = target
+                        .client_tools
+                        .as_ref()
+                        .map(|tools| tools.iter().map(ToolName::as_str).collect::<BTreeSet<_>>())
+                        .unwrap_or_default();
+                    if tools != BTreeSet::from(["read", "edit", "shell"]) {
+                        return Err(BotError::InvalidVibeCoder {
+                            agent: binding.agent.clone(),
+                            message: "client_tools must be exactly read, edit, and shell".into(),
+                        });
+                    }
+                }
+            }
+        }
+        let vibe_coders = self
+            .agents
+            .values()
+            .flat_map(|agent| agent.subagents.values())
+            .filter(|binding| binding.tool_policy == SubagentToolPolicy::VibeCoder)
+            .map(|binding| binding.agent.as_str())
+            .collect::<BTreeSet<_>>();
+        for name in vibe_coders {
+            let selected_as_conversation = self.default_agent == name
+                || self.platforms.values().any(|binding| binding.agent == name)
+                || self
+                    .agents
+                    .values()
+                    .flat_map(|agent| agent.subagents.values())
+                    .any(|binding| {
+                        binding.agent == name
+                            && binding.tool_policy == SubagentToolPolicy::Conversation
+                    });
+            if selected_as_conversation {
+                return Err(BotError::InvalidVibeCoder {
+                    agent: name.to_string(),
+                    message: "a vibe_coder agent cannot also be used as a conversation agent"
+                        .into(),
+                });
             }
         }
         tracing::info!("bot config validated");

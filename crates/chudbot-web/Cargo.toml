@@ -10,19 +10,24 @@ workspace = true
 
 [dependencies]
 chudbot-api = { path = "../chudbot-api" }
+chudbot-vibe = { path = "../chudbot-vibe" }
 bytes = "1"
 futures.workspace = true
 http-body = "1"
 mime_guess = "2"
 moka.workspace = true
+percent-encoding = "2"
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+time.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+url = "2"
 
 [dependencies.axum]
 version = "0.8"
@@ -32,5 +37,6 @@ version = "0.6"
 features = ["fs", "set-header"]
 
 [dev-dependencies]
+http-body-util = "0.1"
 test-case.workspace = true
 time.workspace = true

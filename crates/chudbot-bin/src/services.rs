@@ -121,6 +121,7 @@ impl WebRuntimeTypes for ConfiguredBotRuntime {
     type Storage = <Self as BotRuntimeTypes>::Storage;
     type Media = <Self as BotRuntimeTypes>::Media;
     type Llms = <Self as BotRuntimeTypes>::Llms;
+    type Identity = ConfiguredMessagePlatforms;
 }
 
 impl BootstrapServices {

@@ -42,9 +42,9 @@ pub(crate) use chudbot_api::{
     ToolInputValueSchema, ToolName, ToolTrace, ToolUseId, Transcript, TranscriptTurn, Turn,
     TurnAsset, TurnId, TurnRole, TurnSnapshot, UpdateVideoJob, UrlMediaRef, UsageCostGrouping,
     UsageCostQuery, UsageCostRow, UsageCostScope, UsageRecord, UserProfile, UserRef,
-    VideoGenerator, VideoGeneratorRegistry, VideoJobId, VideoJobStatus, VideoRequest,
-    agent_instruction_part_turn, agent_instructions_turn, canonical_stored_media_uri,
-    collect_agent_run, is_stored_media_uri, stored_media_uri,
+    VibeIdentityProvider, VibeStorage, VideoGenerator, VideoGeneratorRegistry, VideoJobId,
+    VideoJobStatus, VideoRequest, agent_instruction_part_turn, agent_instructions_turn,
+    canonical_stored_media_uri, collect_agent_run, is_stored_media_uri, stored_media_uri,
 };
 
 /// Error derive used by crate-local error types.

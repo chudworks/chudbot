@@ -29,6 +29,8 @@ use thiserror::Error;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+mod vibe;
+
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("../../migrations");
 
 /// Postgres-backed bot storage.
@@ -2594,6 +2596,9 @@ pub enum SqlxStorageError {
     /// Stored media URI was malformed.
     #[error("invalid media uri: {0}")]
     InvalidMediaUri(String),
+    /// A transactional Vibe precondition failed.
+    #[error("Vibe conflict: {0}")]
+    VibeConflict(String),
 }
 
 struct ToolTraceFields {

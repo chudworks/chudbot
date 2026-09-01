@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 bitflags.workspace = true
 chudbot-api = { path = "../chudbot-api" }
+chudbot-vibe = { path = "../chudbot-vibe" }
 dashmap.workspace = true
 futures.workspace = true
 reqwest.workspace = true
@@ -22,6 +23,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 unicode-properties.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true

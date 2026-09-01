@@ -406,6 +406,7 @@ mod tests {
             video_generation: None,
             audio_transcription: None,
             memory: false,
+            skills: Vec::new(),
             subagents: BTreeMap::new(),
         }
     }

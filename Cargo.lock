@@ -893,6 +893,7 @@ dependencies = [
  "chudbot-openai",
  "chudbot-openai-compat",
  "chudbot-storage-sqlx",
+ "chudbot-vibe",
  "chudbot-web",
  "chudbot-xai",
  "clap",
@@ -916,6 +917,7 @@ dependencies = [
  "async-trait",
  "bitflags",
  "chudbot-api",
+ "chudbot-vibe",
  "dashmap",
  "futures",
  "reqwest",
@@ -928,6 +930,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "unicode-properties",
+ "uuid",
 ]
 
 [[package]]
@@ -935,6 +938,8 @@ name = "chudbot-discord"
 version = "0.1.0"
 dependencies = [
  "chudbot-api",
+ "reqwest",
+ "serde",
  "serde_json",
  "thiserror",
  "time",
@@ -946,6 +951,7 @@ dependencies = [
  "twilight-http",
  "twilight-model",
  "twilight-util",
+ "url",
 ]
 
 [[package]]
@@ -1009,18 +1015,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "chudbot-vibe"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chudbot-api",
+ "serde",
+ "serde_json",
+ "test-case",
+ "thiserror",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "chudbot-web"
 version = "0.1.0"
 dependencies = [
  "axum",
  "bytes",
  "chudbot-api",
+ "chudbot-vibe",
  "futures",
  "http-body 1.1.0",
+ "http-body-util",
  "mime_guess",
  "moka",
+ "percent-encoding",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "test-case",
  "thiserror",
  "time",
@@ -1029,6 +1055,7 @@ dependencies = [
  "tokio-util",
  "tower-http",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -2635,6 +2662,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls 0.26.4",

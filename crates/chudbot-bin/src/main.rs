@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+use chudbot_api::VibeStorage;
 use chudbot_bot::{BotRuntime, BotRuntimeParts};
 use chudbot_storage_sqlx::SqlxStorage;
 use chudbot_web::WebRuntimeParts;
@@ -55,6 +56,17 @@ enum Command {
     Migrate,
     /// Build configured services and run the bot plus web viewer until shutdown.
     Serve,
+    /// Local operator-only Vibe maintenance commands.
+    Vibe {
+        #[command(subcommand)]
+        command: VibeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum VibeCommand {
+    /// Permanently delete one site's database rows, repository, and artifacts.
+    Purge { name: String },
 }
 
 /// Parse CLI input, load the config, and dispatch the selected command.
@@ -123,6 +135,11 @@ async fn run(
             // errors on the span-aware diagnostics path before constructing any
             // runtime services.
             config.validate_all(&source)?;
+            if let Some(vibe) = config.vibe.as_ref().filter(|vibe| vibe.enabled) {
+                chudbot_vibe::VibeSandbox::new(vibe.sandbox.clone())
+                    .check_available()
+                    .await?;
+            }
             init_tracing(&config.logging)?;
             log_start(&config_path, &Command::CheckConfig, &config);
 
@@ -143,7 +160,37 @@ async fn run(
         }
         Command::Migrate => migrate_storage(&config).await,
         Command::Serve => serve(config, source).await,
+        Command::Vibe {
+            command: VibeCommand::Purge { name },
+        } => purge_vibe(&config, &source, &name).await,
     }
+}
+
+async fn purge_vibe(
+    config: &RuntimeConfig,
+    source: &diagnostics::ConfigSource,
+    name: &str,
+) -> Result<(), BinError> {
+    config.validate_all(source)?;
+    let vibe = config.vibe.as_ref().ok_or(BinError::VibeNotConfigured)?;
+    let names = chudbot_vibe::VibeNames::new(vibe.reserved_names.clone());
+    names
+        .validate(name)
+        .map_err(|message| BinError::InvalidVibeSiteName(message.to_string()))?;
+    let storage = SqlxStorage::connect(&config.database.url).await?;
+    let site = storage
+        .find_site_by_name(name)
+        .await?
+        .ok_or_else(|| BinError::VibeSiteNotFound(name.to_string()))?;
+    if site.running_job_id.is_some() {
+        return Err(BinError::VibeSiteBusy(name.to_string()));
+    }
+    let disk =
+        chudbot_vibe::VibeDiskStore::new(vibe.root_dir.clone(), vibe.root_dir.join("template"));
+    storage.purge_site(site.id).await?;
+    disk.purge(site.id).await?;
+    tracing::warn!(site = name, site_id = %site.id, "purged Vibe site database rows, repository, and artifacts");
+    Ok(())
 }
 
 async fn migrate_storage(config: &RuntimeConfig) -> Result<(), BinError> {
@@ -166,9 +213,25 @@ async fn serve(
     // Serve is the full runtime path: validate every static reference before
     // opening durable connections or spawning long-lived tasks.
     config.validate_all(&source)?;
+    config.load_skills(source.path())?;
 
     // Storage is shared by the bot and web viewer.
     let storage = SqlxStorage::connect(&config.database.url).await?;
+    if let Some(vibe) = config.vibe.as_ref().filter(|vibe| vibe.enabled) {
+        let sandbox = chudbot_vibe::VibeSandbox::new(vibe.sandbox.clone());
+        sandbox.check_available().await?;
+        let disk =
+            chudbot_vibe::VibeDiskStore::new(vibe.root_dir.clone(), vibe.root_dir.join("template"));
+        disk.initialize().await?;
+        let removed_containers = sandbox.cleanup_orphaned_containers().await?;
+        disk.clear_workspaces().await?;
+        for site in storage.recover_interrupted_jobs().await? {
+            if let Some(revision) = storage.active_revision(site.id).await? {
+                disk.repair_main(site.id, &revision.commit_oid).await?;
+            }
+        }
+        tracing::info!(root = %vibe.root_dir.display(), removed_containers, "Vibe startup recovery complete");
+    }
 
     // Register the git build once per deployment and expose the monotonic
     // app-version id to bot replies, traces, and viewer UI.
@@ -189,8 +252,13 @@ async fn serve(
 
     // Platforms connect after validation and storage setup so incoming events
     // cannot race ahead of a usable runtime.
+    let vibe_auth = config
+        .vibe
+        .as_ref()
+        .filter(|vibe| vibe.enabled)
+        .map(|vibe| &vibe.auth);
     let (platforms, platform_events) =
-        connect_configured_message_platforms(&config.platforms).await?;
+        connect_configured_message_platforms(&config.platforms, vibe_auth).await?;
     let listen = config
         .web
         .listen
@@ -203,9 +271,23 @@ async fn serve(
     // The web API also needs the LLM registry for model metadata, so keep a
     // clone before moving the concrete registries into the bot.
     let llms = services.llms.clone();
+    let vibe_web = config
+        .vibe
+        .as_ref()
+        .filter(|vibe| vibe.enabled)
+        .map(|vibe| chudbot_web::VibeWebParts {
+            config: vibe.clone(),
+            disk: chudbot_vibe::VibeDiskStore::new(
+                vibe.root_dir.clone(),
+                vibe.root_dir.join("template"),
+            ),
+        });
+    let vibe_runtime = vibe_web
+        .as_ref()
+        .map(|parts| chudbot_vibe::VibeRuntime::new(parts.config.clone(), parts.disk.clone()));
     let bot = BotRuntime::<ConfiguredBotRuntime>::new(
         BotRuntimeParts::<ConfiguredBotRuntime> {
-            platforms,
+            platforms: platforms.clone(),
             storage: storage.clone(),
             media_store: services.media_store.clone(),
             llms: services.llms,
@@ -214,6 +296,7 @@ async fn serve(
             audio: services.audio,
             events: services.events.clone(),
             memory: config.memory,
+            vibe: vibe_runtime,
         },
         config.bot,
     );
@@ -226,6 +309,8 @@ async fn serve(
         llms,
         events: services.events,
         config: services.web,
+        identity: platforms,
+        vibe: vibe_web,
     };
     run_runtime_services(bot, platform_events, web, listen).await
 }

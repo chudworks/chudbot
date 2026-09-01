@@ -42,6 +42,17 @@ pub enum BotError {
         /// Target agent name from the subagent binding.
         subagent: String,
     },
+    /// Agent config references a skill absent from `[bot.skills]`.
+    #[error("agent `{agent}` references missing skill `{skill}`")]
+    MissingSkill {
+        /// Agent that owns the invalid skill reference.
+        agent: String,
+        /// Missing skill name.
+        skill: String,
+    },
+    /// A Vibe coding agent is exposed through an unsafe conversation path.
+    #[error("invalid vibe_coder agent `{agent}`: {message}")]
+    InvalidVibeCoder { agent: String, message: String },
     /// Retry storage result did not include the turn that was requested.
     #[error("retry turn `{turn_id}` was not present in the loaded conversation")]
     MissingRetryTurn {

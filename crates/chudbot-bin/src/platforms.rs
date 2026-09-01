@@ -16,7 +16,7 @@ use chudbot_api::{
     AttachmentCandidate, AttachmentPreflight, ChannelRef, FetchMessages, MessagePlatformEvents,
     MessagePlatformRegistry, MessageRef, PlatformCommandDefinition, PlatformCommandResponse,
     PlatformEvent, PlatformMessage, PlatformMessageRelationship, PostedMessage, ReactionKind,
-    SendMessage, UserProfile,
+    SendMessage, UserProfile, VibeIdentityProvider, VibeMembership, VibeOauthLogin,
 };
 use futures::FutureExt;
 use tokio::task::{JoinError, JoinHandle};
@@ -46,6 +46,8 @@ pub struct ConfiguredMessagePlatformEvents {
 struct ConfiguredMessagePlatformsInner {
     /// Discord adapters keyed by deployment-configured platform name.
     discord: BTreeMap<chudbot_api::PlatformName, ConfiguredDiscordPlatform>,
+    vibe_identity:
+        BTreeMap<chudbot_api::PlatformName, chudbot_discord::DiscordVibeIdentityProvider>,
 }
 
 /// Concrete Discord adapter stored under one configured platform name.
@@ -202,10 +204,12 @@ fn log_event_pump_join_result(platform: &chudbot_api::PlatformName, result: Resu
 )]
 pub async fn connect_configured_message_platforms(
     config: &BTreeMap<chudbot_api::PlatformName, MessagePlatformConfig>,
+    vibe_auth: Option<&chudbot_vibe::config::VibeAuthConfig>,
 ) -> Result<(ConfiguredMessagePlatforms, ConfiguredMessagePlatformEvents), ConfiguredPlatformError>
 {
     let mut inner = ConfiguredMessagePlatformsInner {
         discord: BTreeMap::new(),
+        vibe_identity: BTreeMap::new(),
     };
     let mut event_pumps = Vec::new();
     let (events_tx, events_rx) = tokio::sync::mpsc::channel(256);
@@ -228,6 +232,15 @@ pub async fn connect_configured_message_platforms(
                 let platform =
                     chudbot_discord::DiscordPlatform::connect_named(name.clone(), token.clone())
                         .await?;
+                if let Some(auth) = vibe_auth {
+                    inner.vibe_identity.insert(
+                        name.clone(),
+                        platform.vibe_identity_provider(
+                            auth.client_id.clone(),
+                            auth.client_secret.clone(),
+                        ),
+                    );
+                }
                 tracing::info!(platform = %name, kind = "discord", "registered platform");
                 event_pumps.push(spawn_discord_event_pump(
                     name.clone(),
@@ -250,6 +263,53 @@ pub async fn connect_configured_message_platforms(
         event_pumps,
     };
     Ok((platforms, platform_events))
+}
+
+impl VibeIdentityProvider for ConfiguredMessagePlatforms {
+    type Error = ConfiguredPlatformError;
+
+    fn authorization_url(&self, state: &str, callback_url: &str) -> Result<String, Self::Error> {
+        self.primary_vibe_identity()
+            .ok_or(ConfiguredPlatformError::MissingVibeIdentity)?
+            .authorization_url(state, callback_url)
+            .map_err(ConfiguredPlatformError::Discord)
+    }
+
+    async fn exchange_code(
+        &self,
+        code: &str,
+        callback_url: &str,
+    ) -> Result<VibeOauthLogin, Self::Error> {
+        self.primary_vibe_identity()
+            .ok_or(ConfiguredPlatformError::MissingVibeIdentity)?
+            .exchange_code(code, callback_url)
+            .await
+            .map_err(ConfiguredPlatformError::Discord)
+    }
+
+    async fn guild_membership(
+        &self,
+        platform: &chudbot_api::PlatformName,
+        guild_id: &chudbot_api::ExternalId,
+        user_id: &chudbot_api::ExternalId,
+    ) -> Result<Option<VibeMembership>, Self::Error> {
+        self.inner
+            .vibe_identity
+            .get(platform)
+            .ok_or(ConfiguredPlatformError::MissingVibeIdentity)?
+            .guild_membership(platform, guild_id, user_id)
+            .await
+            .map_err(ConfiguredPlatformError::Discord)
+    }
+}
+
+impl ConfiguredMessagePlatforms {
+    fn primary_vibe_identity(&self) -> Option<&chudbot_discord::DiscordVibeIdentityProvider> {
+        self.inner
+            .vibe_identity
+            .get(&chudbot_api::PlatformName::new("discord"))
+            .or_else(|| self.inner.vibe_identity.values().next())
+    }
 }
 
 impl ConfiguredMessagePlatforms {

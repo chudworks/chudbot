@@ -120,6 +120,9 @@ pub enum ConfiguredPlatformError {
     /// All platform event pump senders closed before another event arrived.
     #[error("all message platform event streams are closed")]
     EventsClosed,
+    /// Vibe was enabled without a configured Discord identity adapter.
+    #[error("no Discord identity provider is configured for Vibe")]
+    MissingVibeIdentity,
     /// A spawned platform event pump panicked and was converted into an error event.
     #[error("message platform `{platform}` event pump panicked: {message}")]
     EventPumpPanic {
@@ -154,6 +157,12 @@ pub enum BinError {
     /// Postgres storage setup, migrations, or runtime operation failed.
     #[error(transparent)]
     Storage(#[from] chudbot_storage_sqlx::SqlxStorageError),
+    /// Vibe disk, Git, or sandbox setup failed.
+    #[error(transparent)]
+    Vibe(#[from] chudbot_vibe::VibeError),
+    /// A validated skill file changed or became unreadable before startup.
+    #[error("could not load agent skill: {0}")]
+    SkillLoad(#[from] std::io::Error),
     /// Message platform setup or runtime dispatch failed.
     #[error(transparent)]
     Platform(#[from] ConfiguredPlatformError),
@@ -183,6 +192,18 @@ pub enum BinError {
     /// Database URL was omitted for a command that needs Postgres.
     #[error("database.url must not be empty")]
     MissingDatabaseUrl,
+    /// Vibe maintenance was requested without a `[vibe]` section.
+    #[error("Vibe is not configured")]
+    VibeNotConfigured,
+    /// Operator supplied an invalid Vibe DNS label.
+    #[error("invalid Vibe site name: {0}")]
+    InvalidVibeSiteName(String),
+    /// Operator purge target does not exist.
+    #[error("Vibe site `{0}` was not found")]
+    VibeSiteNotFound(String),
+    /// A running job prevents purge.
+    #[error("Vibe site `{0}` has a running job and cannot be purged")]
+    VibeSiteBusy(String),
     /// Web listen address could not be parsed into a socket address.
     #[error("invalid web listen address: {0}")]
     Listen(#[from] std::net::AddrParseError),

@@ -4,6 +4,7 @@ import { BrowserRouter, Route, Routes } from 'react-router-dom';
 import App from './App';
 import Landing from './components/Landing';
 import ConversationView from './components/ConversationView';
+import VibeSource from './components/VibeSource';
 import './styles/main.scss';
 
 const root = document.getElementById('root');
@@ -18,6 +19,7 @@ createRoot(root).render(
         <Route path="/" element={<App />}>
           <Route index element={<Landing />} />
           <Route path="c/:id" element={<ConversationView />} />
+          <Route path="sites/:name" element={<VibeSource />} />
         </Route>
       </Routes>
     </BrowserRouter>

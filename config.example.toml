@@ -64,6 +64,43 @@ guild_icons_dir = "guild-icons"
 # is omitted, the runtime falls back to [bot].web_base_url.
 public_base_url = "http://localhost:1860"
 
+# Vibe sites are stored under this persistent directory, served only through
+# the loopback web listener, and built in the locally managed Docker image.
+[vibe]
+enabled = true
+base_domain = "vibe.example"
+root_dir = "vibe"
+reserved_names = ["www", "api", "admin", "static", "status", "mail"]
+
+[vibe.access]
+admins_only = false
+allowed_guilds = [
+  { platform = "discord", guild_id = "123456789012345678" },
+]
+
+[vibe.auth]
+client_id = "123456789012345678"
+client_secret = "DISCORD_OAUTH_CLIENT_SECRET"
+session_days = 7
+
+[vibe.sandbox]
+docker_socket = "/var/run/docker.sock"
+image = "chudbot-vibe-sandbox:latest"
+job_timeout_seconds = 900
+command_timeout_seconds = 60
+build_timeout_seconds = 300
+max_repair_attempts = 2
+memory_mebibytes = 1024
+cpus = 2
+pids = 256
+
+[vibe.limits]
+max_source_files = 2000
+max_file_bytes = 10485760
+max_source_bytes = 52428800
+max_artifact_bytes = 52428800
+max_running_jobs_per_guild = 2
+
 # S3-compatible media storage. The stored URIs still use the same
 # media://images/<name> shape; only the configured backend changes where bytes
 # are persisted and loaded. Credentials are loaded by the AWS SDK, so set
@@ -143,6 +180,12 @@ limits = { max_iterations = 8, max_model_step_output_tokens = 4096, text_generat
 # Discord soft-wrap rows.
 thread_threshold_chars = 1500
 thread_threshold_lines = 20
+
+[bot.skills.vibe]
+path = "skills/vibe.md"
+
+[bot.skills.vibe_conversation]
+path = "skills/vibe-conversation.md"
 
 [bot.platforms.discord]
 # Default agent for this message platform. Platform bindings are optional; when
@@ -278,6 +321,7 @@ would materially improve the answer.
 # server_tools = ["web_search", "x_search"]
 # client_tools = ["fetch_messages", "generate_image", "generate_video", "transcribe_audio", "read", "stat", "public_url", "attach", "post_status_message", "add_reaction", "usage_report", "lookup_user_memory", "remember_user_memory", "forget_user_memory"]
 memory = true
+skills = ["vibe_conversation"]
 limits = { max_iterations = 8 }
 
 [bot.agents.default.model]
@@ -293,6 +337,20 @@ top_p = 0.95
 
 [bot.agents.default.model.provider_options]
 value = { reasoning_effort = "high" }
+
+[bot.agents.vibe_coder]
+provider = "grok"
+skills = ["vibe"]
+client_tools = ["read", "edit", "shell"]
+limits = { max_iterations = 150, text_generation_timeout_seconds = 300 }
+instructions = """
+You build small, polished React + TypeScript + Vite + SCSS websites. Work only
+inside /workspace. Inspect before editing, run the build, and finish with a
+short factual summary. Chudbot commits and deploys after you stop.
+"""
+
+[bot.agents.vibe_coder.model]
+id = "grok-4.3"
 
 [bot.agents.default.image_generation]
 provider = "grok_images"
@@ -460,6 +518,11 @@ temperature = 0.4
 [bot.agents.default.subagents.research_helper]
 agent = "research"
 description = "Ask a focused research subagent to gather facts and return a concise summary."
+
+[bot.agents.default.subagents.vibe]
+agent = "vibe_coder"
+tool_policy = "vibe_coder"
+description = "Create or change a Vibe website and deploy it."
 
 # Example local agent for an OpenAI-compatible Chat Completions provider.
 # [bot.agents.local]

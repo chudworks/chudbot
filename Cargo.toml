@@ -29,6 +29,7 @@ base64 = "0.22"
 futures = "0.3"
 dashmap = "6"
 moka = { version = "0.12", features = ["future"] }
+sha2 = "0.10"
 
 [workspace.dependencies.unicode-properties]
 version = "0.1"
@@ -37,7 +38,7 @@ features = ["emoji"]
 
 [workspace.dependencies.tokio]
 version = "1"
-features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util"]
+features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time", "fs", "io-util", "process"]
 
 [workspace.dependencies.tokio-util]
 version = "0.7"
@@ -50,7 +51,7 @@ features = ["sync"]
 [workspace.dependencies.reqwest]
 version = "0.13"
 default-features = false
-features = ["json", "rustls", "http2", "multipart", "stream"]
+features = ["json", "rustls", "http2", "multipart", "stream", "form"]
 
 [workspace.dependencies.serde]
 version = "1"

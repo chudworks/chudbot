@@ -24,6 +24,37 @@
     --system: #c98add;
 }
 
+.vibe-source,
+.vibe-source-state {
+  width: min(1440px, calc(100% - 2rem));
+  margin: 0 auto;
+  padding: 2rem 0 5rem;
+}
+
+.vibe-source__header {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 2rem;
+  padding-bottom: 1.5rem;
+  border-bottom: 1px solid var(--border-color, #30343b);
+}
+
+.vibe-source__header h1 { margin: 0; font-size: clamp(2.5rem, 7vw, 5.5rem); }
+.vibe-source__eyebrow { margin: 0 0 .35rem; color: #8d9cff; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; }
+.vibe-source__layout { display: grid; grid-template-columns: minmax(220px, 320px) minmax(0, 1fr); gap: 2rem; padding-top: 2rem; }
+.vibe-source__history, .vibe-source__files { padding: 0; list-style: none; }
+.vibe-source__history li { display: grid; gap: .25rem; padding: .8rem 0; border-bottom: 1px solid var(--border-color, #30343b); }
+.vibe-source__history small { opacity: .65; }
+.vibe-source__content { min-width: 0; }
+.vibe-source__content pre { max-height: 75vh; overflow: auto; padding: 1.25rem; border: 1px solid var(--border-color, #30343b); border-radius: .5rem; background: #101217; white-space: pre; }
+.vibe-source__files li { padding: .35rem 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+@media (max-width: 760px) {
+  .vibe-source__header { align-items: start; flex-direction: column; }
+  .vibe-source__layout { grid-template-columns: 1fr; }
+}
+
 @media (prefers-color-scheme: light) {
     :root {
         --fg: #1a1a1a;

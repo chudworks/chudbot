@@ -1316,6 +1316,7 @@ fn test_agent_config(provider: &str, model: &str) -> AgentConfig {
         video_generation: None,
         audio_transcription: None,
         memory: false,
+        skills: Vec::new(),
         subagents: BTreeMap::new(),
     }
 }
@@ -1330,6 +1331,7 @@ fn test_bot_config() -> BotConfig {
         web_base_url: "http://localhost:3000".to_string(),
         default_agent: "assistant".to_string(),
         agents,
+        skills: BTreeMap::new(),
         admins: Vec::new(),
         platforms: BTreeMap::new(),
         extra_agent_instructions: None,
@@ -1932,7 +1934,7 @@ fn agent_instruction_part_update_text_is_used_for_existing_part_updates() {
 
     let inserted = insert_agent_instruction_part_changes_before_current_turn(
         &mut first_version_marker,
-        &[version_v1.clone()],
+        std::slice::from_ref(&version_v1),
         StoredAgentInstructionState::LabeledParts(&previous_without_version),
         TurnId::new(),
     );
@@ -1955,7 +1957,7 @@ fn agent_instruction_part_update_text_is_used_for_existing_part_updates() {
 
     let inserted = insert_agent_instruction_part_changes_before_current_turn(
         &mut updated_version_marker,
-        &[version_v2.clone()],
+        std::slice::from_ref(&version_v2),
         StoredAgentInstructionState::LabeledParts(&previous_with_version),
         TurnId::new(),
     );

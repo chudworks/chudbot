@@ -8,19 +8,20 @@ import { useSiteConfig } from './title';
 // view can size its title bar freely. The version footer lives here so
 // it shows on every page.
 export default function App() {
+  const vibeSource = window.location.hostname.startsWith('src.');
   // Pull the server config once, up front. Every page's `usePageTitle`
   // reads the title prefix from the same store; the footer reads the
   // build version from it.
   const loadConfig = useSiteConfig((s) => s.load);
   const version = useSiteConfig((s) => s.version);
   useEffect(() => {
-    void loadConfig();
-  }, [loadConfig]);
+    if (!vibeSource) void loadConfig();
+  }, [loadConfig, vibeSource]);
 
   return (
     <div className="app">
       <Outlet />
-      {version != null && (
+      {!vibeSource && version != null && (
         <footer className="app-footer">
           <span>{version}</span>
         </footer>

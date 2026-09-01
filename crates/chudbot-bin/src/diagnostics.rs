@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use chudbot_api::{AgentLimits, ProviderName, SamplingNumber};
-use chudbot_bot::{GenerationBinding, TranscriptionBinding, VideoGenerationRateLimit};
+use chudbot_bot::{
+    GenerationBinding, SubagentToolPolicy, TranscriptionBinding, VideoGenerationRateLimit,
+};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
@@ -692,6 +694,7 @@ const ROOT_KEYS: &[&str] = &[
     "platforms",
     "web",
     "storage",
+    "vibe",
 ];
 const DATABASE_KEYS: &[&str] = &["url"];
 const LOGGING_KEYS: &[&str] = &["filter", "format", "ansi"];
@@ -739,6 +742,7 @@ const BOT_KEYS: &[&str] = &[
     "web_base_url",
     "default_agent",
     "agents",
+    "skills",
     "admins",
     "platforms",
     "extra_agent_instructions",
@@ -766,7 +770,40 @@ const AGENT_KEYS: &[&str] = &[
     "video_generation",
     "audio_transcription",
     "memory",
+    "skills",
     "subagents",
+];
+const SKILL_KEYS: &[&str] = &["path"];
+const VIBE_KEYS: &[&str] = &[
+    "enabled",
+    "base_domain",
+    "root_dir",
+    "reserved_names",
+    "access",
+    "auth",
+    "sandbox",
+    "limits",
+];
+const VIBE_ACCESS_KEYS: &[&str] = &["admins_only", "allowed_guilds"];
+const VIBE_ALLOWED_GUILD_KEYS: &[&str] = &["platform", "guild_id"];
+const VIBE_AUTH_KEYS: &[&str] = &["client_id", "client_secret", "session_days"];
+const VIBE_SANDBOX_KEYS: &[&str] = &[
+    "docker_socket",
+    "image",
+    "job_timeout_seconds",
+    "command_timeout_seconds",
+    "build_timeout_seconds",
+    "max_repair_attempts",
+    "memory_mebibytes",
+    "cpus",
+    "pids",
+];
+const VIBE_LIMIT_KEYS: &[&str] = &[
+    "max_source_files",
+    "max_file_bytes",
+    "max_source_bytes",
+    "max_artifact_bytes",
+    "max_running_jobs_per_guild",
 ];
 const MODEL_KEYS: &[&str] = &[
     "id",
@@ -787,7 +824,7 @@ const GENERATION_BINDING_KEYS: &[&str] = &[
 const TRANSCRIPTION_BINDING_KEYS: &[&str] = &["provider", "model", "wake_word"];
 const RATE_LIMIT_KEYS: &[&str] = &["limit", "interval", "bypass_scopes"];
 const PLATFORM_SCOPE_BYPASS_KEYS: &[&str] = &["platform", "scope_id"];
-const SUBAGENT_BINDING_KEYS: &[&str] = &["agent", "description"];
+const SUBAGENT_BINDING_KEYS: &[&str] = &["agent", "description", "tool_policy"];
 const LLM_XAI_KEYS: &[&str] = &["kind", "api_key", "base_url", "dump_dir", "model_info"];
 const LLM_OPENAI_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing", "model_info"];
 const LLM_ANTHROPIC_KEYS: &[&str] = &["kind", "api_key", "base_url", "pricing", "model_info"];
@@ -846,6 +883,7 @@ pub(crate) fn validate_runtime_config(
     validate_memory_durations(config, source, &mut diagnostics);
     validate_runtime_references(config, source, &mut diagnostics);
     validate_web(config, source, &mut diagnostics);
+    validate_vibe(config, source, &mut diagnostics);
 
     if diagnostics.is_empty() {
         Ok(())
@@ -879,6 +917,36 @@ fn validate_unexpected_keys(
         }
     }
     validate_known_keys(source, diagnostics, &[key("memory")], MEMORY_KEYS);
+    if config.vibe.is_some() {
+        let vibe_path = [key("vibe")];
+        validate_known_keys(source, diagnostics, &vibe_path, VIBE_KEYS);
+        let access_path = child_path(&vibe_path, "access");
+        validate_known_keys(source, diagnostics, &access_path, VIBE_ACCESS_KEYS);
+        validate_array_item_keys(
+            source,
+            diagnostics,
+            &child_path(&access_path, "allowed_guilds"),
+            VIBE_ALLOWED_GUILD_KEYS,
+        );
+        validate_known_keys(
+            source,
+            diagnostics,
+            &child_path(&vibe_path, "auth"),
+            VIBE_AUTH_KEYS,
+        );
+        validate_known_keys(
+            source,
+            diagnostics,
+            &child_path(&vibe_path, "sandbox"),
+            VIBE_SANDBOX_KEYS,
+        );
+        validate_known_keys(
+            source,
+            diagnostics,
+            &child_path(&vibe_path, "limits"),
+            VIBE_LIMIT_KEYS,
+        );
+    }
     validate_bot_unexpected_keys(config, source, diagnostics);
     validate_runtime_provider_unexpected_keys(config, source, diagnostics);
 }
@@ -907,6 +975,12 @@ fn validate_bot_unexpected_keys(
         diagnostics,
         &child_path(&bot_path, "platforms"),
         PLATFORM_BINDING_KEYS,
+    );
+    validate_map_entry_keys(
+        source,
+        diagnostics,
+        &child_path(&bot_path, "skills"),
+        SKILL_KEYS,
     );
 
     let agents_path = child_path(&bot_path, "agents");
@@ -1699,6 +1773,26 @@ fn validate_bot_config(
     }
 
     for (agent_name, agent) in &config.bot.agents {
+        for (skill_index, skill) in agent.skills.iter().enumerate() {
+            if !config.bot.skills.contains_key(skill) {
+                diagnostics.push(
+                    ConfigDiagnostic::new(format!(
+                        "agent `{agent_name}` references unknown skill `{skill}`"
+                    ))
+                    .with_label(source.primary_label(
+                        &[
+                            key("bot"),
+                            key("agents"),
+                            key(agent_name),
+                            key("skills"),
+                            index(skill_index),
+                        ],
+                        &[key("bot"), key("agents"), key(agent_name)],
+                        "unknown skill referenced here",
+                    )),
+                );
+            }
+        }
         if let Some(limits) = &agent.limits {
             validate_agent_limits(
                 source,
@@ -1775,6 +1869,54 @@ fn validate_bot_config(
                     )),
                 );
             }
+            if binding.tool_policy == SubagentToolPolicy::VibeCoder
+                && let Some(target) = config.bot.agents.get(&binding.agent)
+            {
+                let tools = target
+                    .client_tools
+                    .as_ref()
+                    .map(|tools| {
+                        tools
+                            .iter()
+                            .map(|tool| tool.as_str())
+                            .collect::<BTreeSet<_>>()
+                    })
+                    .unwrap_or_default();
+                if tools != BTreeSet::from(["read", "edit", "shell"]) {
+                    diagnostics.push(ConfigDiagnostic::new(format!(
+                        "vibe_coder agent `{}` must set client_tools to exactly read, edit, and shell",
+                        binding.agent
+                    )));
+                }
+            }
+        }
+    }
+
+    let vibe_coders = config
+        .bot
+        .agents
+        .values()
+        .flat_map(|agent| agent.subagents.values())
+        .filter(|binding| binding.tool_policy == SubagentToolPolicy::VibeCoder)
+        .map(|binding| binding.agent.as_str())
+        .collect::<BTreeSet<_>>();
+    for coder in vibe_coders {
+        let conversation_use = config.bot.default_agent == coder
+            || config
+                .bot
+                .platforms
+                .values()
+                .any(|binding| binding.agent == coder)
+            || config.bot.agents.values().any(|agent| {
+                agent.subagents.values().any(|binding| {
+                    binding.agent == coder
+                        && binding.tool_policy == SubagentToolPolicy::Conversation
+                })
+            });
+        if conversation_use {
+            diagnostics.push(ConfigDiagnostic::new(format!(
+                "vibe_coder agent `{coder}` cannot also be used as a conversation agent"
+            )));
         }
     }
 }
@@ -2307,6 +2449,179 @@ fn missing_provider_diagnostic(
         ))
 }
 
+fn validate_vibe(
+    config: &RuntimeConfig,
+    source: &ConfigSource,
+    diagnostics: &mut Vec<ConfigDiagnostic>,
+) {
+    let config_dir = source.path().parent().unwrap_or_else(|| Path::new("."));
+    for (name, skill) in &config.bot.skills {
+        let path = config_dir.join(&skill.path);
+        match std::fs::read(&path) {
+            Ok(bytes) if bytes.len() > 64 * 1024 => diagnostics.push(
+                ConfigDiagnostic::new(format!("skill `{name}` exceeds 64 KiB")).with_label(
+                    source.primary_label(
+                        &[key("bot"), key("skills"), key(name), key("path")],
+                        &[key("bot"), key("skills"), key(name)],
+                        "skill file is too large",
+                    ),
+                ),
+            ),
+            Ok(bytes) if std::str::from_utf8(&bytes).is_err() => diagnostics.push(
+                ConfigDiagnostic::new(format!("skill `{name}` is not UTF-8")).with_label(
+                    source.primary_label(
+                        &[key("bot"), key("skills"), key(name), key("path")],
+                        &[key("bot"), key("skills"), key(name)],
+                        "skill must be UTF-8 Markdown",
+                    ),
+                ),
+            ),
+            Ok(_) => {}
+            Err(error) => diagnostics.push(
+                ConfigDiagnostic::new(format!("skill `{name}` cannot be read"))
+                    .with_label(source.primary_label(
+                        &[key("bot"), key("skills"), key(name), key("path")],
+                        &[key("bot"), key("skills"), key(name)],
+                        "missing or unreadable skill file",
+                    ))
+                    .with_note(error.to_string()),
+            ),
+        }
+    }
+
+    let Some(vibe) = config.vibe.as_ref() else {
+        return;
+    };
+    if !vibe.enabled {
+        return;
+    }
+    for (address_index, address) in config.web.listen.addresses().iter().enumerate() {
+        if let Ok(address) = SocketAddr::from_str(address)
+            && !address.ip().is_loopback()
+        {
+            let listen_path = [key("web"), key("listen")];
+            let address_path = if config.web.listen.is_multiple() {
+                indexed_path(&listen_path, address_index)
+            } else {
+                listen_path.to_vec()
+            };
+            diagnostics.push(
+                ConfigDiagnostic::new("Vibe requires every web listener to be loopback-only")
+                    .with_label(source.primary_label(
+                        &address_path,
+                        &listen_path,
+                        "public listener is unsafe for Vibe",
+                    ))
+                    .with_help(
+                        "bind to 127.0.0.1 or ::1 and expose Vibe only through the Cloudflare Tunnel",
+                    ),
+            );
+        }
+    }
+    if vibe.base_domain.trim().is_empty()
+        || vibe.base_domain.contains('/')
+        || vibe.base_domain.contains(':')
+        || vibe.base_domain != vibe.base_domain.to_ascii_lowercase()
+        || vibe.base_domain.split('.').count() < 2
+        || vibe.base_domain.split('.').any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+    {
+        diagnostics.push(ConfigDiagnostic::new(
+            "vibe.base_domain must be a bare DNS name",
+        ));
+    }
+    if vibe.sandbox.image.trim().is_empty() {
+        diagnostics.push(ConfigDiagnostic::new(
+            "vibe.sandbox.image must not be empty",
+        ));
+    }
+    let root_text = vibe.root_dir.as_os_str().to_string_lossy();
+    if root_text.is_empty()
+        || matches!(root_text.as_ref(), "/" | "." | "..")
+        || vibe
+            .root_dir
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        diagnostics.push(ConfigDiagnostic::new(
+            "vibe.root_dir must be a dedicated non-root directory without parent traversal",
+        ));
+    }
+    if vibe.auth.session_days == 0 {
+        diagnostics.push(ConfigDiagnostic::new(
+            "vibe.auth.session_days must be greater than zero",
+        ));
+    }
+    if vibe.sandbox.job_timeout_seconds == 0
+        || vibe.sandbox.command_timeout_seconds == 0
+        || vibe.sandbox.build_timeout_seconds == 0
+        || vibe.sandbox.memory_mebibytes == 0
+        || vibe.sandbox.cpus == 0
+        || vibe.sandbox.pids == 0
+    {
+        diagnostics.push(ConfigDiagnostic::new(
+            "Vibe sandbox time and resource limits must all be greater than zero",
+        ));
+    }
+    if vibe.limits.max_source_files == 0
+        || vibe.limits.max_file_bytes == 0
+        || vibe.limits.max_source_bytes == 0
+        || vibe.limits.max_artifact_bytes == 0
+        || vibe.limits.max_running_jobs_per_guild == 0
+    {
+        diagnostics.push(ConfigDiagnostic::new(
+            "Vibe source, artifact, and concurrency limits must all be greater than zero",
+        ));
+    }
+    if vibe.auth.client_id.trim().is_empty() || vibe.auth.client_secret.trim().is_empty() {
+        diagnostics.push(ConfigDiagnostic::new(
+            "vibe.auth client_id and client_secret must not be empty",
+        ));
+    }
+    if vibe
+        .auth
+        .client_id
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .is_none()
+    {
+        diagnostics.push(ConfigDiagnostic::new(
+            "vibe.auth.client_id must be a non-zero Discord id string",
+        ));
+    }
+    for allowed in &vibe.access.allowed_guilds {
+        if !config.platforms.contains_key(&allowed.platform) {
+            diagnostics.push(ConfigDiagnostic::new(format!(
+                "Vibe allowed guild references unconfigured platform `{}`",
+                allowed.platform
+            )));
+        }
+        if matches!(
+            config.platforms.get(&allowed.platform),
+            Some(MessagePlatformConfig::Discord { .. })
+        ) && allowed
+            .guild_id
+            .as_str()
+            .parse::<u64>()
+            .ok()
+            .filter(|id| *id > 0)
+            .is_none()
+        {
+            diagnostics.push(ConfigDiagnostic::new(format!(
+                "Vibe allowed guild `{}` is not a non-zero Discord id string",
+                allowed.guild_id
+            )));
+        }
+    }
+}
+
 fn validate_web(
     config: &RuntimeConfig,
     source: &ConfigSource,
@@ -2582,6 +2897,63 @@ token = "token"
         let config = toml::from_str::<RuntimeConfig>(input).unwrap();
         let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.to_string());
         (input, config, source)
+    }
+
+    #[test]
+    fn vibe_config_reports_loopback_skill_id_and_coder_policy_errors() {
+        let input = r#"
+[database]
+url="postgres://localhost/chudbot"
+[web]
+listen="0.0.0.0:1860"
+title_prefix="Chudbot"
+frontend_dir="frontend-build"
+[bot]
+web_base_url="http://localhost:1860"
+default_agent="default"
+[bot.platforms.discord]
+agent="default"
+[bot.agents.default]
+provider="grok"
+instructions="hi"
+skills=["missing"]
+[bot.agents.default.model]
+id="grok-4.3"
+[bot.agents.default.subagents.vibe]
+agent="vibe_coder"
+description="Vibe"
+tool_policy="vibe_coder"
+[bot.agents.vibe_coder]
+provider="grok"
+instructions="code"
+client_tools=["read"]
+[bot.agents.vibe_coder.model]
+id="grok-4.3"
+[llm.grok]
+kind="xai"
+api_key="test"
+[platforms.discord]
+kind="discord"
+token="test"
+[vibe]
+enabled=true
+base_domain="vibe.example"
+root_dir="vibe"
+[vibe.access]
+allowed_guilds=[{platform="discord",guild_id="bad"}]
+[vibe.auth]
+client_id="1"
+client_secret="secret"
+"#;
+        let config = toml::from_str::<RuntimeConfig>(input).unwrap();
+        let source = ConfigSource::new(PathBuf::from("config.test.toml"), input.into());
+        let rendered = validate_runtime_config(&config, &source)
+            .unwrap_err()
+            .render();
+        assert!(rendered.contains("loopback-only"));
+        assert!(rendered.contains("unknown skill `missing`"));
+        assert!(rendered.contains("exactly read, edit, and shell"));
+        assert!(rendered.contains("not a non-zero Discord id"));
     }
 
     #[test]

@@ -9,11 +9,13 @@ mod media;
 mod middleware;
 mod spa;
 mod static_files;
+mod vibe;
 
 pub use api::{
     ClientToolTraceView, ConversationView, ModelInfoView, ToolTraceView, TurnView, UserMetadata,
 };
 pub use events::EventBus;
 pub use server::{
-    WebConfig, WebRunOptions, WebRuntimeParts, WebRuntimeTypes, WebServerError, run_until_shutdown,
+    VibeWebParts, WebConfig, WebRunOptions, WebRuntimeParts, WebRuntimeTypes, WebServerError,
+    run_until_shutdown,
 };

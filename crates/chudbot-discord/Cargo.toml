@@ -11,11 +11,14 @@ workspace = true
 [dependencies]
 chudbot-api = { path = "../chudbot-api" }
 serde_json.workspace = true
+reqwest.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
+url = "2"
 
 [dependencies.twilight-gateway]
 version = "0.17"
