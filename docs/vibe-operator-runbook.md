@@ -92,6 +92,10 @@ firewall commands. The deployment uses the system Docker daemon at
 2. Copy the `[vibe]` example into the production config. Set the intended
    Discord guild string ids, rollout switches, OAuth credentials, and keep
    `docker_socket = "/var/run/docker.sock"`.
+   Also copy both `[bot.skills.vibe]` and `[bot.skills.vibe_conversation]`
+   tables plus the `vibe_coder` agent/binding from `config.example.toml`.
+   `serve.sh deploy` installs the referenced Markdown files atomically into
+   `$CHUDBOT_DIR/skills` before `check-config` runs.
 3. Build the exact local sandbox image, build the new binary, and run its
    config check before stopping the installed service:
 

@@ -6,6 +6,7 @@
 #     grok-discord-bot/    # this repo (a checkout, kept up to date with `git pull`)
 #     chudbot              # the installed binary, copied from target/distribute/chudbot
 #     config.toml          # the production config (gitignored in the repo)
+#     skills/              # installed Vibe instruction skills referenced by config
 #     frontend-build/      # built React bundle, copied from frontend/dist on deploy
 #     vibe/                 # persistent Vibe bare repositories and build artifacts
 #     images/, videos/     # media storage (per [storage] in config.toml)
@@ -33,6 +34,8 @@ FRONTEND_SRC="$REPO_DIR/frontend"
 FRONTEND_BUILD="$CHUDBOT_DIR/frontend-build"
 VIBE_DATA="$CHUDBOT_DIR/vibe"
 VIBE_SANDBOX_SRC="$REPO_DIR/vibe-sandbox"
+VIBE_SKILL_SRC="$REPO_DIR/skills"
+SKILL_DIR="$CHUDBOT_DIR/skills"
 BINARY="$CHUDBOT_DIR/chudbot"
 LOG_DIR="$CHUDBOT_DIR/logs"
 SESSION="chudbot"
@@ -193,6 +196,22 @@ build_vibe_sandbox() {
     fi
     mv "$template_stage" "$VIBE_DATA/template"
     rm -rf "$template_previous"
+
+    # Config lives one directory above the repository and resolves skill paths
+    # relative to itself. Install the two versioned Vibe skills alongside that
+    # config without replacing unrelated operator-managed skills.
+    mkdir -p "$SKILL_DIR"
+    local skill
+    for skill in vibe.md vibe-conversation.md; do
+        if [[ ! -f "$VIBE_SKILL_SRC/$skill" ]]; then
+            echo "error: required Vibe skill not found at $VIBE_SKILL_SRC/$skill" >&2
+            exit 1
+        fi
+        cp "$VIBE_SKILL_SRC/$skill" "$SKILL_DIR/$skill.new"
+        chmod 644 "$SKILL_DIR/$skill.new"
+        mv "$SKILL_DIR/$skill.new" "$SKILL_DIR/$skill"
+    done
+    echo "==> Vibe skills installed to $SKILL_DIR"
     echo "==> persistent Vibe data remains at $VIBE_DATA"
 }
 
