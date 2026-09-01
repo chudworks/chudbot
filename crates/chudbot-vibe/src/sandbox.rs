@@ -9,6 +9,7 @@ use crate::config::VibeSandboxConfig;
 use crate::{VibeError, export};
 
 const MAX_COMMAND_OUTPUT: usize = 64 * 1024;
+const VIBE_DOCKER_NETWORK: &str = "chudbot-vibe";
 
 #[derive(Debug, Clone)]
 pub struct VibeSandbox {
@@ -59,7 +60,14 @@ impl VibeSandbox {
             ])
             .output()
             .await?;
-        ensure_docker(output, "inspect image")
+        let image_id = ensure_docker(output, "inspect image")?;
+        let output = self
+            .docker()
+            .args(["network", "inspect", VIBE_DOCKER_NETWORK])
+            .output()
+            .await?;
+        ensure_docker(output, "inspect Vibe network")?;
+        Ok(image_id)
     }
 
     pub async fn start_coding(
@@ -210,7 +218,7 @@ impl VibeSandbox {
             "--name",
             name,
             "--network",
-            "bridge",
+            VIBE_DOCKER_NETWORK,
             "--read-only",
             "--cap-drop",
             "ALL",
@@ -381,6 +389,7 @@ mod tests {
             "--read-only",
             "--cap-drop",
             "ALL",
+            VIBE_DOCKER_NETWORK,
             "no-new-privileges:true",
             "--pids-limit",
             "256",

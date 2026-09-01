@@ -23,45 +23,29 @@ firewall commands. The deployment uses the system Docker daemon at
    `/var/run/docker.sock`. Add only the Unix account that runs Chudbot to the
    `docker` group, then start a fresh login session. Membership in that group is
    root-equivalent; do not grant it to site authors.
-2. Confirm forwarding is managed through the `DOCKER-USER` chain:
+2. Apply the repository-managed rules to Vibe's dedicated Docker network:
 
    ```sh
-   sudo iptables -S DOCKER-USER
-   sudo ip6tables -S DOCKER-USER
+   cd "$CHUDBOT_DIR/grok-discord-bot"
+   ./serve.sh firewall-install
    ```
 
-3. Insert the following rules once. They preserve established connections and
-   reject new traffic arriving from Docker bridge interfaces toward loopback,
-   link-local, carrier-grade NAT, and RFC 1918 networks. Public npm/Bun traffic
-   remains allowed.
+   The command idempotently creates the `chudbot-vibe` Docker network with the
+   fixed `chudbot-vibe0` bridge and owns one `CHUDBOT_VIBE` chain. Other Docker
+   networks are unaffected. It rejects loopback, link-local, carrier-grade NAT,
+   RFC 1918, and IPv6 private destinations while allowing public Bun/npm
+   traffic.
+3. Verify the Docker network and every managed firewall rule:
 
    ```sh
-   sudo iptables -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-   sudo iptables -I DOCKER-USER 2 -i docker0 -d 127.0.0.0/8 -j REJECT
-   sudo iptables -I DOCKER-USER 3 -i docker0 -d 169.254.0.0/16 -j REJECT
-   sudo iptables -I DOCKER-USER 4 -i docker0 -d 100.64.0.0/10 -j REJECT
-   sudo iptables -I DOCKER-USER 5 -i docker0 -d 10.0.0.0/8 -j REJECT
-   sudo iptables -I DOCKER-USER 6 -i docker0 -d 172.16.0.0/12 -j REJECT
-   sudo iptables -I DOCKER-USER 7 -i docker0 -d 192.168.0.0/16 -j REJECT
-   sudo iptables -I DOCKER-USER 8 -i br+ -d 127.0.0.0/8 -j REJECT
-   sudo iptables -I DOCKER-USER 9 -i br+ -d 169.254.0.0/16 -j REJECT
-   sudo iptables -I DOCKER-USER 10 -i br+ -d 100.64.0.0/10 -j REJECT
-   sudo iptables -I DOCKER-USER 11 -i br+ -d 10.0.0.0/8 -j REJECT
-   sudo iptables -I DOCKER-USER 12 -i br+ -d 172.16.0.0/12 -j REJECT
-   sudo iptables -I DOCKER-USER 13 -i br+ -d 192.168.0.0/16 -j REJECT
-   sudo ip6tables -I DOCKER-USER 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-   sudo ip6tables -I DOCKER-USER 2 -i docker0 -d ::1/128 -j REJECT
-   sudo ip6tables -I DOCKER-USER 3 -i docker0 -d fe80::/10 -j REJECT
-   sudo ip6tables -I DOCKER-USER 4 -i docker0 -d fc00::/7 -j REJECT
-   sudo ip6tables -I DOCKER-USER 5 -i br+ -d ::1/128 -j REJECT
-   sudo ip6tables -I DOCKER-USER 6 -i br+ -d fe80::/10 -j REJECT
-   sudo ip6tables -I DOCKER-USER 7 -i br+ -d fc00::/7 -j REJECT
+   ./serve.sh firewall-check
    ```
 
-4. Persist the rules with the host's normal firewall mechanism (on Ubuntu,
-   `iptables-persistent`/`netfilter-persistent` is suitable), reboot once, and
-   verify the rules still appear before enabling Vibe.
-5. Build the image, then inspect a throwaway container. It must reach
+   `serve.sh deploy` calls `firewall-install` on every deploy, which also
+   restores rules after a reboot. No systemd unit or global helper is
+   installed. `./serve.sh firewall-remove` stops Chudbot, refuses to proceed if
+   a Vibe container remains attached, and then removes the rules and network.
+4. Build the image, then inspect a throwaway container. It must reach
    `https://registry.npmjs.org/`, must not reach a known LAN address or the
    Docker bridge gateway, and must contain no `/var/run/docker.sock`, Chudbot
    config, media, repositories, artifacts, or sibling workspaces. Verify the

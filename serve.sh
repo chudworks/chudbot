@@ -36,6 +36,9 @@ VIBE_DATA="$CHUDBOT_DIR/vibe"
 VIBE_SANDBOX_SRC="$REPO_DIR/vibe-sandbox"
 VIBE_SKILL_SRC="$REPO_DIR/skills"
 SKILL_DIR="$CHUDBOT_DIR/skills"
+VIBE_DOCKER_NETWORK="chudbot-vibe"
+VIBE_DOCKER_BRIDGE="chudbot-vibe0"
+VIBE_FIREWALL_CHAIN="CHUDBOT_VIBE"
 BINARY="$CHUDBOT_DIR/chudbot"
 LOG_DIR="$CHUDBOT_DIR/logs"
 SESSION="chudbot"
@@ -46,7 +49,7 @@ usage() {
 usage: $0 <command>
 
 commands:
-  deploy    git pull, build frontend, build binary, stop, migrate, install, start
+  deploy    git pull, ensure firewall, build, stop, migrate, install, start
   restart   restart the tmux session (no rebuild)
   start     start the session if not running
   stop      kill the tmux session
@@ -54,6 +57,9 @@ commands:
   logs      attach to the session (Ctrl-b d to detach)
   migrate   run \`chudbot migrate\` with the installed binary
   vibe-purge <name>  permanently purge one Vibe site (operator-only)
+  firewall-install   idempotently apply the Vibe Docker firewall rules
+  firewall-check     verify the Vibe Docker network and firewall rules
+  firewall-remove    stop Chudbot and remove the Vibe firewall rules/network
 
 env vars:
   CHUDBOT_DIR    deployment root (default: \$HOME/chudbot)
@@ -70,6 +76,172 @@ ensure_binary() {
         echo "error: binary not found at $BINARY -- run '$0 deploy' first" >&2
         exit 1
     fi
+}
+
+ensure_firewall_tools() {
+    if [[ "$(uname -s)" != "Linux" ]]; then
+        echo "error: Vibe firewall management supports Linux only" >&2
+        exit 1
+    fi
+    local command
+    for command in docker iptables sudo; do
+        if ! command -v "$command" >/dev/null 2>&1; then
+            echo "error: required command '$command' is not installed" >&2
+            exit 1
+        fi
+    done
+}
+
+ensure_vibe_docker_network() {
+    if docker network inspect "$VIBE_DOCKER_NETWORK" >/dev/null 2>&1; then
+        local bridge
+        bridge="$(docker network inspect --format '{{ index .Options "com.docker.network.bridge.name" }}' "$VIBE_DOCKER_NETWORK")"
+        if [[ "$bridge" != "$VIBE_DOCKER_BRIDGE" ]]; then
+            echo "error: Docker network '$VIBE_DOCKER_NETWORK' uses bridge '$bridge', expected '$VIBE_DOCKER_BRIDGE'" >&2
+            exit 1
+        fi
+        return
+    fi
+    docker network create \
+        --driver bridge \
+        --opt "com.docker.network.bridge.name=$VIBE_DOCKER_BRIDGE" \
+        "$VIBE_DOCKER_NETWORK" >/dev/null
+}
+
+remove_firewall_hook() {
+    local tool="$1"
+    while sudo "$tool" -C DOCKER-USER -i "$VIBE_DOCKER_BRIDGE" -j "$VIBE_FIREWALL_CHAIN" >/dev/null 2>&1; do
+        sudo "$tool" -D DOCKER-USER -i "$VIBE_DOCKER_BRIDGE" -j "$VIBE_FIREWALL_CHAIN"
+    done
+}
+
+apply_ipv4_firewall() {
+    if ! sudo iptables -nL DOCKER-USER >/dev/null 2>&1; then
+        echo "error: iptables has no DOCKER-USER chain; enable Docker's iptables firewall backend" >&2
+        exit 1
+    fi
+    sudo iptables -N "$VIBE_FIREWALL_CHAIN" 2>/dev/null || true
+    sudo iptables -F "$VIBE_FIREWALL_CHAIN"
+    sudo iptables -A "$VIBE_FIREWALL_CHAIN" -d 127.0.0.0/8 -j REJECT
+    sudo iptables -A "$VIBE_FIREWALL_CHAIN" -d 169.254.0.0/16 -j REJECT
+    sudo iptables -A "$VIBE_FIREWALL_CHAIN" -d 100.64.0.0/10 -j REJECT
+    sudo iptables -A "$VIBE_FIREWALL_CHAIN" -d 10.0.0.0/8 -j REJECT
+    sudo iptables -A "$VIBE_FIREWALL_CHAIN" -d 172.16.0.0/12 -j REJECT
+    sudo iptables -A "$VIBE_FIREWALL_CHAIN" -d 192.168.0.0/16 -j REJECT
+    sudo iptables -A "$VIBE_FIREWALL_CHAIN" -j RETURN
+    remove_firewall_hook iptables
+    sudo iptables -I DOCKER-USER 1 -i "$VIBE_DOCKER_BRIDGE" -j "$VIBE_FIREWALL_CHAIN"
+}
+
+apply_ipv6_firewall_if_enabled() {
+    if ! command -v ip6tables >/dev/null 2>&1 \
+        || ! sudo ip6tables -nL DOCKER-USER >/dev/null 2>&1; then
+        return
+    fi
+    sudo ip6tables -N "$VIBE_FIREWALL_CHAIN" 2>/dev/null || true
+    sudo ip6tables -F "$VIBE_FIREWALL_CHAIN"
+    sudo ip6tables -A "$VIBE_FIREWALL_CHAIN" -d ::1/128 -j REJECT
+    sudo ip6tables -A "$VIBE_FIREWALL_CHAIN" -d fe80::/10 -j REJECT
+    sudo ip6tables -A "$VIBE_FIREWALL_CHAIN" -d fc00::/7 -j REJECT
+    sudo ip6tables -A "$VIBE_FIREWALL_CHAIN" -j RETURN
+    remove_firewall_hook ip6tables
+    sudo ip6tables -I DOCKER-USER 1 -i "$VIBE_DOCKER_BRIDGE" -j "$VIBE_FIREWALL_CHAIN"
+}
+
+check_firewall_rule() {
+    local tool="$1"
+    shift
+    if ! sudo "$tool" -C "$VIBE_FIREWALL_CHAIN" "$@" >/dev/null 2>&1; then
+        echo "error: missing Vibe firewall rule: $tool $VIBE_FIREWALL_CHAIN $*" >&2
+        exit 1
+    fi
+}
+
+check_ipv4_firewall() {
+    if ! sudo iptables -nL DOCKER-USER >/dev/null 2>&1; then
+        echo "error: iptables has no DOCKER-USER chain; enable Docker's iptables firewall backend" >&2
+        exit 1
+    fi
+    sudo iptables -C DOCKER-USER -i "$VIBE_DOCKER_BRIDGE" -j "$VIBE_FIREWALL_CHAIN" >/dev/null
+    check_firewall_rule iptables -d 127.0.0.0/8 -j REJECT
+    check_firewall_rule iptables -d 169.254.0.0/16 -j REJECT
+    check_firewall_rule iptables -d 100.64.0.0/10 -j REJECT
+    check_firewall_rule iptables -d 10.0.0.0/8 -j REJECT
+    check_firewall_rule iptables -d 172.16.0.0/12 -j REJECT
+    check_firewall_rule iptables -d 192.168.0.0/16 -j REJECT
+    check_firewall_rule iptables -j RETURN
+}
+
+check_ipv6_firewall_if_enabled() {
+    if ! command -v ip6tables >/dev/null 2>&1 \
+        || ! sudo ip6tables -nL DOCKER-USER >/dev/null 2>&1; then
+        return
+    fi
+    sudo ip6tables -C DOCKER-USER -i "$VIBE_DOCKER_BRIDGE" -j "$VIBE_FIREWALL_CHAIN" >/dev/null
+    check_firewall_rule ip6tables -d ::1/128 -j REJECT
+    check_firewall_rule ip6tables -d fe80::/10 -j REJECT
+    check_firewall_rule ip6tables -d fc00::/7 -j REJECT
+    check_firewall_rule ip6tables -j RETURN
+}
+
+remove_firewall_family() {
+    local tool="$1"
+    if ! command -v "$tool" >/dev/null 2>&1; then
+        return
+    fi
+    if sudo "$tool" -nL DOCKER-USER >/dev/null 2>&1; then
+        remove_firewall_hook "$tool"
+    fi
+    if sudo "$tool" -nL "$VIBE_FIREWALL_CHAIN" >/dev/null 2>&1; then
+        sudo "$tool" -F "$VIBE_FIREWALL_CHAIN"
+        sudo "$tool" -X "$VIBE_FIREWALL_CHAIN"
+    fi
+}
+
+cmd_firewall_install() {
+    ensure_firewall_tools
+    ensure_vibe_docker_network
+    echo "==> apply Vibe firewall to $VIBE_DOCKER_NETWORK ($VIBE_DOCKER_BRIDGE)"
+    apply_ipv4_firewall
+    apply_ipv6_firewall_if_enabled
+    cmd_firewall_check
+}
+
+cmd_firewall_check() {
+    ensure_firewall_tools
+    if ! docker network inspect "$VIBE_DOCKER_NETWORK" >/dev/null 2>&1; then
+        echo "error: Docker network '$VIBE_DOCKER_NETWORK' is missing" >&2
+        exit 1
+    fi
+    local bridge
+    bridge="$(docker network inspect --format '{{ index .Options "com.docker.network.bridge.name" }}' "$VIBE_DOCKER_NETWORK")"
+    if [[ "$bridge" != "$VIBE_DOCKER_BRIDGE" ]]; then
+        echo "error: Docker network '$VIBE_DOCKER_NETWORK' uses bridge '$bridge', expected '$VIBE_DOCKER_BRIDGE'" >&2
+        exit 1
+    fi
+    check_ipv4_firewall
+    check_ipv6_firewall_if_enabled
+    echo "Vibe firewall is active on $VIBE_DOCKER_NETWORK ($VIBE_DOCKER_BRIDGE)"
+}
+
+cmd_firewall_remove() {
+    ensure_firewall_tools
+    echo "==> stop Chudbot before removing its Vibe firewall"
+    stop_session
+    if docker network inspect "$VIBE_DOCKER_NETWORK" >/dev/null 2>&1; then
+        local attached
+        attached="$(docker network inspect --format '{{ len .Containers }}' "$VIBE_DOCKER_NETWORK")"
+        if [[ "$attached" != "0" ]]; then
+            echo "error: $attached container(s) remain attached to $VIBE_DOCKER_NETWORK; firewall was not removed" >&2
+            exit 1
+        fi
+    fi
+    remove_firewall_family iptables
+    remove_firewall_family ip6tables
+    if docker network inspect "$VIBE_DOCKER_NETWORK" >/dev/null 2>&1; then
+        docker network rm "$VIBE_DOCKER_NETWORK" >/dev/null
+    fi
+    echo "==> Vibe firewall removed"
 }
 
 start_session() {
@@ -224,6 +396,7 @@ cmd_deploy() {
     echo "==> git pull --ff-only"
     git -C "$REPO_DIR" pull --ff-only
 
+    cmd_firewall_install
     build_frontend
     build_vibe_sandbox
 
@@ -302,6 +475,9 @@ case "${1:-}" in
     logs)           cmd_logs ;;
     migrate)        cmd_migrate ;;
     vibe-purge)     cmd_vibe_purge "${2:-}" ;;
+    firewall-install) cmd_firewall_install ;;
+    firewall-check)   cmd_firewall_check ;;
+    firewall-remove)  cmd_firewall_remove ;;
     -h|--help|help|"") usage ;;
     *)              echo "unknown command: $1" >&2; usage; exit 1 ;;
 esac
