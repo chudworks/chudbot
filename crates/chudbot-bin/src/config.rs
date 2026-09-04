@@ -865,6 +865,9 @@ pub struct OpenAiTokenPricingConfig {
     /// Cached input token price in USD per 1M tokens.
     #[serde(default)]
     pub cached_input_usd_per_million_tokens: Option<f64>,
+    /// Cache-write token price in USD per 1M tokens.
+    #[serde(default)]
+    pub cache_write_usd_per_million_tokens: Option<f64>,
     /// Output token price in USD per 1M tokens.
     pub output_usd_per_million_tokens: f64,
 }
@@ -875,6 +878,7 @@ impl From<OpenAiTokenPricingConfig> for chudbot_openai::OpenAiTokenPricing {
         Self {
             input_usd_per_million_tokens: value.input_usd_per_million_tokens,
             cached_input_usd_per_million_tokens: value.cached_input_usd_per_million_tokens,
+            cache_write_usd_per_million_tokens: value.cache_write_usd_per_million_tokens,
             output_usd_per_million_tokens: value.output_usd_per_million_tokens,
         }
     }

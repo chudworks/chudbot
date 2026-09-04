@@ -839,6 +839,7 @@ const DISCORD_PLATFORM_KEYS: &[&str] = &["kind", "token", "dev_guild_id"];
 const OPENAI_TOKEN_PRICING_KEYS: &[&str] = &[
     "input_usd_per_million_tokens",
     "cached_input_usd_per_million_tokens",
+    "cache_write_usd_per_million_tokens",
     "output_usd_per_million_tokens",
 ];
 const OPENAI_IMAGE_PRICING_KEYS: &[&str] = &[

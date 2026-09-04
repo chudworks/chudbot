@@ -55,22 +55,29 @@ impl OpenAiPricing {
     /// Returns `None` when there is no model, no known pricing entry, or the
     /// billable estimate is zero ticks. Cached input tokens use the
     /// cached rate when one is configured and otherwise fall back to regular
-    /// input pricing.
+    /// input pricing. Cache writes use their configured rate, or regular input
+    /// pricing when the model has no distinct cache-write rate.
     pub(crate) fn estimate_token_cost(
         &self,
         model: Option<&ModelId>,
         input_tokens: u64,
         cached_input_tokens: u64,
+        cache_write_tokens: u64,
         output_tokens: u64,
     ) -> Option<CostAmount> {
         let pricing = pricing_for_model(&self.token, model?)?;
-        let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+        let uncached_input_tokens =
+            input_tokens.saturating_sub(cached_input_tokens.saturating_add(cache_write_tokens));
         let cached_price = pricing
             .cached_input_usd_per_million_tokens
+            .unwrap_or(pricing.input_usd_per_million_tokens);
+        let cache_write_price = pricing
+            .cache_write_usd_per_million_tokens
             .unwrap_or(pricing.input_usd_per_million_tokens);
         let ticks =
             usd_ticks_for_tokens(uncached_input_tokens, pricing.input_usd_per_million_tokens)
                 .saturating_add(usd_ticks_for_tokens(cached_input_tokens, cached_price))
+                .saturating_add(usd_ticks_for_tokens(cache_write_tokens, cache_write_price))
                 .saturating_add(usd_ticks_for_tokens(
                     output_tokens,
                     pricing.output_usd_per_million_tokens,
@@ -155,6 +162,11 @@ pub struct OpenAiTokenPricing {
     /// When omitted, cached input is charged at the uncached input rate.
     #[serde(default)]
     pub cached_input_usd_per_million_tokens: Option<f64>,
+    /// Cache-write token price in USD per 1M tokens.
+    ///
+    /// When omitted, cache writes are charged at the uncached input rate.
+    #[serde(default)]
+    pub cache_write_usd_per_million_tokens: Option<f64>,
     /// Output token price in USD per 1M tokens.
     pub output_usd_per_million_tokens: f64,
 }
@@ -211,10 +223,56 @@ pub(crate) struct ImagePricingUsage {
 fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
     let mut pricing = BTreeMap::new();
     pricing.insert(
+        ModelId::new("gpt-6-astra"),
+        OpenAiTokenPricing {
+            input_usd_per_million_tokens: 10.00,
+            cached_input_usd_per_million_tokens: Some(1.00),
+            cache_write_usd_per_million_tokens: Some(12.50),
+            output_usd_per_million_tokens: 50.00,
+        },
+    );
+    pricing.insert(
+        ModelId::new("gpt-5.6"),
+        OpenAiTokenPricing {
+            input_usd_per_million_tokens: 4.00,
+            cached_input_usd_per_million_tokens: Some(0.40),
+            cache_write_usd_per_million_tokens: Some(5.00),
+            output_usd_per_million_tokens: 20.00,
+        },
+    );
+    pricing.insert(
+        ModelId::new("gpt-5.6-sol"),
+        OpenAiTokenPricing {
+            input_usd_per_million_tokens: 4.00,
+            cached_input_usd_per_million_tokens: Some(0.40),
+            cache_write_usd_per_million_tokens: Some(5.00),
+            output_usd_per_million_tokens: 20.00,
+        },
+    );
+    pricing.insert(
+        ModelId::new("gpt-5.6-terra"),
+        OpenAiTokenPricing {
+            input_usd_per_million_tokens: 2.00,
+            cached_input_usd_per_million_tokens: Some(0.20),
+            cache_write_usd_per_million_tokens: Some(2.50),
+            output_usd_per_million_tokens: 12.00,
+        },
+    );
+    pricing.insert(
+        ModelId::new("gpt-5.6-luna"),
+        OpenAiTokenPricing {
+            input_usd_per_million_tokens: 0.20,
+            cached_input_usd_per_million_tokens: Some(0.02),
+            cache_write_usd_per_million_tokens: Some(0.25),
+            output_usd_per_million_tokens: 1.20,
+        },
+    );
+    pricing.insert(
         ModelId::new("gpt-5.5"),
         OpenAiTokenPricing {
             input_usd_per_million_tokens: 5.00,
             cached_input_usd_per_million_tokens: Some(0.50),
+            cache_write_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 30.00,
         },
     );
@@ -223,6 +281,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
         OpenAiTokenPricing {
             input_usd_per_million_tokens: 30.00,
             cached_input_usd_per_million_tokens: None,
+            cache_write_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 180.00,
         },
     );
@@ -231,6 +290,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
         OpenAiTokenPricing {
             input_usd_per_million_tokens: 2.50,
             cached_input_usd_per_million_tokens: Some(0.25),
+            cache_write_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 15.00,
         },
     );
@@ -239,6 +299,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
         OpenAiTokenPricing {
             input_usd_per_million_tokens: 0.75,
             cached_input_usd_per_million_tokens: Some(0.075),
+            cache_write_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 4.50,
         },
     );
@@ -247,6 +308,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
         OpenAiTokenPricing {
             input_usd_per_million_tokens: 0.20,
             cached_input_usd_per_million_tokens: Some(0.02),
+            cache_write_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 1.25,
         },
     );
@@ -255,6 +317,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
         OpenAiTokenPricing {
             input_usd_per_million_tokens: 30.00,
             cached_input_usd_per_million_tokens: None,
+            cache_write_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 180.00,
         },
     );
@@ -263,6 +326,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
         OpenAiTokenPricing {
             input_usd_per_million_tokens: 5.00,
             cached_input_usd_per_million_tokens: Some(0.50),
+            cache_write_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 30.00,
         },
     );
@@ -271,6 +335,7 @@ fn default_token_pricing() -> BTreeMap<ModelId, OpenAiTokenPricing> {
         OpenAiTokenPricing {
             input_usd_per_million_tokens: 1.75,
             cached_input_usd_per_million_tokens: Some(0.175),
+            cache_write_usd_per_million_tokens: None,
             output_usd_per_million_tokens: 14.00,
         },
     );
@@ -385,7 +450,13 @@ mod tests {
         let pricing = OpenAiPricing::default();
 
         let cost = pricing
-            .estimate_token_cost(Some(&ModelId::new("gpt-5.5")), 1_000_000, 250_000, 100_000)
+            .estimate_token_cost(
+                Some(&ModelId::new("gpt-5.5")),
+                1_000_000,
+                250_000,
+                0,
+                100_000,
+            )
             .expect("cost estimate");
 
         assert_eq!(cost.unit, "usd_ticks");
@@ -401,12 +472,13 @@ mod tests {
             OpenAiTokenPricing {
                 input_usd_per_million_tokens: 1.00,
                 cached_input_usd_per_million_tokens: Some(0.10),
+                cache_write_usd_per_million_tokens: None,
                 output_usd_per_million_tokens: 2.00,
             },
         )]));
 
         let cost = pricing
-            .estimate_token_cost(Some(&ModelId::new("gpt-5.5")), 100, 50, 10)
+            .estimate_token_cost(Some(&ModelId::new("gpt-5.5")), 100, 50, 0, 10)
             .expect("cost estimate");
 
         assert_eq!(cost.amount, "750000");
@@ -417,7 +489,13 @@ mod tests {
         let pricing = OpenAiPricing::default();
 
         let cost = pricing
-            .estimate_token_cost(Some(&ModelId::new("gpt-5.4-mini-2026-03-17")), 100, 40, 20)
+            .estimate_token_cost(
+                Some(&ModelId::new("gpt-5.4-mini-2026-03-17")),
+                100,
+                40,
+                0,
+                20,
+            )
             .expect("cost estimate");
 
         assert_eq!(cost.amount, "1380000");
@@ -452,14 +530,51 @@ mod tests {
             OpenAiTokenPricing {
                 input_usd_per_million_tokens: 1.00,
                 cached_input_usd_per_million_tokens: Some(0.10),
+                cache_write_usd_per_million_tokens: None,
                 output_usd_per_million_tokens: 2.00,
             },
         )]));
 
         let cost = pricing
-            .estimate_token_cost(Some(&ModelId::new("gpt-5.4-mini-2026-03-17")), 100, 40, 20)
+            .estimate_token_cost(
+                Some(&ModelId::new("gpt-5.4-mini-2026-03-17")),
+                100,
+                40,
+                0,
+                20,
+            )
             .expect("cost estimate");
 
         assert_eq!(cost.amount, "1040000");
+    }
+
+    #[test]
+    fn estimates_cache_writes_at_the_configured_rate() {
+        let pricing = OpenAiPricing::default();
+
+        let cost = pricing
+            .estimate_token_cost(Some(&ModelId::new("gpt-5.6-sol")), 100, 40, 20, 10)
+            .expect("cost estimate");
+
+        assert_eq!(cost.amount, "4760000");
+    }
+
+    #[test]
+    fn current_openai_models_have_builtin_prices() {
+        let pricing = OpenAiPricing::default();
+        let cases = [
+            ("gpt-6-astra", "73500000"),
+            ("gpt-5.6", "29400000"),
+            ("gpt-5.6-sol", "29400000"),
+            ("gpt-5.6-terra", "16700000"),
+            ("gpt-5.6-luna", "1670000"),
+        ];
+
+        for (model, expected) in cases {
+            let cost = pricing
+                .estimate_token_cost(Some(&ModelId::new(model)), 300, 100, 100, 100)
+                .expect("cost estimate");
+            assert_eq!(cost.amount, expected, "wrong price for {model}");
+        }
     }
 }

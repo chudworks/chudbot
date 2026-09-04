@@ -916,6 +916,7 @@ fn usage_from_openai(
         model.as_ref(),
         parsed.input_tokens,
         parsed.input_tokens_details.cached_tokens,
+        parsed.input_tokens_details.cache_write_tokens,
         parsed.output_tokens,
     );
     Some(UsageRecord {
@@ -991,6 +992,8 @@ struct Usage {
 struct TokenDetails {
     #[serde(default)]
     cached_tokens: u64,
+    #[serde(default)]
+    cache_write_tokens: u64,
     #[serde(default)]
     reasoning_tokens: u64,
 }
@@ -1584,14 +1587,17 @@ mod tests {
     fn estimates_usage_cost_for_known_openai_model() {
         let usage = json!({
             "input_tokens": 100,
-            "input_tokens_details": { "cached_tokens": 40 },
+            "input_tokens_details": {
+                "cached_tokens": 40,
+                "cache_write_tokens": 20,
+            },
             "output_tokens": 20,
             "total_tokens": 120,
         });
         let provider = ProviderName::new("openai");
         let record = usage_from_openai(
             &provider,
-            Some(ModelId::new("gpt-5.5")),
+            Some(ModelId::new("gpt-5.6-sol")),
             UsageSubject::ModelStep,
             Some(&usage),
             &OpenAiPricing::default(),
@@ -1601,6 +1607,6 @@ mod tests {
         let cost = record.cost.expect("estimated cost");
         assert_eq!(cost.unit, "usd_ticks");
         assert!(cost.estimated);
-        assert_eq!(cost.amount, "9200000");
+        assert_eq!(cost.amount, "6760000");
     }
 }

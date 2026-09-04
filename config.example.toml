@@ -218,10 +218,11 @@ api_key = "sk-..."
 # Optional cost-estimation overrides. Values are USD per 1M tokens. Built-in
 # defaults cover common standard-tier OpenAI models, but you can pin/update
 # rates here when pricing, service tier, long-context, or regional rates differ.
-[llm.openai.pricing."gpt-5.5"]
-input_usd_per_million_tokens = 5.00
-cached_input_usd_per_million_tokens = 0.50
-output_usd_per_million_tokens = 30.00
+[llm.openai.pricing."gpt-5.6-sol"]
+input_usd_per_million_tokens = 4.00
+cached_input_usd_per_million_tokens = 0.40
+cache_write_usd_per_million_tokens = 5.00
+output_usd_per_million_tokens = 20.00
 
 [llm.anthropic]
 kind = "anthropic"
