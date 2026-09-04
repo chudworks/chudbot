@@ -169,7 +169,7 @@ pub enum VibeSiteStatus {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VibeSiteAccess {
-    /// Require Discord OAuth and current membership in the owning guild.
+    /// Require Discord OAuth and current membership in the owning or a shared guild.
     #[default]
     Protected,
     /// Serve the deployed site without authenticating the viewer.
@@ -469,6 +469,18 @@ pub trait VibeStorage: Send + Sync {
         site_id: VibeSiteId,
         platform: &PlatformName,
         user_id: &ExternalId,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    fn list_site_guilds(
+        &self,
+        site_id: VibeSiteId,
+        platform: &PlatformName,
+    ) -> impl Future<Output = Result<Vec<ExternalId>, Self::Error>> + Send;
+    fn add_site_guild(
+        &self,
+        site_id: VibeSiteId,
+        platform: &PlatformName,
+        guild_id: &ExternalId,
+        added_by: &ExternalId,
     ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
     fn set_site_status(
         &self,

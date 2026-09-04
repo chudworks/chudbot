@@ -258,6 +258,41 @@ impl VibeStorage for SqlxStorage {
         .rows_affected()
             > 0)
     }
+    async fn list_site_guilds(
+        &self,
+        site: VibeSiteId,
+        platform: &PlatformName,
+    ) -> Result<Vec<ExternalId>, Self::Error> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "SELECT guild_id FROM vibe_site_guilds WHERE site_id=$1 AND platform=$2 ORDER BY added_at,guild_id",
+        )
+        .bind(site.0)
+        .bind(platform.as_str())
+        .fetch_all(&self.pool)
+        .await?
+        .into_iter()
+        .map(ExternalId::new)
+        .collect())
+    }
+    async fn add_site_guild(
+        &self,
+        site: VibeSiteId,
+        platform: &PlatformName,
+        guild: &ExternalId,
+        by: &ExternalId,
+    ) -> Result<bool, Self::Error> {
+        Ok(sqlx::query(
+            "INSERT INTO vibe_site_guilds(site_id,platform,guild_id,added_by_user_id) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING",
+        )
+        .bind(site.0)
+        .bind(platform.as_str())
+        .bind(guild.as_str())
+        .bind(by.as_str())
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            > 0)
+    }
     async fn set_site_status(
         &self,
         site: VibeSiteId,

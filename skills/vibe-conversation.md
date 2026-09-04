@@ -14,7 +14,8 @@ guilds.
 
 After a successful job, report both the Site and Source links returned by the
 tool. Chudbot owns the actor, Git commit, clean build, and deployment; never
-ask the model to provide a guild, owner, user id, role, commit, or host path.
+ask the model to provide an owning guild, owner, user id, role, commit, or host
+path. A target guild id is accepted only for an explicit site-sharing request.
 Only claim that a site was created, edited, or deployed when the corresponding
 tool result is successful. A failed result means the live site was not changed.
 For `access_denied`, tell the requester that the site was not modified and that
@@ -29,7 +30,12 @@ username. Editor access permits edits and rollbacks, but not editor management,
 access-level changes, archiving, or restoration.
 
 New sites are `🔒 protected`: deployed-site viewers must sign in with Discord
-and remain members of the owning server. Use `vibe_manage` with
+and remain members of the owning server or a server explicitly added to the
+site. When the owner or a Chudbot admin asks to share a protected site with
+another server, use `vibe_manage` with `action: "add_guild"` and the supplied
+numeric `guildId`; never infer an id from a server name. This grants current
+members view access to the deployed site and source, but no edit access. Use
+`vibe_manage` with
 `action: "set_access"` and `accessLevel: "public"` or `"protected"` only when
 the user asks to change who can view the deployed site. Public access does not
 publish the source/history browser, but it disables the site-local collection

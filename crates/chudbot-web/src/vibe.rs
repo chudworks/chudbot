@@ -1146,6 +1146,47 @@ fn guild_is_allowed(config: &VibeConfig, platform: &PlatformName, guild: &Extern
             .any(|allowed| &allowed.platform == platform && &allowed.guild_id == guild)
 }
 
+fn shared_site_guilds<'a>(
+    config: &'a VibeConfig,
+    site: &'a VibeSite,
+    shared_guilds: &'a [ExternalId],
+) -> impl Iterator<Item = &'a ExternalId> {
+    shared_guilds
+        .iter()
+        .filter(|guild| **guild != site.guild_id && guild_is_allowed(config, &site.platform, guild))
+}
+
+async fn current_membership<R>(
+    state: &WebState<R>,
+    vibe: &VibeWebState,
+    key: MembershipKey,
+) -> Result<Option<VibeMembership>, <R::Identity as VibeIdentityProvider>::Error>
+where
+    R: WebRuntimeTypes,
+{
+    if let Some(member) = vibe.member_cache.get(&key).await {
+        return Ok(Some(member));
+    }
+    if vibe.nonmember_cache.contains_key(&key) {
+        return Ok(None);
+    }
+    match state
+        .identity
+        .guild_membership(&key.platform, &key.guild_id, &key.user_id)
+        .await?
+    {
+        Some(member) => {
+            vibe.nonmember_cache.invalidate(&key).await;
+            vibe.member_cache.insert(key, member.clone()).await;
+            Ok(Some(member))
+        }
+        None => {
+            vibe.nonmember_cache.insert(key, ()).await;
+            Ok(None)
+        }
+    }
+}
+
 async fn authorize<R>(
     state: &WebState<R>,
     vibe: &VibeWebState,
@@ -1191,38 +1232,57 @@ where
     if session.platform != site.platform {
         return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
     }
-    let key = MembershipKey {
+    let owner_key = MembershipKey {
         platform: site.platform.clone(),
         guild_id: site.guild_id.clone(),
         user_id: session.user_id.clone(),
     };
-    if let Some(member) = vibe.member_cache.get(&key).await {
-        return Ok((session, member));
-    }
-    if vibe.nonmember_cache.contains_key(&key) {
-        return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
-    }
-    match state
-        .identity
-        .guild_membership(&key.platform, &key.guild_id, &key.user_id)
+    let mut membership_check_failed = match current_membership(state, vibe, owner_key).await {
+        Ok(Some(member)) => return Ok((session, member)),
+        Ok(None) => false,
+        Err(error) => {
+            tracing::warn!(guild=%site.guild_id,error=%error,"Discord membership check failed");
+            true
+        }
+    };
+    let shared_guilds = match state
+        .storage
+        .list_site_guilds(site.id, &site.platform)
         .await
     {
-        Ok(Some(member)) => {
-            vibe.nonmember_cache.invalidate(&key).await;
-            vibe.member_cache.insert(key, member.clone()).await;
-            Ok((session, member))
-        }
-        Ok(None) => {
-            vibe.nonmember_cache.insert(key, ()).await;
-            Err(Box::new(StatusCode::NOT_FOUND.into_response()))
-        }
+        Ok(guilds) => guilds,
         Err(error) => {
-            tracing::warn!(error=%error,"Discord membership check failed");
-            Err(Box::new(error_page(
+            tracing::error!(site=%site.name,error=%error,"Vibe shared guild lookup failed");
+            return Err(Box::new(error_page(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "Discord membership could not be checked",
-            )))
+                "authorization unavailable",
+            )));
         }
+    };
+    for guild_id in shared_site_guilds(&vibe.config, site, &shared_guilds) {
+        let key = MembershipKey {
+            platform: site.platform.clone(),
+            guild_id: guild_id.clone(),
+            user_id: session.user_id.clone(),
+        };
+        match current_membership(state, vibe, key).await {
+            Ok(Some(member)) => {
+                return Ok((session, member));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                membership_check_failed = true;
+                tracing::warn!(guild=%guild_id,error=%error,"Discord membership check failed");
+            }
+        }
+    }
+    if membership_check_failed {
+        Err(Box::new(error_page(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Discord membership could not be checked",
+        )))
+    } else {
+        Err(Box::new(StatusCode::NOT_FOUND.into_response()))
     }
 }
 
@@ -1401,7 +1461,7 @@ mod tests {
         assert!(direct_login_success_body(None).contains("<h1>Logged in!</h1>"));
     }
     use chudbot_vibe::config::{
-        VibeAccessConfig, VibeAuthConfig, VibeLimitsConfig, VibeSandboxConfig,
+        VibeAccessConfig, VibeAllowedGuild, VibeAuthConfig, VibeLimitsConfig, VibeSandboxConfig,
     };
     use http_body_util::BodyExt;
     use test_case::test_case;
@@ -1660,6 +1720,44 @@ mod tests {
                 .as_ref(),
             b"null"
         );
+    }
+
+    #[test]
+    fn shared_site_guilds_deduplicate_the_owner_and_honor_rollout() {
+        let root = std::env::temp_dir().join(format!("vibe-guild-test-{}", Uuid::new_v4()));
+        let mut vibe = test_vibe(root);
+        vibe.config.access.allowed_guilds = ["1", "2"]
+            .into_iter()
+            .map(|guild| VibeAllowedGuild {
+                platform: PlatformName::new("discord"),
+                guild_id: ExternalId::new(guild),
+            })
+            .collect();
+        let site = VibeSite {
+            id: VibeSiteId::new(),
+            name: "site".into(),
+            platform: PlatformName::new("discord"),
+            guild_id: ExternalId::new("1"),
+            owner_user_id: ExternalId::new("10"),
+            description: String::new(),
+            status: VibeSiteStatus::Active,
+            access: VibeSiteAccess::Protected,
+            active_revision_id: None,
+            running_job_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let shared = [
+            ExternalId::new("2"),
+            ExternalId::new("1"),
+            ExternalId::new("3"),
+        ];
+
+        let guilds = shared_site_guilds(&vibe.config, &site, &shared)
+            .map(ExternalId::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(guilds, ["2"]);
     }
 
     #[test]

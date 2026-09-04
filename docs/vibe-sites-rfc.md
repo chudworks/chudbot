@@ -40,7 +40,8 @@ Chudbot builds it from a clean checkout, commits it to a local Git repository,
 and serves the result from the existing `chudbot` process.
 
 Sites are `🔒 protected` by default: viewers log in with Discord and Chudbot
-checks that they remain members of the owning server. An owner or administrator
+checks that they remain members of the owning server or a server explicitly
+added to the site by an owner or administrator. An owner or administrator
 can make the deployed site public through `vibe_manage`; its source and history
 remain protected. Sites are static. There is no custom server code. The one
 backend feature in version 1 is `vibe.identity()`, a small JavaScript call that
@@ -148,15 +149,15 @@ becomes an edit.
 
 ## Who can do what
 
-| Action | Guild member | Editor | Owner | Chudbot admin |
+| Action | Owning/shared guild member | Editor | Owner | Chudbot admin |
 | --- | --- | --- | --- | --- |
 | View site and source | yes | yes | yes | yes |
 | Edit, roll back | no | yes | yes | yes |
-| Add or remove editors, archive, restore | no | no | yes | yes |
+| Add or remove editors, add shared guild, archive, restore | no | no | yes | yes |
 | Purge | no | no | no | yes |
 
-- Viewing always requires current membership in the site's guild, admins
-  included.
+- Viewing always requires current membership in the owning or an explicitly
+  shared guild, admins included.
 - Sites can only be created from a guild channel, never a DM.
 - The owner is the author of the Discord message. A tool argument cannot
   change that.
@@ -299,9 +300,10 @@ at worst. If that ever matters, switch to per-host cookies with a login
 handoff.
 
 On every protected site or API request, and every source-browser request,
-Chudbot checks that the session's user is a current member of the site's guild
-with the bot's "Get Guild Member" endpoint. Positive results are cached in
-memory for 5 minutes, negative results for 30 seconds. Public deployed-site
+Chudbot checks that the session's user is a current member of the site's owning
+guild or one of its explicitly added guilds with the bot's "Get Guild Member"
+endpoint. Positive results are cached in memory for 5 minutes, negative results
+for 30 seconds. Public deployed-site
 requests skip this check. If Discord is unreachable and nothing is cached, a
 protected request fails with a 503 and a job will not start.
 
@@ -316,6 +318,7 @@ a runbook step.
 | --- | --- |
 | `vibe_sites` | `id`, `name` (unique), `platform`, `guild_id`, `owner_user_id`, `description`, `status` (`creating`, `active`, `archived`), `access` (`protected`, `public`; defaults to `protected`), `active_revision_id`, `running_job_id`, timestamps |
 | `vibe_site_editors` | `site_id`, `platform`, `user_id`, `added_by_user_id`, `added_at`; primary key `(site_id, platform, user_id)` |
+| `vibe_site_guilds` | `site_id`, `platform`, `guild_id`, `added_by_user_id`, `added_at`; primary key `(site_id, platform, guild_id)` |
 | `vibe_revisions` | `id`, `site_id`, `ordinal`, `parent_revision_id`, `commit_oid`, `image_id`, `message`, `build_log` (bounded), `actor_user_id`, `conversation_id`, `turn_id`, `job_id`, `created_at`; unique `(site_id, ordinal)` |
 | `vibe_jobs` | `id`, `site_id` (nullable), `site_name`, `action`, `actor_user_id`, `platform`, `guild_id`, `conversation_id`, `turn_id`, `tool_use_id` (unique), `state`, `error`, timestamps |
 | `vibe_sessions` | `token_hash` (primary key), `platform`, `user_id`, `created_at`, `expires_at`, `revoked_at` |
@@ -531,10 +534,10 @@ When the parent agent has an admitted Vibe binding it also gets
 | `vibe` (subagent) | `{ action: "create" or "edit", siteName, task }`. Starts a job and returns the result and links. |
 | `vibe_check_names` | Checks up to 8 candidate names. Returns `available`, `unavailable`, or `invalid` for each and nothing else. Reserves nothing. |
 | `vibe_list_sites` | Lists active sites in this guild with name, description, access level, the actor's role, links, and last-changed time. Optional text filter. Current-conversation sites first, then the actor's own by recency, then the rest. |
-| `vibe_manage` | `rollback` (to a revision number from `src.`, default the previous one), `add_editor`, `remove_editor`, `set_access`, `archive`, `restore`. Same server-side checks as everything else. `set_access` accepts `protected` or `public`. |
+| `vibe_manage` | `rollback` (to a revision number from `src.`, default the previous one), `add_editor`, `remove_editor`, `add_guild`, `set_access`, `archive`, `restore`. Same server-side checks as everything else. `add_guild` accepts a guild ID and gives its current members access to a protected site. `set_access` accepts `protected` or `public`. |
 
-None of these accept a guild, user, or role argument. The actor comes from the
-turn.
+Only `add_guild` accepts a target guild argument and the editor actions accept
+a target user. The actor and owning guild always come from the turn.
 
 ### Coding tools
 
@@ -886,8 +889,8 @@ alongside the behavior it adds.
    tools, the `vibe` subagent, `vibe_check_names`, `vibe_list_sites`, the job
    state machine with repair turns, status messages, and the Discord reply.
    This is the first usable release.
-4. **Management**: `vibe_manage` (rollback, editors, access level, archive,
-   restore) and the `vibe purge` operator command.
+4. **Management**: `vibe_manage` (rollback, editors, shared guilds, access
+   level, archive, restore) and the `vibe purge` operator command.
 
 ## Tests
 
@@ -897,8 +900,8 @@ smoke checklist.
 - Names: the regex, reserved labels, `xn--`, batch checks, and two concurrent
   creates yielding one owner.
 - Access: table-driven checks for member, editor, owner, admin, non-member,
-  wrong guild, DM, `admins_only`, the guild allowlist, protected/public site
-  access, and anonymous public identity.
+  wrong guild, DM, `admins_only`, the guild allowlist, explicitly shared guilds,
+  protected/public site access, and anonymous public identity.
 - Login: state expiry and replay, `return` URL validation, cookie flags,
   logout, membership cache expiry, and Discord-down behavior.
 - Host routing: apex, reserved labels, valid site, unknown site, nested
@@ -941,6 +944,8 @@ smoke checklist.
   identity.
 - A member logs in with Discord once and can then open any site in their
   guilds.
+- Adding a guild to a protected site lets current members of that guild open
+  the deployed site and its protected source without granting edit access.
 - A public site skips OAuth, returns `null` from `vibe.identity()`, and keeps its
   source/history protected.
 - On a protected site, `vibe.identity()` returns the viewer's name and guild,

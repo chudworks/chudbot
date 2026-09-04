@@ -602,7 +602,7 @@ pub(crate) fn vibe_list_sites_spec() -> ClientToolSpec {
 
 pub(crate) fn vibe_manage_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Roll back, authorize or revoke editors, change viewer access, archive, or restore a Vibe site when the current actor has permission. Only the owner or a Chudbot admin can manage editors. Sites are 🔒 protected by default.".into(),
+        description: "Roll back, authorize or revoke editors, share a protected site with another server, change viewer access, archive, or restore a Vibe site when the current actor has permission. Only the owner or a Chudbot admin can manage access. Sites are 🔒 protected by default.".into(),
         input_schema: ToolInputSchema::object([
             ToolInputField::required(
                 "action",
@@ -610,6 +610,7 @@ pub(crate) fn vibe_manage_spec() -> ClientToolSpec {
                     "rollback",
                     "add_editor",
                     "remove_editor",
+                    "add_guild",
                     "set_access",
                     "archive",
                     "restore",
@@ -626,6 +627,12 @@ pub(crate) fn vibe_manage_spec() -> ClientToolSpec {
             ToolInputField::optional(
                 "accessLevel",
                 ToolInputValueSchema::string().enum_values(["protected", "public"]),
+            ),
+            ToolInputField::optional(
+                "guildId",
+                ToolInputValueSchema::string().description(
+                    "Numeric platform guild id required by add_guild. Members of that guild will be able to view the protected site after signing in.",
+                ),
             ),
         ]),
     }
@@ -978,6 +985,48 @@ impl<R: BotRuntimeTypes> RuntimeToolExecutor<R> {
                     })?;
                 serde_json::json!({"action":"remove_editor","userId":user,"removed":removed})
             }
+            "add_guild" => {
+                if site.access != VibeSiteAccess::Protected {
+                    return Ok(vibe_error(
+                        "site_is_public",
+                        "guild sharing only applies to protected sites",
+                    ));
+                }
+                let Some(target_guild) = call
+                    .input
+                    .get("guildId")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(numeric_guild_id)
+                else {
+                    return Ok(vibe_error(
+                        "invalid_input",
+                        "guildId must be a nonzero numeric platform guild id",
+                    ));
+                };
+                if target_guild == site.guild_id {
+                    return Ok(vibe_error(
+                        "guild_already_allowed",
+                        "the owning server already has access",
+                    ));
+                }
+                let mut target_actor = actor.clone();
+                target_actor.guild_id = Some(target_guild.clone());
+                if let Err(error) =
+                    VibeAccess::new(runtime.config.enabled, runtime.config.access.clone())
+                        .check_rollout(&target_actor, VibeOperation::View)
+                {
+                    return Ok(vibe_error("guild_not_allowed", &error.to_string()));
+                }
+                let added = self
+                    .deps
+                    .storage
+                    .add_site_guild(site.id, &site.platform, &target_guild, &actor.user_id)
+                    .await
+                    .map_err(|error| {
+                        ClientToolExecutorError::execution(RuntimeToolError(error.to_string()))
+                    })?;
+                serde_json::json!({"action":"add_guild","guildId":target_guild,"added":added})
+            }
             "set_access" => {
                 let access = match call
                     .input
@@ -1085,6 +1134,14 @@ fn job_state(state: VibeJobState) -> &'static str {
         _ => "running",
     }
 }
+fn numeric_guild_id(input: &str) -> Option<ExternalId> {
+    input
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|id| *id != 0)
+        .map(|id| ExternalId::new(id.to_string()))
+}
 fn vibe_error(code: &str, message: &str) -> ClientToolOutput {
     let value = serde_json::json!({"error":{"code":code,"message":message},"siteModified":false});
     ClientToolOutput {
@@ -1183,6 +1240,18 @@ impl<S: VibeStorage + Clone + 'static> Drop for JobCleanup<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_case::test_case;
+
+    #[test_case("123", Some("123") ; "numeric id")]
+    #[test_case(" 00123 ", Some("123") ; "normalizes whitespace and leading zeroes")]
+    #[test_case("0", None ; "zero")]
+    #[test_case("guild", None ; "non numeric")]
+    fn parses_numeric_guild_ids(input: &str, expected: Option<&str>) {
+        assert_eq!(
+            numeric_guild_id(input).as_ref().map(ExternalId::as_str),
+            expected
+        );
+    }
 
     #[test]
     fn denied_edit_is_an_explicit_non_mutating_tool_error() {

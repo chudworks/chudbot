@@ -119,8 +119,11 @@ firewall commands. The deployment uses the system Docker daemon at
    success page greets the target member rather than redirecting to `/`. Confirm
    the resulting cookie uses `[vibe.auth].session_days`, a nonmember target is
    rejected, and failed DM delivery leaves no redeemable link.
-6. Add an editor, edit, roll back, archive, restore, and have another user race
-   for the same new name. Confirm the permissions and single winner.
+6. Add a second guild to the protected site. Confirm one of its current members
+   can open both site and source after login while a nonmember still sees no
+   site data. Then add an editor, edit, roll back, archive, restore, and have
+   another user race for the same new name. Confirm the permissions and single
+   winner.
 7. Force a build failure and cancel a coding run. Confirm the previous revision
    remains live, no partial artifact is served, and containers/workspaces are
    removed. Restart Chudbot during a disposable job and confirm recovery clears

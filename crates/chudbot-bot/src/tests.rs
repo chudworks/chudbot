@@ -150,6 +150,12 @@ fn generated_tool_schemas_advertise_canonical_input_fields() {
             .as_array()
             .is_some_and(|actions| actions.contains(&json!("set_access")))
     );
+    assert!(
+        vibe_manage["properties"]["action"]["enum"]
+            .as_array()
+            .is_some_and(|actions| actions.contains(&json!("add_guild")))
+    );
+    assert!(vibe_manage["properties"]["guildId"].is_object());
 }
 
 // Shared binding fixture for schema and parser tests that need configured

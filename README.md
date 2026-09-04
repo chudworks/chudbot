@@ -68,7 +68,8 @@ media, memory, and subagent tool that agent must retain.
 
 Vibe sites use local bare Git repositories for source history and immutable
 built artifacts for serving. Sites are `🔒 protected` by default and authenticate
-with Discord OAuth before verifying current guild membership through the bot.
+with Discord OAuth before verifying membership in the owning guild or a guild
+the site owner or an administrator has explicitly added through the bot.
 Members can also ask Chudbot to DM a single-use, 10-minute login link to
 themselves or another current server member; redemption creates the same
 configured-duration session without exposing the credential in the channel or
