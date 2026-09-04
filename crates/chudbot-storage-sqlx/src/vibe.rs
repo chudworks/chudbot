@@ -380,15 +380,25 @@ impl VibeStorage for SqlxStorage {
         session_hash: Vec<u8>,
         now: OffsetDateTime,
         session_expires_at: OffsetDateTime,
-    ) -> Result<bool, Self::Error> {
-        sqlx::query_scalar("WITH consumed AS (UPDATE vibe_login_links SET consumed_at=$3 WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>$3 RETURNING platform,user_id), inserted AS (INSERT INTO vibe_sessions(token_hash,platform,user_id,expires_at) SELECT $2,platform,user_id,$4 FROM consumed RETURNING 1) SELECT EXISTS(SELECT 1 FROM inserted)")
+    ) -> Result<Option<VibeLoginLink>, Self::Error> {
+        Ok(sqlx::query("WITH consumed AS (UPDATE vibe_login_links SET consumed_at=$3 WHERE token_hash=$1 AND consumed_at IS NULL AND expires_at>$3 RETURNING token_hash,platform,guild_id,user_id,requested_by_user_id,expires_at,consumed_at), inserted AS (INSERT INTO vibe_sessions(token_hash,platform,user_id,expires_at) SELECT $2,platform,user_id,$4 FROM consumed RETURNING 1) SELECT consumed.token_hash,consumed.platform,consumed.guild_id,consumed.user_id,consumed.requested_by_user_id,consumed.expires_at,consumed.consumed_at FROM consumed CROSS JOIN inserted")
             .bind(link_hash)
             .bind(session_hash)
             .bind(now)
             .bind(session_expires_at)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(Into::into)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| VibeLoginLink {
+                token_hash: row.get("token_hash"),
+                platform: PlatformName::new(row.get::<String, _>("platform")),
+                guild_id: ExternalId::new(row.get::<String, _>("guild_id")),
+                user_id: ExternalId::new(row.get::<String, _>("user_id")),
+                requested_by_user_id: ExternalId::new(
+                    row.get::<String, _>("requested_by_user_id"),
+                ),
+                expires_at: row.get("expires_at"),
+                consumed_at: row.get("consumed_at"),
+            }))
     }
     async fn create_session(&self, session: NewVibeSession) -> Result<(), Self::Error> {
         sqlx::query(

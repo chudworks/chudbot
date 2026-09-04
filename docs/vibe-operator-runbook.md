@@ -116,8 +116,9 @@ firewall commands. The deployment uses the system Docker daemon at
 5. Ask Chudbot for a login link for the requesting member and for a mentioned
    second member. Confirm only each target's DM receives its link, each link
    expires after 10 minutes or one use, redemption skips Discord OAuth, and the
-   resulting cookie uses `[vibe.auth].session_days`. Confirm a nonmember target
-   is rejected and failed DM delivery leaves no redeemable link.
+   success page greets the target member rather than redirecting to `/`. Confirm
+   the resulting cookie uses `[vibe.auth].session_days`, a nonmember target is
+   rejected, and failed DM delivery leaves no redeemable link.
 6. Add an editor, edit, roll back, archive, restore, and have another user race
    for the same new name. Confirm the permissions and single winner.
 7. Force a build failure and cancel a coding run. Confirm the previous revision

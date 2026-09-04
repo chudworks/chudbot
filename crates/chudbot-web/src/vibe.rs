@@ -291,7 +291,7 @@ where
     };
     let now = OffsetDateTime::now_utc();
     let token = random_token();
-    match state
+    let link = match state
         .storage
         .redeem_login_link(
             &token_hash(link_token),
@@ -301,8 +301,8 @@ where
         )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => {
+        Ok(Some(link)) => link,
+        Ok(None) => {
             return error_page(
                 StatusCode::BAD_REQUEST,
                 "this sign-in link expired or was already used",
@@ -315,8 +315,23 @@ where
                 "sign-in is temporarily unavailable",
             );
         }
-    }
-    let mut response = redirect(&format!("https://{}/", vibe.config.base_domain));
+    };
+    let display_name = match state
+        .identity
+        .guild_membership(&link.platform, &link.guild_id, &link.user_id)
+        .await
+    {
+        Ok(Some(membership)) => Some(membership.display_name),
+        Ok(None) => None,
+        Err(error) => {
+            tracing::warn!(error=%error, "failed to load Vibe direct-login display name");
+            None
+        }
+    };
+    let mut response = secured(html(
+        StatusCode::OK,
+        &direct_login_success_body(display_name.as_deref()),
+    ));
     let cookie = session_cookie(
         &vibe.config.base_domain,
         &token,
@@ -1357,6 +1372,12 @@ fn error_page(status: StatusCode, message: &str) -> Response {
         &format!("<main><h1>Vibe</h1><p>{}</p></main>", escape_html(message)),
     )
 }
+fn direct_login_success_body(display_name: Option<&str>) -> String {
+    let heading = display_name
+        .map(|name| format!("Logged in, {}!", escape_html(name)))
+        .unwrap_or_else(|| "Logged in!".to_string());
+    format!("<main><h1>{heading}</h1><p>You can close this tab and return to Vibe.</p></main>")
+}
 fn escape_html(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -1370,6 +1391,15 @@ fn escape_html(value: &str) -> String {
 mod tests {
     use super::*;
     use chudbot_api::{VibeRevisionId, VibeSiteAccess, VibeSiteId};
+
+    #[test]
+    fn direct_login_success_greets_and_escapes_the_target_member() {
+        assert_eq!(
+            direct_login_success_body(Some("Pork & Beans")),
+            "<main><h1>Logged in, Pork &amp; Beans!</h1><p>You can close this tab and return to Vibe.</p></main>"
+        );
+        assert!(direct_login_success_body(None).contains("<h1>Logged in!</h1>"));
+    }
     use chudbot_vibe::config::{
         VibeAccessConfig, VibeAuthConfig, VibeLimitsConfig, VibeSandboxConfig,
     };

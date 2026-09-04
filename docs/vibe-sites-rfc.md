@@ -286,8 +286,9 @@ person's session.
 Direct-login links are bearer credentials, expire after 10 minutes, and are
 single-use. Only their SHA-256 hashes are stored. `GET /login/direct?token=...`
 atomically consumes the link, creates a fresh browser session for the bound
-platform user, sets the normal `vibe_session` cookie, and redirects to the apex
-host. The resulting session lifetime is `[vibe.auth].session_days`, exactly as
+platform user, sets the normal `vibe_session` cookie, and renders a private
+success page greeting that member by their current Discord display name. The
+resulting session lifetime is `[vibe.auth].session_days`, exactly as
 for OAuth-created sessions. Failed DM delivery consumes the new link so an
 undelivered credential cannot remain active. Discord embeds are suppressed on
 the DM to avoid link-preview redemption.

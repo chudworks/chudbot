@@ -517,7 +517,7 @@ pub trait VibeStorage: Send + Sync {
         session_token_hash: Vec<u8>,
         now: OffsetDateTime,
         session_expires_at: OffsetDateTime,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<VibeLoginLink>, Self::Error>> + Send;
     fn create_session(
         &self,
         session: NewVibeSession,
