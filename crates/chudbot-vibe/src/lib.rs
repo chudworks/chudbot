@@ -1,6 +1,7 @@
 //! Vibe website names, access policy, source/artifact storage, and sandboxing.
 
 pub mod access;
+pub mod auth;
 pub mod browser;
 pub mod coding;
 pub mod config;
@@ -10,6 +11,7 @@ pub mod names;
 pub mod sandbox;
 
 pub use access::{VibeAccess, VibeAccessError, VibeOperation};
+pub use auth::{LOGIN_LINK_TTL_MINUTES, direct_login_url, random_token, token_hash};
 pub use browser::{
     SDK_TYPESCRIPT_PATH, SDK_V1_JAVASCRIPT, SDK_V1_TYPESCRIPT, install_typescript_bindings,
 };

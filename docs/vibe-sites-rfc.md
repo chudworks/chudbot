@@ -272,8 +272,25 @@ After the callback, Chudbot creates a session row and sets one cookie:
 vibe_session=<random>; Domain=.vibe.example; Secure; HttpOnly; SameSite=Lax; Path=/
 ```
 
-Only a hash of the cookie value is stored. Sessions last 7 days. `/logout`
-revokes the session and clears the cookie.
+Only a hash of the cookie value is stored. Sessions last for the configured
+`[vibe.auth].session_days`. `/logout` revokes the session and clears the cookie.
+
+As an OAuth-free alternative, a current member of an allowed server can ask
+Chudbot to DM a login link to themselves or another current member. Chudbot
+checks the target's current membership before creating the link. The raw token
+is delivered only to the target's DM; the requester-facing tool result and
+stored trace contain delivery metadata but never the token or URL. This makes
+requesting a link for someone else safe without granting the requester that
+person's session.
+
+Direct-login links are bearer credentials, expire after 10 minutes, and are
+single-use. Only their SHA-256 hashes are stored. `GET /login/direct?token=...`
+atomically consumes the link, creates a fresh browser session for the bound
+platform user, sets the normal `vibe_session` cookie, and redirects to the apex
+host. The resulting session lifetime is `[vibe.auth].session_days`, exactly as
+for OAuth-created sessions. Failed DM delivery consumes the new link so an
+undelivered credential cannot remain active. Discord embeds are suppressed on
+the DM to avoid link-preview redemption.
 
 One cookie for the whole domain is a deliberate simplification. A hostile site
 under `vibe.example` could set a sibling's cookie, which among friends is a prank
@@ -302,6 +319,7 @@ a runbook step.
 | `vibe_jobs` | `id`, `site_id` (nullable), `site_name`, `action`, `actor_user_id`, `platform`, `guild_id`, `conversation_id`, `turn_id`, `tool_use_id` (unique), `state`, `error`, timestamps |
 | `vibe_sessions` | `token_hash` (primary key), `platform`, `user_id`, `created_at`, `expires_at`, `revoked_at` |
 | `vibe_oauth_states` | `state_hash` (primary key), `return_url`, `expires_at`, `consumed_at` |
+| `vibe_login_links` | `token_hash` (primary key), `platform`, `guild_id`, `user_id`, `requested_by_user_id`, `expires_at`, `consumed_at` |
 | `vibe_collection_documents` | `site_id`, `collection`, `id`, JSONB `document`, `inserted_by`, `inserted_at`, `updated_by`, `updated_at`; primary key `(site_id, collection, id)` |
 
 Revisions are never updated or deleted except by purge. `running_job_id` is
@@ -730,13 +748,14 @@ There is no Content-Security-Policy in version 1. It would stop sites from
 calling public APIs, which is half the fun, and it does not protect against
 the one threat we have accepted.
 
-There are no state-changing HTTP endpoints anywhere in Vibe, so there is
-nothing for CSRF to attack. Archived protected sites return a plain "not
+Login callbacks establish sessions from single-use bearer credentials and do
+not mutate site data. Archived protected sites return a plain "not
 available" page to members and a 404 to everyone else; an archived public site
 returns the plain unavailable page.
 
 Logging uses the existing tracing setup with the site name and job id on
-spans. Cookies, OAuth codes, secrets, and source contents are never logged.
+spans. Cookies, OAuth codes, direct-login tokens, secrets, and source contents
+are never logged.
 
 ## `src.vibe.example`
 

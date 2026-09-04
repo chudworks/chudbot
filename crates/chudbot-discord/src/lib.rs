@@ -669,6 +669,46 @@ impl MessagePlatform for DiscordPlatform {
     }
 
     #[tracing::instrument(
+        name = "discord.send_direct_message",
+        skip_all,
+        fields(
+            platform = %recipient.platform,
+            recipient = %recipient.user_id,
+            content_chars = content.chars().count(),
+        )
+    )]
+    async fn send_direct_message(
+        &self,
+        recipient: UserRef,
+        content: String,
+    ) -> Result<PostedMessage, Self::Error> {
+        let recipient_id = parse_user_id(&recipient.user_id)?;
+        let channel = self
+            .inner
+            .http
+            .create_private_channel(recipient_id)
+            .await?
+            .model()
+            .await?;
+        MessagePlatform::send_message(
+            self,
+            SendMessage {
+                channel: ChannelRef {
+                    platform: self.inner.platform.clone(),
+                    guild_id: None,
+                    channel_id: external_id(channel.id),
+                },
+                reply_to: None,
+                content,
+                attachments: Vec::new(),
+                suppress_embeds: true,
+                open_thread: None,
+            },
+        )
+        .await
+    }
+
+    #[tracing::instrument(
         name = "discord.send_message",
         skip_all,
         fields(

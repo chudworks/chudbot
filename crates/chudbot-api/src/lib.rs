@@ -150,13 +150,13 @@ pub use usage::{
 // statically-dispatched traits. Concrete SQLx, Twilight, Docker, Git, and Axum
 // code belongs in downstream crates.
 pub use vibe::{
-    CompleteVibeRevision, CreateVibeJob, NewVibeOauthState, NewVibeSession, VibeAction, VibeActor,
-    VibeCollectionChange, VibeCollectionChangeKind, VibeCollectionDocument,
+    CompleteVibeRevision, CreateVibeJob, NewVibeLoginLink, NewVibeOauthState, NewVibeSession,
+    VibeAction, VibeActor, VibeCollectionChange, VibeCollectionChangeKind, VibeCollectionDocument,
     VibeCollectionOperation, VibeCollectionOrder, VibeCollectionOrderDirection,
     VibeCollectionOutcome, VibeCollectionQuery, VibeCollectionWriteMode, VibeIdentity,
-    VibeIdentityProvider, VibeJob, VibeJobId, VibeJobState, VibeMembership, VibeOauthLogin,
-    VibeOauthState, VibeRevision, VibeRevisionId, VibeRole, VibeSession, VibeSite, VibeSiteAccess,
-    VibeSiteId, VibeSiteStatus, VibeStorage,
+    VibeIdentityProvider, VibeJob, VibeJobId, VibeJobState, VibeLoginLink, VibeMembership,
+    VibeOauthLogin, VibeOauthState, VibeRevision, VibeRevisionId, VibeRole, VibeSession, VibeSite,
+    VibeSiteAccess, VibeSiteId, VibeSiteStatus, VibeStorage,
 };
 
 // Viewer-safe reasoning summaries extracted from provider continuations and

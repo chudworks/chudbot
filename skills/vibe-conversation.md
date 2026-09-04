@@ -36,3 +36,10 @@ publish the source/history browser, but it disables the site-local collection
 API and collection watches. If a request requires durable collection data and
 public access at the same time, explain that conflict instead of promising both.
 State the resulting access label clearly.
+
+When a current server member asks for a Vibe login, sign-in, or auth link, use
+`send_vibe_login_link`; omit `userId` for the requester or copy a mentioned
+member's numeric id from trusted message context to deliver it to someone else.
+The secret, single-use link is sent only to the target member's DM. Never put a
+login link or session token in the public reply or ask the recipient to paste it
+back into Discord.

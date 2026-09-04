@@ -451,6 +451,17 @@ impl MessagePlatformRegistry for ConfiguredMessagePlatforms {
             .map_err(ConfiguredPlatformError::Discord)
     }
 
+    async fn send_direct_message(
+        &self,
+        recipient: chudbot_api::UserRef,
+        content: String,
+    ) -> Result<PostedMessage, Self::Error> {
+        let platform = self.discord(&recipient.platform)?;
+        MessagePlatform::send_direct_message(&platform.platform, recipient, content)
+            .await
+            .map_err(ConfiguredPlatformError::Discord)
+    }
+
     async fn send_message(&self, request: SendMessage) -> Result<PostedMessage, Self::Error> {
         let platform = self.discord(&request.channel.platform)?;
         MessagePlatform::send_message(&platform.platform, request)

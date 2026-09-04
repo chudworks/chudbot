@@ -606,6 +606,13 @@ pub trait MessagePlatform: Send + Sync {
         response: PlatformCommandResponse,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
 
+    /// Open or reuse a private channel with one user and send them a message.
+    fn send_direct_message(
+        &self,
+        recipient: UserRef,
+        content: String,
+    ) -> impl Future<Output = Result<PostedMessage, Self::Error>> + Send;
+
     /// Send a visible platform message.
     fn send_message(
         &self,

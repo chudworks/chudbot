@@ -15,13 +15,15 @@ use chudbot_api::{
     ExternalId, PlatformName, VibeIdentity, VibeIdentityProvider, VibeMembership, VibeSession,
     VibeSite, VibeSiteAccess, VibeSiteStatus, VibeStorage,
 };
-use chudbot_vibe::{SDK_V1_JAVASCRIPT, SDK_V1_TYPESCRIPT, VibeConfig, VibeDiskStore, VibeNames};
+use chudbot_vibe::{
+    SDK_V1_JAVASCRIPT, SDK_V1_TYPESCRIPT, VibeConfig, VibeDiskStore, VibeNames, random_token,
+    token_hash,
+};
 use lru::LruCache;
 use moka::future::Cache;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
@@ -267,12 +269,64 @@ where
             "<main><h1>Vibe</h1><p>Small websites made with friends in Discord.</p></main>",
         ),
         (&Method::GET, "/login") => login(state, vibe, request.uri()).await,
+        (&Method::GET, "/login/direct") => direct_login(state, vibe, request.uri()).await,
         (&Method::GET, "/oauth/callback") => oauth_callback(state, vibe, request.uri()).await,
         (&Method::GET, "/logout") | (&Method::POST, "/logout") => {
             logout(state, vibe, request.headers()).await
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+async fn direct_login<R>(state: &WebState<R>, vibe: &VibeWebState, uri: &Uri) -> Response
+where
+    R: WebRuntimeTypes,
+{
+    let query = query_map(uri);
+    let Some(link_token) = query
+        .get("token")
+        .filter(|token| !token.is_empty() && token.len() <= 128)
+    else {
+        return error_page(StatusCode::BAD_REQUEST, "invalid sign-in link");
+    };
+    let now = OffsetDateTime::now_utc();
+    let token = random_token();
+    match state
+        .storage
+        .redeem_login_link(
+            &token_hash(link_token),
+            token_hash(&token),
+            now,
+            now + Duration::days(i64::from(vibe.config.auth.session_days)),
+        )
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => {
+            return error_page(
+                StatusCode::BAD_REQUEST,
+                "this sign-in link expired or was already used",
+            );
+        }
+        Err(error) => {
+            tracing::error!(error=%error, "failed to consume Vibe direct-login link");
+            return error_page(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "sign-in is temporarily unavailable",
+            );
+        }
+    }
+    let mut response = redirect(&format!("https://{}/", vibe.config.base_domain));
+    let cookie = session_cookie(
+        &vibe.config.base_domain,
+        &token,
+        vibe.config.auth.session_days,
+    );
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&cookie).expect("generated cookie is valid"),
+    );
+    response
 }
 
 async fn login<R>(state: &WebState<R>, vibe: &VibeWebState, uri: &Uri) -> Response
@@ -1194,9 +1248,6 @@ fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
             (key == name && !value.is_empty() && value.len() <= 128).then_some(value)
         })
 }
-fn random_token() -> String {
-    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
-}
 fn session_cookie(base: &str, token: &str, days: u16) -> String {
     format!(
         "{SESSION_COOKIE}={token}; Domain=.{base}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
@@ -1205,9 +1256,6 @@ fn session_cookie(base: &str, token: &str, days: u16) -> String {
 }
 fn clear_session_cookie(base: &str) -> String {
     format!("{SESSION_COOKIE}=; Domain=.{base}; Secure; HttpOnly; SameSite=Lax; Path=/; Max-Age=0")
-}
-fn token_hash(token: &str) -> Vec<u8> {
-    Sha256::digest(token.as_bytes()).to_vec()
 }
 fn query_map(uri: &Uri) -> std::collections::BTreeMap<String, String> {
     url::form_urlencoded::parse(uri.query().unwrap_or_default().as_bytes())
@@ -1235,13 +1283,14 @@ fn valid_return_url(value: &str, base: &str) -> bool {
 }
 fn redirect(location: &str) -> Response {
     let mut response = StatusCode::SEE_OTHER.into_response();
-    match HeaderValue::from_str(location) {
+    let response = match HeaderValue::from_str(location) {
         Ok(value) => {
             response.headers_mut().insert(header::LOCATION, value);
             response
         }
         Err(_) => error_page(StatusCode::BAD_REQUEST, "invalid redirect"),
-    }
+    };
+    secured(response)
 }
 fn safe_url_path(path: &str) -> Option<PathBuf> {
     let decoded = percent_decode_str(path.trim_start_matches('/'))

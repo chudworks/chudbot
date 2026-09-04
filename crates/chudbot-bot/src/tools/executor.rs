@@ -323,6 +323,8 @@ pub(crate) struct RuntimeToolExecutor<R: BotRuntimeTypes> {
     vibe_subagents: BTreeMap<ToolName, VibeSubagent<R>>,
     /// Companion Vibe conversation tools when an admitted binding exists.
     pub(super) vibe: Option<chudbot_vibe::VibeRuntime>,
+    /// Vibe browser-login configuration exposed only to the top-level agent.
+    vibe_login_config: Option<chudbot_vibe::VibeConfig>,
     pub(super) vibe_actor_is_admin: bool,
 }
 
@@ -342,6 +344,7 @@ where
             .field("audio_transcription", &self.audio_transcription.is_some())
             .field("subagents", &self.subagents)
             .field("vibe_subagents", &self.vibe_subagents.keys())
+            .field("vibe_login", &self.vibe_login_config.is_some())
             .finish()
     }
 }
@@ -401,6 +404,9 @@ where
             }
             FORGET_USER_MEMORY_TOOL if self.memory_writes_enabled() => {
                 self.forget_user_memory(call).await
+            }
+            SEND_VIBE_LOGIN_LINK_TOOL if self.vibe_login_config.is_some() => {
+                self.send_vibe_login_link(call).await
             }
             VIBE_CHECK_NAMES_TOOL if self.vibe.is_some() => self.vibe_check_names(call).await,
             VIBE_LIST_SITES_TOOL if self.vibe.is_some() => self.vibe_list_sites(call).await,
@@ -502,6 +508,12 @@ where
         for (name, subagent) in &self.vibe_subagents {
             definitions.push(ClientToolDefinition::new(name.clone(), subagent.spec()));
         }
+        if let Some(tool) = self.vibe_login_link_tool() {
+            definitions.push(ClientToolDefinition::new(
+                SEND_VIBE_LOGIN_LINK_TOOL,
+                tool.spec(),
+            ));
+        }
         if self.vibe.is_some() {
             definitions.push(ClientToolDefinition::new(
                 VIBE_CHECK_NAMES_TOOL,
@@ -537,6 +549,7 @@ where
             subagents: BTreeMap::new(),
             vibe_subagents: BTreeMap::new(),
             vibe: None,
+            vibe_login_config: None,
             vibe_actor_is_admin: false,
         }
     }
@@ -565,6 +578,10 @@ where
 
     pub(crate) fn enable_audio_transcription(&mut self, binding: TranscriptionBinding) {
         self.audio_transcription = Some(binding);
+    }
+
+    pub(crate) fn enable_vibe_login(&mut self, config: chudbot_vibe::VibeConfig) {
+        self.vibe_login_config = Some(config);
     }
 
     pub(crate) fn add_subagent(
@@ -615,6 +632,17 @@ where
             storage: self.deps.storage.clone(),
             channel: self.context.default_channel.clone(),
         }
+    }
+
+    fn vibe_login_link_tool(&self) -> Option<VibeLoginLinkTool<R::Platforms, R::Storage>> {
+        self.vibe_login_config
+            .as_ref()
+            .map(|config| VibeLoginLinkTool {
+                platforms: self.deps.platforms.clone(),
+                storage: self.deps.storage.clone(),
+                context: self.context.clone(),
+                config: config.clone(),
+            })
     }
 
     fn image_generation_tool(
@@ -735,6 +763,16 @@ where
             .call(call)
             .await
             .map_err(runtime_tool_execution_error)
+    }
+
+    async fn send_vibe_login_link(
+        &self,
+        call: ClientToolCall,
+    ) -> Result<ClientToolOutput, ClientToolExecutorError<RuntimeToolError>> {
+        let Some(tool) = self.vibe_login_link_tool() else {
+            return Err(ClientToolExecutorError::unknown(call.name));
+        };
+        tool.call(call).await.map_err(runtime_tool_execution_error)
     }
 
     async fn generate_image(

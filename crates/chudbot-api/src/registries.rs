@@ -24,7 +24,7 @@ use std::future::Future;
 
 use futures::Stream;
 
-use crate::ids::{ChannelRef, MessageRef, PlatformName, ProviderName, VideoJobId};
+use crate::ids::{ChannelRef, MessageRef, PlatformName, ProviderName, UserRef, VideoJobId};
 use crate::llm::{ModelInfo, ModelInfoRequest, ModelStepEvent, ModelStepRequest};
 use crate::media::{
     AudioTranscription, AudioTranscriptionRequest, GeneratedImage, ImageRequest, VideoJobStatus,
@@ -204,6 +204,13 @@ pub trait MessagePlatformRegistry: Clone + Send + Sync {
         &self,
         response: PlatformCommandResponse,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+
+    /// Send a private message to a user through the named platform.
+    fn send_direct_message(
+        &self,
+        recipient: UserRef,
+        content: String,
+    ) -> impl Future<Output = Result<PostedMessage, Self::Error>> + Send;
 
     /// Send a message through the platform named by `request.channel.platform`.
     ///

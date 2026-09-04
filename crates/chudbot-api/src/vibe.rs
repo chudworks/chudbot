@@ -337,6 +337,29 @@ pub struct NewVibeOauthState {
     pub expires_at: OffsetDateTime,
 }
 
+/// Hashed, single-use browser login link delivered to a platform user.
+#[derive(Debug, Clone)]
+pub struct VibeLoginLink {
+    pub token_hash: Vec<u8>,
+    pub platform: PlatformName,
+    pub guild_id: ExternalId,
+    pub user_id: ExternalId,
+    pub requested_by_user_id: ExternalId,
+    pub expires_at: OffsetDateTime,
+    pub consumed_at: Option<OffsetDateTime>,
+}
+
+/// Values persisted when Chudbot issues a direct-message login link.
+#[derive(Debug, Clone)]
+pub struct NewVibeLoginLink {
+    pub token_hash: Vec<u8>,
+    pub platform: PlatformName,
+    pub guild_id: ExternalId,
+    pub user_id: ExternalId,
+    pub requested_by_user_id: ExternalId,
+    pub expires_at: OffsetDateTime,
+}
+
 /// Result of the identify-only Discord OAuth exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VibeOauthLogin {
@@ -479,6 +502,22 @@ pub trait VibeStorage: Send + Sync {
         state_hash: &[u8],
         now: OffsetDateTime,
     ) -> impl Future<Output = Result<Option<VibeOauthState>, Self::Error>> + Send;
+    fn create_login_link(
+        &self,
+        link: NewVibeLoginLink,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn consume_login_link(
+        &self,
+        token_hash: &[u8],
+        now: OffsetDateTime,
+    ) -> impl Future<Output = Result<Option<VibeLoginLink>, Self::Error>> + Send;
+    fn redeem_login_link(
+        &self,
+        link_token_hash: &[u8],
+        session_token_hash: Vec<u8>,
+        now: OffsetDateTime,
+        session_expires_at: OffsetDateTime,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send;
     fn create_session(
         &self,
         session: NewVibeSession,

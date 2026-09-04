@@ -125,6 +125,10 @@ impl ConversationToolPolicy {
     fn final_reply_attach(self) -> bool {
         self.top_level
     }
+
+    fn vibe_login(self) -> bool {
+        self.top_level
+    }
 }
 
 impl<R> BotRuntime<R>
@@ -190,7 +194,6 @@ where
             ensure_client_tool_enabled(&mut spec.client_tools, memory::REMEMBER_USER_MEMORY_TOOL);
             ensure_client_tool_enabled(&mut spec.client_tools, memory::FORGET_USER_MEMORY_TOOL);
         }
-
         // Seed the executor with per-turn handles. Later blocks only enable
         // feature bits or attach configured bindings; they do not change turn
         // identity.
@@ -238,6 +241,15 @@ where
         tracing::debug!(tool = ADD_REACTION_TOOL, "attaching runtime tool");
         tracing::debug!(tool = USAGE_REPORT_TOOL, "attaching runtime tool");
         tool_executor.enable_tools(RuntimeToolFlags::CONVERSATION_HELPERS);
+        if policy.vibe_login()
+            && let Some(runtime) = &self.vibe
+        {
+            tracing::debug!(
+                tool = SEND_VIBE_LOGIN_LINK_TOOL,
+                "attaching Vibe login tool"
+            );
+            tool_executor.enable_vibe_login(runtime.config.clone());
+        }
 
         // Generated media is only delivered from the top-level trace. Subagents
         // return text to their parent, so exposing generation there would make

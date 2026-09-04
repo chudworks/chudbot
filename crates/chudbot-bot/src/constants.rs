@@ -40,6 +40,9 @@ pub(crate) const ADD_REACTION_TOOL: &str = "add_reaction";
 /// Model-visible client tool name for generating usage and cost summaries.
 pub(crate) const USAGE_REPORT_TOOL: &str = "usage_report";
 
+/// Model-visible client tool name for delivering a single-use Vibe login link.
+pub(crate) const SEND_VIBE_LOGIN_LINK_TOOL: &str = "send_vibe_login_link";
+
 /// Reaction used while a turn or retry is actively running.
 pub(crate) const WORKING_REACTION: &str = "👀";
 

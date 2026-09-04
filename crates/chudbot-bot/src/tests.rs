@@ -844,6 +844,16 @@ impl MessagePlatformRegistry for ReactionRecordingPlatform {
         ))
     }
 
+    async fn send_direct_message(
+        &self,
+        _recipient: UserRef,
+        _content: String,
+    ) -> Result<PostedMessage, Self::Error> {
+        Err(TestPlatformError(
+            "unexpected send_direct_message".to_string(),
+        ))
+    }
+
     async fn send_message(&self, _request: SendMessage) -> Result<PostedMessage, Self::Error> {
         Err(TestPlatformError("unexpected send_message".to_string()))
     }

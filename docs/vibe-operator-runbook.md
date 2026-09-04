@@ -113,22 +113,27 @@ firewall commands. The deployment uses the system Docker daemon at
    assets without an OAuth redirect, `vibe.identity()` returns JSON `null`, and
    the source link still requires guild membership. Set it back to
    `🔒 protected` and confirm the OAuth redirect returns.
-5. Add an editor, edit, roll back, archive, restore, and have another user race
+5. Ask Chudbot for a login link for the requesting member and for a mentioned
+   second member. Confirm only each target's DM receives its link, each link
+   expires after 10 minutes or one use, redemption skips Discord OAuth, and the
+   resulting cookie uses `[vibe.auth].session_days`. Confirm a nonmember target
+   is rejected and failed DM delivery leaves no redeemable link.
+6. Add an editor, edit, roll back, archive, restore, and have another user race
    for the same new name. Confirm the permissions and single winner.
-6. Force a build failure and cancel a coding run. Confirm the previous revision
+7. Force a build failure and cancel a coding run. Confirm the previous revision
    remains live, no partial artifact is served, and containers/workspaces are
    removed. Restart Chudbot during a disposable job and confirm recovery clears
    locks and repairs `main` to the Postgres-active commit.
-7. Inspect response headers on HTML, JS, images, SDK, and identity responses:
+8. Inspect response headers on HTML, JS, images, SDK, and identity responses:
    `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`,
    `Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY`.
-8. Inspect Cloudflare responses repeatedly. `CF-Cache-Status` must never be
+9. Inspect Cloudflare responses repeatedly. `CF-Cache-Status` must never be
    `HIT` for the apex, source, any site file, or `/__vibe/` response.
-9. Open two tabs on one protected site and exercise room join, broadcast,
+10. Open two tabs on one protected site and exercise room join, broadcast,
    user-state, and quit events. Repeat on a public site and confirm its anonymous
    id survives a reload. Join the same room name on a second site and confirm no
    users, state, or events cross the site boundary.
-10. On a protected site, insert, update, filter, count, and delete collection
+11. On a protected site, insert, update, filter, count, and delete collection
     documents, including a JSON-valued non-matching column and `deleteOne` with
     multiple matches. Open a watch in a second tab and confirm insert, update
     entry/exit, and delete events. Make the site public and confirm collection

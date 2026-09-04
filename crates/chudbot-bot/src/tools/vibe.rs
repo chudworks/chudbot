@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use chudbot_api::vibe::{
     CompleteVibeRevision, CreateVibeJob, VibeAction, VibeActor, VibeJobState, VibeRevision,
     VibeRevisionId, VibeRole, VibeSiteAccess, VibeSiteId,
@@ -1200,6 +1203,3 @@ mod tests {
         assert_eq!(value, output.trace_response);
     }
 }
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
