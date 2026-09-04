@@ -1,8 +1,10 @@
 # Chudbot
 
-Discord bot + trace viewer for model-backed agents. Chudbot records each
-conversation turn in Postgres, including model input, client tool results,
-provider-side tool traces, usage records, media references, and final replies.
+Discord bot, trace viewer, and private website builder for model-backed agents.
+Chudbot records each conversation turn in Postgres, including model input,
+client tool results, provider-side tool traces, usage records, media references,
+and final replies. Its optional Vibe runtime lets Discord users create and
+maintain small React sites through a sandboxed coding agent.
 
 ## Run
 
@@ -31,6 +33,22 @@ Production deploy:
 ./serve.sh deploy
 ```
 
+The production helper targets Linux. It applies the repository-managed Docker
+firewall, builds the pinned sandbox image, installs the Vibe skills and
+template, builds Chudbot, validates configuration, runs migrations, and
+restarts the tmux service. It does not install a systemd unit or write a helper
+into a global system path.
+
+Useful production commands:
+
+```sh
+./serve.sh status
+./serve.sh firewall-install
+./serve.sh firewall-check
+./serve.sh firewall-remove
+./serve.sh vibe-purge <site-name>
+```
+
 ## Configuration
 
 Copy `config.example.toml` to `config.toml`. The example is the reference for
@@ -38,7 +56,33 @@ all supported options: logging, database, web serving, storage, named
 providers, platforms, agents, media generation bindings, memory, and subagents.
 
 The runtime is agent-first. Agents select named provider services and model
-specs; provider credentials live under `[llm.*]`, `[image.*]`, and `[video.*]`.
+specs; provider credentials live under `[llm.*]`, `[image.*]`, `[video.*]`, and
+`[audio.*]`.
+
+`[bot.agents.<name>].client_tools` is a strict allowlist over tools registered
+by the runtime. It does not add to the default tool set. Omit it when an agent
+should receive every configured runtime tool; otherwise include every normal,
+media, memory, and subagent tool that agent must retain.
+
+## Vibe Sites
+
+Vibe sites use local bare Git repositories for source history and immutable
+built artifacts for serving. Site and source hosts authenticate with Discord
+OAuth and verify current guild membership through the bot before returning site
+data. The coding container receives one workspace bind mount, no Docker socket
+or Chudbot secrets, a read-only root filesystem, dropped capabilities, and
+bounded CPU, memory, PIDs, output, and runtime.
+
+The default conversation agent loads `vibe_conversation` and exposes a `vibe`
+subagent bound to `vibe_coder`. The coding agent loads the `vibe` skill and has
+exactly `read`, `edit`, and `shell`; its `read` and `edit` operations execute in
+the container namespace. Generated dependency and build paths such as
+`node_modules`, `dist`, and TypeScript build metadata are neither committed nor
+shown by the source viewer.
+
+See [config.example.toml](config.example.toml) for the complete configuration
+and [docs/vibe-operator-runbook.md](docs/vibe-operator-runbook.md) for the DGX
+Spark firewall, Docker, Cloudflare, OAuth, backup, and smoke-test procedure.
 
 ## Crates
 
@@ -48,6 +92,8 @@ specs; provider credentials live under `[llm.*]`, `[image.*]`, and `[video.*]`.
 - `chudbot-web`: Axum viewer/API/SSE server.
 - `chudbot-storage-sqlx`: Postgres storage.
 - `chudbot-asset-local`, `chudbot-asset-s3`: media storage backends.
+- `chudbot-vibe`: Vibe access rules, Git/artifact storage, sandbox execution,
+  coding tools, names, and site runtime configuration.
 - `chudbot-xai`, `chudbot-gemini`, `chudbot-openai`,
   `chudbot-openai-compat`, `chudbot-anthropic`: provider crates.
 - `chudbot-bin`: process launcher.
