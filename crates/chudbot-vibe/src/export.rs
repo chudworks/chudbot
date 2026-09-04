@@ -273,18 +273,31 @@ async fn copy_artifact_tree(
 }
 
 async fn inject_sdk(index: &Path) -> Result<(), VibeError> {
-    const TAG: &str = "<script defer src=\"/__vibe/sdk/v1/vibe.js\"></script>";
     let html = tokio::fs::read_to_string(index).await?;
-    if html.contains(TAG) {
-        return Ok(());
-    }
-    let updated = if let Some(position) = html.rfind("</body>") {
-        format!("{}  {TAG}\n{}", &html[..position], &html[position..])
-    } else {
-        format!("{html}\n{TAG}\n")
-    };
+    let updated = inject_sdk_html(&html);
     tokio::fs::write(index, updated).await?;
     Ok(())
+}
+
+fn inject_sdk_html(html: &str) -> String {
+    const DEFERRED_TAG: &str = "<script defer src=\"/__vibe/sdk/v1/vibe.js\"></script>";
+    const TAG: &str = "<script src=\"/__vibe/sdk/v1/vibe.js\"></script>";
+
+    // A module script may run before a later deferred classic script, which leaves the
+    // application racing the global `vibe` binding. Keep the SDK parser-blocking and place it
+    // before every application script so the binding exists before modules can be evaluated.
+    let html = html.replace(DEFERRED_TAG, "").replace(TAG, "");
+    let position = find_ascii_case_insensitive(&html, "<script")
+        .or_else(|| find_ascii_case_insensitive(&html, "</body>"))
+        .unwrap_or(html.len());
+    format!("{}{TAG}\n{}", &html[..position], &html[position..])
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Option<usize> {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 #[cfg(test)]
@@ -318,6 +331,29 @@ mod tests {
             .await
             .unwrap();
         root
+    }
+
+    #[test]
+    fn sdk_loader_is_synchronous_and_precedes_application_scripts() {
+        let html = r#"<!doctype html><html><head><script type="module" src="/assets/app.js"></script></head><body></body></html>"#;
+        let injected = inject_sdk_html(html);
+        let sdk = injected.find("/__vibe/sdk/v1/vibe.js").unwrap();
+        let app = injected.find("/assets/app.js").unwrap();
+
+        assert!(sdk < app);
+        assert!(!injected.contains("script defer"));
+    }
+
+    #[test]
+    fn sdk_loader_replaces_the_previous_deferred_injection() {
+        let html = r#"<HTML><BODY><SCRIPT type="module" src="/app.js"></SCRIPT><script defer src="/__vibe/sdk/v1/vibe.js"></script></BODY></HTML>"#;
+        let injected = inject_sdk_html(html);
+
+        assert_eq!(injected.matches("/__vibe/sdk/v1/vibe.js").count(), 1);
+        assert!(
+            injected.find("/__vibe/sdk/v1/vibe.js").unwrap() < injected.find("/app.js").unwrap()
+        );
+        assert!(!injected.contains("script defer"));
     }
 
     #[tokio::test]
