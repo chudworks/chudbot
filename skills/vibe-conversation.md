@@ -15,3 +15,9 @@ guilds.
 After a successful job, report both the Site and Source links returned by the
 tool. Chudbot owns the actor, Git commit, clean build, and deployment; never
 ask the model to provide a guild, owner, user id, role, commit, or host path.
+
+New sites are `🔒 protected`: deployed-site viewers must sign in with Discord
+and remain members of the owning server. Use `vibe_manage` with
+`action: "set_access"` and `accessLevel: "public"` or `"protected"` only when
+the user asks to change who can view the deployed site. Public access does not
+publish the source/history browser. State the resulting access label clearly.

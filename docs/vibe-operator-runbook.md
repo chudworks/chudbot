@@ -66,7 +66,8 @@ firewall commands. The deployment uses the system Docker daemon at
 4. Enable “Always Use HTTPS” (or an equivalent redirect rule) for the zone.
 5. Create a Cache Rule matching every hostname in the zone and set cache
    eligibility to bypass. Do not rely only on origin `Cache-Control`; the rule
-   prevents a Cloudflare cache hit from bypassing a membership check.
+   prevents a Cloudflare cache hit from bypassing a membership check or
+   retaining public content after a site becomes protected.
 6. Confirm Universal SSL is active for the apex and one-level wildcard before
    testing a site.
 
@@ -106,14 +107,18 @@ firewall commands. The deployment uses the system Docker daemon at
    link refresh, and `vibe.identity()`'s exact public fields.
 3. With a second account that is not in the guild, request the HTML, a known
    asset, source, and the identity API. Every request must reveal no site data.
-4. Add an editor, edit, roll back, archive, restore, and have another user race
+4. Make the site public. Confirm a signed-out browser can load the HTML and
+   assets without an OAuth redirect, `vibe.identity()` returns JSON `null`, and
+   the source link still requires guild membership. Set it back to
+   `🔒 protected` and confirm the OAuth redirect returns.
+5. Add an editor, edit, roll back, archive, restore, and have another user race
    for the same new name. Confirm the permissions and single winner.
-5. Force a build failure and cancel a coding run. Confirm the previous revision
+6. Force a build failure and cancel a coding run. Confirm the previous revision
    remains live, no partial artifact is served, and containers/workspaces are
    removed. Restart Chudbot during a disposable job and confirm recovery clears
    locks and repairs `main` to the Postgres-active commit.
-6. Inspect response headers on HTML, JS, images, SDK, and identity responses:
+7. Inspect response headers on HTML, JS, images, SDK, and identity responses:
    `Cache-Control: private, no-store`, `X-Content-Type-Options: nosniff`,
    `Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY`.
-7. Inspect Cloudflare responses repeatedly. `CF-Cache-Status` must never be
+8. Inspect Cloudflare responses repeatedly. `CF-Cache-Status` must never be
    `HIT` for the apex, source, any site file, or `/__vibe/` response.

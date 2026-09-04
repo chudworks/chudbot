@@ -20,7 +20,7 @@ Workspace crates:
   into `chudbot-api`.
 - `chudbot-web`: Axum JSON API, SSE, media routes, static SPA serving, crawler
   controls, link-preview (OpenGraph) injection, viewer config, and authenticated
-  Vibe site/source host routing.
+  Vibe source plus access-aware site host routing.
 - `chudbot-storage-sqlx`: Postgres `BotStorage` implementation and embedded
   migrations.
 - `chudbot-asset-local`: local filesystem `MediaStore`.
@@ -117,10 +117,13 @@ The web viewer is unauthenticated. Security relies on unguessable UUIDs plus
 the web layer's no-index/crawler controls. Do not add route-listing or
 guessable conversation discovery.
 
-Vibe is separate from the trace viewer. Site and source hosts require a Discord
-OAuth session and a current guild-membership check. Wrong-guild and nonmember
-requests must reveal no site data. `/__vibe/` routes take precedence over site
-artifacts, and every Vibe response remains private and uncacheable.
+Vibe is separate from the trace viewer. Sites are `🔒 protected` by default;
+protected site and source hosts require a Discord OAuth session and a current
+guild-membership check. Public sites skip OAuth and return a null browser
+identity, but their source remains protected. Wrong-guild and nonmember
+requests to protected surfaces must reveal no site data. `/__vibe/` routes take
+precedence over site artifacts, and every Vibe response remains private and
+uncacheable.
 
 Vibe source history lives in local bare Git repositories; served files come
 only from immutable per-revision artifact directories. Postgres is authoritative

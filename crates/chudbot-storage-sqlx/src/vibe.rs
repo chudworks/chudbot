@@ -53,7 +53,7 @@ impl VibeStorage for SqlxStorage {
         }
         match input.action {
             VibeAction::Create => {
-                sqlx::query("INSERT INTO vibe_sites (id,name,platform,guild_id,owner_user_id,description,status) VALUES ($1,$2,$3,$4,$5,$6,'creating')")
+                sqlx::query("INSERT INTO vibe_sites (id,name,platform,guild_id,owner_user_id,description,status,access) VALUES ($1,$2,$3,$4,$5,$6,'creating','protected')")
                     .bind(input.site_id.0).bind(&input.site_name).bind(input.actor.platform.as_str()).bind(guild.as_str())
                     .bind(input.actor.user_id.as_str()).bind(&input.description).execute(&mut *tx).await?;
             }
@@ -181,7 +181,7 @@ impl VibeStorage for SqlxStorage {
             return Ok(Vec::new());
         };
         let pattern = filter.map(|f| format!("%{}%", f.replace('%', "\\%").replace('_', "\\_")));
-        let rows = sqlx::query("SELECT s.id,s.name,s.platform,s.guild_id,s.owner_user_id,s.description,s.status::text AS status,s.active_revision_id,s.running_job_id,s.created_at,s.updated_at,EXISTS(SELECT 1 FROM vibe_site_editors e WHERE e.site_id=s.id AND e.platform=$1 AND e.user_id=$3) AS editor,EXISTS(SELECT 1 FROM vibe_jobs j WHERE j.site_id=s.id AND j.conversation_id=$4) AS current_conversation FROM vibe_sites s WHERE s.platform=$1 AND s.guild_id=$2 AND s.status='active' AND ($5::text IS NULL OR s.name ILIKE $5 ESCAPE '\\' OR s.description ILIKE $5 ESCAPE '\\') ORDER BY current_conversation DESC,(s.owner_user_id=$3) DESC,s.updated_at DESC")
+        let rows = sqlx::query("SELECT s.id,s.name,s.platform,s.guild_id,s.owner_user_id,s.description,s.status::text AS status,s.access::text AS access,s.active_revision_id,s.running_job_id,s.created_at,s.updated_at,EXISTS(SELECT 1 FROM vibe_site_editors e WHERE e.site_id=s.id AND e.platform=$1 AND e.user_id=$3) AS editor,EXISTS(SELECT 1 FROM vibe_jobs j WHERE j.site_id=s.id AND j.conversation_id=$4) AS current_conversation FROM vibe_sites s WHERE s.platform=$1 AND s.guild_id=$2 AND s.status='active' AND ($5::text IS NULL OR s.name ILIKE $5 ESCAPE '\\' OR s.description ILIKE $5 ESCAPE '\\') ORDER BY current_conversation DESC,(s.owner_user_id=$3) DESC,s.updated_at DESC")
             .bind(actor.platform.as_str()).bind(guild.as_str()).bind(actor.user_id.as_str()).bind(actor.conversation_id.0).bind(pattern).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|row| {
@@ -253,6 +253,20 @@ impl VibeStorage for SqlxStorage {
         )
         .bind(site.0)
         .bind(site_status_text(status))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+    async fn set_site_access(
+        &self,
+        site: VibeSiteId,
+        access: VibeSiteAccess,
+    ) -> Result<(), Self::Error> {
+        sqlx::query(
+            "UPDATE vibe_sites SET access=$2::vibe_site_access,updated_at=now() WHERE id=$1",
+        )
+        .bind(site.0)
+        .bind(access.as_str())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -344,13 +358,13 @@ fn site_query(
 ) -> sqlx::query::Query<'static, sqlx::Postgres, sqlx::postgres::PgArguments> {
     match suffix {
         "WHERE name = $1" => sqlx::query(
-            "SELECT id,name,platform,guild_id,owner_user_id,description,status::text AS status,active_revision_id,running_job_id,created_at,updated_at FROM vibe_sites WHERE name = $1",
+            "SELECT id,name,platform,guild_id,owner_user_id,description,status::text AS status,access::text AS access,active_revision_id,running_job_id,created_at,updated_at FROM vibe_sites WHERE name = $1",
         ),
         "WHERE id = $1" => sqlx::query(
-            "SELECT id,name,platform,guild_id,owner_user_id,description,status::text AS status,active_revision_id,running_job_id,created_at,updated_at FROM vibe_sites WHERE id = $1",
+            "SELECT id,name,platform,guild_id,owner_user_id,description,status::text AS status,access::text AS access,active_revision_id,running_job_id,created_at,updated_at FROM vibe_sites WHERE id = $1",
         ),
         "WHERE active_revision_id IS NOT NULL" => sqlx::query(
-            "SELECT id,name,platform,guild_id,owner_user_id,description,status::text AS status,active_revision_id,running_job_id,created_at,updated_at FROM vibe_sites WHERE active_revision_id IS NOT NULL",
+            "SELECT id,name,platform,guild_id,owner_user_id,description,status::text AS status,access::text AS access,active_revision_id,running_job_id,created_at,updated_at FROM vibe_sites WHERE active_revision_id IS NOT NULL",
         ),
         _ => unreachable!("site query suffix is internal and fixed"),
     }
@@ -378,6 +392,7 @@ fn site_from_row(row: sqlx::postgres::PgRow) -> Result<VibeSite, SqlxStorageErro
         owner_user_id: ExternalId::new(row.get::<String, _>("owner_user_id")),
         description: row.get("description"),
         status: parse_site_status(&row.get::<String, _>("status"))?,
+        access: parse_site_access(&row.get::<String, _>("access"))?,
         active_revision_id: row
             .get::<Option<Uuid>, _>("active_revision_id")
             .map(VibeRevisionId),
@@ -466,6 +481,13 @@ fn parse_site_status(v: &str) -> Result<VibeSiteStatus, SqlxStorageError> {
         "active" => Ok(VibeSiteStatus::Active),
         "archived" => Ok(VibeSiteStatus::Archived),
         _ => Err(invalid("site status", v)),
+    }
+}
+fn parse_site_access(v: &str) -> Result<VibeSiteAccess, SqlxStorageError> {
+    match v {
+        "protected" => Ok(VibeSiteAccess::Protected),
+        "public" => Ok(VibeSiteAccess::Public),
+        _ => Err(invalid("site access", v)),
     }
 }
 fn parse_job_state(v: &str) -> Result<VibeJobState, SqlxStorageError> {

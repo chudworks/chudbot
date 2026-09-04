@@ -153,7 +153,7 @@ pub use vibe::{
     CompleteVibeRevision, CreateVibeJob, NewVibeOauthState, NewVibeSession, VibeAction, VibeActor,
     VibeIdentity, VibeIdentityProvider, VibeJob, VibeJobId, VibeJobState, VibeMembership,
     VibeOauthLogin, VibeOauthState, VibeRevision, VibeRevisionId, VibeRole, VibeSession, VibeSite,
-    VibeSiteId, VibeSiteStatus, VibeStorage,
+    VibeSiteAccess, VibeSiteId, VibeSiteStatus, VibeStorage,
 };
 
 // Viewer-safe reasoning summaries extracted from provider continuations and

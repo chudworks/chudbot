@@ -15,8 +15,9 @@ summary.
 
 The global `vibe` object is typed by `src/vibe.d.ts`. Call
 `await vibe.identity()` to get the signed-in viewer's public Discord display
-identity, guild display name, and site name. Do not assume identity is
-available before the promise resolves. Use browser-side public APIs only.
+identity, guild display name, and site name. It returns `null` for public
+sites, whose viewers are anonymous. Do not assume identity is available before
+the promise resolves. Use browser-side public APIs only.
 
 Client-side routing must tolerate a direct navigation or refresh: Chudbot
 serves `index.html` for document requests that do not match a built file.

@@ -1,6 +1,6 @@
 # Chudbot
 
-Discord bot, trace viewer, and private website builder for model-backed agents.
+Discord bot, trace viewer, and website builder for model-backed agents.
 Chudbot records each conversation turn in Postgres, including model input,
 client tool results, provider-side tool traces, usage records, media references,
 and final replies. Its optional Vibe runtime lets Discord users create and
@@ -67,11 +67,13 @@ media, memory, and subagent tool that agent must retain.
 ## Vibe Sites
 
 Vibe sites use local bare Git repositories for source history and immutable
-built artifacts for serving. Site and source hosts authenticate with Discord
-OAuth and verify current guild membership through the bot before returning site
-data. The coding container receives one workspace bind mount, no Docker socket
-or Chudbot secrets, a read-only root filesystem, dropped capabilities, and
-bounded CPU, memory, PIDs, output, and runtime.
+built artifacts for serving. Sites are `🔒 protected` by default and authenticate
+with Discord OAuth before verifying current guild membership through the bot.
+Owners can make deployed sites public through the conversation tool; public
+viewers are anonymous, while source/history stays protected. The coding
+container receives one workspace bind mount, no Docker socket or Chudbot
+secrets, a read-only root filesystem, dropped capabilities, and bounded CPU,
+memory, PIDs, output, and runtime.
 
 The default conversation agent loads `vibe_conversation` and exposes a `vibe`
 subagent bound to `vibe_coder`. The coding agent loads the `vibe` skill and has

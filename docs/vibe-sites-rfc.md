@@ -37,13 +37,14 @@ Source: https://src.vibe.example/sites/chud-mortgages
 
 A coding agent writes a React site inside a throwaway Docker container.
 Chudbot builds it from a clean checkout, commits it to a local Git repository,
-and serves the result from the existing `chudbot` process. Sites are private
-to the Discord server they were created in: viewers log in with Discord, and
-Chudbot checks that they are still a member.
+and serves the result from the existing `chudbot` process.
 
-Sites are static. There is no custom server code. The one backend feature in
-version 1 is `vibe.identity()`, a small JavaScript call that tells the site
-who is looking at it.
+Sites are `🔒 protected` by default: viewers log in with Discord and Chudbot
+checks that they remain members of the owning server. An owner or administrator
+can make the deployed site public through `vibe_manage`; its source and history
+remain protected. Sites are static. There is no custom server code. The one
+backend feature in version 1 is `vibe.identity()`, a small JavaScript call that
+tells a protected site who is looking at it and returns `null` on a public site.
 
 Everything else stays deliberately small:
 
@@ -259,7 +260,7 @@ contain a top-level `__vibe` entry.
 ## Login and sessions
 
 Vibe uses the Discord authorization-code flow with the `identify` scope only.
-A browser that opens a site without a session is redirected to
+A browser that opens a protected site without a session is redirected to
 `https://vibe.example/login?return=<url>`. Asset and API requests get a 401
 instead, so a stylesheet never receives a login page. Only `return` URLs under
 `vibe.example` are accepted. The OAuth `state` value is stored server-side,
@@ -279,12 +280,12 @@ under `vibe.example` could set a sibling's cookie, which among friends is a pran
 at worst. If that ever matters, switch to per-host cookies with a login
 handoff.
 
-On every site or API request, Chudbot checks that the session's user is a
-current member of the site's guild with the bot's "Get Guild Member" endpoint.
-Positive results are cached in memory for 5 minutes, negative results for 30
-seconds. A member of the wrong guild sees a short "this site belongs to
-another server" page. If Discord is unreachable and nothing is cached, the
-request fails with a 503 and a job will not start.
+On every protected site or API request, and every source-browser request,
+Chudbot checks that the session's user is a current member of the site's guild
+with the bot's "Get Guild Member" endpoint. Positive results are cached in
+memory for 5 minutes, negative results for 30 seconds. Public deployed-site
+requests skip this check. If Discord is unreachable and nothing is cached, a
+protected request fails with a 503 and a job will not start.
 
 The OAuth callback URL must be registered on the Discord application. That is
 a runbook step.
@@ -295,7 +296,7 @@ a runbook step.
 
 | Table | Columns |
 | --- | --- |
-| `vibe_sites` | `id`, `name` (unique), `platform`, `guild_id`, `owner_user_id`, `description`, `status` (`creating`, `active`, `archived`), `active_revision_id`, `running_job_id`, timestamps |
+| `vibe_sites` | `id`, `name` (unique), `platform`, `guild_id`, `owner_user_id`, `description`, `status` (`creating`, `active`, `archived`), `access` (`protected`, `public`; defaults to `protected`), `active_revision_id`, `running_job_id`, timestamps |
 | `vibe_site_editors` | `site_id`, `platform`, `user_id`, `added_by_user_id`, `added_at`; primary key `(site_id, platform, user_id)` |
 | `vibe_revisions` | `id`, `site_id`, `ordinal`, `parent_revision_id`, `commit_oid`, `image_id`, `message`, `build_log` (bounded), `actor_user_id`, `conversation_id`, `turn_id`, `job_id`, `created_at`; unique `(site_id, ordinal)` |
 | `vibe_jobs` | `id`, `site_id` (nullable), `site_name`, `action`, `actor_user_id`, `platform`, `guild_id`, `conversation_id`, `turn_id`, `tool_use_id` (unique), `state`, `error`, timestamps |
@@ -509,8 +510,8 @@ When the parent agent has an admitted Vibe binding it also gets
 | --- | --- |
 | `vibe` (subagent) | `{ action: "create" or "edit", siteName, task }`. Starts a job and returns the result and links. |
 | `vibe_check_names` | Checks up to 8 candidate names. Returns `available`, `unavailable`, or `invalid` for each and nothing else. Reserves nothing. |
-| `vibe_list_sites` | Lists active sites in this guild with name, description, the actor's role, links, and last-changed time. Optional text filter. Current-conversation sites first, then the actor's own by recency, then the rest. |
-| `vibe_manage` | `rollback` (to a revision number from `src.`, default the previous one), `add_editor`, `remove_editor`, `archive`, `restore`. Same server-side checks as everything else. |
+| `vibe_list_sites` | Lists active sites in this guild with name, description, access level, the actor's role, links, and last-changed time. Optional text filter. Current-conversation sites first, then the actor's own by recency, then the rest. |
+| `vibe_manage` | `rollback` (to a revision number from `src.`, default the previous one), `add_editor`, `remove_editor`, `set_access`, `archive`, `restore`. Same server-side checks as everything else. `set_access` accepts `protected` or `public`. |
 
 None of these accept a guild, user, or role argument. The actor comes from the
 turn.
@@ -578,13 +579,14 @@ type VibeIdentity = {
   site: { name: string };
 };
 
-const user = await vibe.identity();
+const user = await vibe.identity(); // VibeIdentity | null
 ```
 
-`identity()` does a same-origin `GET /__vibe/api/v1/identity`. The server
-takes the site from the host and the user from the session cookie, and
-returns nothing secret: no tokens, email, roles, or session id. Errors use one
-envelope:
+`identity()` does a same-origin `GET /__vibe/api/v1/identity`. On a protected
+site, the server takes the site from the host and the user from the session
+cookie, and returns nothing secret: no tokens, email, roles, or session id. On
+a public site it returns JSON `null` and does not authenticate the request.
+Errors use one envelope:
 
 ```json
 { "error": { "code": "not_authenticated", "message": "Sign in with Discord to continue." } }
@@ -594,7 +596,8 @@ envelope:
 
 ## Serving sites
 
-After the session and membership checks, a request on `<name>.vibe.example`
+For protected sites, session and membership checks happen before routing. For
+public sites, those checks are skipped. A request on `<name>.vibe.example` then
 resolves as:
 
 1. `/__vibe/*` is handled by Chudbot.
@@ -613,17 +616,19 @@ Referrer-Policy: no-referrer
 X-Frame-Options: DENY
 ```
 
-`no-store` matters: sites are private, and a Cloudflare cache hit would skip
-the membership check. Content types come from the file extension, not from
-anything in the site.
+`no-store` matters for protected sites, where a Cloudflare cache hit would skip
+the membership check. It is retained for public sites so an access change to
+protected cannot leave public cached content behind. Content types come from
+the file extension, not from anything in the site.
 
 There is no Content-Security-Policy in version 1. It would stop sites from
 calling public APIs, which is half the fun, and it does not protect against
 the one threat we have accepted.
 
 There are no state-changing HTTP endpoints anywhere in Vibe, so there is
-nothing for CSRF to attack. Archived and suspended sites return a plain "not
-available" page to members and a 404 to everyone else.
+nothing for CSRF to attack. Archived protected sites return a plain "not
+available" page to members and a 404 to everyone else; an archived public site
+returns the plain unavailable page.
 
 Logging uses the existing tracing setup with the site name and job id on
 spans. Cookies, OAuth codes, secrets, and source contents are never logged.
@@ -655,7 +660,8 @@ touches Cloudflare.
 
 Two zone settings are mandatory: HTTP redirects to HTTPS, and a Cache Rule
 that bypasses cache for every request. Without the second one Cloudflare
-would cache JavaScript and images from private sites.
+could cache protected content or keep serving a formerly public site after it
+is changed to protected.
 
 `cloudflared` runs as its own systemd service, and its credential is not in
 Chudbot config. Chudbot listens on loopback only, trusts forwarded headers
@@ -756,8 +762,8 @@ alongside the behavior it adds.
    tools, the `vibe` subagent, `vibe_check_names`, `vibe_list_sites`, the job
    state machine with repair turns, status messages, and the Discord reply.
    This is the first usable release.
-4. **Management**: `vibe_manage` (rollback, editors, archive, restore) and the
-   `vibe purge` operator command.
+4. **Management**: `vibe_manage` (rollback, editors, access level, archive,
+   restore) and the `vibe purge` operator command.
 
 ## Tests
 
@@ -767,7 +773,8 @@ smoke checklist.
 - Names: the regex, reserved labels, `xn--`, batch checks, and two concurrent
   creates yielding one owner.
 - Access: table-driven checks for member, editor, owner, admin, non-member,
-  wrong guild, DM, `admins_only`, and the guild allowlist.
+  wrong guild, DM, `admins_only`, the guild allowlist, protected/public site
+  access, and anonymous public identity.
 - Login: state expiry and replay, `return` URL validation, cookie flags,
   logout, membership cache expiry, and Discord-down behavior.
 - Host routing: apex, reserved labels, valid site, unknown site, nested
@@ -802,10 +809,14 @@ smoke checklist.
   question.
 - "Change that site" works in a later conversation through
   `vibe_list_sites`.
-- A non-member sees nothing: no HTML, assets, source, or identity.
+- On a protected site, a non-member sees nothing: no HTML, assets, source, or
+  identity.
 - A member logs in with Discord once and can then open any site in their
   guilds.
-- `vibe.identity()` returns the viewer's name and guild, and nothing secret.
+- A public site skips OAuth, returns `null` from `vibe.identity()`, and keeps its
+  source/history protected.
+- On a protected site, `vibe.identity()` returns the viewer's name and guild,
+  and nothing secret.
 - The owner and editors can edit and roll back; other members are refused.
 - Two users racing for one name produce one owner.
 - A failed, cancelled, or hostile coding run cannot change the live site or
@@ -830,7 +841,8 @@ These steps are outside the code and are done by hand before enabling Vibe:
 3. Install Docker on the host and add the firewall rule blocking the Docker
    bridge from private ranges.
 4. Run `serve.sh deploy`, then open the apex, `src.`, and a test site.
-   Confirm login works, a non-member account is refused, and
+   Confirm protected login works, a non-member account is refused, public
+   access works anonymously while source remains protected, and
    `CF-Cache-Status` never reports `HIT`.
 
 ## References

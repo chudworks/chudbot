@@ -101,7 +101,8 @@ mod tests {
     use super::*;
     use crate::config::{VibeAccessConfig, VibeAllowedGuild};
     use chudbot_api::{
-        ConversationId, ExternalId, PlatformName, TurnId, VibeSiteId, VibeSiteStatus,
+        ConversationId, ExternalId, PlatformName, TurnId, VibeSiteAccess, VibeSiteId,
+        VibeSiteStatus,
     };
     use test_case::test_case;
     use time::OffsetDateTime;
@@ -125,6 +126,7 @@ mod tests {
             owner_user_id: ExternalId::new("10"),
             description: String::new(),
             status: VibeSiteStatus::Active,
+            access: VibeSiteAccess::Protected,
             active_revision_id: None,
             running_job_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,

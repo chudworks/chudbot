@@ -60,6 +60,33 @@ pub enum VibeSiteStatus {
     Archived,
 }
 
+/// Who may view a deployed site.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VibeSiteAccess {
+    /// Require Discord OAuth and current membership in the owning guild.
+    #[default]
+    Protected,
+    /// Serve the deployed site without authenticating the viewer.
+    Public,
+}
+
+impl VibeSiteAccess {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Protected => "protected",
+            Self::Public => "public",
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Protected => "🔒 protected",
+            Self::Public => "public",
+        }
+    }
+}
+
 /// Coding job action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +131,7 @@ pub struct VibeSite {
     pub owner_user_id: ExternalId,
     pub description: String,
     pub status: VibeSiteStatus,
+    pub access: VibeSiteAccess,
     pub active_revision_id: Option<VibeRevisionId>,
     pub running_job_id: Option<VibeJobId>,
     pub created_at: OffsetDateTime,
@@ -318,6 +346,11 @@ pub trait VibeStorage: Send + Sync {
         &self,
         site_id: VibeSiteId,
         status: VibeSiteStatus,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn set_site_access(
+        &self,
+        site_id: VibeSiteId,
+        access: VibeSiteAccess,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
     fn activate_existing_revision(
         &self,

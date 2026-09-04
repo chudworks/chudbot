@@ -139,6 +139,17 @@ fn generated_tool_schemas_advertise_canonical_input_fields() {
     assert!(attach_description.contains("media://videos/..."));
     assert!(attach_description.contains("file://videos/..."));
     assert!(!attach_description.contains("Rejects: videos"));
+
+    let vibe_manage = vibe_manage_spec().input_schema.json_schema();
+    assert_eq!(
+        vibe_manage["properties"]["accessLevel"]["enum"],
+        json!(["protected", "public"])
+    );
+    assert!(
+        vibe_manage["properties"]["action"]["enum"]
+            .as_array()
+            .is_some_and(|actions| actions.contains(&json!("set_access")))
+    );
 }
 
 // Shared binding fixture for schema and parser tests that need configured

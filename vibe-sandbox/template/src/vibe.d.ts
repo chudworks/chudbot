@@ -9,5 +9,5 @@ type VibeIdentity = {
 
 declare const vibe: {
   readonly version: "1";
-  identity(): Promise<VibeIdentity>;
+  identity(): Promise<VibeIdentity | null>;
 };

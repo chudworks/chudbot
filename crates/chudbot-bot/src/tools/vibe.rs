@@ -1,6 +1,6 @@
 use chudbot_api::vibe::{
     CompleteVibeRevision, CreateVibeJob, VibeAction, VibeActor, VibeJobState, VibeRevision,
-    VibeRevisionId, VibeRole, VibeSiteId,
+    VibeRevisionId, VibeRole, VibeSiteAccess, VibeSiteId,
 };
 use chudbot_vibe::{
     ExportLimits, VibeAccess, VibeCodingExecutor, VibeOperation, VibeRuntime, validate_and_export,
@@ -581,7 +581,7 @@ pub(crate) fn vibe_list_sites_spec() -> ClientToolSpec {
 
 pub(crate) fn vibe_manage_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Roll back, manage editors, archive, or restore a Vibe site when the current actor has permission.".into(),
+        description: "Roll back, manage editors, change access, archive, or restore a Vibe site when the current actor has permission. Sites are 🔒 protected by default.".into(),
         input_schema: ToolInputSchema::object([
             ToolInputField::required(
                 "action",
@@ -589,6 +589,7 @@ pub(crate) fn vibe_manage_spec() -> ClientToolSpec {
                     "rollback",
                     "add_editor",
                     "remove_editor",
+                    "set_access",
                     "archive",
                     "restore",
                 ]),
@@ -596,6 +597,10 @@ pub(crate) fn vibe_manage_spec() -> ClientToolSpec {
             ToolInputField::required("siteName", ToolInputValueSchema::string()),
             ToolInputField::optional("revision", ToolInputValueSchema::integer().minimum(1)),
             ToolInputField::optional("userId", ToolInputValueSchema::string()),
+            ToolInputField::optional(
+                "accessLevel",
+                ToolInputValueSchema::string().enum_values(["protected", "public"]),
+            ),
         ]),
     }
 }
@@ -745,7 +750,7 @@ impl<R: BotRuntimeTypes> RuntimeToolExecutor<R> {
                     "Vibe storage is temporarily unavailable".into(),
                 ))
             })?;
-        let sites=sites.into_iter().map(|(site,role)|serde_json::json!({"name":site.name,"description":site.description,"role":format!("{role:?}").to_ascii_lowercase(),"siteUrl":format!("https://{}.{}",site.name,runtime.config.base_domain),"sourceUrl":format!("https://src.{}/sites/{}",runtime.config.base_domain,site.name),"lastChanged":site.updated_at})).collect::<Vec<_>>();
+        let sites=sites.into_iter().map(|(site,role)|serde_json::json!({"name":site.name,"description":site.description,"role":format!("{role:?}").to_ascii_lowercase(),"accessLevel":site.access.as_str(),"accessLabel":site.access.label(),"siteUrl":format!("https://{}.{}",site.name,runtime.config.base_domain),"sourceUrl":format!("https://src.{}/sites/{}",runtime.config.base_domain,site.name),"lastChanged":site.updated_at})).collect::<Vec<_>>();
         let value = serde_json::json!({"sites":sites});
         Ok(ClientToolOutput {
             result: ClientToolResultContent::Json {
@@ -946,6 +951,30 @@ impl<R: BotRuntimeTypes> RuntimeToolExecutor<R> {
                         ClientToolExecutorError::execution(RuntimeToolError(error.to_string()))
                     })?;
                 serde_json::json!({"action":"remove_editor","userId":user,"removed":removed})
+            }
+            "set_access" => {
+                let access = match call
+                    .input
+                    .get("accessLevel")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    Some("protected") => VibeSiteAccess::Protected,
+                    Some("public") => VibeSiteAccess::Public,
+                    _ => {
+                        return Ok(vibe_error(
+                            "invalid_input",
+                            "accessLevel must be protected or public",
+                        ));
+                    }
+                };
+                self.deps
+                    .storage
+                    .set_site_access(site.id, access)
+                    .await
+                    .map_err(|error| {
+                        ClientToolExecutorError::execution(RuntimeToolError(error.to_string()))
+                    })?;
+                serde_json::json!({"action":"set_access","accessLevel":access.as_str(),"accessLabel":access.label()})
             }
             "archive" => {
                 self.deps

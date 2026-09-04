@@ -9,7 +9,7 @@ use axum::response::{IntoResponse, Response};
 use chudbot_api::vibe::{NewVibeOauthState, NewVibeSession, VibeIdentityGuild, VibeIdentitySite};
 use chudbot_api::{
     ExternalId, PlatformName, VibeIdentity, VibeIdentityProvider, VibeMembership, VibeSession,
-    VibeSite, VibeSiteStatus, VibeStorage,
+    VibeSite, VibeSiteAccess, VibeSiteStatus, VibeStorage,
 };
 use chudbot_vibe::{VibeConfig, VibeDiskStore, VibeNames};
 use moka::future::Cache;
@@ -333,19 +333,24 @@ where
     if !guild_is_allowed(&vibe.config, &site.platform, &site.guild_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let auth = match authorize(state, vibe, &site, request.headers(), request.uri()).await {
-        Ok(value) => value,
-        Err(response) => {
-            let response = *response;
-            return secured(
-                if site.status == VibeSiteStatus::Archived
-                    && response.status() != StatusCode::SERVICE_UNAVAILABLE
-                {
-                    StatusCode::NOT_FOUND.into_response()
-                } else {
-                    response
-                },
-            );
+    let membership = match site.access {
+        VibeSiteAccess::Public => None,
+        VibeSiteAccess::Protected => {
+            match authorize(state, vibe, &site, request.headers(), request.uri()).await {
+                Ok((_, membership)) => Some(membership),
+                Err(response) => {
+                    let response = *response;
+                    return secured(
+                        if site.status == VibeSiteStatus::Archived
+                            && response.status() != StatusCode::SERVICE_UNAVAILABLE
+                        {
+                            StatusCode::NOT_FOUND.into_response()
+                        } else {
+                            response
+                        },
+                    );
+                }
+            }
         }
     };
     if site.status != VibeSiteStatus::Active {
@@ -353,14 +358,14 @@ where
     }
     let path = request.uri().path();
     let response = if path.starts_with("/__vibe/") {
-        vibe_api(path, &site, &auth.1)
+        vibe_api(path, &site, membership.as_ref())
     } else {
         serve_site_file(vibe, &site, path, is_document(request.headers())).await
     };
     secured(response)
 }
 
-fn vibe_api(path: &str, site: &VibeSite, membership: &VibeMembership) -> Response {
+fn vibe_api(path: &str, site: &VibeSite, membership: Option<&VibeMembership>) -> Response {
     match path {
         "/__vibe/sdk/v1/vibe.js" => (
             StatusCode::OK,
@@ -368,19 +373,23 @@ fn vibe_api(path: &str, site: &VibeSite, membership: &VibeMembership) -> Respons
             SDK_V1,
         )
             .into_response(),
-        "/__vibe/api/v1/identity" => axum::Json(VibeIdentity {
-            id: membership.user_id.as_str().to_string(),
-            username: membership.username.clone(),
-            display_name: membership.display_name.clone(),
-            avatar_url: membership.avatar_url.clone(),
-            guild: VibeIdentityGuild {
-                id: membership.guild_id.as_str().to_string(),
-                display_name: membership.guild_display_name.clone(),
-            },
-            site: VibeIdentitySite {
-                name: site.name.clone(),
-            },
-        })
+        "/__vibe/api/v1/identity" => axum::Json(
+            membership
+                .filter(|_| site.access == VibeSiteAccess::Protected)
+                .map(|membership| VibeIdentity {
+                    id: membership.user_id.as_str().to_string(),
+                    username: membership.username.clone(),
+                    display_name: membership.display_name.clone(),
+                    avatar_url: membership.avatar_url.clone(),
+                    guild: VibeIdentityGuild {
+                        id: membership.guild_id.as_str().to_string(),
+                        display_name: membership.guild_display_name.clone(),
+                    },
+                    site: VibeIdentitySite {
+                        name: site.name.clone(),
+                    },
+                }),
+        )
         .into_response(),
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -777,7 +786,7 @@ fn escape_html(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chudbot_api::{VibeRevisionId, VibeSiteId};
+    use chudbot_api::{VibeRevisionId, VibeSiteAccess, VibeSiteId};
     use chudbot_vibe::config::{
         VibeAccessConfig, VibeAuthConfig, VibeLimitsConfig, VibeSandboxConfig,
     };
@@ -887,6 +896,7 @@ mod tests {
             owner_user_id: ExternalId::new("2"),
             description: String::new(),
             status: VibeSiteStatus::Active,
+            access: VibeSiteAccess::Protected,
             active_revision_id: Some(revision_id),
             running_job_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
@@ -935,18 +945,57 @@ mod tests {
             owner_user_id: ExternalId::new("1"),
             description: String::new(),
             status: VibeSiteStatus::Active,
+            access: VibeSiteAccess::Protected,
             active_revision_id: None,
             running_job_id: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         };
         assert_eq!(
-            vibe_api("/__vibe/sdk/v1/vibe.js", &site, &membership).status(),
+            vibe_api("/__vibe/sdk/v1/vibe.js", &site, Some(&membership)).status(),
             StatusCode::OK
         );
         assert_eq!(
-            vibe_api("/__vibe/unknown", &site, &membership).status(),
+            vibe_api("/__vibe/unknown", &site, Some(&membership)).status(),
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn public_site_identity_is_json_null() {
+        let membership = VibeMembership {
+            user_id: ExternalId::new("1"),
+            username: "u".into(),
+            display_name: "User".into(),
+            avatar_url: None,
+            guild_id: ExternalId::new("2"),
+            guild_display_name: "Guild".into(),
+        };
+        let site = VibeSite {
+            id: VibeSiteId::new(),
+            name: "site".into(),
+            platform: PlatformName::new("discord"),
+            guild_id: ExternalId::new("2"),
+            owner_user_id: ExternalId::new("1"),
+            description: String::new(),
+            status: VibeSiteStatus::Active,
+            access: VibeSiteAccess::Public,
+            active_revision_id: None,
+            running_job_id: None,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        };
+        let response = vibe_api("/__vibe/api/v1/identity", &site, Some(&membership));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            b"null"
         );
     }
 }
