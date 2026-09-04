@@ -1045,6 +1045,7 @@ dependencies = [
  "futures",
  "http-body 1.1.0",
  "http-body-util",
+ "lru",
  "mime_guess",
  "moka",
  "percent-encoding",

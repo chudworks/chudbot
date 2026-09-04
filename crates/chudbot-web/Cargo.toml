@@ -17,6 +17,7 @@ futures.workspace = true
 http-body = "1"
 mime_guess = "2"
 moka.workspace = true
+lru.workspace = true
 percent-encoding = "2"
 sha2.workspace = true
 serde.workspace = true

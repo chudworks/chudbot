@@ -61,16 +61,28 @@ impl VibeStorage for SqlxStorage {
                     .bind(input.actor.user_id.as_str()).bind(&input.description).execute(&mut *tx).await?;
             }
             VibeAction::Edit => {
-                let unlocked = sqlx::query_scalar::<_, bool>(
-                    "SELECT running_job_id IS NULL FROM vibe_sites WHERE id=$1 FOR UPDATE",
+                let claim_state = sqlx::query_scalar::<_, String>(
+                    "SELECT CASE WHEN platform<>$2 OR guild_id<>$3 OR NOT ($5 OR owner_user_id=$4 OR EXISTS(SELECT 1 FROM vibe_site_editors e WHERE e.site_id=vibe_sites.id AND e.platform=$2 AND e.user_id=$4)) THEN 'unauthorized' WHEN running_job_id IS NOT NULL THEN 'busy' ELSE 'ready' END FROM vibe_sites WHERE id=$1 FOR UPDATE",
                 )
                 .bind(input.site_id.0)
+                .bind(input.actor.platform.as_str())
+                .bind(guild.as_str())
+                .bind(input.actor.user_id.as_str())
+                .bind(input.actor.is_admin)
                 .fetch_optional(&mut *tx)
                 .await?;
-                if unlocked != Some(true) {
-                    return Err(SqlxStorageError::VibeConflict(
-                        "site is missing or busy".into(),
-                    ));
+                match claim_state.as_deref() {
+                    Some("ready") => {}
+                    Some("unauthorized") => {
+                        return Err(SqlxStorageError::VibeConflict(
+                            "site edit not authorized".into(),
+                        ));
+                    }
+                    _ => {
+                        return Err(SqlxStorageError::VibeConflict(
+                            "site is missing or busy".into(),
+                        ));
+                    }
                 }
             }
         }

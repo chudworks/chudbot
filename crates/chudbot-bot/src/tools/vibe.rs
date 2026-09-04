@@ -226,7 +226,7 @@ impl<R: BotRuntimeTypes> VibeSubagent<R> {
                 };
                 if let Err(error) = access.check_site(&actor, site, role, VibeOperation::Edit, true)
                 {
-                    return vibe_error("access_denied", &error.to_string());
+                    return vibe_edit_access_denied(&error.to_string());
                 }
                 site.id
             }
@@ -249,27 +249,40 @@ impl<R: BotRuntimeTypes> VibeSubagent<R> {
         {
             Ok(job) => job,
             Err(error) => {
-                if error.to_string().contains("guild job limit") {
+                let error = error.to_string();
+                if error.contains("guild job limit") {
                     return vibe_error(
                         "guild_busy",
                         "this server already has the maximum number of Vibe jobs running",
                     );
                 }
+                if action == VibeAction::Edit && error.contains("site edit not authorized") {
+                    return vibe_edit_access_denied(
+                        "you do not have permission to perform this action",
+                    );
+                }
                 if let Ok(Some(job)) = self.deps.storage.find_job_by_tool_use(&tool_use_id).await {
                     return self.existing_job_output(job).await;
                 }
-                if self
-                    .deps
-                    .storage
-                    .find_site_by_name(&name)
-                    .await
-                    .ok()
-                    .flatten()
-                    .is_some()
+                if action == VibeAction::Create
+                    && self
+                        .deps
+                        .storage
+                        .find_site_by_name(&name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
                 {
                     return vibe_error(
                         "name_unavailable",
                         "that site name was claimed by another request",
+                    );
+                }
+                if action == VibeAction::Edit && error.contains("site is missing or busy") {
+                    return vibe_error(
+                        "site_busy",
+                        "that site is missing or already has a coding job in progress",
                     );
                 }
                 tracing::error!(error=%error,"Vibe job claim failed");
@@ -586,7 +599,7 @@ pub(crate) fn vibe_list_sites_spec() -> ClientToolSpec {
 
 pub(crate) fn vibe_manage_spec() -> ClientToolSpec {
     ClientToolSpec {
-        description: "Roll back, manage editors, change access, archive, or restore a Vibe site when the current actor has permission. Sites are 🔒 protected by default.".into(),
+        description: "Roll back, authorize or revoke editors, change viewer access, archive, or restore a Vibe site when the current actor has permission. Only the owner or a Chudbot admin can manage editors. Sites are 🔒 protected by default.".into(),
         input_schema: ToolInputSchema::object([
             ToolInputField::required(
                 "action",
@@ -601,7 +614,12 @@ pub(crate) fn vibe_manage_spec() -> ClientToolSpec {
             ),
             ToolInputField::required("siteName", ToolInputValueSchema::string()),
             ToolInputField::optional("revision", ToolInputValueSchema::integer().minimum(1)),
-            ToolInputField::optional("userId", ToolInputValueSchema::string()),
+            ToolInputField::optional(
+                "userId",
+                ToolInputValueSchema::string().description(
+                    "Numeric platform user id required by add_editor and remove_editor; copy it from trusted message context, never infer it from a username.",
+                ),
+            ),
             ToolInputField::optional(
                 "accessLevel",
                 ToolInputValueSchema::string().enum_values(["protected", "public"]),
@@ -1065,7 +1083,7 @@ fn job_state(state: VibeJobState) -> &'static str {
     }
 }
 fn vibe_error(code: &str, message: &str) -> ClientToolOutput {
-    let value = serde_json::json!({"error":{"code":code,"message":message}});
+    let value = serde_json::json!({"error":{"code":code,"message":message},"siteModified":false});
     ClientToolOutput {
         result: ClientToolResultContent::Json {
             value: value.clone(),
@@ -1075,6 +1093,14 @@ fn vibe_error(code: &str, message: &str) -> ClientToolOutput {
         trace_response: value,
         usage: Vec::new(),
     }
+}
+fn vibe_edit_access_denied(message: &str) -> ClientToolOutput {
+    vibe_error(
+        "access_denied",
+        &format!(
+            "{message}. The site was not modified. Its owner or a Chudbot admin must authorize you as an editor before you can edit it"
+        ),
+    )
 }
 fn vibe_success(
     name: &str,
@@ -1150,5 +1176,30 @@ impl<S: VibeStorage + Clone + 'static> Drop for JobCleanup<S> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denied_edit_is_an_explicit_non_mutating_tool_error() {
+        let output = vibe_edit_access_denied("you do not have permission");
+
+        assert!(output.is_error);
+        assert_eq!(output.trace_response["siteModified"], false);
+        assert_eq!(output.trace_response["error"]["code"], "access_denied");
+        assert!(
+            output.trace_response["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("owner or a Chudbot admin must authorize you as an editor")
+        );
+        let ClientToolResultContent::Json { value } = output.result else {
+            panic!("Vibe access denial should be returned as JSON");
+        };
+        assert_eq!(value, output.trace_response);
+    }
+}
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};

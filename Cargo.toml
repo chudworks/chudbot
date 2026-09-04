@@ -29,6 +29,7 @@ base64 = "0.22"
 futures = "0.3"
 dashmap = "6"
 moka = { version = "0.12", features = ["future"] }
+lru = "0.18"
 sha2 = "0.10"
 
 [workspace.dependencies.unicode-properties]

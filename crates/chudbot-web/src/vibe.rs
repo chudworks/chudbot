@@ -1,6 +1,9 @@
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration as StdDuration;
+use std::time::Instant;
 
 use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{FromRequestParts, Request, State};
@@ -13,6 +16,7 @@ use chudbot_api::{
     VibeSite, VibeSiteAccess, VibeSiteStatus, VibeStorage,
 };
 use chudbot_vibe::{SDK_V1_JAVASCRIPT, SDK_V1_TYPESCRIPT, VibeConfig, VibeDiskStore, VibeNames};
+use lru::LruCache;
 use moka::future::Cache;
 use percent_encoding::percent_decode_str;
 use serde::Deserialize;
@@ -27,6 +31,8 @@ use crate::vibe_collections::{CollectionWatchHub, serve_collection_watch};
 use crate::vibe_rooms::{RoomHub, serve_room};
 
 const SESSION_COOKIE: &str = "vibe_session";
+const SESSION_CACHE_CAPACITY: usize = 4_096;
+const SESSION_CACHE_TTL: StdDuration = StdDuration::from_secs(30);
 const SITE_CACHE_CONTROL: &str = "private, no-store";
 const MAX_COLLECTION_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_COLLECTION_FILTERS: usize = 64;
@@ -34,6 +40,80 @@ const MAX_COLLECTION_ORDERS: usize = 16;
 const MAX_COLLECTION_COLUMNS: usize = 128;
 type CollectionValidationError = (&'static str, &'static str);
 type ParsedCollectionWrite = (Option<Uuid>, Map<String, Value>);
+
+#[derive(Debug, Clone)]
+struct CachedSession {
+    session: VibeSession,
+    cached_at: Instant,
+}
+
+#[derive(Clone)]
+struct SessionCache {
+    entries: Arc<Mutex<LruCache<Vec<u8>, CachedSession>>>,
+}
+
+impl SessionCache {
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(LruCache::new(capacity))),
+        }
+    }
+
+    fn get(&self, token_hash: &[u8], now: OffsetDateTime) -> Option<VibeSession> {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match entries.get(token_hash) {
+            Some(cached)
+                if cached.cached_at.elapsed() < SESSION_CACHE_TTL
+                    && cached.session.expires_at > now =>
+            {
+                Some(cached.session.clone())
+            }
+            Some(_) => {
+                entries.pop(token_hash);
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn insert(&self, session: VibeSession) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .put(
+                session.token_hash.clone(),
+                CachedSession {
+                    session,
+                    cached_at: Instant::now(),
+                },
+            );
+    }
+
+    fn invalidate(&self, token_hash: &[u8]) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop(token_hash);
+    }
+}
+
+impl std::fmt::Debug for SessionCache {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len();
+        formatter
+            .debug_struct("SessionCache")
+            .field("entry_count", &len)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Eq)]
 struct MembershipKey {
     platform: PlatformName,
@@ -61,6 +141,7 @@ impl Hash for MembershipKey {
 pub(crate) struct VibeWebState {
     config: VibeConfig,
     disk: VibeDiskStore,
+    session_cache: SessionCache,
     member_cache: Cache<MembershipKey, VibeMembership>,
     nonmember_cache: Cache<MembershipKey, ()>,
     rooms: RoomHub,
@@ -74,6 +155,10 @@ impl VibeWebState {
         Self {
             config: parts.config,
             disk: parts.disk,
+            session_cache: SessionCache::new(
+                NonZeroUsize::new(SESSION_CACHE_CAPACITY)
+                    .expect("session cache capacity is nonzero"),
+            ),
             member_cache: Cache::builder()
                 .time_to_live(StdDuration::from_secs(5 * 60))
                 .build(),
@@ -303,10 +388,12 @@ async fn logout<R>(state: &WebState<R>, vibe: &VibeWebState, headers: &HeaderMap
 where
     R: WebRuntimeTypes,
 {
-    if let Some(token) = cookie_value(headers, SESSION_COOKIE)
-        && let Err(error) = state.storage.revoke_session(&token_hash(token)).await
-    {
-        tracing::warn!(error=%error,"failed to revoke Vibe session");
+    if let Some(token) = cookie_value(headers, SESSION_COOKIE) {
+        let hash = token_hash(token);
+        match state.storage.revoke_session(&hash).await {
+            Ok(()) => vibe.session_cache.invalidate(&hash),
+            Err(error) => tracing::warn!(error=%error,"failed to revoke Vibe session"),
+        }
     }
     let mut response = redirect(&format!("https://{}/", vibe.config.base_domain));
     let cookie = clear_session_cookie(&vibe.config.base_domain);
@@ -1007,26 +1094,30 @@ where
             &vibe.config.base_domain,
         )));
     };
-    let session = match state
-        .storage
-        .find_session(&token_hash(token), OffsetDateTime::now_utc())
-        .await
-    {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return Err(Box::new(unauthenticated(
-                headers,
-                uri,
-                &vibe.config.base_domain,
-            )));
-        }
-        Err(error) => {
-            tracing::error!(error=%error,"Vibe session lookup failed");
-            return Err(Box::new(error_page(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "authorization unavailable",
-            )));
-        }
+    let hash = token_hash(token);
+    let now = OffsetDateTime::now_utc();
+    let session = match vibe.session_cache.get(&hash, now) {
+        Some(session) => session,
+        None => match state.storage.find_session(&hash, now).await {
+            Ok(Some(session)) => {
+                vibe.session_cache.insert(session.clone());
+                session
+            }
+            Ok(None) => {
+                return Err(Box::new(unauthenticated(
+                    headers,
+                    uri,
+                    &vibe.config.base_domain,
+                )));
+            }
+            Err(error) => {
+                tracing::error!(error=%error,"Vibe session lookup failed");
+                return Err(Box::new(error_page(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authorization unavailable",
+                )));
+            }
+        },
     };
     if session.platform != site.platform {
         return Err(Box::new(StatusCode::NOT_FOUND.into_response()));
@@ -1283,6 +1374,70 @@ mod tests {
             assert!(cookie.contains(expected), "{expected}");
         }
         assert!(clear_session_cookie("vibe.example").ends_with("Max-Age=0"));
+    }
+
+    #[test]
+    fn session_cache_reuses_valid_entries_and_honors_session_expiry() {
+        let cache = test_session_cache(2);
+        let now = OffsetDateTime::now_utc();
+        let valid = test_session(1, now + Duration::minutes(1));
+        let expired = test_session(2, now);
+
+        cache.insert(valid.clone());
+        cache.insert(expired);
+
+        assert_eq!(
+            cache.get(&valid.token_hash, now).unwrap().user_id,
+            valid.user_id
+        );
+        assert!(cache.get(&[2], now).is_none());
+    }
+
+    #[test]
+    fn session_cache_expires_entries_after_short_ttl() {
+        let cache = test_session_cache(1);
+        let now = OffsetDateTime::now_utc();
+        let session = test_session(1, now + Duration::minutes(1));
+        cache.entries.lock().unwrap().put(
+            session.token_hash.clone(),
+            CachedSession {
+                session,
+                cached_at: Instant::now().checked_sub(SESSION_CACHE_TTL).unwrap(),
+            },
+        );
+
+        assert!(cache.get(&[1], now).is_none());
+    }
+
+    #[test]
+    fn session_cache_is_lru_bounded_and_supports_invalidation() {
+        let cache = test_session_cache(2);
+        let expires_at = OffsetDateTime::now_utc() + Duration::minutes(1);
+        cache.insert(test_session(1, expires_at));
+        cache.insert(test_session(2, expires_at));
+        assert!(cache.get(&[1], OffsetDateTime::now_utc()).is_some());
+
+        cache.insert(test_session(3, expires_at));
+
+        assert!(cache.get(&[2], OffsetDateTime::now_utc()).is_none());
+        assert!(cache.get(&[1], OffsetDateTime::now_utc()).is_some());
+        cache.invalidate(&[1]);
+        assert!(cache.get(&[1], OffsetDateTime::now_utc()).is_none());
+    }
+
+    fn test_session_cache(capacity: usize) -> SessionCache {
+        SessionCache::new(NonZeroUsize::new(capacity).unwrap())
+    }
+
+    fn test_session(token_hash: u8, expires_at: OffsetDateTime) -> VibeSession {
+        VibeSession {
+            token_hash: vec![token_hash],
+            platform: PlatformName::new("discord"),
+            user_id: ExternalId::new(token_hash.to_string()),
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            expires_at,
+            revoked_at: None,
+        }
     }
 
     #[test]
