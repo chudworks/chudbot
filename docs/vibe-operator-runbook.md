@@ -127,3 +127,9 @@ firewall commands. The deployment uses the system Docker daemon at
    user-state, and quit events. Repeat on a public site and confirm its anonymous
    id survives a reload. Join the same room name on a second site and confirm no
    users, state, or events cross the site boundary.
+10. On a protected site, insert, update, filter, count, and delete collection
+    documents, including a JSON-valued non-matching column and `deleteOne` with
+    multiple matches. Open a watch in a second tab and confirm insert, update
+    entry/exit, and delete events. Make the site public and confirm collection
+    HTTP and WebSocket endpoints return `collections_unavailable`. Purge the
+    disposable site and confirm its `vibe_collection_documents` rows cascade.

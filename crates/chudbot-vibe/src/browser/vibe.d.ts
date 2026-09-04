@@ -47,8 +47,57 @@ interface VibeRoom {
   join(): Promise<VibeRoomConnection>;
 }
 
+type VibeCollectionDocument<T extends Record<string, VibeJsonValue> = Record<string, VibeJsonValue>> =
+  T & {
+    id: string;
+    inserted_by: string;
+    inserted_at: string;
+    updated_by: string;
+    updated_at: string;
+  };
+
+type VibeCollectionFilterValue = VibeJsonPrimitive | readonly VibeJsonPrimitive[];
+type VibeCollectionFilters = Record<string, VibeCollectionFilterValue>;
+
+type VibeCollectionChange<T extends Record<string, VibeJsonValue> = Record<string, VibeJsonValue>> = {
+  type: "insert" | "update" | "delete";
+  document: VibeCollectionDocument<T>;
+  before: VibeCollectionDocument<T> | null;
+  after: VibeCollectionDocument<T> | null;
+  matchesBefore: boolean;
+  matchesAfter: boolean;
+};
+
+interface VibeCollectionWatch {
+  disconnect(): Promise<void>;
+}
+
+interface VibeCollectionQuery<T extends Record<string, VibeJsonValue>> {
+  where(filters: VibeCollectionFilters): VibeCollectionQuery<T>;
+  limit(value: number): VibeCollectionQuery<T>;
+  offset(value: number): VibeCollectionQuery<T>;
+  orderBy(column: string, direction?: "asc" | "desc"): VibeCollectionQuery<T>;
+  select(columns: readonly string[]): VibeCollectionQuery<T>;
+  distinct(enabled?: boolean): VibeCollectionQuery<T>;
+  find(): Promise<VibeCollectionDocument<T>[]>;
+  delete(): Promise<VibeCollectionDocument<T>[]>;
+  deleteOne(): Promise<VibeCollectionDocument<T>[]>;
+  count(): Promise<number>;
+  watch(handler: (change: VibeCollectionChange<T>) => void): Promise<VibeCollectionWatch>;
+}
+
+interface VibeCollection<T extends Record<string, VibeJsonValue>> extends VibeCollectionQuery<T> {
+  readonly name: string;
+  put(document: T & { id?: string; _id?: string }): Promise<VibeCollectionDocument<T>>;
+  insert(document: T): Promise<VibeCollectionDocument<T>>;
+  update(document: T & ({ id: string } | { _id: string })): Promise<VibeCollectionDocument<T>>;
+}
+
 declare const vibe: {
   readonly version: "1";
   identity(): Promise<VibeIdentity | null>;
   room(name: string): VibeRoom;
+  collection<T extends Record<string, VibeJsonValue> = Record<string, VibeJsonValue>>(
+    name: string,
+  ): VibeCollection<T>;
 };

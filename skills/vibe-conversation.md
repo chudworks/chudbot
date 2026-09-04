@@ -20,4 +20,7 @@ New sites are `🔒 protected`: deployed-site viewers must sign in with Discord
 and remain members of the owning server. Use `vibe_manage` with
 `action: "set_access"` and `accessLevel: "public"` or `"protected"` only when
 the user asks to change who can view the deployed site. Public access does not
-publish the source/history browser. State the resulting access label clearly.
+publish the source/history browser, but it disables the site-local collection
+API and collection watches. If a request requires durable collection data and
+public access at the same time, explain that conflict instead of promising both.
+State the resulting access label clearly.

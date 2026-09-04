@@ -1,8 +1,10 @@
 //! Provider-neutral contracts for Vibe websites.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -39,6 +41,109 @@ macro_rules! uuid_id {
 uuid_id!(VibeSiteId, "Stable id for one Vibe site.");
 uuid_id!(VibeRevisionId, "Stable id for one immutable site revision.");
 uuid_id!(VibeJobId, "Stable id for one coding job.");
+
+/// Automatically maintained row returned by a Vibe collection operation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VibeCollectionDocument {
+    pub id: Uuid,
+    #[serde(flatten)]
+    pub fields: Map<String, Value>,
+    pub inserted_by: ExternalId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub inserted_at: OffsetDateTime,
+    pub updated_by: ExternalId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+/// Insert/update behavior for one collection document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VibeCollectionWriteMode {
+    Put,
+    Insert,
+    Update,
+}
+
+/// One sortable collection column and its direction.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCollectionOrder {
+    pub column: String,
+    pub direction: VibeCollectionOrderDirection,
+}
+
+/// Supported Vibe collection sort directions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VibeCollectionOrderDirection {
+    Asc,
+    Desc,
+}
+
+/// Query modifiers shared by collection reads and deletes.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VibeCollectionQuery {
+    #[serde(default, rename = "where")]
+    pub filters: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    #[serde(default)]
+    pub offset: u64,
+    #[serde(default)]
+    pub order_by: Vec<VibeCollectionOrder>,
+    #[serde(default)]
+    pub select: Option<Vec<String>>,
+    #[serde(default)]
+    pub distinct: bool,
+}
+
+/// One fully validated operation against a site-local collection.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VibeCollectionOperation {
+    Write {
+        mode: VibeCollectionWriteMode,
+        id: Option<Uuid>,
+        fields: Map<String, Value>,
+    },
+    Find(VibeCollectionQuery),
+    Delete {
+        query: VibeCollectionQuery,
+        one: bool,
+    },
+    Count(VibeCollectionQuery),
+}
+
+/// One committed collection mutation used to notify live watchers.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct VibeCollectionChange {
+    #[serde(rename = "type")]
+    pub kind: VibeCollectionChangeKind,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
+}
+
+/// Kind of mutation carried by a collection watch event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VibeCollectionChangeKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// Semantic result of a Vibe collection operation.
+#[derive(Debug, Clone, PartialEq)]
+pub enum VibeCollectionOutcome {
+    Documents {
+        values: Vec<Value>,
+        changes: Vec<VibeCollectionChange>,
+    },
+    Count(u64),
+    MissingDocument,
+    TooManyDocuments,
+    Unavailable,
+}
 
 /// Trusted actor assembled from the incoming platform event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +492,13 @@ pub trait VibeStorage: Send + Sync {
         &self,
         token_hash: &[u8],
     ) -> impl Future<Output = Result<(), Self::Error>> + Send;
+    fn execute_collection_operation(
+        &self,
+        site_id: VibeSiteId,
+        collection: &str,
+        actor_user_id: &ExternalId,
+        operation: VibeCollectionOperation,
+    ) -> impl Future<Output = Result<VibeCollectionOutcome, Self::Error>> + Send;
 }
 
 /// Discord-specific login and membership boundary.

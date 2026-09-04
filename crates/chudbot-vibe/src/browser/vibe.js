@@ -66,7 +66,7 @@
   const jsonValue = (value) => {
     const encoded = JSON.stringify(value);
     if (encoded === undefined) {
-      throw new TypeError('Vibe room values must be JSON serializable.');
+      throw new TypeError('Vibe values must be JSON serializable.');
     }
     return JSON.parse(encoded);
   };
@@ -320,11 +320,248 @@
     }
   }
 
+  const COLLECTION_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+  const isScalar = (value) =>
+    value === null || ['string', 'number', 'boolean'].includes(typeof value);
+
+  const assertCollectionName = (name) => {
+    if (typeof name !== 'string' || !COLLECTION_NAME.test(name)) {
+      throw new TypeError(
+        'Vibe collection names must be 1-64 ASCII letters, digits, underscores, or hyphens.',
+      );
+    }
+  };
+
+  const assertColumn = (column) => {
+    if (typeof column !== 'string' || !column || column.length > 128) {
+      throw new TypeError('Vibe collection columns must be non-empty strings up to 128 characters.');
+    }
+  };
+
+  const queryFilters = (filters) => {
+    if (!filters || typeof filters !== 'object' || Array.isArray(filters)) {
+      throw new TypeError('Vibe collection where() requires an object.');
+    }
+    const copy = jsonValue(filters);
+    for (const [column, expected] of Object.entries(copy)) {
+      assertColumn(column);
+      const valid = Array.isArray(expected) ? expected.every(isScalar) : isScalar(expected);
+      if (!valid) {
+        throw new TypeError('Vibe collection filters accept scalar values or lists of scalar values.');
+      }
+    }
+    return copy;
+  };
+
+  const requestCollection = async (name, payload) => {
+    const response = await fetch(`/__vibe/api/v1/collections/${encodeURIComponent(name)}`, {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const body = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw Object.assign(
+        new Error(body?.error?.message || 'Vibe collection request failed.'),
+        { code: body?.error?.code },
+      );
+    }
+    return body;
+  };
+
+  class CollectionWatch {
+    constructor(collection, filters, handler) {
+      this._handler = handler;
+      this._closed = false;
+      const url = new URL(
+        `/__vibe/api/v1/collections/${encodeURIComponent(collection)}/watch`,
+        location.href,
+      );
+      url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      this._socket = new WebSocket(url);
+      this._ready = new Promise((resolve, reject) => {
+        this._resolveReady = resolve;
+        this._rejectReady = reject;
+      });
+      this._socket.addEventListener('open', () => {
+        this._socket.send(JSON.stringify({ type: 'watch', where: filters }));
+      });
+      this._socket.addEventListener('message', (event) => this._message(event));
+      this._socket.addEventListener('error', () => {
+        if (!this._connected) this._rejectReady(this._error('connection_failed', 'The collection watch failed.'));
+      });
+      this._socket.addEventListener('close', () => {
+        this._closed = true;
+        if (!this._connected) this._rejectReady(this._error('connection_closed', 'The collection watch closed.'));
+      });
+    }
+
+    async connect() {
+      await this._ready;
+      return this;
+    }
+
+    async disconnect() {
+      if (this._closed || this._socket.readyState === WebSocket.CLOSED) return;
+      const closed = new Promise((resolve) =>
+        this._socket.addEventListener('close', resolve, { once: true }),
+      );
+      this._socket.close(1000, 'client disconnect');
+      await closed;
+    }
+
+    _message(event) {
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch (_) {
+        return;
+      }
+      if (message.type === 'ready') {
+        this._connected = true;
+        this._resolveReady(this);
+      } else if (message.type === 'change') {
+        try {
+          this._handler(Object.freeze({
+            type: message.changeType,
+            document: message.document,
+            before: message.before ?? null,
+            after: message.after ?? null,
+            matchesBefore: message.matchesBefore,
+            matchesAfter: message.matchesAfter,
+          }));
+        } catch (error) {
+          reportHandlerError(error);
+        }
+      } else if (message.type === 'error') {
+        const error = this._error(message.code, message.message);
+        if (!this._connected) this._rejectReady(error);
+        else reportHandlerError(error);
+      }
+    }
+
+    _error(code, message) {
+      return Object.assign(new Error(message || 'Vibe collection watch failed.'), { code });
+    }
+  }
+
+  class CollectionQuery {
+    constructor(collection, state = {}) {
+      this._collection = collection;
+      this._state = {
+        where: state.where || {},
+        ...(state.limit == null ? {} : { limit: state.limit }),
+        ...(state.offset == null ? {} : { offset: state.offset }),
+        orderBy: state.orderBy || [],
+        ...(state.select == null ? {} : { select: state.select }),
+        distinct: state.distinct || false,
+      };
+    }
+
+    where(filters) {
+      return this._clone({ where: { ...this._state.where, ...queryFilters(filters) } });
+    }
+
+    limit(value) {
+      this._assertInteger(value, 'limit');
+      return this._clone({ limit: value });
+    }
+
+    offset(value) {
+      this._assertInteger(value, 'offset');
+      return this._clone({ offset: value });
+    }
+
+    orderBy(column, direction = 'asc') {
+      assertColumn(column);
+      if (direction !== 'asc' && direction !== 'desc') {
+        throw new TypeError('Vibe collection order direction must be "asc" or "desc".');
+      }
+      return this._clone({
+        orderBy: [...this._state.orderBy, { column, direction }],
+      });
+    }
+
+    select(columns) {
+      if (!Array.isArray(columns)) {
+        throw new TypeError('Vibe collection select() requires an array of column names.');
+      }
+      columns.forEach(assertColumn);
+      return this._clone({ select: [...columns] });
+    }
+
+    distinct(enabled = true) {
+      if (typeof enabled !== 'boolean') {
+        throw new TypeError('Vibe collection distinct() requires a boolean when supplied.');
+      }
+      return this._clone({ distinct: enabled });
+    }
+
+    find() {
+      return this._execute('find');
+    }
+
+    delete() {
+      return this._execute('delete');
+    }
+
+    deleteOne() {
+      return this._execute('delete_one');
+    }
+
+    async count() {
+      return (await this._execute('count')).count;
+    }
+
+    watch(handler) {
+      if (typeof handler !== 'function') {
+        throw new TypeError('Vibe collection watch() requires a handler function.');
+      }
+      return new CollectionWatch(this._collection, this._state.where, handler).connect();
+    }
+
+    _execute(action) {
+      return requestCollection(this._collection, { action, query: this._state });
+    }
+
+    _clone(patch) {
+      return new CollectionQuery(this._collection, { ...this._state, ...patch });
+    }
+
+    _assertInteger(value, name) {
+      if (!Number.isSafeInteger(value) || value < 0) {
+        throw new TypeError(`Vibe collection ${name} must be a non-negative safe integer.`);
+      }
+    }
+  }
+
+  class Collection extends CollectionQuery {
+    constructor(name) {
+      assertCollectionName(name);
+      super(name);
+      this.name = name;
+    }
+
+    put(document) {
+      return requestCollection(this.name, { action: 'put', document: jsonValue(document) });
+    }
+
+    insert(document) {
+      return requestCollection(this.name, { action: 'insert', document: jsonValue(document) });
+    }
+
+    update(document) {
+      return requestCollection(this.name, { action: 'update', document: jsonValue(document) });
+    }
+  }
+
   Object.defineProperty(globalThis, 'vibe', {
     value: Object.freeze({
       version: '1',
       identity: requestIdentity,
       room: (name) => new Room(name),
+      collection: (name) => new Collection(name),
     }),
     writable: false,
   });

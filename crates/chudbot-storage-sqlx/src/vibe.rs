@@ -1,5 +1,8 @@
+use std::cmp::Ordering;
+
 use chudbot_api::vibe::*;
 use chudbot_api::{ConversationId, ExternalId, PlatformName, ToolUseId, TurnId};
+use serde_json::{Map, Value};
 use sqlx::Row;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -351,6 +354,329 @@ impl VibeStorage for SqlxStorage {
             .await?;
         Ok(())
     }
+
+    async fn execute_collection_operation(
+        &self,
+        site: VibeSiteId,
+        collection: &str,
+        actor: &ExternalId,
+        operation: VibeCollectionOperation,
+    ) -> Result<VibeCollectionOutcome, Self::Error> {
+        let mut tx = self.pool.begin().await?;
+        let access = sqlx::query_scalar::<_, String>(
+            "SELECT access::text FROM vibe_sites WHERE id=$1 FOR SHARE",
+        )
+        .bind(site.0)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if access.as_deref() != Some("protected") {
+            return Ok(VibeCollectionOutcome::Unavailable);
+        }
+
+        let outcome = match operation {
+            VibeCollectionOperation::Write { mode, id, fields } => {
+                let (row, before, kind) = match (mode, id) {
+                    (VibeCollectionWriteMode::Put | VibeCollectionWriteMode::Insert, None) => {
+                        let row = sqlx::query("INSERT INTO vibe_collection_documents(site_id,collection,id,document,inserted_by,updated_by) VALUES($1,$2,$3,$4,$5,$5) RETURNING id,document,inserted_by,inserted_at,updated_by,updated_at")
+                            .bind(site.0)
+                            .bind(collection)
+                            .bind(Uuid::new_v4())
+                            .bind(Value::Object(fields))
+                            .bind(actor.as_str())
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                        (row, None, VibeCollectionChangeKind::Insert)
+                    }
+                    (VibeCollectionWriteMode::Put | VibeCollectionWriteMode::Update, Some(id)) => {
+                        let before = sqlx::query("SELECT id,document,inserted_by,inserted_at,updated_by,updated_at FROM vibe_collection_documents WHERE site_id=$1 AND collection=$2 AND id=$3 FOR UPDATE")
+                            .bind(site.0)
+                            .bind(collection)
+                            .bind(id)
+                            .fetch_optional(&mut *tx)
+                            .await?
+                            .map(collection_document_from_row)
+                            .transpose()?;
+                        let row = sqlx::query("UPDATE vibe_collection_documents SET document=$4,updated_by=$5,updated_at=now() WHERE site_id=$1 AND collection=$2 AND id=$3 RETURNING id,document,inserted_by,inserted_at,updated_by,updated_at")
+                            .bind(site.0)
+                            .bind(collection)
+                            .bind(id)
+                            .bind(Value::Object(fields))
+                            .bind(actor.as_str())
+                            .fetch_optional(&mut *tx)
+                            .await?;
+                        (row, before, VibeCollectionChangeKind::Update)
+                    }
+                    _ => (None, None, VibeCollectionChangeKind::Update),
+                };
+                match row {
+                    Some(row) => {
+                        let after = collection_document_from_row(row)?;
+                        let value = document_value(after.clone(), None);
+                        VibeCollectionOutcome::Documents {
+                            values: vec![value.clone()],
+                            changes: vec![VibeCollectionChange {
+                                kind,
+                                before: before.map(|document| document_value(document, None)),
+                                after: Some(value),
+                            }],
+                        }
+                    }
+                    None => VibeCollectionOutcome::MissingDocument,
+                }
+            }
+            VibeCollectionOperation::Find(query) => {
+                let documents = load_collection_documents(&mut tx, site, collection, false).await?;
+                let selected = select_collection_documents(documents, &query);
+                VibeCollectionOutcome::Documents {
+                    values: project_collection_documents(selected, &query),
+                    changes: Vec::new(),
+                }
+            }
+            VibeCollectionOperation::Count(query) => {
+                let documents = load_collection_documents(&mut tx, site, collection, false).await?;
+                let selected = select_collection_documents(documents, &query);
+                let count = project_collection_documents(selected, &query).len();
+                VibeCollectionOutcome::Count(count.try_into().unwrap_or(u64::MAX))
+            }
+            VibeCollectionOperation::Delete { query, one } => {
+                let documents = load_collection_documents(&mut tx, site, collection, true).await?;
+                let selected = select_collection_documents(documents, &query);
+                if one && selected.len() > 1 {
+                    VibeCollectionOutcome::TooManyDocuments
+                } else {
+                    let ids = selected
+                        .iter()
+                        .map(|document| document.id)
+                        .collect::<Vec<_>>();
+                    if !ids.is_empty() {
+                        sqlx::query("DELETE FROM vibe_collection_documents WHERE site_id=$1 AND collection=$2 AND id=ANY($3)")
+                            .bind(site.0)
+                            .bind(collection)
+                            .bind(&ids)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                    let changes = selected
+                        .iter()
+                        .cloned()
+                        .map(|document| VibeCollectionChange {
+                            kind: VibeCollectionChangeKind::Delete,
+                            before: Some(document_value(document, None)),
+                            after: None,
+                        })
+                        .collect();
+                    VibeCollectionOutcome::Documents {
+                        values: project_collection_documents(selected, &query),
+                        changes,
+                    }
+                }
+            }
+        };
+        tx.commit().await?;
+        Ok(outcome)
+    }
+}
+
+async fn load_collection_documents(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    site: VibeSiteId,
+    collection: &str,
+    lock: bool,
+) -> Result<Vec<VibeCollectionDocument>, SqlxStorageError> {
+    let sql = if lock {
+        "SELECT id,document,inserted_by,inserted_at,updated_by,updated_at FROM vibe_collection_documents WHERE site_id=$1 AND collection=$2 ORDER BY id FOR UPDATE"
+    } else {
+        "SELECT id,document,inserted_by,inserted_at,updated_by,updated_at FROM vibe_collection_documents WHERE site_id=$1 AND collection=$2 ORDER BY id"
+    };
+    sqlx::query(sql)
+        .bind(site.0)
+        .bind(collection)
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(collection_document_from_row)
+        .collect()
+}
+
+fn collection_document_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<VibeCollectionDocument, SqlxStorageError> {
+    let document = row.get::<Value, _>("document");
+    let Value::Object(fields) = document else {
+        return Err(SqlxStorageError::InvalidReference(
+            "Vibe collection document is not an object".into(),
+        ));
+    };
+    Ok(VibeCollectionDocument {
+        id: row.get("id"),
+        fields,
+        inserted_by: ExternalId::new(row.get::<String, _>("inserted_by")),
+        inserted_at: row.get("inserted_at"),
+        updated_by: ExternalId::new(row.get::<String, _>("updated_by")),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn select_collection_documents(
+    mut documents: Vec<VibeCollectionDocument>,
+    query: &VibeCollectionQuery,
+) -> Vec<VibeCollectionDocument> {
+    documents.retain(|document| collection_document_matches(document, &query.filters));
+    if !query.order_by.is_empty() {
+        documents.sort_by(|left, right| compare_collection_documents(left, right, &query.order_by));
+    }
+    let offset = usize::try_from(query.offset).unwrap_or(usize::MAX);
+    let limit = query
+        .limit
+        .map(|limit| usize::try_from(limit).unwrap_or(usize::MAX))
+        .unwrap_or(usize::MAX);
+    documents.into_iter().skip(offset).take(limit).collect()
+}
+
+fn collection_document_matches(
+    document: &VibeCollectionDocument,
+    filters: &std::collections::BTreeMap<String, Value>,
+) -> bool {
+    filters.iter().all(|(column, expected)| {
+        let Some(actual) = collection_document_column(document, column) else {
+            return false;
+        };
+        if !is_json_scalar(&actual) {
+            return false;
+        }
+        match expected {
+            Value::Array(values) => values
+                .iter()
+                .any(|value| is_json_scalar(value) && value == &actual),
+            value => is_json_scalar(value) && value == &actual,
+        }
+    })
+}
+
+fn compare_collection_documents(
+    left: &VibeCollectionDocument,
+    right: &VibeCollectionDocument,
+    order: &[VibeCollectionOrder],
+) -> Ordering {
+    for item in order {
+        let ordering = compare_collection_values(
+            collection_document_column(left, &item.column).as_ref(),
+            collection_document_column(right, &item.column).as_ref(),
+            item.direction,
+        );
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+    Ordering::Equal
+}
+
+fn compare_collection_values(
+    left: Option<&Value>,
+    right: Option<&Value>,
+    direction: VibeCollectionOrderDirection,
+) -> Ordering {
+    match (
+        sortable_collection_value(left),
+        sortable_collection_value(right),
+    ) {
+        (
+            Some(SortableCollectionValue::Number(left)),
+            Some(SortableCollectionValue::Number(right)),
+        ) => directed_order(
+            left.partial_cmp(&right).unwrap_or(Ordering::Equal),
+            direction,
+        ),
+        (Some(SortableCollectionValue::Text(left)), Some(SortableCollectionValue::Text(right))) => {
+            directed_order(left.cmp(right), direction)
+        }
+        (Some(SortableCollectionValue::Number(_)), Some(SortableCollectionValue::Text(_))) => {
+            directed_order(Ordering::Less, direction)
+        }
+        (Some(SortableCollectionValue::Text(_)), Some(SortableCollectionValue::Number(_))) => {
+            directed_order(Ordering::Greater, direction)
+        }
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
+fn directed_order(ordering: Ordering, direction: VibeCollectionOrderDirection) -> Ordering {
+    match direction {
+        VibeCollectionOrderDirection::Asc => ordering,
+        VibeCollectionOrderDirection::Desc => ordering.reverse(),
+    }
+}
+
+enum SortableCollectionValue<'a> {
+    Number(f64),
+    Text(&'a str),
+}
+
+fn sortable_collection_value(value: Option<&Value>) -> Option<SortableCollectionValue<'_>> {
+    match value? {
+        Value::Number(number) => number.as_f64().map(SortableCollectionValue::Number),
+        Value::String(text) => Some(SortableCollectionValue::Text(text)),
+        _ => None,
+    }
+}
+
+fn project_collection_documents(
+    documents: Vec<VibeCollectionDocument>,
+    query: &VibeCollectionQuery,
+) -> Vec<Value> {
+    let mut values = Vec::with_capacity(documents.len());
+    for document in documents {
+        let value = document_value(document, query.select.as_deref());
+        if !query.distinct || !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    values
+}
+
+fn document_value(document: VibeCollectionDocument, select: Option<&[String]>) -> Value {
+    let all = serde_json::to_value(document)
+        .expect("Vibe collection document serialization cannot fail")
+        .as_object()
+        .expect("Vibe collection document serializes as an object")
+        .clone();
+    let Some(select) = select else {
+        return Value::Object(all);
+    };
+    Value::Object(
+        select
+            .iter()
+            .filter_map(|column| {
+                all.get(column)
+                    .cloned()
+                    .map(|value| (column.clone(), value))
+            })
+            .collect::<Map<_, _>>(),
+    )
+}
+
+fn collection_document_column(document: &VibeCollectionDocument, column: &str) -> Option<Value> {
+    match column {
+        "id" => Some(Value::String(document.id.to_string())),
+        "inserted_by" => Some(Value::String(document.inserted_by.to_string())),
+        "inserted_at" => timestamp_value(document.inserted_at),
+        "updated_by" => Some(Value::String(document.updated_by.to_string())),
+        "updated_at" => timestamp_value(document.updated_at),
+        _ => document.fields.get(column).cloned(),
+    }
+}
+
+fn timestamp_value(timestamp: OffsetDateTime) -> Option<Value> {
+    timestamp
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(Value::String)
+}
+
+fn is_json_scalar(value: &Value) -> bool {
+    !matches!(value, Value::Array(_) | Value::Object(_))
 }
 
 fn site_query(
@@ -503,5 +829,64 @@ fn parse_job_state(v: &str) -> Result<VibeJobState, SqlxStorageError> {
         "cancelled" => Ok(VibeJobState::Cancelled),
         "timed_out" => Ok(VibeJobState::TimedOut),
         _ => Err(invalid("job state", v)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn document(id: u128, fields: Value) -> VibeCollectionDocument {
+        VibeCollectionDocument {
+            id: Uuid::from_u128(id),
+            fields: fields.as_object().unwrap().clone(),
+            inserted_by: ExternalId::new("1"),
+            inserted_at: OffsetDateTime::UNIX_EPOCH,
+            updated_by: ExternalId::new("1"),
+            updated_at: OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn collection_filters_lists_and_rejects_json_columns() {
+        let scalar = document(1, json!({"user":"123","score":10}));
+        let json_column = document(2, json!({"user":["123"],"score":20}));
+        let filters = std::collections::BTreeMap::from([("user".into(), json!(["123", "456"]))]);
+        assert!(collection_document_matches(&scalar, &filters));
+        assert!(!collection_document_matches(&json_column, &filters));
+    }
+
+    #[test]
+    fn collection_query_orders_pages_projects_and_deduplicates() {
+        let query = VibeCollectionQuery {
+            limit: Some(2),
+            offset: 1,
+            order_by: vec![VibeCollectionOrder {
+                column: "score".into(),
+                direction: VibeCollectionOrderDirection::Desc,
+            }],
+            select: Some(vec!["team".into()]),
+            distinct: true,
+            ..VibeCollectionQuery::default()
+        };
+        let selected = select_collection_documents(
+            vec![
+                document(1, json!({"team":"red","score":10})),
+                document(2, json!({"team":"red","score":30})),
+                document(3, json!({"team":"red","score":20})),
+            ],
+            &query,
+        );
+        assert_eq!(
+            project_collection_documents(selected, &query),
+            vec![json!({"team":"red"})]
+        );
+    }
+
+    #[test]
+    fn automatic_timestamps_are_queryable_strings() {
+        let value = collection_document_column(&document(1, json!({})), "inserted_at").unwrap();
+        assert_eq!(value, json!("1970-01-01T00:00:00Z"));
     }
 }

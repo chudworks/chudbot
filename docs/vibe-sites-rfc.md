@@ -302,6 +302,7 @@ a runbook step.
 | `vibe_jobs` | `id`, `site_id` (nullable), `site_name`, `action`, `actor_user_id`, `platform`, `guild_id`, `conversation_id`, `turn_id`, `tool_use_id` (unique), `state`, `error`, timestamps |
 | `vibe_sessions` | `token_hash` (primary key), `platform`, `user_id`, `created_at`, `expires_at`, `revoked_at` |
 | `vibe_oauth_states` | `state_hash` (primary key), `return_url`, `expires_at`, `consumed_at` |
+| `vibe_collection_documents` | `site_id`, `collection`, `id`, JSONB `document`, `inserted_by`, `inserted_at`, `updated_by`, `updated_at`; primary key `(site_id, collection, id)` |
 
 Revisions are never updated or deleted except by purge. `running_job_id` is
 the per-site lock: a site with a running job rejects a second one. The unique
@@ -461,10 +462,10 @@ prompt snapshotting applies. Skills grant no tools or permissions, and nothing
 inside a site repository is ever treated as a skill.
 
 `skills/vibe.md` is the coding manual: the project layout, the Bun commands,
-npm rules, `vibe.identity()`, SPA routing, design expectations, and "stop
-after a summary; Chudbot commits and deploys". `skills/vibe-conversation.md`
-is the workflow: create versus edit, inventing and checking names, finding
-sites, and how to report links.
+npm rules, `vibe.identity()`, durable collections and ephemeral watches/rooms,
+SPA routing, design expectations, and "stop after a summary; Chudbot commits
+and deploys". `skills/vibe-conversation.md` is the workflow: create versus
+edit, inventing and checking names, finding sites, and how to report links.
 
 ### Configuration
 
@@ -643,6 +644,58 @@ share a mutex. Bounded message size, room/site/deployment connection counts,
 room count, state keys/bytes, and per-connection outbound queues make excess
 load fail locally. Per-connection command rate limiting bounds hot senders, and
 a slow receiver is disconnected instead of accumulating an unbounded queue.
+
+### Site-local database collections
+
+Protected sites can persist JSON documents in collections scoped by the
+immutable site id. Public sites cannot read, write, delete, count, or watch
+collections; the backend returns a `collections_unavailable` API error even if
+client code attempts it. The collection API uses the Discord-authenticated
+session and additionally enforces a same-origin request.
+
+```js
+const scores = vibe.collection("scores");
+const score = await scores.put({ user: "123", score: 10 });
+const leaders = await scores
+  .where({ user: ["123", "456"] })
+  .orderBy("score", "desc")
+  .limit(5)
+  .find();
+```
+
+Documents receive `id`, `inserted_by`, `inserted_at`, `updated_by`, and
+`updated_at`. `put` inserts without an id and updates an existing row when `id`
+or `_id` is supplied. A supplied id that does not exist is an error. `insert`
+never updates, while `update` requires an existing id. Supplied audit fields are
+ignored and recomputed, so a returned document can be spread back into `put` or
+`update`. JSON arrays and objects round-trip but are not queryable; `where`
+compares only scalar columns against a scalar or list of scalars. Queries also
+support offset, numeric/text/ISO timestamp ordering, projection, distinct
+projected results, count, delete, and the multi-match-safe `deleteOne`.
+
+The backend stores all collection rows in one Postgres JSONB table and performs
+the deliberately unindexed document filtering in Rust. The site foreign key
+uses `ON DELETE CASCADE`, so purging a site removes its collection data in the
+same database transaction.
+
+`watch(handler)` opens an authenticated WebSocket for the query's `where`
+criteria. Insert events are emitted when the new document matches, delete
+events when the old document matched, and update events when either side
+matches. Events include the current document (or removed document for a
+delete), `before`, `after`, `matchesBefore`, and `matchesAfter`, which lets a UI
+recognize rows entering or leaving its live result set.
+
+```js
+const watch = await scores.where({ user: "123" }).watch((change) => {
+  console.log(change.type, change.before, change.after);
+});
+await watch.disconnect();
+```
+
+Watch fanout is process-local Rust state with bounded queues and the existing
+room connection limits. It is an ephemeral best-effort notification surface,
+not a durable change log: reconnecting does not replay missed changes, and a
+restart closes all watches.
 
 ## Serving sites
 
@@ -830,6 +883,10 @@ smoke checklist.
   labels, ports, trailing dots, and bad `Host` values.
 - Serving: `/__vibe/` precedence, exact files, document fallback including
   paths with dots, 404 for other requests, and exact headers.
+- Collections: protected/public gating, same-origin checks, automatic audit
+  fields, write preconditions, scalar/list matching, JSON-column non-matches,
+  ordering, pagination, projection/distinct/count, safe delete, purge cascade,
+  and watch enter/leave/delete delivery with site/collection isolation.
 - Export: property tests for path rules, symlinks, nested `.git`, reserved
   paths, size limits, and forbidden dependency sources.
 - Sandbox: the container has no socket, secrets, or other workspaces; limits
@@ -866,6 +923,8 @@ smoke checklist.
   source/history protected.
 - On a protected site, `vibe.identity()` returns the viewer's name and guild,
   and nothing secret.
+- Protected sites can persist and watch site-local collection documents;
+  public sites receive an API error and purged sites retain no collection data.
 - The owner and editors can edit and roll back; other members are refused.
 - Two users racing for one name produce one owner.
 - A failed, cancelled, or hostile coding run cannot change the live site or

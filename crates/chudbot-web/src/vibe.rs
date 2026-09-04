@@ -15,16 +15,25 @@ use chudbot_api::{
 use chudbot_vibe::{SDK_V1_JAVASCRIPT, SDK_V1_TYPESCRIPT, VibeConfig, VibeDiskStore, VibeNames};
 use moka::future::Cache;
 use percent_encoding::percent_decode_str;
+use serde::Deserialize;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::middleware;
 use crate::server::{VibeWebParts, WebRuntimeTypes, WebState};
+use crate::vibe_collections::{CollectionWatchHub, serve_collection_watch};
 use crate::vibe_rooms::{RoomHub, serve_room};
 
 const SESSION_COOKIE: &str = "vibe_session";
 const SITE_CACHE_CONTROL: &str = "private, no-store";
+const MAX_COLLECTION_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_COLLECTION_FILTERS: usize = 64;
+const MAX_COLLECTION_ORDERS: usize = 16;
+const MAX_COLLECTION_COLUMNS: usize = 128;
+type CollectionValidationError = (&'static str, &'static str);
+type ParsedCollectionWrite = (Option<Uuid>, Map<String, Value>);
 #[derive(Debug, Clone, Eq)]
 struct MembershipKey {
     platform: PlatformName,
@@ -55,11 +64,13 @@ pub(crate) struct VibeWebState {
     member_cache: Cache<MembershipKey, VibeMembership>,
     nonmember_cache: Cache<MembershipKey, ()>,
     rooms: RoomHub,
+    collection_watches: CollectionWatchHub,
 }
 
 impl VibeWebState {
     pub(crate) fn new(parts: VibeWebParts) -> Self {
         let rooms = RoomHub::new(&parts.config.limits);
+        let collection_watches = CollectionWatchHub::new(&parts.config.limits);
         Self {
             config: parts.config,
             disk: parts.disk,
@@ -70,6 +81,7 @@ impl VibeWebState {
                 .time_to_live(StdDuration::from_secs(30))
                 .build(),
             rooms,
+            collection_watches,
         }
     }
 }
@@ -382,13 +394,336 @@ where
     {
         return response;
     }
-    match (request.method(), request.uri().path()) {
+    let path = request.uri().path();
+    if request.method() == Method::GET
+        && let Some(collection) = collection_watch_path(path)
+    {
+        let collection = collection.to_string();
+        return collection_watch_upgrade(state, vibe, request, site, membership, &collection).await;
+    }
+    if request.method() == Method::POST
+        && let Some(collection) = collection_operation_path(path)
+    {
+        let collection = collection.to_string();
+        return collection_operation(state, vibe, request, site, membership, &collection).await;
+    }
+    match (request.method(), path) {
         (&Method::GET, "/__vibe/api/v1/identity") => identity_response(&site, membership.as_ref()),
         (&Method::GET, "/__vibe/api/v1/rooms") => {
             room_upgrade(state, vibe, request, site, membership).await
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+enum CollectionRequest {
+    Put {
+        document: Value,
+    },
+    Insert {
+        document: Value,
+    },
+    Update {
+        document: Value,
+    },
+    Find {
+        query: chudbot_api::VibeCollectionQuery,
+    },
+    Delete {
+        query: chudbot_api::VibeCollectionQuery,
+    },
+    DeleteOne {
+        query: chudbot_api::VibeCollectionQuery,
+    },
+    Count {
+        query: chudbot_api::VibeCollectionQuery,
+    },
+}
+
+async fn collection_operation<R>(
+    state: &WebState<R>,
+    vibe: &VibeWebState,
+    request: Request,
+    site: VibeSite,
+    membership: Option<VibeMembership>,
+    collection: &str,
+) -> Response
+where
+    R: WebRuntimeTypes,
+{
+    let Some(membership) = membership.filter(|_| site.access == VibeSiteAccess::Protected) else {
+        return collections_unavailable();
+    };
+    if !site_origin_matches(request.headers(), &site.name, &vibe.config.base_domain) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "invalid_origin",
+            "The request origin does not match this Vibe site.",
+        );
+    }
+    if !valid_collection_name(collection) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_collection",
+            "Collection names must be 1-64 ASCII letters, digits, underscores, or hyphens.",
+        );
+    }
+    let body = match axum::body::to_bytes(request.into_body(), MAX_COLLECTION_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_too_large",
+                "The collection request is too large.",
+            );
+        }
+    };
+    let request = match serde_json::from_slice::<CollectionRequest>(&body) {
+        Ok(request) => request,
+        Err(_) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "The collection request is invalid.",
+            );
+        }
+    };
+    let (operation, single) = match collection_storage_operation(request) {
+        Ok(operation) => operation,
+        Err((code, message)) => return json_error(StatusCode::BAD_REQUEST, code, message),
+    };
+    let outcome = match state
+        .storage
+        .execute_collection_operation(site.id, collection, &membership.user_id, operation)
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::error!(site=%site.name, site_id=%site.id, collection, error=%error, "Vibe collection operation failed");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "collection_unavailable",
+                "The collection is temporarily unavailable.",
+            );
+        }
+    };
+    match outcome {
+        chudbot_api::VibeCollectionOutcome::Documents {
+            mut values,
+            changes,
+        } => {
+            vibe.collection_watches
+                .publish(site.id, collection, &changes);
+            if single {
+                axum::Json(values.pop().unwrap_or(Value::Null)).into_response()
+            } else {
+                axum::Json(values).into_response()
+            }
+        }
+        chudbot_api::VibeCollectionOutcome::Count(count) => {
+            axum::Json(serde_json::json!({"count":count})).into_response()
+        }
+        chudbot_api::VibeCollectionOutcome::MissingDocument => json_error(
+            StatusCode::NOT_FOUND,
+            "document_not_found",
+            "The collection document does not exist.",
+        ),
+        chudbot_api::VibeCollectionOutcome::TooManyDocuments => json_error(
+            StatusCode::CONFLICT,
+            "multiple_documents",
+            "deleteOne matched more than one document.",
+        ),
+        chudbot_api::VibeCollectionOutcome::Unavailable => collections_unavailable(),
+    }
+}
+
+fn collection_storage_operation(
+    request: CollectionRequest,
+) -> Result<(chudbot_api::VibeCollectionOperation, bool), CollectionValidationError> {
+    use chudbot_api::{VibeCollectionOperation, VibeCollectionWriteMode};
+    let write = |mode, document| {
+        collection_write_document(mode, document)
+            .map(|(id, fields)| (VibeCollectionOperation::Write { mode, id, fields }, true))
+    };
+    match request {
+        CollectionRequest::Put { document } => write(VibeCollectionWriteMode::Put, document),
+        CollectionRequest::Insert { document } => write(VibeCollectionWriteMode::Insert, document),
+        CollectionRequest::Update { document } => write(VibeCollectionWriteMode::Update, document),
+        CollectionRequest::Find { query } => {
+            validate_collection_query(&query)?;
+            Ok((VibeCollectionOperation::Find(query), false))
+        }
+        CollectionRequest::Delete { query } => {
+            validate_collection_query(&query)?;
+            Ok((VibeCollectionOperation::Delete { query, one: false }, false))
+        }
+        CollectionRequest::DeleteOne { query } => {
+            validate_collection_query(&query)?;
+            Ok((VibeCollectionOperation::Delete { query, one: true }, false))
+        }
+        CollectionRequest::Count { query } => {
+            validate_collection_query(&query)?;
+            Ok((VibeCollectionOperation::Count(query), false))
+        }
+    }
+}
+
+fn collection_write_document(
+    mode: chudbot_api::VibeCollectionWriteMode,
+    document: Value,
+) -> Result<ParsedCollectionWrite, CollectionValidationError> {
+    let Value::Object(mut fields) = document else {
+        return Err((
+            "invalid_document",
+            "A collection document must be a JSON object.",
+        ));
+    };
+    let id = match (fields.remove("id"), fields.remove("_id")) {
+        (Some(_), Some(_)) => {
+            return Err(("invalid_document", "Supply either id or _id, not both."));
+        }
+        (Some(value), None) | (None, Some(value)) => value
+            .as_str()
+            .and_then(|value| Uuid::try_parse(value).ok())
+            .ok_or((
+                "invalid_document_id",
+                "The collection document id must be a UUID.",
+            ))
+            .map(Some)?,
+        (None, None) => None,
+    };
+    for field in ["inserted_by", "inserted_at", "updated_by", "updated_at"] {
+        fields.remove(field);
+    }
+    match mode {
+        chudbot_api::VibeCollectionWriteMode::Insert if id.is_some() => Err((
+            "invalid_document_id",
+            "insert generates its own document id.",
+        )),
+        chudbot_api::VibeCollectionWriteMode::Update if id.is_none() => Err((
+            "missing_document_id",
+            "update requires an existing document id.",
+        )),
+        _ => Ok((id, fields)),
+    }
+}
+
+fn validate_collection_query(
+    query: &chudbot_api::VibeCollectionQuery,
+) -> Result<(), CollectionValidationError> {
+    if query.filters.len() > MAX_COLLECTION_FILTERS
+        || query.order_by.len() > MAX_COLLECTION_ORDERS
+        || query
+            .filters
+            .values()
+            .any(|value| !valid_collection_filter(value))
+        || query
+            .filters
+            .keys()
+            .any(|column| !valid_collection_column(column))
+        || query
+            .order_by
+            .iter()
+            .any(|order| !valid_collection_column(&order.column))
+        || query.select.as_ref().is_some_and(|columns| {
+            columns.len() > MAX_COLLECTION_COLUMNS
+                || columns
+                    .iter()
+                    .any(|column| !valid_collection_column(column))
+        })
+    {
+        return Err(("invalid_query", "The collection query is invalid."));
+    }
+    Ok(())
+}
+
+fn valid_collection_filter(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().all(is_json_scalar),
+        value => is_json_scalar(value),
+    }
+}
+
+fn is_json_scalar(value: &Value) -> bool {
+    !matches!(value, Value::Array(_) | Value::Object(_))
+}
+
+fn valid_collection_column(column: &str) -> bool {
+    !column.is_empty() && column.len() <= 128 && !column.chars().any(char::is_control)
+}
+
+fn valid_collection_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn collection_operation_path(path: &str) -> Option<&str> {
+    path.strip_prefix("/__vibe/api/v1/collections/")
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+}
+
+fn collection_watch_path(path: &str) -> Option<&str> {
+    path.strip_prefix("/__vibe/api/v1/collections/")
+        .and_then(|path| path.strip_suffix("/watch"))
+        .filter(|name| !name.is_empty() && !name.contains('/'))
+}
+
+async fn collection_watch_upgrade<R>(
+    state: &WebState<R>,
+    vibe: &VibeWebState,
+    request: Request,
+    site: VibeSite,
+    membership: Option<VibeMembership>,
+    collection: &str,
+) -> Response
+where
+    R: WebRuntimeTypes,
+{
+    if site.access != VibeSiteAccess::Protected || membership.is_none() {
+        return collections_unavailable();
+    }
+    if !valid_collection_name(collection) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_collection",
+            "The collection name is invalid.",
+        );
+    }
+    if !site_origin_matches(request.headers(), &site.name, &vibe.config.base_domain) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "invalid_origin",
+            "The WebSocket origin does not match this Vibe site.",
+        );
+    }
+    let collection = collection.to_string();
+    let (mut parts, _body) = request.into_parts();
+    let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(upgrade) => upgrade,
+        Err(error) => return error.into_response(),
+    };
+    let hub = vibe.collection_watches.clone();
+    let shutdown = state.shutdown_token();
+    let max_message_bytes = vibe.config.limits.max_room_message_bytes;
+    upgrade
+        .max_message_size(max_message_bytes)
+        .max_frame_size(max_message_bytes)
+        .on_upgrade(move |socket| {
+            serve_collection_watch(socket, hub, site, collection, shutdown, max_message_bytes)
+        })
+}
+
+fn collections_unavailable() -> Response {
+    json_error(
+        StatusCode::FORBIDDEN,
+        "collections_unavailable",
+        "Vibe collections require a protected site with Discord sign-in.",
+    )
 }
 
 fn static_vibe_api(path: &str) -> Option<Response> {
@@ -444,7 +779,7 @@ async fn room_upgrade<R>(
 where
     R: WebRuntimeTypes,
 {
-    if !room_origin_matches(request.headers(), &site.name, &vibe.config.base_domain) {
+    if !site_origin_matches(request.headers(), &site.name, &vibe.config.base_domain) {
         tracing::warn!(site=%site.name, origin=?request.headers().get(header::ORIGIN), "rejected cross-origin Vibe room upgrade");
         return json_error(
             StatusCode::FORBIDDEN,
@@ -477,7 +812,7 @@ where
         })
 }
 
-fn room_origin_matches(headers: &HeaderMap, site: &str, base_domain: &str) -> bool {
+fn site_origin_matches(headers: &HeaderMap, site: &str, base_domain: &str) -> bool {
     let Some(origin) = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
@@ -931,7 +1266,7 @@ mod tests {
     fn room_origins(value: &str, valid: bool) {
         let mut headers = HeaderMap::new();
         headers.insert(header::ORIGIN, HeaderValue::from_str(value).unwrap());
-        assert_eq!(room_origin_matches(&headers, "site", "vibe.example"), valid);
+        assert_eq!(site_origin_matches(&headers, "site", "vibe.example"), valid);
     }
 
     #[test]
@@ -1090,6 +1425,58 @@ mod tests {
                 .to_bytes()
                 .as_ref(),
             b"null"
+        );
+    }
+
+    #[test]
+    fn collection_routes_are_unambiguous() {
+        assert_eq!(
+            collection_operation_path("/__vibe/api/v1/collections/scores"),
+            Some("scores")
+        );
+        assert_eq!(
+            collection_watch_path("/__vibe/api/v1/collections/scores/watch"),
+            Some("scores")
+        );
+        assert!(collection_operation_path("/__vibe/api/v1/collections/scores/watch").is_none());
+    }
+
+    #[test]
+    fn collection_write_accepts_id_alias_only_for_existing_document_operations() {
+        let id = Uuid::new_v4();
+        let (_, fields) = collection_write_document(
+            chudbot_api::VibeCollectionWriteMode::Put,
+            serde_json::json!({"_id":id,"score":10,"inserted_by":"spoofed"}),
+        )
+        .unwrap();
+        assert_eq!(
+            fields,
+            serde_json::json!({"score":10}).as_object().unwrap().clone()
+        );
+        assert!(
+            collection_write_document(
+                chudbot_api::VibeCollectionWriteMode::Insert,
+                serde_json::json!({"id":id}),
+            )
+            .is_err()
+        );
+        assert!(
+            collection_write_document(
+                chudbot_api::VibeCollectionWriteMode::Update,
+                serde_json::json!({"score":10}),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn collection_unavailable_is_a_json_api_error() {
+        let response = collections_unavailable();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+            "collections_unavailable"
         );
     }
 }
