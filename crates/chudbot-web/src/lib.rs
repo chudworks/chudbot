@@ -10,6 +10,7 @@ mod middleware;
 mod spa;
 mod static_files;
 mod vibe;
+mod vibe_rooms;
 
 pub use api::{
     ClientToolTraceView, ConversationView, ModelInfoView, ToolTraceView, TurnView, UserMetadata,

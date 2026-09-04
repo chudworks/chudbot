@@ -12,6 +12,7 @@ workspace = true
 chudbot-api = { path = "../chudbot-api" }
 chudbot-vibe = { path = "../chudbot-vibe" }
 bytes = "1"
+dashmap.workspace = true
 futures.workspace = true
 http-body = "1"
 mime_guess = "2"
@@ -31,6 +32,7 @@ url = "2"
 
 [dependencies.axum]
 version = "0.8"
+features = ["ws"]
 
 [dependencies.tower-http]
 version = "0.6"

@@ -2575,9 +2575,26 @@ fn validate_vibe(
         || vibe.limits.max_source_bytes == 0
         || vibe.limits.max_artifact_bytes == 0
         || vibe.limits.max_running_jobs_per_guild == 0
+        || vibe.limits.max_rooms_per_site == 0
+        || vibe.limits.max_room_connections == 0
+        || vibe.limits.max_room_connections_per_site == 0
+        || vibe.limits.max_room_connections_total == 0
+        || vibe.limits.max_room_user_states == 0
+        || vibe.limits.max_room_user_state_bytes == 0
+        || vibe.limits.max_room_message_bytes == 0
+        || vibe.limits.room_outbound_queue == 0
+        || vibe.limits.max_room_commands_per_second == 0
     {
         diagnostics.push(ConfigDiagnostic::new(
-            "Vibe source, artifact, and concurrency limits must all be greater than zero",
+            "Vibe source, artifact, room, and concurrency limits must all be greater than zero",
+        ));
+    }
+    if vibe.limits.max_room_connections > vibe.limits.max_room_connections_per_site
+        || usize::from(vibe.limits.max_room_connections_per_site)
+            > vibe.limits.max_room_connections_total
+    {
+        diagnostics.push(ConfigDiagnostic::new(
+            "Vibe room connection limits must increase from room to site to deployment",
         ));
     }
     if vibe.auth.client_id.trim().is_empty() || vibe.auth.client_secret.trim().is_empty() {

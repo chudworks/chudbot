@@ -382,6 +382,11 @@ impl<R: BotRuntimeTypes> VibeSubagent<R> {
             };
             transcript = run.transcript.clone();
             runs.push(run);
+            self.runtime
+                .disk
+                .install_typescript_bindings(&workspace)
+                .await
+                .map_err(|e| e.to_string())?;
             exported = validate_and_export(
                 &workspace,
                 self.runtime.disk.root().join("workspaces").as_path(),

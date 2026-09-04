@@ -92,6 +92,24 @@ pub struct VibeLimitsConfig {
     pub max_artifact_bytes: u64,
     #[serde(default = "default_guild_jobs")]
     pub max_running_jobs_per_guild: u16,
+    #[serde(default = "default_rooms_per_site")]
+    pub max_rooms_per_site: u16,
+    #[serde(default = "default_room_connections")]
+    pub max_room_connections: u16,
+    #[serde(default = "default_site_room_connections")]
+    pub max_room_connections_per_site: u16,
+    #[serde(default = "default_total_room_connections")]
+    pub max_room_connections_total: usize,
+    #[serde(default = "default_room_user_states")]
+    pub max_room_user_states: u16,
+    #[serde(default = "default_room_user_state_bytes")]
+    pub max_room_user_state_bytes: usize,
+    #[serde(default = "default_room_message_bytes")]
+    pub max_room_message_bytes: usize,
+    #[serde(default = "default_room_outbound_queue")]
+    pub room_outbound_queue: u16,
+    #[serde(default = "default_room_commands_per_second")]
+    pub max_room_commands_per_second: u16,
 }
 
 impl Default for VibeLimitsConfig {
@@ -102,6 +120,15 @@ impl Default for VibeLimitsConfig {
             max_source_bytes: default_tree_bytes(),
             max_artifact_bytes: default_tree_bytes(),
             max_running_jobs_per_guild: default_guild_jobs(),
+            max_rooms_per_site: default_rooms_per_site(),
+            max_room_connections: default_room_connections(),
+            max_room_connections_per_site: default_site_room_connections(),
+            max_room_connections_total: default_total_room_connections(),
+            max_room_user_states: default_room_user_states(),
+            max_room_user_state_bytes: default_room_user_state_bytes(),
+            max_room_message_bytes: default_room_message_bytes(),
+            room_outbound_queue: default_room_outbound_queue(),
+            max_room_commands_per_second: default_room_commands_per_second(),
         }
     }
 }
@@ -163,6 +190,33 @@ fn default_tree_bytes() -> u64 {
 }
 fn default_guild_jobs() -> u16 {
     2
+}
+fn default_rooms_per_site() -> u16 {
+    32
+}
+fn default_room_connections() -> u16 {
+    64
+}
+fn default_site_room_connections() -> u16 {
+    256
+}
+fn default_total_room_connections() -> usize {
+    1_024
+}
+fn default_room_user_states() -> u16 {
+    16
+}
+fn default_room_user_state_bytes() -> usize {
+    64 * 1024
+}
+fn default_room_message_bytes() -> usize {
+    32 * 1024
+}
+fn default_room_outbound_queue() -> u16 {
+    64
+}
+fn default_room_commands_per_second() -> u16 {
+    32
 }
 fn default_base_domain() -> String {
     "vibe.example".to_string()

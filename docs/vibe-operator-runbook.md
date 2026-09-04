@@ -104,7 +104,8 @@ firewall commands. The deployment uses the system Docker daemon at
    navigation. Asset and API requests without a session must return 401.
 2. Create a disposable site from an allowed guild. Confirm the Discord reply's
    Site and Source links, the Git history, the clean-build revision, an SPA deep
-   link refresh, and `vibe.identity()`'s exact public fields.
+   link refresh, `vibe.identity()`'s exact public fields, and that the committed
+   `src/vibe.d.ts` matches `/__vibe/sdk/v1/vibe.d.ts`.
 3. With a second account that is not in the guild, request the HTML, a known
    asset, source, and the identity API. Every request must reveal no site data.
 4. Make the site public. Confirm a signed-out browser can load the HTML and
@@ -122,3 +123,7 @@ firewall commands. The deployment uses the system Docker daemon at
    `Referrer-Policy: no-referrer`, and `X-Frame-Options: DENY`.
 8. Inspect Cloudflare responses repeatedly. `CF-Cache-Status` must never be
    `HIT` for the apex, source, any site file, or `/__vibe/` response.
+9. Open two tabs on one protected site and exercise room join, broadcast,
+   user-state, and quit events. Repeat on a public site and confirm its anonymous
+   id survives a reload. Join the same room name on a second site and confirm no
+   users, state, or events cross the site boundary.

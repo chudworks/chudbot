@@ -2,7 +2,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration as StdDuration;
 
-use axum::extract::{Request, State};
+use axum::extract::ws::WebSocketUpgrade;
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -11,7 +12,7 @@ use chudbot_api::{
     ExternalId, PlatformName, VibeIdentity, VibeIdentityProvider, VibeMembership, VibeSession,
     VibeSite, VibeSiteAccess, VibeSiteStatus, VibeStorage,
 };
-use chudbot_vibe::{VibeConfig, VibeDiskStore, VibeNames};
+use chudbot_vibe::{SDK_V1_JAVASCRIPT, SDK_V1_TYPESCRIPT, VibeConfig, VibeDiskStore, VibeNames};
 use moka::future::Cache;
 use percent_encoding::percent_decode_str;
 use sha2::{Digest, Sha256};
@@ -20,20 +21,10 @@ use uuid::Uuid;
 
 use crate::middleware;
 use crate::server::{VibeWebParts, WebRuntimeTypes, WebState};
+use crate::vibe_rooms::{RoomHub, serve_room};
 
 const SESSION_COOKIE: &str = "vibe_session";
 const SITE_CACHE_CONTROL: &str = "private, no-store";
-const SDK_V1: &str = r#"(() => {
-  const request = async () => {
-    const response = await fetch('/__vibe/api/v1/identity', { credentials: 'same-origin' });
-    const body = await response.json();
-    if (!response.ok) throw Object.assign(new Error(body?.error?.message || 'Vibe identity failed'), { code: body?.error?.code });
-    return body;
-  };
-  Object.defineProperty(globalThis, 'vibe', { value: Object.freeze({ version: '1', identity: request }), writable: false });
-})();
-"#;
-
 #[derive(Debug, Clone, Eq)]
 struct MembershipKey {
     platform: PlatformName,
@@ -63,10 +54,12 @@ pub(crate) struct VibeWebState {
     disk: VibeDiskStore,
     member_cache: Cache<MembershipKey, VibeMembership>,
     nonmember_cache: Cache<MembershipKey, ()>,
+    rooms: RoomHub,
 }
 
 impl VibeWebState {
     pub(crate) fn new(parts: VibeWebParts) -> Self {
+        let rooms = RoomHub::new(&parts.config.limits);
         Self {
             config: parts.config,
             disk: parts.disk,
@@ -76,6 +69,7 @@ impl VibeWebState {
             nonmember_cache: Cache::builder()
                 .time_to_live(StdDuration::from_secs(30))
                 .build(),
+            rooms,
         }
     }
 }
@@ -366,41 +360,141 @@ where
     }
     let path = request.uri().path();
     let response = if path.starts_with("/__vibe/") {
-        vibe_api(path, &site, membership.as_ref())
+        vibe_api(state, vibe, request, site, membership).await
     } else {
         serve_site_file(vibe, &site, path, is_document(request.headers())).await
     };
     secured(response)
 }
 
-fn vibe_api(path: &str, site: &VibeSite, membership: Option<&VibeMembership>) -> Response {
-    match path {
-        "/__vibe/sdk/v1/vibe.js" => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-            SDK_V1,
-        )
-            .into_response(),
-        "/__vibe/api/v1/identity" => axum::Json(
-            membership
-                .filter(|_| site.access == VibeSiteAccess::Protected)
-                .map(|membership| VibeIdentity {
-                    id: membership.user_id.as_str().to_string(),
-                    username: membership.username.clone(),
-                    display_name: membership.display_name.clone(),
-                    avatar_url: membership.avatar_url.clone(),
-                    guild: VibeIdentityGuild {
-                        id: membership.guild_id.as_str().to_string(),
-                        display_name: membership.guild_display_name.clone(),
-                    },
-                    site: VibeIdentitySite {
-                        name: site.name.clone(),
-                    },
-                }),
-        )
-        .into_response(),
+async fn vibe_api<R>(
+    state: &WebState<R>,
+    vibe: &VibeWebState,
+    request: Request,
+    site: VibeSite,
+    membership: Option<VibeMembership>,
+) -> Response
+where
+    R: WebRuntimeTypes,
+{
+    if request.method() == Method::GET
+        && let Some(response) = static_vibe_api(request.uri().path())
+    {
+        return response;
+    }
+    match (request.method(), request.uri().path()) {
+        (&Method::GET, "/__vibe/api/v1/identity") => identity_response(&site, membership.as_ref()),
+        (&Method::GET, "/__vibe/api/v1/rooms") => {
+            room_upgrade(state, vibe, request, site, membership).await
+        }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+fn static_vibe_api(path: &str) -> Option<Response> {
+    match path {
+        "/__vibe/sdk/v1/vibe.js" => Some(
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+                SDK_V1_JAVASCRIPT,
+            )
+                .into_response(),
+        ),
+        "/__vibe/sdk/v1/vibe.d.ts" => Some(
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                SDK_V1_TYPESCRIPT,
+            )
+                .into_response(),
+        ),
+        _ => None,
+    }
+}
+
+fn identity_response(site: &VibeSite, membership: Option<&VibeMembership>) -> Response {
+    axum::Json(
+        membership
+            .filter(|_| site.access == VibeSiteAccess::Protected)
+            .map(|membership| VibeIdentity {
+                id: membership.user_id.as_str().to_string(),
+                username: membership.username.clone(),
+                display_name: membership.display_name.clone(),
+                avatar_url: membership.avatar_url.clone(),
+                guild: VibeIdentityGuild {
+                    id: membership.guild_id.as_str().to_string(),
+                    display_name: membership.guild_display_name.clone(),
+                },
+                site: VibeIdentitySite {
+                    name: site.name.clone(),
+                },
+            }),
+    )
+    .into_response()
+}
+
+async fn room_upgrade<R>(
+    state: &WebState<R>,
+    vibe: &VibeWebState,
+    request: Request,
+    site: VibeSite,
+    membership: Option<VibeMembership>,
+) -> Response
+where
+    R: WebRuntimeTypes,
+{
+    if !room_origin_matches(request.headers(), &site.name, &vibe.config.base_domain) {
+        tracing::warn!(site=%site.name, origin=?request.headers().get(header::ORIGIN), "rejected cross-origin Vibe room upgrade");
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "invalid_origin",
+            "The WebSocket origin does not match this Vibe site.",
+        );
+    }
+    let (mut parts, _body) = request.into_parts();
+    let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(upgrade) => upgrade,
+        Err(error) => return error.into_response(),
+    };
+    let rooms = vibe.rooms.clone();
+    let shutdown = state.shutdown_token();
+    let max_message_bytes = vibe.config.limits.max_room_message_bytes;
+    let max_commands_per_second = vibe.config.limits.max_room_commands_per_second;
+    upgrade
+        .max_message_size(max_message_bytes)
+        .max_frame_size(max_message_bytes)
+        .on_upgrade(move |socket| {
+            serve_room(
+                socket,
+                rooms,
+                site,
+                membership,
+                shutdown,
+                max_message_bytes,
+                max_commands_per_second,
+            )
+        })
+}
+
+fn room_origin_matches(headers: &HeaderMap, site: &str, base_domain: &str) -> bool {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| url::Url::parse(value).ok())
+    else {
+        return false;
+    };
+    origin.scheme() == "https"
+        && origin.username().is_empty()
+        && origin.password().is_none()
+        && origin.port().is_none()
+        && origin.path() == "/"
+        && origin.query().is_none()
+        && origin.fragment().is_none()
+        && origin
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case(&format!("{site}.{base_domain}")))
 }
 
 async fn serve_site_file(
@@ -829,6 +923,17 @@ mod tests {
         assert_eq!(valid_return_url(value, "vibe.example"), valid);
     }
 
+    #[test_case("https://site.vibe.example", true ; "exact origin")]
+    #[test_case("https://SITE.VIBE.EXAMPLE", true ; "origin host case is ignored")]
+    #[test_case("https://other.vibe.example", false)]
+    #[test_case("https://site.vibe.example.evil.example", false)]
+    #[test_case("http://site.vibe.example", false)]
+    fn room_origins(value: &str, valid: bool) {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ORIGIN, HeaderValue::from_str(value).unwrap());
+        assert_eq!(room_origin_matches(&headers, "site", "vibe.example"), valid);
+    }
+
     #[test]
     fn session_cookie_has_exact_security_flags() {
         let cookie = session_cookie("vibe.example", "secret", 7);
@@ -943,36 +1048,11 @@ mod tests {
 
     #[test]
     fn vibe_api_reserves_sdk_prefix_before_static_files() {
-        let membership = VibeMembership {
-            user_id: ExternalId::new("1"),
-            username: "u".into(),
-            display_name: "User".into(),
-            avatar_url: None,
-            guild_id: ExternalId::new("2"),
-            guild_display_name: "Guild".into(),
-        };
-        let site = VibeSite {
-            id: VibeSiteId::new(),
-            name: "site".into(),
-            platform: PlatformName::new("discord"),
-            guild_id: ExternalId::new("2"),
-            owner_user_id: ExternalId::new("1"),
-            description: String::new(),
-            status: VibeSiteStatus::Active,
-            access: VibeSiteAccess::Protected,
-            active_revision_id: None,
-            running_job_id: None,
-            created_at: OffsetDateTime::UNIX_EPOCH,
-            updated_at: OffsetDateTime::UNIX_EPOCH,
-        };
         assert_eq!(
-            vibe_api("/__vibe/sdk/v1/vibe.js", &site, Some(&membership)).status(),
+            static_vibe_api("/__vibe/sdk/v1/vibe.js").unwrap().status(),
             StatusCode::OK
         );
-        assert_eq!(
-            vibe_api("/__vibe/unknown", &site, Some(&membership)).status(),
-            StatusCode::NOT_FOUND
-        );
+        assert!(static_vibe_api("/__vibe/unknown").is_none());
     }
 
     #[tokio::test]
@@ -999,7 +1079,7 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             updated_at: OffsetDateTime::UNIX_EPOCH,
         };
-        let response = vibe_api("/__vibe/api/v1/identity", &site, Some(&membership));
+        let response = identity_response(&site, Some(&membership));
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response

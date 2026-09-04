@@ -100,6 +100,17 @@ max_file_bytes = 10485760
 max_source_bytes = 52428800
 max_artifact_bytes = 52428800
 max_running_jobs_per_guild = 2
+# Rooms are in-memory and isolated per site. Busy sites fail new joins rather
+# than consuming unbounded process memory.
+max_rooms_per_site = 32
+max_room_connections = 64
+max_room_connections_per_site = 256
+max_room_connections_total = 1024
+max_room_user_states = 16
+max_room_user_state_bytes = 65536
+max_room_message_bytes = 32768
+room_outbound_queue = 64
+max_room_commands_per_second = 32
 
 # S3-compatible media storage. The stored URIs still use the same
 # media://images/<name> shape; only the configured backend changes where bytes

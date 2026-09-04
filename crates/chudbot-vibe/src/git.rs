@@ -4,7 +4,7 @@ use std::process::Stdio;
 use chudbot_api::{ExternalId, VibeRevisionId, VibeSiteId};
 use tokio::process::Command;
 
-use crate::VibeError;
+use crate::{VibeError, install_typescript_bindings};
 
 const GENERATED_GITIGNORE_RULES: [&str; 3] = ["node_modules/", "dist/", "*.tsbuildinfo"];
 
@@ -55,6 +55,10 @@ impl VibeDiskStore {
         Ok(())
     }
 
+    pub async fn install_typescript_bindings(&self, workspace: &Path) -> Result<(), VibeError> {
+        install_typescript_bindings(workspace).await
+    }
+
     pub async fn create_workspace(
         &self,
         site: VibeSiteId,
@@ -76,6 +80,7 @@ impl VibeDiskStore {
             }
             None => copy_template(&self.template, &workspace).await?,
         }
+        install_typescript_bindings(&workspace).await?;
         ensure_generated_gitignore(&workspace).await?;
         initialize_workspace_git(&workspace).await?;
         Ok(workspace)
@@ -601,7 +606,13 @@ mod tests {
 
         assert_eq!(
             store.list_files(site, &commit1.oid).await.unwrap(),
-            ["package.json", "src/App.tsx"]
+            ["package.json", "src/App.tsx", "src/vibe.d.ts"]
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(first.join("src/vibe.d.ts"))
+                .await
+                .unwrap(),
+            crate::SDK_V1_TYPESCRIPT
         );
         for hidden in [
             "node_modules/pkg/index.js",
