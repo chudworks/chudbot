@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type CSSProperties } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
+import type { HighlightedToken } from '../syntaxHighlight';
 import RelativeTime from './RelativeTime';
 
 type Revision = {
@@ -56,20 +57,73 @@ function diffLineKind(line: string): string {
   return 'context';
 }
 
-function SourceLines({ text, diff = false }: { text: string; diff?: boolean }) {
+type SyntaxTokenStyle = CSSProperties & {
+  '--shiki-dark'?: string;
+  '--shiki-light'?: string;
+};
+
+function syntaxTokenStyle(token: HighlightedToken): SyntaxTokenStyle {
+  const fontStyle = token.fontStyle ?? 0;
+  return {
+    '--shiki-dark': token.darkColor,
+    '--shiki-light': token.lightColor,
+    fontStyle: fontStyle & 1 ? 'italic' : undefined,
+    fontWeight: fontStyle & 2 ? 700 : undefined,
+    textDecoration: fontStyle & 4 ? 'underline' : undefined,
+  };
+}
+
+function SourceLines({ text, path, diff = false }: { text: string; path?: string; diff?: boolean }) {
   const normalized = text.endsWith('\n') ? text.slice(0, -1) : text;
-  const lines = normalized ? normalized.split('\n') : [''];
+  const plainLines = normalized ? normalized.split('\n') : [''];
+  const highlightKey = `${diff ? 'diff' : path ?? ''}\0${normalized}`;
+  const [highlightResult, setHighlightResult] = useState<{
+    key: string;
+    lines: HighlightedToken[][];
+  } | null>(null);
+  const highlightedLines = highlightResult?.key === highlightKey ? highlightResult.lines : null;
+
+  useEffect(() => {
+    let active = true;
+
+    void import('../syntaxHighlight')
+      .then(async ({ highlightSource: highlight, languageForPath }) => {
+        const language = diff ? 'diff' : languageForPath(path ?? '');
+        if (!language) return null;
+        return highlight(normalized, language);
+      })
+      .then((lines) => {
+        if (active && lines && lines.length === plainLines.length) {
+          setHighlightResult({ key: highlightKey, lines });
+        }
+      })
+      .catch(() => {
+        // Highlighting is an enhancement. Source remains readable if a grammar fails.
+      });
+
+    return () => { active = false; };
+  }, [diff, highlightKey, normalized, path, plainLines.length]);
+
+  const lines = highlightedLines ?? plainLines.map((line) => [{ content: line }]);
 
   return (
     <pre className={`vibe-source__code${diff ? ' vibe-source__code--diff' : ''}`}>
       <code>
         {lines.map((line, index) => (
           <span
-            className={`vibe-source__code-line${diff ? ` vibe-source__code-line--${diffLineKind(line)}` : ''}`}
+            className={`vibe-source__code-line${diff ? ` vibe-source__code-line--${diffLineKind(plainLines[index] ?? '')}` : ''}`}
             key={index}
           >
             <span className="vibe-source__line-number" aria-hidden="true">{index + 1}</span>
-            <span className="vibe-source__line-text">{line || '\u200b'}</span>
+            <span className="vibe-source__line-text">
+              {line.length > 0
+                ? line.map((token, tokenIndex) => (
+                    <span className="vibe-source__syntax-token" style={syntaxTokenStyle(token)} key={tokenIndex}>
+                      {token.content}
+                    </span>
+                  ))
+                : '\u200b'}
+            </span>
           </span>
         ))}
       </code>
@@ -253,7 +307,7 @@ export default function VibeSource() {
                 </div>
                 <span>{view.text.split('\n').length} lines</span>
               </div>
-              <SourceLines text={view.text} />
+              <SourceLines text={view.text} path={view.path} />
             </>
           ) : (
             <>
