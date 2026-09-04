@@ -568,10 +568,12 @@ else.
 
 Served at `/__vibe/sdk/v1/vibe.js` on every site host and injected at build
 time. Chudbot owns one canonical `vibe.d.ts`, serves it at
-`/__vibe/sdk/v1/vibe.d.ts`, and overwrites `src/vibe.d.ts` when a coding
-workspace opens and immediately before each validated build. Existing sites
-therefore build against the declarations compiled into the running Chudbot
-binary instead of retaining a stale template copy.
+`/__vibe/sdk/v1/vibe.d.ts`, and writes `src/vibe.d.ts` when a coding workspace
+opens and into the temporary clean-build tree. The generated file is excluded
+from source export and removed after the build, so it is never committed or
+shown in site source history. Existing sites therefore build against the
+declarations compiled into the running Chudbot binary instead of retaining a
+stale template copy.
 
 ```ts
 type VibeIdentity = {

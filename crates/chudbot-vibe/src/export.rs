@@ -4,7 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::VibeError;
+use crate::{SDK_TYPESCRIPT_PATH, VibeError};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExportLimits {
@@ -100,6 +100,9 @@ async fn copy_tree(
             }
             let child_relative = relative.join(&name);
             validate_relative_path(&child_relative)?;
+            if child_relative == Path::new(SDK_TYPESCRIPT_PATH) {
+                continue;
+            }
             let metadata = tokio::fs::symlink_metadata(entry.path()).await?;
             let kind = metadata.file_type();
             if kind.is_symlink() {
@@ -392,6 +395,9 @@ mod tests {
         tokio::fs::write(root.join("tsconfig.app.tsbuildinfo"), "metadata")
             .await
             .unwrap();
+        tokio::fs::write(root.join(SDK_TYPESCRIPT_PATH), "generated bindings")
+            .await
+            .unwrap();
 
         let exported = validate_and_export(&root, &std::env::temp_dir(), limits())
             .await
@@ -399,6 +405,7 @@ mod tests {
         assert!(!exported.root.join("node_modules").exists());
         assert!(!exported.root.join("dist").exists());
         assert!(!exported.root.join("tsconfig.app.tsbuildinfo").exists());
+        assert!(!exported.root.join(SDK_TYPESCRIPT_PATH).exists());
         assert!(exported.root.join("src/App.tsx").exists());
 
         let _ = tokio::fs::remove_dir_all(root).await;

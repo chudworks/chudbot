@@ -8,7 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::config::VibeSandboxConfig;
-use crate::{VibeError, export};
+use crate::{SDK_TYPESCRIPT_PATH, VibeError, export, install_typescript_bindings};
 
 const MAX_COMMAND_OUTPUT: usize = 64 * 1024;
 const MAX_FILE_TOOL_REQUEST: usize = 4 * 1024 * 1024;
@@ -109,6 +109,27 @@ impl VibeSandbox {
     }
 
     pub async fn clean_build(
+        &self,
+        job: VibeJobId,
+        source: &Path,
+        artifact: &Path,
+        max_artifact_bytes: u64,
+    ) -> Result<BuildOutput, VibeError> {
+        install_typescript_bindings(source).await?;
+        let result = self
+            .clean_build_with_bindings(job, source, artifact, max_artifact_bytes)
+            .await;
+        if let Err(error) = tokio::fs::remove_file(source.join(SDK_TYPESCRIPT_PATH)).await {
+            if result.is_ok() {
+                let _ = tokio::fs::remove_dir_all(artifact).await;
+                return Err(error.into());
+            }
+            tracing::warn!(error=%error, source=%source.display(), "failed to remove generated Vibe bindings after failed build");
+        }
+        result
+    }
+
+    async fn clean_build_with_bindings(
         &self,
         job: VibeJobId,
         source: &Path,

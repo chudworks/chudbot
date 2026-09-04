@@ -305,6 +305,7 @@ impl VibeDiskStore {
                     ":(glob,exclude)**/node_modules/**",
                     ":(glob,exclude)**/dist/**",
                     ":(glob,exclude)**/*.tsbuildinfo",
+                    ":(exclude)src/vibe.d.ts",
                 ],
                 "diff",
             )
@@ -362,9 +363,10 @@ impl VibeDiskStore {
 }
 
 fn source_path_is_visible(path: &str) -> bool {
-    !path
-        .split('/')
-        .any(|segment| matches!(segment, "node_modules" | "dist"))
+    path != crate::SDK_TYPESCRIPT_PATH
+        && !path
+            .split('/')
+            .any(|segment| matches!(segment, "node_modules" | "dist"))
         && !path
             .rsplit('/')
             .next()
@@ -606,7 +608,7 @@ mod tests {
 
         assert_eq!(
             store.list_files(site, &commit1.oid).await.unwrap(),
-            ["package.json", "src/App.tsx", "src/vibe.d.ts"]
+            ["package.json", "src/App.tsx"]
         );
         assert_eq!(
             tokio::fs::read_to_string(first.join("src/vibe.d.ts"))

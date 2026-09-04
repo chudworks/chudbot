@@ -10,7 +10,9 @@ pub mod names;
 pub mod sandbox;
 
 pub use access::{VibeAccess, VibeAccessError, VibeOperation};
-pub use browser::{SDK_V1_JAVASCRIPT, SDK_V1_TYPESCRIPT, install_typescript_bindings};
+pub use browser::{
+    SDK_TYPESCRIPT_PATH, SDK_V1_JAVASCRIPT, SDK_V1_TYPESCRIPT, install_typescript_bindings,
+};
 pub use coding::VibeCodingExecutor;
 pub use config::{VibeConfig, VibeLimitsConfig, VibeSandboxConfig};
 pub use export::{ExportLimits, ExportedTree, validate_and_export};

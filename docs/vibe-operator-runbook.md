@@ -104,8 +104,9 @@ firewall commands. The deployment uses the system Docker daemon at
    navigation. Asset and API requests without a session must return 401.
 2. Create a disposable site from an allowed guild. Confirm the Discord reply's
    Site and Source links, the Git history, the clean-build revision, an SPA deep
-   link refresh, `vibe.identity()`'s exact public fields, and that the committed
-   `src/vibe.d.ts` matches `/__vibe/sdk/v1/vibe.d.ts`.
+   link refresh, `vibe.identity()`'s exact public fields, and that
+   `/__vibe/sdk/v1/vibe.d.ts` is available but `src/vibe.d.ts` is absent from
+   the committed/source-browser tree.
 3. With a second account that is not in the guild, request the HTML, a known
    asset, source, and the identity API. Every request must reveal no site data.
 4. Make the site public. Confirm a signed-out browser can load the HTML and

@@ -8,11 +8,14 @@ pub const SDK_V1_JAVASCRIPT: &str = include_str!("browser/vibe.js");
 /// Canonical TypeScript declarations installed into every Vibe workspace.
 pub const SDK_V1_TYPESCRIPT: &str = include_str!("browser/vibe.d.ts");
 
+/// Generated workspace path for the TypeScript declarations.
+pub const SDK_TYPESCRIPT_PATH: &str = "src/vibe.d.ts";
+
 /// Install the declarations owned by this Chudbot binary into a site workspace.
 pub async fn install_typescript_bindings(workspace: &Path) -> Result<(), VibeError> {
-    let source = workspace.join("src");
-    tokio::fs::create_dir_all(&source).await?;
-    tokio::fs::write(source.join("vibe.d.ts"), SDK_V1_TYPESCRIPT).await?;
+    let destination = workspace.join(SDK_TYPESCRIPT_PATH);
+    tokio::fs::create_dir_all(destination.parent().expect("binding path has a parent")).await?;
+    tokio::fs::write(destination, SDK_V1_TYPESCRIPT).await?;
     Ok(())
 }
 
