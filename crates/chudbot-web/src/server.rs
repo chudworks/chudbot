@@ -231,15 +231,18 @@ where
         .fallback(spa::spa_index::<R>)
         .layer(middleware::x_robots_layer())
         .layer(axum_middleware::from_fn(middleware::block_crawlers))
+        .with_state(state.clone());
+    router
+        .layer(axum_middleware::from_fn_with_state(
+            state,
+            vibe::host_router::<R>,
+        ))
+        // Keep access logging outside host dispatch: Vibe host handlers return
+        // directly instead of entering the trace-viewer router.
         .layer(axum_middleware::from_fn_with_state(
             trust_forwarded_for,
             middleware::access_log,
         ))
-        .with_state(state.clone());
-    router.layer(axum_middleware::from_fn_with_state(
-        state,
-        vibe::host_router::<R>,
-    ))
 }
 
 /// Web server startup error.

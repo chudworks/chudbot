@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use axum::extract::{ConnectInfo, Request, State};
@@ -8,13 +9,30 @@ use axum::response::{IntoResponse, Response};
 use http_body::Body as _;
 use tower_http::set_header::SetResponseHeaderLayer;
 
+#[derive(Debug, Clone)]
+struct AccessIdentity {
+    platform: String,
+    user_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct AccessLogContext {
+    identity: Arc<OnceLock<AccessIdentity>>,
+}
+
 pub(crate) async fn access_log(
     State(trust_forwarded_for): State<bool>,
-    req: Request,
+    mut req: Request,
     next: Next,
 ) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-")
+        .to_owned();
     let remote = client_ip(&req, trust_forwarded_for);
     let user_agent = req
         .headers()
@@ -23,17 +41,23 @@ pub(crate) async fn access_log(
         .map(short_user_agent)
         .unwrap_or_else(|| "-".to_string());
     let input_bytes = req.body().size_hint().exact().unwrap_or(0);
+    let context = AccessLogContext::default();
+    req.extensions_mut().insert(context.clone());
 
     let start = Instant::now();
     let response = next.run(req).await;
     let duration = start.elapsed();
     let output_bytes = response.body().size_hint().exact().unwrap_or(0);
+    let identity = context.identity.get();
 
     tracing::info!(
         target: "web::access",
         %method,
         path,
+        host,
         remote,
+        identity_platform = identity.map(|identity| identity.platform.as_str()).unwrap_or("-"),
+        identity_user_id = identity.map(|identity| identity.user_id.as_str()).unwrap_or("-"),
         status = response.status().as_u16(),
         duration_ms = duration.as_millis(),
         input_bytes,
@@ -43,6 +67,16 @@ pub(crate) async fn access_log(
     );
 
     response
+}
+
+pub(crate) fn record_access_identity(req: &Request, platform: &str, user_id: &str) {
+    let Some(context) = req.extensions().get::<AccessLogContext>() else {
+        return;
+    };
+    let _ = context.identity.set(AccessIdentity {
+        platform: platform.to_owned(),
+        user_id: user_id.to_owned(),
+    });
 }
 
 pub(crate) async fn block_crawlers(req: Request, next: Next) -> Response {
@@ -270,5 +304,18 @@ mod tests {
             short_user_agent(ua),
             "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUV"
         );
+    }
+
+    #[test]
+    fn authenticated_identity_is_shared_with_access_logger() {
+        let mut req = Request::builder().body(Body::empty()).unwrap();
+        let context = AccessLogContext::default();
+        req.extensions_mut().insert(context.clone());
+
+        record_access_identity(&req, "discord", "123");
+
+        let identity = context.identity.get().unwrap();
+        assert_eq!(identity.platform, "discord");
+        assert_eq!(identity.user_id, "123");
     }
 }

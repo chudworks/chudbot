@@ -18,6 +18,7 @@ use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+use crate::middleware;
 use crate::server::{VibeWebParts, WebRuntimeTypes, WebState};
 
 const SESSION_COOKIE: &str = "vibe_session";
@@ -353,6 +354,13 @@ where
             }
         }
     };
+    if let Some(membership) = membership.as_ref() {
+        middleware::record_access_identity(
+            &request,
+            site.platform.as_str(),
+            membership.user_id.as_str(),
+        );
+    }
     if site.status != VibeSiteStatus::Active {
         return secured(error_page(StatusCode::GONE, "This site is not available."));
     }
@@ -459,9 +467,15 @@ where
     if !guild_is_allowed(&vibe.config, &site.platform, &site.guild_id) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Err(response) = authorize(state, vibe, &site, request.headers(), request.uri()).await {
-        return *response;
-    }
+    let membership = match authorize(state, vibe, &site, request.headers(), request.uri()).await {
+        Ok((_, membership)) => membership,
+        Err(response) => return *response,
+    };
+    middleware::record_access_identity(
+        &request,
+        site.platform.as_str(),
+        membership.user_id.as_str(),
+    );
     if site.status != VibeSiteStatus::Active {
         return error_page(StatusCode::GONE, "This site is not available.");
     }
